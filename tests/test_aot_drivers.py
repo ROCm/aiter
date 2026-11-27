@@ -145,14 +145,14 @@ class MegaMoEProductionJobsTest(unittest.TestCase):
         jobs = mega_moe.production_jobs()
         ep4 = [job for job in jobs if job["world_size"] == 4]
         # V4-Pro (3 MTPRs x 3 EPLB profiles x 2 quants x 8 ranks), Kimi-K3
-        # (3 x 2 x 8) and V4.1-Flash EP4 / EP2 / EP8 (3 MTPRs x 2 quants x 4 / 2 / 8 ranks).
-        self.assertEqual(len(jobs), 144 + 48 + 2 * (12 + 6 + 24))
+        # (3 x 2 x 8) and V4.1-Flash EP4 / EP2 / EP8 (4 MTPRs x 2 quants x 4 / 2 / 8 ranks).
+        self.assertEqual(len(jobs), 144 + 48 + 2 * (16 + 8 + 32))
         self.assertEqual(
             {(job["quant"], job["mtpr"], job["rank"]) for job in ep4},
             {
                 (quant, mtpr, rank)
                 for quant in ("a8w4", "a4w4")
-                for mtpr in (128, 8192, 16384)
+                for mtpr in (128, 8192, 16384, 32768)
                 for rank in range(4)
             },
         )
@@ -167,11 +167,12 @@ class MegaMoEProductionJobsTest(unittest.TestCase):
                 (96, 5120, 2304, 6),
             )
         self.assertEqual(len({job["kernel_name"] for job in jobs}), len(jobs))
-        # The prefill instances (8192, 16384) build the large-input kernel too, for both quants.
+        # The prefill instances (8192, 16384, 32768) build the large-input kernel too, for both quants.
         from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import LARGE_M_MTPRS
 
         self.assertEqual(
-            {job["mtpr"] for job in ep4 if job["mtpr"] in LARGE_M_MTPRS}, {8192, 16384}
+            {job["mtpr"] for job in ep4 if job["mtpr"] in LARGE_M_MTPRS},
+            {8192, 16384, 32768},
         )
         self.assertEqual(
             {
@@ -179,7 +180,7 @@ class MegaMoEProductionJobsTest(unittest.TestCase):
                 for job in ep4
                 if job["quant"] == "a4w4" and job["mtpr"] in LARGE_M_MTPRS
             },
-            {8192, 16384},
+            {8192, 16384, 32768},
         )
         # A4W4 ships the staged, small-input and large-input routes: one job a rank and MTPR, as A8W4.
         self.assertEqual(
@@ -190,7 +191,7 @@ class MegaMoEProductionJobsTest(unittest.TestCase):
                     if job["world_size"] == 4
                 ]
             ),
-            12,
+            16,
         )
 
     def test_v41_flash_ep2_profile(self):
@@ -203,7 +204,7 @@ class MegaMoEProductionJobsTest(unittest.TestCase):
             {
                 (quant, mtpr, rank)
                 for quant in ("a8w4", "a4w4")
-                for mtpr in (128, 8192, 16384)
+                for mtpr in (128, 8192, 16384, 32768)
                 for rank in range(2)
             },
         )
@@ -218,7 +219,8 @@ class MegaMoEProductionJobsTest(unittest.TestCase):
                 (192, 5120, 2304, 6),
             )
         self.assertEqual(
-            {job["mtpr"] for job in ep2 if job["mtpr"] in LARGE_M_MTPRS}, {8192, 16384}
+            {job["mtpr"] for job in ep2 if job["mtpr"] in LARGE_M_MTPRS},
+            {8192, 16384, 32768},
         )
         self.assertEqual(
             {
@@ -226,7 +228,7 @@ class MegaMoEProductionJobsTest(unittest.TestCase):
                 for job in ep2
                 if job["quant"] == "a4w4" and job["mtpr"] in LARGE_M_MTPRS
             },
-            {8192, 16384},
+            {8192, 16384, 32768},
         )
         self.assertEqual(
             len(
@@ -236,7 +238,7 @@ class MegaMoEProductionJobsTest(unittest.TestCase):
                     if job["world_size"] == 2
                 ]
             ),
-            6,
+            8,
         )
 
     def test_v41_flash_ep8_profile(self):
@@ -251,7 +253,7 @@ class MegaMoEProductionJobsTest(unittest.TestCase):
             {
                 (quant, mtpr, rank)
                 for quant in ("a8w4", "a4w4")
-                for mtpr in (128, 8192, 16384)
+                for mtpr in (128, 8192, 16384, 32768)
                 for rank in range(8)
             },
         )
@@ -270,5 +272,5 @@ class MegaMoEProductionJobsTest(unittest.TestCase):
                     for job in ep8
                     if job["quant"] == quant and job["mtpr"] in LARGE_M_MTPRS
                 },
-                {8192, 16384},
+                {8192, 16384, 32768},
             )

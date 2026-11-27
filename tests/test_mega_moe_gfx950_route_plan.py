@@ -23,6 +23,7 @@ from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
     FUSED_TOKEN_BUCKETS,
     LARGE_M_MIN_TOKENS,
     LARGE_M_MTPRS,
+    MAX_MTPR_CLASS,
     ROUTE_LARGE_M,
     ROUTE_SMALL_M,
     ROUTE_STAGED,
@@ -172,19 +173,29 @@ def test_route_exclusions():
 )
 def test_large_m_capacities_share_one_tune(layout, quant):
     """Every layout builds the large-input kernel at every LARGE_M_MTPRS capacity, each launching at a token bucket
-    the config the capacity of 16384 launches there (its tunes measured at 8192 / 16384 carry over unchanged).
+    the config the capacity of 16384 launches there (its tunes measured at 8192 / 16384 carry over unchanged), but
+    V4-Pro A8W4 at 32768, which takes the V4-Pro A4W4 tune. At 32768 every config sends a token row to a
+    destination once (dedup_rows): a route-major payload would not fit the symmetric heap.
     """
     shape = _ROUTED_LAYOUTS[layout]
     for mtpr in LARGE_M_MTPRS:
         for bucket in large_m_buckets(mtpr):
-            assert select_fused_config(
-                bucket, mtpr, quant=quant, **shape
-            ) == select_fused_config(bucket, 16384, quant=quant, **shape), (
+            config = select_fused_config(bucket, mtpr, quant=quant, **shape)
+            if mtpr == MAX_MTPR_CLASS:
+                assert config.fused_stage1.dedup_rows, bucket
+            tuned = min(bucket, 16384)
+            if mtpr == MAX_MTPR_CLASS and layout == "v4_pro_ep8" and quant == "a8w4":
+                a4w4 = select_fused_config(tuned, 16384, quant="a4w4", **shape)
+                assert config == a4w4, bucket
+                continue
+            assert config == select_fused_config(tuned, 16384, quant=quant, **shape), (
                 mtpr,
                 bucket,
             )
     with pytest.raises(ValueError):
-        select_fused_config(32768, 32768, quant=quant, **shape)
+        select_fused_config(
+            2 * MAX_MTPR_CLASS, 2 * MAX_MTPR_CLASS, quant=quant, **shape
+        )
 
 
 @pytest.mark.parametrize("quant", ("a8w4", "a4w4"))
@@ -298,6 +309,9 @@ def test_large_m_buffers_fit_32bit_offsets(layout, quant):
         k1, k2 = config.fused_stage1, config.fused_stage2
         if k1.tag_counts:
             assert mtpr < 1 << 16
+        scale_cols = (inter_dim // 32 + 7) // 8 * 8
+        assert num_valid_max * scale_cols + 8192 < 1 << 31, (layout, mtpr)
+        assert config.stage1.use_tile_resource or num_valid_max * inter_dim < 1 << 31
         if k1.bucket_pairs:
             assert world_size * epr * mtpr * 4 < 1 << 31, (layout, mtpr)
         if k2.scale_stage:
@@ -611,7 +625,8 @@ def test_small_m_token_rows_live_in_the_payload_arena(mtpr):
 
 def test_route_payload_sharing():
     """The EP8 fused runtimes end with an all-rank barrier, so they share the instance's payload arena; the EP4
-    small- (tok_done) and large-input (comb_tok_wait) runtimes can end before their peers, so they keep their own.
+    small- (tok_done) and large-input (comb_tok_wait) runtimes, and EP8 V4-Pro's large-input one at 32768 (the A4W4
+    tune's comb_tok_wait), can end before their peers, so they keep their own.
     """
     from aiter.ops.flydsl.kernels.mega_moe.mega_moe_large_m import LargeMRuntime
     from aiter.ops.flydsl.kernels.mega_moe.mega_moe_small_m import SmallMRuntime
@@ -634,7 +649,9 @@ def test_route_payload_sharing():
         assert SmallMRuntime.ends_all_ranks(max_tok_per_rank=mtpr, **ep8)
         assert not SmallMRuntime.ends_all_ranks(max_tok_per_rank=mtpr, **ep4)
     for mtpr in LARGE_M_MTPRS:
-        assert LargeMRuntime.ends_all_ranks(max_tok_per_rank=mtpr, **ep8)
+        assert LargeMRuntime.ends_all_ranks(max_tok_per_rank=mtpr, **ep8) == (
+            mtpr < MAX_MTPR_CLASS
+        )
         assert not LargeMRuntime.ends_all_ranks(max_tok_per_rank=mtpr, **ep4)
     # EP8 V4.1-Flash takes EP4's tok_done (its small-input runtime keeps its own payload) but not its
     # comb_tok_wait (the large-input runtime shares the instance's payload arena).
@@ -785,7 +802,7 @@ _ROUTED_LAYOUTS = {
 }
 
 
-@pytest.mark.parametrize("mtpr", (128, 1024, 4096, 8192, 16384))
+@pytest.mark.parametrize("mtpr", (128, 1024, 4096, 8192, 16384, 32768))
 @pytest.mark.parametrize("quant", ("a8w4", "a4w4"))
 @pytest.mark.parametrize("layout", sorted(_ROUTED_LAYOUTS))
 def test_routed_instance_routes(layout, quant, mtpr):
@@ -908,12 +925,12 @@ def test_routed_instance_routes(layout, quant, mtpr):
 @pytest.mark.parametrize("layout", sorted(_ROUTED_LAYOUTS))
 def test_routed_calls_never_stage(layout, quant):
     """On a fused layout every call of a routed instance (both fused routes built) at a power-of-two capacity up to
-    16384 that passes max_tokens takes a fused route: the small-input route up to 512 rows a rank, the large-input
+    32768 that passes max_tokens takes a fused route: the small-input route up to 512 rows a rank, the large-input
     route for the rest, launching a config its runtime builds. Without the small-input route (prequantized input, or
     a part without 256 CUs) the large-input route takes every call from capacity 1024; below it such a call stages.
     """
     shape = _ROUTED_LAYOUTS[layout]
-    for log2 in range(15):
+    for log2 in range(16):
         mtpr = 1 << log2
         plan = build_mega_moe_bundle_plan(
             mtpr,
@@ -1028,6 +1045,7 @@ _FUSED_SHAPES = ({}, V41_FLASH_EP4_SHAPE, V41_FLASH_EP2_SHAPE, V41_FLASH_EP8_SHA
 def test_large_m_buckets():
     assert large_m_buckets(1024) == (512, 1024)
     assert large_m_buckets(16384) == (512, 1024, 2048, 4096, 8192, 16384)
+    assert large_m_buckets(32768) == (512, 1024, 2048, 4096, 8192, 16384, 32768)
 
 
 @pytest.mark.parametrize("quant", ("a8w4", "a4w4"))
@@ -1035,7 +1053,7 @@ def test_large_m_buckets():
 def test_large_m_bucket_configs_share_the_runtime_knobs(shape, quant):
     """A large-input call launches the config of its EP-wide max_tokens; the runtime's buffers and the routes'
     shared storage follow the capacity's config, so every bucket keeps its runtime knobs. A8W4 runs one config
-    per capacity."""
+    per capacity but V4-Pro's at 32768 (the V4-Pro A4W4 tune)."""
     from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import large_m_runtime_knobs
 
     for mtpr in LARGE_M_MTPRS:
@@ -1043,7 +1061,7 @@ def test_large_m_bucket_configs_share_the_runtime_knobs(shape, quant):
         for bucket in large_m_buckets(mtpr):
             config = select_fused_config(bucket, mtpr, quant=quant, **shape)
             assert large_m_runtime_knobs(config) == large_m_runtime_knobs(capacity)
-            if quant == "a8w4":
+            if quant == "a8w4" and (shape or mtpr < MAX_MTPR_CLASS):
                 assert config == capacity, (mtpr, bucket)
 
 
@@ -1052,8 +1070,8 @@ def test_large_m_bucket_configs_share_the_runtime_knobs(shape, quant):
 # the configs of 16384, test_large_m_capacities_share_one_tune) at each of its token buckets. On a mismatch the
 # assertion shows the current table.
 _A4W4_DIGEST_LARGE_MTPRS = {
-    "v4_pro_ep8": LARGE_M_MTPRS,
-    "v41_flash_ep8": LARGE_M_MTPRS,
+    "v4_pro_ep8": (1024, 2048, 4096, 8192, 16384),
+    "v41_flash_ep8": (1024, 2048, 4096, 8192, 16384),
     "v41_flash_ep4": (8192, 16384),
     "v41_flash_ep2": (8192, 16384),
 }

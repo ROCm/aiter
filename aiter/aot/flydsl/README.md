@@ -104,11 +104,11 @@ variant of the profile's bundle plan.
   EP8 / EP4 / EP2), `preload_aot_bundles()` also loads the small-input kernel
   (a8w4 or a4w4) of every token bucket of each reachable small-input capacity
   (256 and 512), and, for an instance at an MTPR in `LARGE_M_MTPRS`
-  (1024..16384, every layout), the large-input persistent kernel (a8w4 or
+  (1024..32768, every layout), the large-input persistent kernel (a8w4 or
   a4w4). The default build covers the V4.1-Flash EP4,
   EP2 and EP8 profiles at the MTPRs of ATOM's instances (`V41_FLASH_MTPRS`:
-  128, 8192, 16384; the large-input kernel at 8192 and 16384); one MTPR of the
-  EP4 profile alone:
+  128, 8192, 16384, 32768; the large-input kernel at 8192, 16384 and 32768);
+  one MTPR of the EP4 profile alone:
   `python -m aiter.aot.flydsl.mega_moe --world-size 4 --model-dim 5120
   --inter-dim 2304 --experts-per-rank 96 --mtpr 8192 --quant a8w4`.
 - `--check` compiles nothing: with `FLYDSL_RUNTIME_RUN_ONLY=1`, any kernel the
@@ -290,7 +290,7 @@ GPU_ARCHS=gfx1250 python -m aiter.aot.flydsl.moe
 MegaMoE defaults to every profile the service ships: DeepSeek-V4-Pro r0/r32/r64
 (`experts_per_rank=48/52/56`), Kimi-K3 (`experts_per_rank=112`) and
 DeepSeek-V4.1-Flash EP4 / EP2 / EP8 (`world_size=4/2/8`,
-`experts_per_rank=96/192/48`, MTPR 128/8192/16384 unless `--mtpr` is
+`experts_per_rank=96/192/48`, MTPR 128/8192/16384/32768 unless `--mtpr` is
 given), each for both quants (a8w4 and a4w4) unless `--quant` is given; a4w4
 doubles the V4.1-Flash jobs. The expert count is part of the
 compiled ABI, so one profile cannot safely reuse another profile's bundle.
