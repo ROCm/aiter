@@ -5,7 +5,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from aiter.ops.triton.gemm.basic.gemm_a16w16 import _is_gluon_available, gemm_a16w16
+from aiter.ops.triton.gemm.basic.gemm_a16w16 import (
+    _gluon_gfx950_unsupported_reason,
+    _is_gluon_available,
+    gemm_a16w16,
+)
 from aiter.ops.triton.gemm.basic.gemm_a16w16_atomic import gemm_a16w16_atomic
 from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 from op_tests.triton_tests.utils.types import str_to_torch_dtype
@@ -14,6 +18,26 @@ from op_tests.triton_tests.utils.types import str_to_torch_dtype
 def is_gluon_supported():
     """gluon a16w16 kernels are only available on supported archs (gfx1250)."""
     return _is_gluon_available()
+
+
+def _skip_unsupported_gluon(
+    backend, kernel_type, M, N, K, layout="TN", activation=None
+):
+    """Skip gluon cases that no gluon kernel on this architecture covers."""
+    if backend != "gluon":
+        return
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+    if "gfx950" in (get_arch() or ""):
+        # The gfx950 config selects the compute_bound kernel, for the TN layout only.
+        if layout != "TN":
+            pytest.skip("gfx950 gluon a16w16 supports the TN layout only")
+        reason = _gluon_gfx950_unsupported_reason(M, N, K, activation=activation)
+        if reason:
+            pytest.skip(f"gfx950 gluon a16w16: {reason}")
+        return
+    if not is_gluon_supported():
+        pytest.skip("Gluon not supported on this architecture")
 
 
 def _skip_if_triton_on_gfx1250(backend):
@@ -64,8 +88,7 @@ def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True, bias=F
 def test_gemm_a16_w16(M: int, N: int, K: int, backend, kernel_type):
     if backend == "triton" and kernel_type != "bandwidth_bound":
         pytest.skip("kernel_type only applies to the gluon backend")
-    if backend == "gluon" and not is_gluon_supported():
-        pytest.skip("Gluon not supported on this architecture")
+    _skip_unsupported_gluon(backend, kernel_type, M, N, K)
     _skip_if_triton_on_gfx1250(backend)
 
     x, w, _, _out_dtype, _y = generate_gemm_a16w16_inputs(
@@ -120,8 +143,7 @@ def test_gemm_a16_w16_activation(
 ):
     if backend == "triton" and kernel_type != "bandwidth_bound":
         pytest.skip("kernel_type only applies to the gluon backend")
-    if backend == "gluon" and not is_gluon_supported():
-        pytest.skip("Gluon not supported on this architecture")
+    _skip_unsupported_gluon(backend, kernel_type, M, N, K, activation=activation)
     _skip_if_triton_on_gfx1250(backend)
 
     x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(
@@ -161,8 +183,7 @@ def test_gemm_a16_w16_activation(
 def test_gemm_a16_w16_layout(M: int, N: int, K: int, layout, backend, kernel_type):
     if backend == "triton" and kernel_type != "bandwidth_bound":
         pytest.skip("kernel_type only applies to the gluon backend")
-    if backend == "gluon" and not is_gluon_supported():
-        pytest.skip("Gluon not supported on this architecture")
+    _skip_unsupported_gluon(backend, kernel_type, M, N, K, layout=layout)
     _skip_if_triton_on_gfx1250(backend)
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
@@ -384,3 +405,88 @@ def test_gemm_a16w16_gfx1250_gptoss_tuned(M, N, K):
     torch.testing.assert_close(
         gemm_a16w16(x, w, backend="gluon"), F.linear(x, w), atol=1e-1, rtol=1e-2
     )
+
+
+def _gluon_ref(x, w, b):
+    """fp32 reference in the input dtype, as the other a16w16-family tests build it
+    (e.g. test_fused_gemm_a16w16_mul_add)."""
+    return F.linear(x.float(), w.float(), None if b is None else b.float()).to(x.dtype)
+
+
+# Large compute-bound shapes, and one shape for each M bucket of the gfx950 config.
+@pytest.mark.parametrize(
+    "M, N, K",
+    [
+        (4096, 4096, 8192),
+        (8192, 8192, 8192),
+        (4096, 8192, 4096),
+        (64, 2048, 1024),
+        (128, 2048, 1024),
+        (256, 1024, 1024),
+        (512, 2048, 1024),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("output", [True, False])
+@pytest.mark.parametrize("bias", [False, True])
+def test_gemm_a16_w16_gluon_compute_bound(M: int, N: int, K: int, dtype, output, bias):
+    _skip_unsupported_gluon("gluon", "compute_bound", M, N, K)
+    x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(M, N, K, dtype, output=output)
+    b = torch.randn((N,), dtype=dtype, device="cuda") if bias else None
+    torch_out = _gluon_ref(x, w, b)
+    out = gemm_a16w16(
+        x, w, b, out_dtype, y, backend="gluon", kernel_type="compute_bound"
+    )
+    torch.testing.assert_close(out, torch_out, atol=1e-1, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "M, N, K",
+    [
+        (1000, 2048, 512),  # ragged M
+        (512, 1016, 512),  # ragged N (a multiple of 8, not of any tile)
+        (256, 256, 1032),  # ragged K, one tail chunk
+        (256, 256, 1000),  # ragged K, two tail chunks, K not a multiple of 16
+        (475, 1016, 1000),  # all three ragged
+        (100, 72, 264),  # smaller than the tile
+        (57, 19360, 4096),  # a production shape with a ragged M
+    ],
+)
+@pytest.mark.parametrize("bias", [False, True])
+def test_gemm_a16_w16_gluon_compute_bound_ragged(M, N, K, bias):
+    """Ragged M, N and K give the right result. The output starts as NaN, so an
+    element that the kernel does not write makes the test fail."""
+    _skip_unsupported_gluon("gluon", "compute_bound", M, N, K)
+    x, w, _, out_dtype, _ = generate_gemm_a16w16_inputs(
+        M, N, K, torch.bfloat16, output=False
+    )
+    b = torch.randn((N,), dtype=torch.bfloat16, device="cuda") if bias else None
+    y = torch.full((M, N), float("nan"), dtype=torch.bfloat16, device="cuda")
+    torch_out = _gluon_ref(x, w, b)
+    out = gemm_a16w16(
+        x, w, b, out_dtype, y, backend="gluon", kernel_type="compute_bound"
+    )
+    assert not torch.isnan(out).any()
+    torch.testing.assert_close(out, torch_out, atol=1e-1, rtol=1e-2)
+
+
+# One M for each tile of the gfx950 config. Each K occurs only here, so that the
+# kernel compiles again into the temporary Triton cache.
+@pytest.mark.parametrize("M, K", [(64, 1288), (128, 1296), (256, 1304)])
+def test_gemm_a16_w16_gluon_compute_bound_is_scheduled(M, K, monkeypatch, tmp_path):
+    """The compiled kernel has the sched.barriers of the MFMA scheduler. A Triton
+    that ignores schedule_hint passes the other tests, but is about 15% slower."""
+    N = 1024
+    _skip_unsupported_gluon("gluon", "compute_bound", M, N, K)
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path))
+    monkeypatch.delenv("AITER_MFMA_SCHED", raising=False)
+    x, w, _, out_dtype, _ = generate_gemm_a16w16_inputs(
+        M, N, K, torch.bfloat16, output=False
+    )
+    out = gemm_a16w16(x, w, None, out_dtype, None, backend="gluon")
+    torch.testing.assert_close(out, _gluon_ref(x, w, None), atol=1e-1, rtol=1e-2)
+    llir = list(tmp_path.rglob("*.llir"))
+    amdgcn = list(tmp_path.rglob("*.amdgcn"))
+    assert llir and amdgcn, f"the kernel did not compile into {tmp_path}"
+    assert all("llvm.amdgcn.sched.barrier" in f.read_text() for f in llir)
+    assert all("sched_barrier" in f.read_text() for f in amdgcn)
