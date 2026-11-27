@@ -418,6 +418,18 @@ class FlyQuickAllReduce:
         self.relay_fraction = None
         self.relay_min_bytes = None
         self._inbox_flags = inbox_flags
+        # ``_init_relay`` is a collective, so every rank has to take the same
+        # branch: one rank passing ``relay_devices`` alone would wait in its
+        # broadcast while the others went on to the grid all-reduce below.
+        wants_relay = int(relay_devices is not None)
+        votes = torch.tensor([wants_relay, -wants_relay], dtype=torch.int64)
+        dist.all_reduce(votes, op=dist.ReduceOp.MAX, group=group)
+        if int(votes[0]) + int(votes[1]) != 0:
+            raise ValueError(
+                "relay_devices is set on some ranks and not on others "
+                f"(rank {self.rank}: {relay_devices!r}); pass the same relay "
+                "settings on every rank"
+            )
         if relay_devices is not None:
             self._init_relay(arch, relay_devices, relay_fraction, relay_min_bytes)
         try:

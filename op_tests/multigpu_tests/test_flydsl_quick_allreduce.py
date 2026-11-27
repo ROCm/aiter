@@ -2078,6 +2078,80 @@ def test_quick_allreduce_run_ahead(tokens, hidden, tp, algorithm):
     }
 
 
+def _run_relay_mixed_rank(rank: int, tp: int, init_method: str) -> dict:
+    """One rank of a mixed-relay spawn: rank 0 asks for ``DEFAULT_RELAY``, the
+    other rank for no relay; then both build a clean engine."""
+    import torch.distributed as dist
+
+    from aiter.ops.flydsl import FlyQuickAllReduce
+
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="gloo", init_method=init_method, world_size=tp, rank=rank
+    )
+
+    def _build(relay_devices):
+        FlyQuickAllReduce(
+            group=dist.group.WORLD,
+            device=device,
+            rank=rank,
+            world_size=tp,
+            algorithm="mesh",
+            relay_devices=relay_devices,
+        ).close()
+
+    row = {"err": None, "s": None, "rebuild_err": None}
+    try:
+        start = perf_counter()
+        try:
+            _build(DEFAULT_RELAY if rank == 0 else None)
+        except Exception as exc:  # noqa: BLE001
+            row["err"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            row["s"] = perf_counter() - start
+        try:
+            _build(None)
+        except Exception as exc:  # noqa: BLE001
+            row["rebuild_err"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        dist.destroy_process_group()
+    return row
+
+
+@benchmark()
+def test_quick_allreduce_relay_mixed():
+    """``relay_devices`` on rank 0 only fails construction on both TP2 ranks.
+
+    Gates: both ranks raise the ValueError about mixed relay settings instead
+    of one waiting in ``_init_relay``'s exchange, and a clean engine then
+    builds on both. The time to the raise is reported, not asserted.
+    """
+    label = f"tp=2 relay_devices={DEFAULT_RELAY} on rank 0 only"
+    try:
+        rows = _spawn(_run_relay_mixed_rank, 2, timeout_s=SETUP_FAULT_TIMEOUT_S)
+    except Exception as exc:  # noqa: BLE001
+        why = str(exc) or f"no result within {SETUP_FAULT_TIMEOUT_S} s"
+        _check(label, [f"spawn failed: {type(exc).__name__}: {why}"])
+        return {"gfx": ARCH, "raised_on_all": False, "rebuilt": False}
+    expected = "ValueError: relay_devices is set on some ranks and not on others"
+    fails = []
+    for rank, row in enumerate(rows):
+        if row["err"] is None:
+            fails.append(f"rank {rank}: the engine built")
+        elif not row["err"].startswith(expected):
+            fails.append(f"rank {rank}: raised {row['err']!r}, expected {expected!r}")
+        if row["rebuild_err"] is not None:
+            fails.append(f"rank {rank}: rebuild failed: {row['rebuild_err']}")
+    _check(label, fails)
+    return {
+        "gfx": ARCH,
+        "raised_on_all": all(r["err"] for r in rows),
+        "max raise s": max(r["s"] for r in rows),
+        "rebuilt": not any(r["rebuild_err"] for r in rows),
+    }
+
+
 @benchmark()
 def test_quick_allreduce_setup_failure(tp, fault):
     """A ``_StEngine`` setup step failing on one rank fails engine construction
@@ -4310,6 +4384,10 @@ def _verify(args, tps, algos, dts, link) -> None:
     _summarize(
         "flydsl quick allreduce TP2 relay",
         [test_quick_allreduce_relay(*row) for row in relay],
+    )
+    _summarize(
+        "flydsl quick allreduce TP2 relay on one rank only",
+        [test_quick_allreduce_relay_mixed()] if relay else [],
     )
     _summarize(
         "flydsl quick allreduce engine setup failure",
