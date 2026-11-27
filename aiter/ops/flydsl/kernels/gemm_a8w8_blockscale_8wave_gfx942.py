@@ -482,17 +482,36 @@ def compile_gemm_fp8_blockscale_gfx942(
             # t = tick (k % 2) and u = tock select the ScaleB slots; SA = ScaleA
             # (packet), SB = ScaleB. Each stage's memory phase writes the packets
             # staged one stage earlier (pf1), reads its operands and issues its
-            # loads; then its compute phase runs do_gemm.
-            # | Stage | ds_write (tile)    | ds_read | loads issued (tile)          |
-            # |-------|--------------------|---------|------------------------------|
-            # | 0     | A3 (k)             | B, A0   | SA1 (k), A0 B0 (k+1)         |
-            # | 1     | A0 B0 (k+1)        | A1      | SA2 (k), A1 B1 (k+1)         |
-            # | 2     | A1 B1 (k+1)        | A2      | SA3 (k), A2 B2 B3 (k+1)      |
-            # | 3     | A2 B2 B3 (k+1)     | A3      | SA0 (k+1), A3 (k+1)          |
-            # Every stage: ds_write -> ds_read -> loads -> lgkmcnt(0) ->
-            # s_barrier -> s_setprio 3 -> do_gemm -> s_setprio 0 -> s_barrier.
+            # loads; then its compute phase runs do_gemm. Written and loaded A/B
+            # packets are tile k+1's unless marked; all else is tile k's unless
+            # marked. dequant is one FMA per MFMA: C += partial * SA * SB.
+            # | Stage | ds_write | ds_read | load A | load B | load scale    | MFMA x32  | dequant x32 |
+            # |-------|----------|---------|--------|--------|---------------|-----------|-------------|
+            # | 0     | A3 (k)   | B0-3 A0 | A0     | B0     | SA1, SB (k+1) | A0 x B0-3 | * SA0 * SB  |
+            # | 1     | A0 B0    | A1      | A1     | B1     | SA2           | A1 x B0-3 | * SA1 * SB  |
+            # | 2     | A1 B1    | A2      | A2     | B2 B3  | SA3           | A2 x B0-3 | * SA2 * SB  |
+            # | 3     | A2 B2 B3 | A3      | A3     | -      | SA0 (k+1)     | A3 x B0-3 | * SA3 * SB  |
+
+            # Every stage: vmcnt -> ds_write -> ds_read -> loads (SA, A, B) ->
+            # lgkmcnt(0) -> s_barrier -> s_setprio 3 -> do_gemm -> s_setprio 0 ->
+            # s_barrier. The vmcnt waits are LLVM's, before each ds_write for that
+            # packet's load; a stage's last ds_write stores the previous stage's
+            # last load, so it needs vmcnt(0).
+
             # Stage 0's compute phase first loads SB (u, k+1) into two SGPRs.
+            # A stage's first 8 dequant FMAs still retire the previous stage's partials.
             # The last tile re-fetches clamped tiles so it stays inside the loop body.
+            # Registers behind these columns. One DWORDx4 is 4 VGPRs: 16 bytes per lane,
+            # 1 KiB per wave, 1/8 of a packet (64 rows x 128 K bytes). A prefetch slot
+            # is live from its load to its ds_write: here at most 3 of the 6 at once.
+            # | Use     | Registers      | one wave holds                | DWORDx4                             |
+            # |---------|----------------|---------------------------    |-------------------------------------|
+            # | load    | a_prefetch_reg | A0-A3: 1/8 of each            | 4 = NUM_PACKETS                     |
+            # | load    | b_prefetch_reg | 2 B packets: 1/8 of each      | 2 = packet % 2 slots                |
+            # | MFMA    | frag_A         | A_p one packet: 32 of 64 rows | 4 = PHASE_M_REP x 2 half_k          |
+            # | MFMA    | frag_B         | B0-B3: 16 of 64 rows each     | 8 = 2 quadrant_n x N_REP x 2 half_k |
+            # | dequant | frag_P         | 4 partials: 16x16 FP32        | 4 = PHASE_M_REP x N_REP             |
+            # N_REP is per quadrant_n (128 columns); half_k is a 64-byte K half.
             ki_next = (ki + 1 < num_tiles).select(ki + 1, num_tiles - 1)
             tock = 1 - tick
             for packet in range_constexpr(NUM_PACKETS):
