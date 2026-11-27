@@ -955,150 +955,104 @@ def test_gfx950_heuristic_does_not_try_secondary_kids(monkeypatch):
 
 
 # ---- partial-K contract (ROCm/aiter#5954) --------------------------------
-# These pipelines have no K-tail mask: the A/B buffer resources are bounded by
-# rows, so a partial last K tile reads the bytes past logical K in each row.
+# Every gfx950 a16w16 pipeline zeroes the K tail (k >= K) of the A and B
+# register fragments in the last K tile, so a partial K must give the same
+# result whatever bytes (including NaN/Inf) sit past logical K in each row.
+
+_PARTIAL_K_PADS = (0.0, 1.0, -3.0, float("nan"), float("inf"))
 
 
-def _gfx950_a16_kids(*, requires_aligned_k):
-    from csrc.opus_gemm.opus_gemm_common import (
-        KERNEL_REGISTRY,
-        a16w16_requires_k_aligned,
-    )
-
-    return sorted(
-        kid
-        for kid, inst in KERNEL_REGISTRY["a16w16"]["gfx950"][256].items()
-        if a16w16_requires_k_aligned(inst) == requires_aligned_k
-    )
-
-
-@pytest.mark.parametrize("kid", _gfx950_a16_kids(requires_aligned_k=True))
-def test_gfx950_unmasked_k_tail_kid_requires_aligned_k(kid):
-    """Every kid without K-tail handling rejects a partial K and keeps aligned K."""
+def _gfx950_a16_registry():
     from csrc.opus_gemm.opus_gemm_common import KERNEL_REGISTRY
 
-    block_k = KERNEL_REGISTRY["a16w16"]["gfx950"][256][kid].B_K
-    # 1536 is a multiple of every gfx950 a16w16 B_M/B_N, so only K can reject.
-    args = _a16_policy_args("gfx950", 1536, 1536, 16 * block_k)
-    plan = _get_cached_a16w16_launch_plan(**args, kid=kid, split_k=0)
-    assert plan.resolved_kid == kid
-
-    for partial_k in (16 * block_k + 2, 16 * block_k + block_k // 2 + 2):
-        args["K"] = partial_k
-        with pytest.raises(ValueError, match=rf"K % {block_k} == 0; got K={partial_k}"):
-            _get_cached_a16w16_launch_plan(**args, kid=kid, split_k=0)
+    return KERNEL_REGISTRY["a16w16"]["gfx950"][256]
 
 
-@pytest.mark.parametrize("kid", (6, 10, 12, 14, 20))
-def test_gfx950_masked_k_tail_kid_keeps_partial_k(kid):
-    """flatmm_splitk with OOB masks the K tail, so partial K stays accepted."""
-    assert kid in _gfx950_a16_kids(requires_aligned_k=False)
-    args = _a16_policy_args("gfx950", 1536, 1536, 1250)
-    plan = _get_cached_a16w16_launch_plan(**args, kid=kid, split_k=0)
+@pytest.mark.parametrize("kid", sorted(_gfx950_a16_registry()))
+def test_gfx950_partial_k_is_accepted_by_launch_plan(kid):
+    """No gfx950 a16w16 kid is rejected on the host for K % B_K != 0."""
+    block_k = _gfx950_a16_registry()[kid].B_K
+    # 1536 is a multiple of every gfx950 a16w16 B_M/B_N, so only K could reject.
+    # 15 * B_K + 2 keeps ceil(K / B_K) even and is not a multiple of B_K.
+    K = 15 * block_k + 2
+    plan = _get_cached_a16w16_launch_plan(
+        **_a16_policy_args("gfx950", 1536, 1536, K), kid=kid, split_k=0
+    )
     assert plan.resolved_kid == kid
 
 
-@pytest.mark.parametrize("kid", (30, 76, 121, 131))
-@pytest.mark.parametrize("K", (194, 254))
-def test_gfx950_persistent_partial_k_is_never_selected(kid, K):
-    """The persistent kid of #5954 is skipped for partial K, not launched."""
-    from aiter.ops.opus.policy import (
-        resolve_a16w16_heuristic_candidate,
-        resolve_a16w16_tuned_candidate,
-    )
-
-    args = _a16_policy_args("gfx950", 8192, 4096, K)
-    assert resolve_a16w16_tuned_candidate(**args, requested_kid=kid) is None
-    # Heuristic fallback picks a kid that masks the K tail (or none), never kid 30.
-    plan = resolve_a16w16_heuristic_candidate(**args)
-    assert plan is None or plan.resolved_kid in _gfx950_a16_kids(
-        requires_aligned_k=False
-    )
-
-
-def test_gfx950_heuristic_never_picks_unmasked_kid_for_partial_k():
-    from aiter.ops.opus.policy import resolve_a16w16_heuristic_candidate
-
-    masked = set(_gfx950_a16_kids(requires_aligned_k=False))
-    for M in (1, 4, 64, 100, 128, 1000, 4096, 8192):
-        for N in (256, 1000, 4096):
-            for K in (194, 254, 450, 1250):
-                plan = resolve_a16w16_heuristic_candidate(
-                    **_a16_policy_args("gfx950", M, N, K)
-                )
-                assert plan is None or plan.resolved_kid in masked, (M, N, K)
-
-
-@pytest.mark.parametrize(
-    ("M", "N", "K", "kid"),
-    ((8192, 4096, 256, 76), (4096, 4096, 1024, 76), (1000, 4096, 1024, 30)),
-)
-def test_gfx950_heuristic_selection_unchanged_for_aligned_k(M, N, K, kid):
-    from aiter.ops.opus.policy import resolve_a16w16_heuristic_candidate
-
-    plan = resolve_a16w16_heuristic_candidate(**_a16_policy_args("gfx950", M, N, K))
-    assert plan is not None and plan.resolved_kid == kid
-
-
-def _padded_k_operands(rows, K, row_stride, pad, gen):
+def _padded_k_operand(rows, K, row_stride, pad, gen):
     """Return a [1, rows, K] view whose physical rows are row_stride wide."""
     buf = torch.full((1, rows, row_stride), pad, device="cuda", dtype=torch.bfloat16)
     buf[:, :, :K] = torch.randn(
         (1, rows, K), device="cuda", dtype=torch.bfloat16, generator=gen
     )
-    return buf[:, :, :K], buf
+    return buf[:, :, :K]
 
 
-@pytest.mark.parametrize("K", (194, 254))
-def test_gfx950_partial_k_result_is_independent_of_row_padding(K):
-    """Same logical A/B, different bytes in the row padding -> same output."""
+# flatmm_splitk kids need ceil(K / B_K) >= their prefetch depth, so the small
+# K values only apply to the shallow-prefetch kids; the other kids take every K.
+_PARTIAL_K_CASES = [
+    (kid, K) for kid in (2, 30, 76, 92, 117, 121) for K in (194, 254, 1250)
+] + [
+    (6, 194),
+    (6, 254),
+    (6, 1250),
+    (10, 194),
+    (12, 578),
+    (12, 1250),
+    (52, 578),
+]
+
+
+@pytest.mark.parametrize(("kid", "K"), _PARTIAL_K_CASES)
+def test_gfx950_partial_k_result_is_independent_of_row_padding(kid, K):
+    """Same logical A/B, any bytes in the row padding -> same, correct output."""
     if _runtime_arch() != "gfx950":
         pytest.skip("requires gfx950 hardware")
-    from aiter.ops.opus import gemm_a16w16_opus
-
-    M, N, stride = 2048, 1024, 256
+    M, N = 1536, 1536  # a multiple of every B_M/B_N used above
+    stride = (K + 63) // 64 * 64 + 64
     outputs = []
-    for pad in (0.0, 1.0, -3.0):
-        gen = torch.Generator(device="cuda").manual_seed(0x5954)
-        A, _ = _padded_k_operands(M, K, stride, pad, gen)
-        B, _ = _padded_k_operands(N, K, stride, pad, gen)
-        # Shape-driven path: heuristic selection must avoid the unmasked kids.
-        actual = gemm_a16w16_opus(A, B)
+    for pad in _PARTIAL_K_PADS:
+        gen = torch.Generator(device="cuda").manual_seed(0x5954 + K)
+        A = _padded_k_operand(M, K, stride, pad, gen)
+        B = _padded_k_operand(N, K, stride, pad, gen)
+        Y = torch.empty((1, M, N), device="cuda", dtype=torch.bfloat16)
+        actual = opus_bmm(A, B, Y, family="a16w16", kid=kid, split_k=0)
         torch.cuda.synchronize()
         _assert_matches_golden(actual, A, B)
         outputs.append(actual.clone())
     assert all(torch.equal(outputs[0], other) for other in outputs[1:])
 
 
-@pytest.mark.parametrize("kid", (30, 76))
-def test_gfx950_explicit_unmasked_kid_rejects_partial_k_before_launch(kid):
+@pytest.mark.parametrize("kid", (2, 6, 30, 76, 92))
+def test_gfx950_partial_k_contiguous_rows_match_torch(kid):
+    """stride == K: the over-read of the last K tile lands in the next row."""
     if _runtime_arch() != "gfx950":
         pytest.skip("requires gfx950 hardware")
+    torch.manual_seed(0x5954 + kid)
     K = 194
-    gen = torch.Generator(device="cuda").manual_seed(0x5954)
-    A, _ = _padded_k_operands(1024, K, 256, 1.0, gen)
-    B, _ = _padded_k_operands(512, K, 256, 1.0, gen)
-    Y = torch.full((1, 1024, 512), 7.0, device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="requires K % 64 == 0"):
-        opus_bmm(A, B, Y, family="a16w16", kid=kid, split_k=0)
+    A = torch.randn((1, 1536, K), device="cuda", dtype=torch.bfloat16)
+    B = torch.randn((1, 1536, K), device="cuda", dtype=torch.bfloat16)
+    Y = torch.empty((1, 1536, 1536), device="cuda", dtype=torch.bfloat16)
+    actual = opus_bmm(A, B, Y, family="a16w16", kid=kid, split_k=0)
     torch.cuda.synchronize()
-    assert bool((Y == 7.0).all()), "the rejected kid must not launch"
+    _assert_matches_golden(actual, A, B)
 
 
-def test_gfx950_tuner_rejects_unaligned_k_for_unmasked_kids():
+def test_gfx950_tuner_ignores_k_tail_for_every_kid():
+    """A partial last K tile alone never makes the tuner reject a kid."""
     if _runtime_arch() != "gfx950":
         pytest.skip("requires gfx950 hardware")
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "csrc/opus_gemm"))
-    from csrc.opus_gemm.opus_gemm_common import KERNEL_REGISTRY
     from opus_gemm_tune import kid_rejects_shape
 
-    registry = KERNEL_REGISTRY["a16w16"]["gfx950"][256]
-    for kid in _gfx950_a16_kids(requires_aligned_k=True):
-        inst = registry[kid]
-        K = 16 * inst.B_K + 2
-        assert kid_rejects_shape(inst, 1536, 1536, K, 256), kid
-    for kid in (6, 10, 12, 14, 20):
-        assert not kid_rejects_shape(registry[kid], 1536, 1536, 1250, 256), kid
+    for kid, inst in sorted(_gfx950_a16_registry().items()):
+        # Same ceil(K / B_K) = 16 (so the even-loops / prefetch-depth rules see
+        # the same loop count); only the K tail differs.
+        aligned = kid_rejects_shape(inst, 1536, 1536, 16 * inst.B_K, 256)
+        partial = kid_rejects_shape(inst, 1536, 1536, 15 * inst.B_K + 2, 256)
+        assert partial == aligned, kid
 
 
 if __name__ == "__main__":

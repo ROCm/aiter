@@ -1231,9 +1231,9 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
 """
     min_k = 2 * k.B_K
     k_check = f"""
-    int loops_ = K / {k.B_K};
-    AITER_CHECK(K % {k.B_K} == 0,
-        "mono-tile requires K divisible by B_K={k.B_K}; got K=", K);
+    // A partial last K tile is allowed: the pipeline zeroes the K tail of the
+    // A and B register fragments (opus_gemm_k_tail_mask_gfx950.cuh).
+    int loops_ = (K + {k.B_K} - 1) / {k.B_K};
     AITER_CHECK(loops_ >= 2,
         "K=", K, " too small for B_K={k.B_K}, need K >= {min_k}");
     AITER_CHECK(K % 2 == 0,

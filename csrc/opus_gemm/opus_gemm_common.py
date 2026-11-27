@@ -538,22 +538,6 @@ class OpusGemmInstance:
         return _opus_sf_shuf_sub()
 
 
-# gfx950 a16w16 pipelines whose A/B tile loads have no K-tail mask. Their buffer
-# resources are bounded by rows, not by K, so a partial last K tile reads the
-# bytes that follow logical K in each physical row (padding, or the next row)
-# and the output depends on them (ROCm/aiter#5954). They are only correct when
-# K % B_K == 0. ``a16w16_flatmm_splitk`` masks the A tail under HAS_OOB and is
-# not listed; its no-OOB variants are covered by the has_oob rule below.
-A16W16_UNMASKED_K_TAIL_TAGS = frozenset(
-    {"a16w16", "a16w16_flatmm", "a16w16_persistent", "a16w16_mono_tile"}
-)
-
-
-def a16w16_requires_k_aligned(instance: OpusGemmInstance) -> bool:
-    """Whether the kid is only correct when K is a multiple of its B_K."""
-    return instance.kernel_tag in A16W16_UNMASKED_K_TAIL_TAGS or not instance.has_oob
-
-
 def a16w16_flatmm_prefetch_k_iter(instance: OpusGemmInstance) -> int:
     """Mirror gfx950 ``Traits::prefetch_k_iter`` for host-side planning.
 
@@ -2006,7 +1990,8 @@ a16w16_persistent_kernels_list_cpol_nooob = {
 # Locks: BLOCK_SIZE=512, T_M=2, T_N=4, T_K=1, W_M=W_N=16, W_K=32 (MFMA
 # 16x16x32 BF16), VEC=8. Single v_c accumulator over the full B_M x B_N
 # tile per K iter (no quad-subtile, no split barrier). Intrinsically
-# non-OOB (launcher enforces M%B_M==N%B_N==K%B_K==0) and HAS_BIAS=false
+# non-OOB (launcher enforces M%B_M==N%B_N==0; the K tail is masked in-kernel)
+# and HAS_BIAS=false
 # (launcher rejects non-empty bias up front). No splitK.
 #
 # B_M <= 192 hard cap. The 7 tiles below were picked to cover

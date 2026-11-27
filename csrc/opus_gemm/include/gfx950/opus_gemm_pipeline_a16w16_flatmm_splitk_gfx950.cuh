@@ -19,6 +19,7 @@
 
 #include "opus_gemm_traits_a16w16_gfx950.cuh"
 #include "splitk_reduce_gfx950.cuh"
+#include "opus_gemm_k_tail_mask_gfx950.cuh"
 
 // ============================================================================
 // Layout functions -- device-only. Suffixed with _splitk to avoid symbol
@@ -167,32 +168,26 @@ inline __device__ auto make_layout_rb_splitk(int lane_id) {
                         lane_id / T::W_N}));
 }
 
-// Consumer helper: runtime-conditional zero of v_a K-tail elements. Only
-// relevant for the last iter of the last split when K is not a multiple of
-// B_K. For every other iter k_valid == B_K and the ternary folds to identity.
-//
-// v_a layout (from tiled_mma_adaptor + mfma_adaptor for 16x16x32_bf16):
-//   v_a[idx] where idx = (i_m * COM_REP_K + i_k) * pack_a + j
-//   with pack_a = 8, i_m in [0, COM_REP_M), i_k in [0, COM_REP_K), j in [0, 8)
-// Lane-to-K mapping for a single MFMA: K = (lane_id / W_M) * pack_a + j.
-// With tiled adaptor's i_k axis: K_tile = i_k * W_K + (lane_id / W_M) * pack_a + j.
+// Consumer helpers: zero the K-tail elements (k >= k_valid) of the A / B
+// operand fragments. Only relevant for the last iter of the last split when K
+// is not a multiple of B_K; the call sites guard them with a wave-uniform
+// branch so aligned K never executes them. Both operands are masked so that a
+// NaN/Inf in either operand's padding cannot reach the accumulator (0 * NaN).
+// The fragment layout is documented in opus_gemm_k_tail_mask_gfx950.cuh; here
+// idx = (i_mn * COM_REP_K + i_k) * VEC + j with i_k = k_group * 2 + c over the
+// (NUM_LOAD_GROUPS_PER_BK, 2) K axes.
 template<typename T, typename VA>
 __device__ __attribute__((always_inline)) inline
 void mask_va_tail(VA& v_a, int k_valid, int lane_id) {
-    constexpr int pack_a = 8;  // mfma_adaptor::pack_a for bf16 16x16x32
-    const int k_group = lane_id / T::W_M;
-    opus::static_for<T::COM_REP_M>([&](auto im_c) {
-        constexpr int im = decltype(im_c)::value;
-        opus::static_for<T::COM_REP_K>([&](auto ik_c) {
-            constexpr int ik = decltype(ik_c)::value;
-            opus::static_for<pack_a>([&](auto j_c) {
-                constexpr int j   = decltype(j_c)::value;
-                constexpr int idx = (im * T::COM_REP_K + ik) * pack_a + j;
-                int my_k = ik * T::W_K + k_group * pack_a + j;
-                v_a[idx] = (my_k < k_valid) ? v_a[idx] : static_cast<typename T::D_A>(0.0f);
-            });
-        });
-    });
+    opus_k_tail_gfx950::mask_k_tail_frag<T::COM_REP_M, T::COM_REP_K, T::W_M, T::W_K, T::VEC_A>(
+        v_a, k_valid, lane_id);
+}
+
+template<typename T, typename VB>
+__device__ __attribute__((always_inline)) inline
+void mask_vb_tail(VB& v_b, int k_valid, int lane_id) {
+    opus_k_tail_gfx950::mask_k_tail_frag<T::COM_REP_N, T::COM_REP_K, T::W_N, T::W_K, T::VEC_B>(
+        v_b, k_valid, lane_id);
 }
 
 #endif // __HIP_DEVICE_COMPILE__
@@ -515,13 +510,15 @@ void gemm_a16w16_flatmm_splitk_kernel(opus_gemm_flatmm_splitk_kargs_gfx950 kargs
         }
 
         // Epilogue: load K=loops-1, mma K=loops-2 then K=loops-1.
-        // Last mma's v_a may contain K beyond kargs.k (last split's tail), so
-        // apply the mask_va_tail zeroing only for the final MMA.
+        // The last mma's v_a / v_b may contain K beyond kargs.k (last split's
+        // tail), so zero both fragments' tails for the final MMA only. This is
+        // independent of HAS_OOB (which only governs M/N edge handling).
         __builtin_amdgcn_s_barrier();
         int last_slot = (loops - 1) % T::prefetch_k_iter;
         auto sa_last = make_smem(smem_a_at(last_slot, 0, 0));
         auto sb_last = make_smem(smem_b_at(last_slot, 0, 0));
         const int k_valid_final = is_last_split ? k_valid_in_last_iter : T::B_K;
+        const bool k_tail_partial = k_valid_final != T::B_K;  // wave-uniform
         if (last_in_buf1) {
             v_a0 = load<T::VEC_A>(sa_last, u_ra);
             v_b0 = load<T::VEC_B>(sb_last, u_rb);
@@ -530,7 +527,10 @@ void gemm_a16w16_flatmm_splitk_kernel(opus_gemm_flatmm_splitk_kargs_gfx950 kargs
             v_c = mma(v_a1, v_b1, v_c);
             __builtin_amdgcn_s_setprio(0);
             s_waitcnt_lgkmcnt(0_I);
-            if constexpr (T::HAS_OOB) { mask_va_tail<T>(v_a0, k_valid_final, lane_id); }
+            if (k_tail_partial) {
+                mask_va_tail<T>(v_a0, k_valid_final, lane_id);
+                mask_vb_tail<T>(v_b0, k_valid_final, lane_id);
+            }
             __builtin_amdgcn_s_setprio(1);
             v_c = mma(v_a0, v_b0, v_c);
             __builtin_amdgcn_s_setprio(0);
@@ -542,7 +542,10 @@ void gemm_a16w16_flatmm_splitk_kernel(opus_gemm_flatmm_splitk_kargs_gfx950 kargs
             v_c = mma(v_a0, v_b0, v_c);
             __builtin_amdgcn_s_setprio(0);
             s_waitcnt_lgkmcnt(0_I);
-            if constexpr (T::HAS_OOB) { mask_va_tail<T>(v_a1, k_valid_final, lane_id); }
+            if (k_tail_partial) {
+                mask_va_tail<T>(v_a1, k_valid_final, lane_id);
+                mask_vb_tail<T>(v_b1, k_valid_final, lane_id);
+            }
             __builtin_amdgcn_s_setprio(1);
             v_c = mma(v_a1, v_b1, v_c);
             __builtin_amdgcn_s_setprio(0);
