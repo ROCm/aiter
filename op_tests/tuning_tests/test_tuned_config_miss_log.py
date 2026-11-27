@@ -12,6 +12,7 @@ Run:
     python3 -m unittest op_tests.tuning_tests.test_tuned_config_miss_log -v
 """
 
+import functools
 import unittest
 from unittest import mock
 
@@ -67,7 +68,8 @@ class TestLogTunedConfigMiss(_MissLogCase):
         self.set_log_all(0)
         lines = []
         for family, n, k in [("a", 32, 6144), ("a", 256, 6144), ("b", 32, 6144)]:
-            lines += self.misses(lambda m: self.log(m, n, k, family), (1, 2, 3))
+            log = functools.partial(self.log, n=n, k=k, family=family)
+            lines += self.misses(log, (1, 2, 3))
         self.assertEqual(len(lines), 3)
 
     def test_log_tuned_config_logs_every_miss_without_suffix(self):
