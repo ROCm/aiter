@@ -6,6 +6,8 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm as mlir_llvm
 from flydsl.expr import const_expr, llvm, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.rocdl.cluster import cluster_barrier
 from flydsl.expr.typing import T
@@ -23,6 +25,95 @@ SUPPORTED_MMA = {GEMM_DTYPE_BF16: ((16, 16, 32),), GEMM_DTYPE_FP16: ((16, 16, 32
 GEMM_DTYPE_BITS = {GEMM_DTYPE_BF16: 16, GEMM_DTYPE_FP16: 16}
 FRAGMENT_LOAD_BITS = 128
 STORE_VEC_BITS = 128
+
+
+def _global_pointer(pointer, element_offset, element_bytes):
+    address = fx.Int64(fx.ptrtoint(pointer)) + fx.Int64(element_offset) * element_bytes
+    return mlir_llvm.IntToPtrOp(
+        mlir_llvm.PointerType.get(address_space=1), address.ir_value()
+    ).result
+
+
+def _agent_scope():
+    return mlir_llvm.MetadataAsValueOp(
+        ir.Attribute.parse('#llvm.md_node<#llvm.md_string<"agent">>')
+    ).result
+
+
+def _store_partial_available(pointer, offset, values):
+    """Publish one naturally aligned, same-dtype 16-byte partial at agent scope."""
+    packed = mlir_llvm.BitcastOp(T.vec(4, T.i32), values.ir_value()).res
+    mlir_llvm.call_intrinsic(
+        None,
+        "llvm.amdgcn.av.store.b128",
+        [_global_pointer(pointer, offset, 2), packed, _agent_scope()],
+        [],
+        [],
+    )
+
+
+def _load_partial_visible(pointer, offset, dtype):
+    """Read exactly one agent-visible 16-byte partial, not a cache-wide acquire."""
+    packed = mlir_llvm.call_intrinsic(
+        T.vec(4, T.i32),
+        "llvm.amdgcn.av.load.b128",
+        [_global_pointer(pointer, offset, 2), _agent_scope()],
+        [],
+        [],
+    )
+    return fx.Vector(mlir_llvm.BitcastOp(T.vec(8, dtype.ir_type), packed).res)
+
+
+def _order_av_accesses(ordering):
+    # AV stores/loads supply availability/visibility at the accessed locations.
+    # Keep release/acquire ordering around the cluster execution barrier without
+    # cache-wide make-available/make-visible operations. Agent-scope atomics
+    # supply the same access-local guarantees. Never pair this fence with
+    # ordinary unscoped memory accesses.
+    fence = mlir_llvm.FenceOp(ordering, syncscope="agent")
+    fence.operation.attributes["llvm.mmra"] = ir.Attribute.parse(
+        '#llvm.mmra_tag<"amdgcn-av":"none">'
+    )
+
+
+def _zero_output_available(pointer, width):
+    """Publish aligned BF16 pairs without writing beyond the guarded N edge."""
+    addr = fx.to_llvm_ptr(pointer)
+    if const_expr(width == 8):
+        mlir_llvm.call_intrinsic(
+            None,
+            "llvm.amdgcn.av.store.b128",
+            [addr, fx.full(4, 0, fx.Int32).ir_value(), _agent_scope()],
+            [],
+            [],
+        )
+    else:
+        # Supported FlyDSL LLVM builds provide b128 AV operations, but not
+        # necessarily b32. An agent-scope atomic store also supplies
+        # store-available semantics; exactly one aligned BF16 pair is zeroed.
+        mlir_llvm.StoreOp(
+            fx.Int32(0).ir_value(),
+            addr,
+            alignment=4,
+            ordering=mlir_llvm.AtomicOrdering.monotonic,
+            syncscope="agent",
+        )
+
+
+def _register_prefetch_fits(
+    m_steps, n_steps, k_steps, frag_elems, elem_bits, acc_elems, waves
+):
+    """Conservative tuning heuristic, not a compiler register allocation bound.
+
+    Hold current and next operand tiles plus FP32 accumulators. Cap both the
+    per-wave working set and workgroup aggregate: eager whole-tile prefetch on
+    large/many-wave tiles can spill, even when the LDS allocation is legal.
+    Unmodeled address temporaries get 32 registers of headroom. Layout gating is
+    separate so NN and quadrant-interleaved schedules retain their pipelines.
+    """
+    operands = 2 * k_steps * (m_steps + n_steps) * frag_elems * elem_bits // 32
+    estimate = operands + m_steps * n_steps * acc_elems + 32
+    return estimate <= 512 and estimate * waves <= 2048
 
 
 def _validate_interleaved_tile(
@@ -255,6 +346,19 @@ def build_gemm_gfx1250(
     shared_elements = max(stages * (a_stage_size + b_stage_size), c_slots)
     m_steps, n_steps = (block_m // (m_waves * mma_m), block_n // (n_waves * mma_n))
     half_m_steps, half_n_steps = (m_steps // 2, n_steps // 2)
+    use_register_pipeline = (
+        b_k_contiguous
+        and not interleave
+        and _register_prefetch_fits(
+            m_steps,
+            n_steps,
+            block_k // mma_k,
+            frag_elems,
+            elem_bits,
+            acc_elems,
+            waves,
+        )
+    )
     _validate_interleaved_tile(
         block_m,
         block_n,
@@ -461,6 +565,42 @@ def build_gemm_gfx1250(
                         acc = accumulators[mi * n_steps + ni]
                         fx.gemm(mma, acc, a_fragment, b_fragments[ni], acc)
 
+        def read_fragments(stage):
+            a_values = [
+                load_fragment(
+                    shared_a, a_stage_size, stage, wave_row + mi * mma_m, ki * mma_k
+                ).load()
+                for ki in range_constexpr(block_k // mma_k)
+                for mi in range_constexpr(m_steps)
+            ]
+            b_values = [
+                load_fragment(
+                    shared_b,
+                    b_stage_size,
+                    stage,
+                    wave_col + ni * mma_n,
+                    ki * mma_k,
+                    k_contiguous=b_k_contiguous,
+                ).load()
+                for ki in range_constexpr(block_k // mma_k)
+                for ni in range_constexpr(n_steps)
+            ]
+            return a_values, b_values
+
+        def compute_fragments(a_values, b_values):
+            for ki in range_constexpr(block_k // mma_k):
+                b_frags = []
+                for ni in range_constexpr(n_steps):
+                    fragment = fx.make_rmem_tensor(frag_elems, elem_dtype)
+                    fragment.store(b_values[ki * n_steps + ni])
+                    b_frags.append(fragment)
+                for mi in range_constexpr(m_steps):
+                    fragment = fx.make_rmem_tensor(frag_elems, elem_dtype)
+                    fragment.store(a_values[ki * m_steps + mi])
+                    for ni in range_constexpr(n_steps):
+                        acc = accumulators[mi * n_steps + ni]
+                        fx.gemm(mma, acc, fragment, b_frags[ni], acc)
+
         k_rank = fx.block_idx.y
         k_tiles = k // split_k // block_k
         k_tile_base = k_rank * k_tiles
@@ -478,21 +618,20 @@ def build_gemm_gfx1250(
                         + col
                     )
                     if row_start + block_m <= m and col_start + block_n <= n:
-                        fx.make_view(
-                            destination, fx.make_layout(out_vec_elems, 1)
-                        ).store(fx.full(out_vec_elems, 0.0, out_dtype))
+                        _zero_output_available(destination, out_vec_elems)
                     else:
                         for pair in range_constexpr(out_vec_elems // 2):
                             if (
                                 row_start + row < m
                                 and col_start + col + pair * 2 + 1 < n
                             ):
-                                fx.make_view(
-                                    destination + pair * 2, fx.make_layout(2, 1)
-                                ).store(fx.full(2, 0.0, out_dtype))
-            llvm.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Release)
+                                _zero_output_available(destination + pair * 2, 2)
+            # Rank 0 publishes C before any split updates it. Every update
+            # below is an agent-scope atomic RMW (load-visible/store-available).
+            rocdl.s_wait_storecnt(0)
+            _order_av_accesses(mlir_llvm.AtomicOrdering.release)
             cluster_barrier()
-            llvm.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Acquire)
+            _order_av_accesses(mlir_llvm.AtomicOrdering.acquire)
         if const_expr(interleave):
             fragment_words = frag_elems * elem_bits // 32
             quadrant_steps = half_m_steps * half_n_steps
@@ -775,6 +914,67 @@ def build_gemm_gfx1250(
             else:
                 run_interleaved(1)
             tdm_ops.tensor_wait(0)
+        elif const_expr(use_register_pipeline):
+            for stage in range_constexpr(stages - 1):
+                copy_tile(stage, k_tile_base + fx.Int32(stage))
+            wait_tile(stages - 2)
+            current_a, current_b = read_fragments(fx.Int32(0))
+            a_count = block_k // mma_k * m_steps
+            b_count = block_k // mma_k * n_steps
+            main_tiles = k_tiles - (stages - 1)
+            # Prefetch the next LDS tile while current operands are carried
+            # in registers. Carry accumulators explicitly through the SSA loop.
+            # main_tiles may be zero; the prologue fragments then feed drain.
+            init_state = (
+                [acc.load() for acc in accumulators]
+                + current_a
+                + current_b
+                + [fx.Int32(0)]
+            )
+            loop_result = init_state
+            for tile, state in range(main_tiles, init=init_state):
+                for i in range_constexpr(m_steps * n_steps):
+                    accumulators[i].store(state[i])
+                ca = list(state[m_steps * n_steps : m_steps * n_steps + a_count])
+                cb = list(
+                    state[
+                        m_steps * n_steps
+                        + a_count : m_steps * n_steps
+                        + a_count
+                        + b_count
+                    ]
+                )
+                current_stage = fx.Int32(state[-1])
+                copy_tile(
+                    (current_stage + stages - 1) % stages,
+                    k_tile_base + fx.Int32(tile) + stages - 1,
+                )
+                wait_tile(stages - 2)
+                next_stage = (current_stage + 1) % stages
+                na, nb = read_fragments(next_stage)
+                compute_fragments(ca, cb)
+                loop_result = yield (
+                    [acc.load() for acc in accumulators] + na + nb + [next_stage]
+                )
+            for i in range_constexpr(m_steps * n_steps):
+                accumulators[i].store(loop_result[i])
+            ca = list(loop_result[m_steps * n_steps : m_steps * n_steps + a_count])
+            cb = list(
+                loop_result[
+                    m_steps * n_steps + a_count : m_steps * n_steps + a_count + b_count
+                ]
+            )
+            current_stage = fx.Int32(loop_result[-1])
+            for tail in range_constexpr(stages - 1):
+                if const_expr(tail < stages - 2):
+                    wait_tile(stages - 3 - tail)
+                    next_stage = (current_stage + 1) % stages
+                    na, nb = read_fragments(next_stage)
+                    compute_fragments(ca, cb)
+                    ca, cb = na, nb
+                    current_stage = next_stage
+                else:
+                    compute_fragments(ca, cb)
         else:
             for stage in range_constexpr(stages - 1):
                 copy_tile(stage, k_tile_base + fx.Int32(stage))
@@ -886,17 +1086,6 @@ def build_gemm_gfx1250(
 
         tile_elems = block_m * block_n
         if const_expr(split_k_atomic):
-            output_view = fx.make_view(
-                out, fx.make_layout((m, n), (c_leading_stride, 1))
-            )
-            # Each pair is explicitly M/N-masked below; the host bounds the
-            # complete strided byte footprint to the buffer offset range.
-            output_buffer = rocdl.make_buffer_tensor(output_view)
-            atomic_atom = fx.make_copy_atom(
-                rocdl.BufferAtomicPkAdd(out_dtype), out_dtype
-            )
-            pair_layout = fx.make_layout(2, 1)
-            pair_fragment = fx.make_rmem_tensor(pair_layout, out_dtype)
             for i in range_constexpr(tile_elems // (threads * out_vec_elems)):
                 offset = (i * threads + tid) * out_vec_elems
                 row, col = (offset // block_n, offset % block_n)
@@ -907,21 +1096,33 @@ def build_gemm_gfx1250(
                 for pair in range_constexpr(out_vec_elems // 2):
                     pair_col = col_start + col + pair * 2
                     if row_start + row < m and pair_col + 1 < n:
-                        pair_fragment.store(
-                            fx.Vector.from_elements(
-                                [values[pair * 2], values[pair * 2 + 1]], out_dtype
-                            )
+                        pair_value = fx.Vector.from_elements(
+                            [values[pair * 2], values[pair * 2 + 1]], out_dtype
                         )
-                        destination = fx.make_view(
-                            fx.get_iter(output_buffer)
-                            + (row_start + row) * c_leading_stride
-                            + pair_col,
-                            pair_layout,
+                        destination = (
+                            out
+                            + fx.Int64(row_start + row) * c_leading_stride
+                            + pair_col
                         )
-                        fx.copy(atomic_atom, pair_fragment, destination)
-            llvm.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Release)
+                        # LLVM models the packed BF16 pair as a single scoped
+                        # atomic, preserving per-update BF16 rounding.
+                        mlir_llvm.AtomicRMWOp(
+                            mlir_llvm.AtomicBinOp.fadd,
+                            fx.to_llvm_ptr(destination),
+                            pair_value.ir_value(),
+                            mlir_llvm.AtomicOrdering.monotonic,
+                            syncscope="agent",
+                            alignment=4,
+                        )
+            # Await completion of the scoped atomic updates. Their own accesses
+            # publish C; no cache-wide writeback of unrelated memory is needed.
+            rocdl.s_wait_storecnt(0)
+            rocdl.s_wait_loadcnt(0)
+            _order_av_accesses(mlir_llvm.AtomicOrdering.release)
             if const_expr(has_bias):
+                pair_layout = fx.make_layout(2, 1)
                 cluster_barrier()
+                # Bias reads remain ordinary loads, so retain their full acquire.
                 llvm.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Acquire)
                 if k_rank == 0:
                     for i in range_constexpr(tile_elems // (threads * out_vec_elems)):
@@ -1012,35 +1213,30 @@ def build_gemm_gfx1250(
                     shared_out + row * c_pitch + col,
                     result_type=T.vec(out_vec_elems, out_dtype.ir_type),
                 )
-                partial = (
-                    workspace
-                    + fx.Int64(block_id) * (split_k * tile_elems)
+                partial_offset = (
+                    fx.Int64(block_id) * (split_k * tile_elems)
                     + fx.Int64(k_rank) * tile_elems
-                    + row * block_n
-                    + col
+                    + offset
                 )
-                fx.make_view(partial, fx.make_layout(out_vec_elems, 1)).store(values)
-            # Publish same-dtype partials before another workgroup reads them.
-            llvm.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Release)
+                _store_partial_available(workspace, partial_offset, values)
+            # Every lane publishes its own complete 16-byte partial before the
+            # workgroup+cluster barrier. Every reducer lane then uses AV loads.
+            # Keep the cluster barrier; only remove redundant cache maintenance.
+            rocdl.s_wait_storecnt(0)
+            _order_av_accesses(mlir_llvm.AtomicOrdering.release)
             cluster_barrier()
-            llvm.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Acquire)
+            _order_av_accesses(mlir_llvm.AtomicOrdering.acquire)
             if k_rank == 0:
                 for i in range_constexpr(tile_elems // (threads * out_vec_elems)):
                     offset = (i * threads + tid) * out_vec_elems
                     row, col = (offset // block_n, offset % block_n)
-                    total = fx.ptr_load(
-                        workspace
-                        + fx.Int64(block_id) * (split_k * tile_elems)
-                        + offset,
-                        result_type=T.vec(out_vec_elems, out_dtype.ir_type),
-                    ).to(fx.Float32)
-                    for part in range_constexpr(split_k - 1):
-                        partial = fx.ptr_load(
-                            workspace
-                            + fx.Int64(block_id) * (split_k * tile_elems)
-                            + (part + 1) * tile_elems
-                            + offset,
-                            result_type=T.vec(out_vec_elems, out_dtype.ir_type),
+                    base = fx.Int64(block_id) * (split_k * tile_elems) + offset
+                    total = _load_partial_visible(workspace, base, out_dtype).to(
+                        fx.Float32
+                    )
+                    for part in range_constexpr(1, split_k):
+                        partial = _load_partial_visible(
+                            workspace, base + part * tile_elems, out_dtype
                         )
                         total = total + partial.to(fx.Float32)
                     commit_output(total, row, col)
@@ -1114,6 +1310,11 @@ def build_gemm_gfx1250(
         interleave,
         split_k_atomic,
     )
+    if use_register_pipeline:
+        launch.compile_hints["llvm_options"] = {
+            "amdgpu-expert-scheduling-mode": True,
+            "unroll-threshold": 0,
+        }
     if interleave:
         launch.compile_hints["llvm_options"] = {
             "amdgpu-expert-scheduling-mode": True,
