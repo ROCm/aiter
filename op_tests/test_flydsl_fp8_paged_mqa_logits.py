@@ -419,6 +419,15 @@ def _grade(ref, got, msg):
     )
 
 
+def _worst_row_mismatches(ref, got):
+    """Most out-of-tolerance logits in any one row, with `_grade`'s tolerances."""
+    live = ref != float("-inf")
+    ref = ref.masked_fill(~live, 0)
+    got = got.masked_fill(~live, 0)
+    bad = (got - ref).abs() > 5.0 + 1e-2 * ref.abs()
+    return int(bad.sum(dim=1).max())
+
+
 def _roofline(batch, next_n, kv_len, context_lens, q_fp8, weights, out):
     total_ctx = int(context_lens.sum().item())
     flops = 2 * HEADS * HEAD_DIM * next_n * total_ctx
@@ -747,11 +756,11 @@ def test_fp8_paged_mqa_logits_big_cache(batch, kv_len, kv_block_size):
     ret = _time_candidates(
         {"flydsl": (flydsl, out)}, ref, flops, nbytes, "paged big_cache"
     )
-    # One FP8 MFMA vs fp32 ReLU-boundary outlier (~6.1e-5) is tolerated; a wrong
-    # 64-token page mismatches at least 64/16384 (~3.9e-3).
-    assert (
-        ret["flydsl err"] < 1e-3
-    ), f"paged big_cache mismatch fraction: {ret['flydsl err']}"
+    # A wrong page puts a whole kv_block_size of logits out of tolerance in one
+    # row; the lone FP8 MFMA vs fp32 rounding outlier is one element. The count is
+    # per row because a fraction over every element dilutes with the batch.
+    worst = _worst_row_mismatches(ref, out)
+    assert worst < kv_block_size // 2, f"paged big_cache row mismatches: {worst}"
     return ret
 
 
