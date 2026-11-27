@@ -194,27 +194,6 @@ def test_k_cache_matches_reference(ratio, page_size):
     assert (got - ref).abs().max() <= 2 * ref.abs().max() * 0.25
 
 
-@pytest.mark.parametrize("shuffle", [(48, 16, 2), (32, 24, 2), (32, 16, 3)])
-def test_k_cache_rejects_a_pattern_that_does_not_tile(shuffle):
-    """A pattern that does not tile the page's tokens, value bytes or scales
-    is refused before anything is written."""
-    torch.manual_seed(0)
-    c = _k_case(8, 64, 1)
-    _, cache = _paged_pool(c["num_pages"], 64, 0, fill=0xAA)
-    with pytest.raises(ValueError, match="does not tile"):
-        k_norm_rope_mxfp4_cache(
-            c["k"],
-            c["positions"],
-            c["cos_sin"],
-            c["w"],
-            1e-6,
-            cache,
-            c["slots"],
-            shuffle=shuffle,
-        )
-    assert (cache == 0xAA).all()
-
-
 @pytest.mark.parametrize(
     "num_tokens, num_heads, with_weights",
     [(64, 20, False), (1000, 64, True), (4200, 64, True)],

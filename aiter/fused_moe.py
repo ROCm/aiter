@@ -101,6 +101,7 @@ from aiter.moev2.segments.sort import (  # noqa: F401
     _aux_uses_opus,
     _empty_bf16,
     _flydsl_moe_sorting,
+    _flydsl_moe_sorting_onewg,
     _moe_prepare_unsorted_input,
     _moe_sorting_impl,
     _mxfp4_aux_instance_supported,
@@ -2552,6 +2553,7 @@ def fused_moe_1stage(
     doweight_stage1: bool | None = None,
     flat: AsmMoeMode | int = AsmMoeMode.SORTED,
     expert_mask: torch.Tensor | None = None,
+    intermediate_pad: int = 0,
 ):
     asm_mode = AsmMoeMode(flat)
     if quant_type == QuantType.No and activation == ActivationType.Silu and not isG1U1:
@@ -2683,7 +2685,9 @@ def fused_moe_1stage(
             )
             return moe_buf
         elif isG1U1:
-            fmoe_func = aiter.fmoe_g1u1
+            fmoe_func = functools.partial(
+                aiter.fmoe_g1u1, intermediate_pad=intermediate_pad
+            )
         else:
             aiter.fmoe_int8_g1u0(
                 moe_buf,
@@ -2726,6 +2730,7 @@ def fused_moe_1stage(
 cfg_2stages = None
 cfg_2stages_by_file = {}
 cfg_2stages_by_limit_tag = {}
+cfg_2stages_stage2_fp8 = None
 
 # Itanium symbols encode the activation (`_silu_` / `_gelu_` / `_situv2_`).
 # SiLU and GELU are the same length, so swapping the tag keeps the mangled
@@ -3447,10 +3452,15 @@ def _mxfp4_a4w4_stage2_fw(
     kernelName2="",
     reverse_sorted=None,
     use_valid_token_count=False,
+    scatter_intermediate=None,
     expert_mask=None,
     topk_ids=None,
     **_kwargs,
 ):
+    """``scatter_intermediate``: see ``_flydsl_v2_stage2_wrapper``. The native
+    MXMOE GEMM2 ignores it and returns the complete ``moe_out``."""
+    if scatter_intermediate is not None:
+        scatter_intermediate.clear()  # no items of an earlier call
 
     device = inter_states.device
     # kernelName2's format selects the gemm2 family: a flydsl_moe2_layout name
@@ -3502,6 +3512,7 @@ def _mxfp4_a4w4_stage2_fw(
             topk_ids=topk_ids,
             reverse_sorted=reverse_sorted,
             use_valid_token_count=use_valid_token_count,
+            scatter_intermediate=scatter_intermediate,
         )
     if bias2 is not None:
         raise ValueError(f"MXMOE GEMM2 {kernelName2!r} does not support bias")
@@ -3598,8 +3609,30 @@ def _flydsl_v2_stage2_wrapper(
     reverse_sorted=None,
     use_valid_token_count=False,
     per_slot_out=None,
+    scatter_intermediate=None,
     **_kwargs,
 ):
+    """``scatter_intermediate``: None (the default) or a dict. With a dict and the
+    bf16 ``scatter`` epilogue, the wrapper does not call
+    ``mxfp4_moe_scatter_reduce`` and does not write ``out``. It puts these items
+    in the dict, so that the caller can do the top-k combine, for example in
+    ``fused_moe_combine_reduce_scatter``:
+
+    - ``inter``: [max_sorted, model_dim] bf16, one unweighted row for each sorted
+      position. It is a stage-2 scratch buffer: use it before the next stage-2
+      call on this stream.
+    - ``reverse_sorted``: [M * topk] int32, the sorted position of each (token, k).
+    - ``sorted_weights``: fp32, the weight of each sorted position.
+    - ``topk``, ``M``, ``model_dim`` and ``MB``.
+
+    With another epilogue, the dict is empty and ``out`` is complete. The wrapper
+    clears the dict first, so a caller can use one dict for all calls.
+    ``per_slot_out`` gives weighted per-(token, slot) rows of the ``reduce``
+    epilogue instead; do not give both."""
+    if scatter_intermediate is not None:
+        if per_slot_out is not None:
+            raise ValueError("give per_slot_out or scatter_intermediate, not both")
+        scatter_intermediate.clear()  # no items of an earlier call
     from aiter.ops.flydsl.kernels.mxmoe_dispatcher import (
         _validate_v2_gemm2_dtypes,
         mxfp4_moe_gemm2,
@@ -3790,6 +3823,17 @@ def _flydsl_v2_stage2_wrapper(
             NE=num_experts,
             TOPK=topk,
             D_HIDDEN=model_dim_runtime,
+            MB=bm,
+        )
+        return out
+    if epilog == "scatter" and scatter_intermediate is not None:
+        scatter_intermediate.update(
+            inter=target,
+            reverse_sorted=reverse_sorted,
+            sorted_weights=sorted_weights,
+            topk=topk,
+            M=token_num,
+            model_dim=model_dim_runtime,
             MB=bm,
         )
         return out
@@ -4585,7 +4629,7 @@ def get_2stage_cfgs(
             tune_file, _INDEX_COLS, config_file is not None, tag
         )
 
-    global cfg_2stages
+    global cfg_2stages, cfg_2stages_stage2_fp8
     tune_file = config_file or AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
     config_path = os.path.dirname(tune_file)
     untune_file = os.path.join(config_path, "untuned_fmoe.csv")
@@ -4660,10 +4704,12 @@ def get_2stage_cfgs(
         logger.info("\033[0m")
 
     def _lookup_cfg(c2s):
+        """Return the row for `keys` and the token tier of that row."""
         if not c2s:
-            return None
+            return None, None
         primary, fallback = c2s
         lookup_keys = keys[:7] + (str(activation),) + keys[8:]
+        tier = token
         result = primary.get(lookup_keys, None)
         if result is None and config_file is None:
             result = fallback.get(keys_disabled, None)
@@ -4671,6 +4717,7 @@ def get_2stage_cfgs(
         if result is None and config_file is None and token > _PADDED_M_TIERS[0]:
             tier_idx = _PADDED_M_TIERS.index(token) if token in _PADDED_M_TIERS else -1
             for fallback_tier in reversed(_PADDED_M_TIERS[:tier_idx]):
+                tier = fallback_tier
                 # keys layout: (gfx, cu_num, token, ...); replace token (idx 2).
                 keys_fb = lookup_keys[:2] + (fallback_tier,) + lookup_keys[3:]
                 keys_fb_disabled = (
@@ -4681,9 +4728,9 @@ def get_2stage_cfgs(
                     result = fallback.get(keys_fb_disabled, None)
                 if result is not None:
                     break
-        return result
+        return result, tier
 
-    cfg = _lookup_cfg(active_cfg_2stages)
+    cfg, cfg_tier = _lookup_cfg(active_cfg_2stages)
     limit_tag = (
         swiglu_limit_tag(swiglu_limit)
         if config_file is None
@@ -4698,7 +4745,7 @@ def get_2stage_cfgs(
         if limit_cfgs is None:
             limit_cfgs = get_cfg_2stages(limit_tune_file, tag=limit_tag)
             cfg_2stages_by_limit_tag[(limit_tune_file, limit_tag)] = limit_cfgs
-        limit_cfg = _lookup_cfg(limit_cfgs)
+        limit_cfg, _ = _lookup_cfg(limit_cfgs)
         if limit_cfg is not None:
             if (
                 limit_cfg.get("run_1stage", False)
@@ -4715,6 +4762,23 @@ def get_2stage_cfgs(
             logger.info(
                 f"[fused_moe] no row for {keys} with {limit_tag}; using default config"
             )
+    if config_file is None and not limit_tag and _flydsl_stage2_fp8_enabled():
+        # Rows that are fastest when stage 2 writes FP8 route rows, e.g. a
+        # FlyDSL `reduce` row for a shape whose main row is a one-stage kernel.
+        if cfg_2stages_stage2_fp8 is None:
+            # Exact act_type only: through the act_type-agnostic dict, a Silu row
+            # would replace the main row of another activation.
+            cfg_2stages_stage2_fp8 = (
+                get_cfg_2stages(AITER_CONFIGS.AITER_CONFIG_FMOE_STAGE2_FP8_FILE)[0],
+                {},
+            )
+        fp8_cfg, fp8_tier = _lookup_cfg(cfg_2stages_stage2_fp8)
+        # A row of a smaller token tier does not replace a row of this tier.
+        if fp8_cfg is not None and (cfg is None or fp8_tier >= cfg_tier):
+            logger.info(
+                f"[fused_moe] AITER_FLYDSL_STAGE2_FP8=1: using the stage2 FP8 row for {keys}"
+            )
+            cfg = fp8_cfg
     if (
         cfg is None
         and config_file is None
@@ -4724,9 +4788,44 @@ def get_2stage_cfgs(
         lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{lock_name}")
         mp_lock(lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
         cfg_2stages = get_cfg_2stages(tune_file)
-        cfg = _lookup_cfg(cfg_2stages)
+        cfg, _ = _lookup_cfg(cfg_2stages)
         if cfg is None:
             logger.warning(f"Fmoe tuning not support for {keys}")
+
+    # A padded call (stored inter_dim, zero-filled intermediate_pad) can reuse a
+    # row tuned at the logical width, but only a FLAT or EMSORT MXFP4 SiLU/GELU
+    # 1-stage row: fmoe_g1u1 launches those over the logical columns and strides
+    # over the stored ones. Every other kernel, including POST_REDUCE and the
+    # Situv2/SwiGLU tiles, computes over the full stored width it was tuned for.
+    if (
+        cfg is None
+        and config_file is None
+        and intermediate_pad
+        and active_cfg_2stages
+        and q_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.fp4x2
+        and activation in (ActivationType.Silu, ActivationType.Gelu)
+    ):
+        logical_keys = (
+            keys[:4]
+            + (inter_dim - intermediate_pad,)
+            + keys[5:7]
+            + (str(activation),)
+            + keys[8:]
+        )
+        logical_cfg = active_cfg_2stages[0].get(logical_keys)
+        if (
+            logical_cfg is not None
+            and logical_cfg.get("run_1stage") == 1
+            and AsmMoeMode(int(logical_cfg.get("flat", 0)))
+            in (AsmMoeMode.NO_SORT, AsmMoeMode.EMSORT)
+        ):
+            cfg = logical_cfg
+            logger.info(
+                f"[fused_moe] using the FLAT/EMSORT row tuned at inter_dim="
+                f"{inter_dim - intermediate_pad} for {keys} with "
+                f"intermediate_pad={intermediate_pad}"
+            )
 
     if cfg is not None:
         kn1 = str(cfg.get("kernelName1", "") or "").strip()
@@ -5430,6 +5529,7 @@ def get_2stage_cfgs(
                 quant_type=q_type,
                 xbf16=run_1stage_xbf16,
                 flat=cfg_flat,
+                intermediate_pad=intermediate_pad,
             ),
             None,
             block_m,
@@ -6293,7 +6393,8 @@ def fused_moe_2stages(
         and q_dtype_a == dtypes.bf16
         and getattr(metadata.stage1, "func", metadata.stage1) is _flydsl_stage1_wrapper
     )
-    if _is_a16w4_port:
+    # Fused-quant stage1 kernels also allocate their own output.
+    if _is_a16w4_port or metadata.fuse_quant:
         a2 = None
     elif quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
         ratio = a1_scale.element_size() // a1.element_size()
@@ -6416,7 +6517,7 @@ def fused_moe_2stages(
         sorted_ids,
         sorted_expert_ids,
         num_valid_ids,
-        None if metadata.fuse_quant else a2,
+        a2,
         topk,
         block_m=block_size_M,
         a1_scale=a1_scale,

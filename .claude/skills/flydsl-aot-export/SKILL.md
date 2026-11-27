@@ -28,6 +28,8 @@ Converted wrappers to copy from:
 | Module-level `@flyc.jit` with constexpr launch arguments | `kernels/gemm_a16w16_gfx950.py` (`bind_aot` under key `()`, the config in `specialization_key`) |
 | Constexprs bound by a cached `@flyc.jit` wrapper | `mxscale_preshuffle_kernels.py` (`_bound_gemm_exe`), `batched_gemm_a8w8_gfx950.py` |
 | Launcher built inside a wrapper and kept in its own dict | `kernels/mxmoe_dispatcher.py` (`bind_aot` with `make_exe`) |
+| Factory argument the cache cannot key (a tuple of dataclasses) | `kernels/mega_moe/mega_moe_stage1.py` (`_stage1_bundle_launcher`: the configs as tuples of their fields) |
+| Caller keeps the function `flyc.compile` returned, or preloads it | `kernels/flydsl_dispatch_combine_intranode_op.py` (`_compile_and_keep`, `_preload_compiled` of a `lazy` handle) |
 
 ## The one rule
 
@@ -55,19 +57,18 @@ So, for each launch, list what the trace depends on and tick each item off:
    and the launcher's signature. Note which parameters are `Constexpr`, which
    object caches the launcher today (`functools.cache`, a module dict, a
    module-level function) and who else launches the same launcher.
-2. **Pick the pattern.**
+2. **Declare what the cache is built from** in `aiter/aot/flydsl/sources.py`:
+   add `"my_kernel": {"sources": [...], "env": [...]}` to `AOT_CACHES`. List
+   every file the kernel's code comes from besides the file that creates the
+   cache and `COMMON_SOURCES` (paths relative to `aiter/ops/flydsl`; a
+   directory stands for its `.py` files), and every variable those files read.
+   Reuse a shared list there if the kernel family has one.
+3. **Pick the pattern.**
 
    Constexprs go to the factory:
 
    ```python
-   @aot_factory(                        # above functools.cache
-       "my_kernel",                     # the cache name
-       # Every file the kernel's code comes from, besides this one and the
-       # common sources (aot_cache._COMMON_SOURCES: kernels_common.py,
-       # tensor_shim.py, buffer_ops.py, the jit hardware tables); relative
-       # to aiter/ops/flydsl. A directory stands for its .py files.
-       sources=["kernels/my_kernel.py"],
-   )
+   @aot_factory("my_kernel")            # the cache name; above functools.cache
    @functools.cache
    def _my_launcher(N, K, tile_m, out_dtype):
        from .kernels.my_kernel import compile_my_kernel   # import inside
@@ -80,7 +81,7 @@ So, for each launch, list what the trace depends on and tick each item off:
    no argument, and the constexprs in `specialization_key`:
 
    ```python
-   @aot_factory("my_kernel", sources=["kernels/my_kernel.py"])
+   @aot_factory("my_kernel")
    @functools.cache
    def _my_launcher():
        from .kernels.my_kernel import launch_my_kernel
@@ -99,20 +100,24 @@ So, for each launch, list what the trace depends on and tick each item off:
             make_exe=lambda: _build(traits)["launch"])
    ```
 
-3. **Launch `factory.lazy(...)`, not `factory(...)`.** A hit then never calls
+4. **Launch `factory.lazy(...)`, not `factory(...)`.** A hit then never calls
    the factory. Move the kernel-module imports into the factory and out of the
    wrapper's `_lazy_import`, or the hit still pays the `@flyc.kernel`
    definitions (a few hundred ms per module in a fresh process).
-4. **One launcher, one cache.** When several wrappers launch the same
+5. **One launcher, one cache.** When several wrappers launch the same
    launcher, define its factory once and import it. Two factories
    returning one launcher object bind it to two keys, and it falls back to
    the JIT path.
-5. **Update what else compiles the kernel.** A preload or warm-up helper must
+6. **Update what else compiles the kernel.** A preload or warm-up helper must
    go through the same launch path under compile-only
-   (`_run_compiled(factory.lazy(), ...)` with `COMPILE_ONLY=1` set),
-   or it warms FlyDSL's cache and not the entry the launch loads. An AOT replay
-   under `aiter/aot/flydsl/` needs no change if it enters at the public op.
-6. **Document it.** Add the cache name, wrapper and key to
+   (`_run_compiled(factory.lazy(), ...)` with `COMPILE_ONLY=1` set, or
+   `_preload_compiled(factory.lazy(), ...)`, which builds the entry in a
+   prebuild and loads it elsewhere), or it warms FlyDSL's cache and not the
+   entry the launch loads. A call site that keeps what `flyc.compile`
+   returned and calls it directly uses `_compile_and_keep(handle, ...)`. An
+   AOT replay under `aiter/aot/flydsl/` needs no change if it enters at the
+   public op.
+7. **Document it.** Add the cache name, wrapper and key to
    `docs/flydsl_aot_cache.md` §5, and remove the op from the "not converted"
    list in §7.
 
@@ -161,8 +166,8 @@ Behaviour kept:
 
 An entry is looked up by four things, and by nothing else: the **key**
 (factory arguments, `specialization_key`, `Constexpr` launch arguments), the
-**contents of the declared source files** (`sources=`, the creating file and
-`aot_cache._COMMON_SOURCES`), the **declared variables** (`env=`), and the
+**contents of the declared source files** and the **declared variables**
+(both in `aiter/aot/flydsl/sources.py`, plus the creating file), and the
 **fingerprint** (FlyDSL and its own compile variables, arch, CU count).
 Whatever else the generated code depends on is invisible: change it, and a
 later process loads the old kernel without an error. When you convert or
@@ -172,15 +177,15 @@ review a launcher, look for each of these.
 |---|---|---|---|
 | A value the factory or kernel closes over that is not a factory argument | `tile = _pick_tile(device)` inside the factory, then used in the kernel | No | Make it a factory argument, or pass it in `specialization_key` |
 | A module global changed at run time | `kernels_common.FAST_MATH = True` set by a caller or a test | No | Pass the value through the key; do not patch module state |
-| A constant in a file that is not declared | a helper the wrapper (outside `kernels/`) imports; `importlib.import_module(name)`; another installed package | Only an import between two files under `kernels/` (prebuild and unit test raise) | Add the file to `sources=` |
-| A non-Python input read while building | a tuning CSV or JSON the factory reads its tiles from | No | Read it in the wrapper and pass the values as factory arguments, or declare the file in `sources=` |
-| An environment variable a declared file reads | `os.environ.get("AITER_FLYDSL_MY_SWITCH")` in a kernel file | Yes, by a literal name: a prebuild and the unit test raise if it is not in `env=` | Add it to `env=`; if it cannot change generated code, to `aot_cache._ENV_NOT_CODE` |
+| A constant in a file that is not declared | a helper the wrapper (outside `kernels/`) imports; `importlib.import_module(name)`; another installed package | Only an import between two files under `kernels/` (prebuild and unit test raise) | Add the file to the cache's `"sources"` |
+| A non-Python input read while building | a tuning CSV or JSON the factory reads its tiles from | No | Read it in the wrapper and pass the values as factory arguments, or declare the file in the cache's `"sources"` |
+| An environment variable a declared file reads | `os.environ.get("AITER_FLYDSL_MY_SWITCH")` in a kernel file | Yes, by a literal name: a prebuild and the unit test raise if it is not in the cache's `"env"` | Add it to the cache's `"env"`; if it cannot change generated code, to `ENV_NOT_CODE` in `aiter/aot/flydsl/sources.py` |
 | An environment variable read in a file that is not declared, or passed in from a caller | the wrapper reads `MY_SWITCH` and branches in the factory | No | Read it in the wrapper and pass its value as a factory argument |
 | A variable read under a computed name | `os.environ.get(f"AITER_X_{stage}")` | No | Do not do this in kernel code; read it by a literal name |
 | A device property other than arch and CU count | memory size, device name, a driver version | No | Pass it in the key |
 | A `Constexpr` launch argument missing from `specialization_key` | `launch(..., tile: Constexpr[int])` | Yes: stored per entry and compared; two values under one key raise | Still put it in `specialization_key` |
 | Tensor dtype, rank or unit-stride axis that varies for one launcher | the same launcher called with fp8 and bf16 | On disk yes (the digest holds them); in memory no | Put it in `specialization_key` |
-| Linked bitcode | `link_extern(..., bitcode_path=...)` | Yes: a prebuild raises if it is not declared | Add its path to `sources=` |
+| Linked bitcode | `link_extern(..., bitcode_path=...)` | Yes: a prebuild raises if it is not declared | Add its path to the cache's `"sources"` |
 | `True`, `1` and `1.0` as one key | a flag passed as `1` by one caller and `True` by another | No (they hash alike in memory) | Coerce to one type at the call site |
 
 Two more rules that are not about the key:
@@ -191,7 +196,7 @@ Two more rules that are not about the key:
 - **A variable is an input of the caches that declare it, and of no other.**
   Setting a variable a kernel's files read (an `AITER_FLYDSL_*` one too) to
   a value the prebuild did not have makes that kernel's entries miss. The
-  variables the common sources read (`aot_cache._COMMON_ENV`) and FlyDSL's
+  variables the common sources read (`COMMON_ENV` in that file) and FlyDSL's
   own compile variables apply to every cache.
 
 `AITER_FLYDSL_AOT_CACHE=verify` re-traces every entry a process loads and
@@ -223,7 +228,7 @@ the conversion.
    lists the constexpr argument indexes and values, `sources` the files the
    cache declares. Compare them with what the kernel is built from: a file
    that is not declared invalidates nothing (§4.2 of the doc). Declare
-   variables the kernel code reads in `env=`.
+   variables the kernel code reads under `"env"` in `aiter/aot/flydsl/sources.py`.
 6. **Result.** On the target GPU, compare the op's output bitwise against
    mode `0`: prebuild the entries (the op's replay, or its test once under
    `COMPILE_ONLY=1`), then run its op test on that cache directory.
@@ -269,11 +274,11 @@ or `tensor_shim.py`, and after a FlyDSL pin bump.
 | `... launching through the JIT path` at bind time | A key element the cache cannot store | Convert it to a plain value at the call site |
 | `no prebuilt entry in ...; tracing it on the JIT path` | A launch found no entry: only a prebuild (`COMPILE_ONLY`) builds one | Run the op's replay in `aiter/aot/flydsl`, or add the shape to its list |
 | `changed after this process hashed it` | A declared source was edited while a prebuild ran | Rerun the prebuild |
-| `does not declare [...], which its sources import` | A declared kernel file imports a kernel file missing from `sources=` | Add it to `sources=` |
-| `links [...], which it does not declare` | The kernel links bitcode missing from `sources=` | Add its path to `sources=` |
+| `does not declare [...], which its sources import` | A declared kernel file imports a kernel file missing from the cache's `"sources"` in `aiter/aot/flydsl/sources.py` | Add it to the cache's `"sources"` |
+| `links [...], which it does not declare` | The kernel links bitcode missing from the cache's `"sources"` | Add its path there |
 | A second prebuild builds again | The key, a declared source or a declared variable differs between runs | Diff the two sidecars |
 | `verify` mismatch | The trace reads something the key does not hold | Find it (a global, a config, a device property) and put it in the key |
-| The preload/tuner precompile does not speed up the first launch | It compiles the raw launcher | Step 5 above |
+| The preload/tuner precompile does not speed up the first launch | It compiles the raw launcher | Step 6 above |
 
 ## Limits to state, not to hide
 

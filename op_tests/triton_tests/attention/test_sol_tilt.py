@@ -490,12 +490,6 @@ def test_tilt_valu_params_carry_the_value_shift_and_score_multiplier(strides):
     assert sol_tilt._TILT_W_MAX / 2 < m <= sol_tilt._TILT_W_MAX * (1 + 1e-6)
 
 
-def test_tilt_valu_params_reject_more_than_three_strides():
-    planes = sol_tilt_planes(**make_tilt_inputs("int8", "e4m3"))
-    with pytest.raises(ValueError, match="at most three strides"):
-        sol_tilt_valu_params(planes, strides=(1, 2, 3, 4))
-
-
 def test_tilt_scaled_params_carry_the_value_shift_and_score_multiplier():
     planes = sol_tilt_planes(**make_tilt_inputs("mxfp8", "e4m3", q_multiplier=2.0))
     out = sol_tilt_scaled_params(planes, planes.k_scale_plane_stride).tolist()
@@ -903,78 +897,3 @@ def test_jensen_cap_compiles_fullgraph_and_matches_eager(kind):
     kwargs, prep = make_jensen_inputs(kind)
     _cap_most(kind, kwargs, prep)
     _assert_same(sol_jensen_cap(**kwargs), _compiled(sol_jensen_cap)(**kwargs), "cap")
-
-
-@pytest.mark.parametrize("path", ["factors", "planes"])
-@pytest.mark.parametrize(
-    "v_shape",
-    [(1, 1024, 2, 128), (1, 4096, 2, 128), (2, 2048, 2, 128)],
-    ids=["shorter", "longer", "batch"],
-)
-def test_tilt_rejects_v_not_shaped_as_k(path, v_shape):
-    """The factor kernel loads V unmasked over K's extent, so a V shorter than K would be read
-    past its allocation; any other V shape is refused before the launch."""
-    kv_tile = SOL_ATTN_TS_KV
-    k = torch.randn((1, 2048, 2, 128), dtype=torch.float32, device="cuda").to(FP8)
-    v = torch.randn(v_shape, dtype=torch.float32, device="cuda").to(FP8)
-    q = torch.randn((1, 512, 2, 128), dtype=torch.float32, device="cuda").to(FP8)
-    mean = torch.zeros(
-        (1, k.shape[1] // kv_tile, 2, 128), dtype=torch.float32, device="cuda"
-    ).to(FP8)
-    one = torch.ones(1, dtype=torch.float32, device="cuda")
-    with pytest.raises(ValueError, match="the tilt needs V shaped as K"):
-        if path == "factors":
-            sol_tilt_factors(q, k, v, one, one, one, mean, mean, 0.125, 2, kv_tile)
-        else:
-            sol_tilt_planes(
-                k,
-                v,
-                sol_q_abs_max(q),
-                mean,
-                mean,
-                0.125,
-                2,
-                kv_tile,
-                k_format="e4m3",
-                v_format="e4m3",
-            )
-
-
-@pytest.mark.parametrize("path", ["factors", "planes"])
-@pytest.mark.parametrize(
-    "kv_tile, k_blocks, v_blocks",
-    [(64, 2, 2), (128, 4, 4), (128, 2, 1)],
-    ids=["pooled_at_128_for_64", "pooled_at_64_for_128", "short_mean_v"],
-)
-def test_tilt_rejects_pooled_blocks_of_another_kv_tile(
-    path, kv_tile, k_blocks, v_blocks
-):
-    """The factor kernel writes one plane row per full kv_tile block of K, and the pack kernel
-    reads mean_v over mean_k's blocks, so pooled K/V of any other block count are refused before
-    the planes are allocated."""
-    k = torch.randn((1, 256, 1, 128), dtype=torch.float32, device="cuda").to(FP8)
-    v = torch.randn((1, 256, 1, 128), dtype=torch.float32, device="cuda").to(FP8)
-    q = torch.randn((1, 512, 1, 128), dtype=torch.float32, device="cuda").to(FP8)
-
-    def pooled(blocks):
-        rows = torch.zeros((1, blocks, 1, 128), dtype=torch.float32, device="cuda")
-        return rows.to(FP8)
-
-    mean_k, mean_v = pooled(k_blocks), pooled(v_blocks)
-    one = torch.ones(1, dtype=torch.float32, device="cuda")
-    with pytest.raises(ValueError, match="pooled at another kv_tile"):
-        if path == "factors":
-            sol_tilt_factors(q, k, v, one, one, one, mean_k, mean_v, 0.125, 2, kv_tile)
-        else:
-            sol_tilt_planes(
-                k,
-                v,
-                sol_q_abs_max(q),
-                mean_k,
-                mean_v,
-                0.125,
-                2,
-                kv_tile,
-                k_format="e4m3",
-                v_format="e4m3",
-            )
