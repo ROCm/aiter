@@ -268,6 +268,10 @@ def compile_one_config(**job):
         device = torch.device("cuda", job["rank"])
         with (
             dry_run(ARCH, NUM_CU, name=DEVICE_NAME),
+            # This is the process of that rank, as in serving: MegaMoEV2 runs
+            # on cuda:{rank} and the dispatch/combine op it builds on the
+            # current device, which dry_run alone leaves at cuda:0.
+            mock.patch.object(torch.cuda, "current_device", lambda: job["rank"]),
             _fake_shmem(device, job["rank"], job["world_size"]),
         ):
             # Imported only now: without mori, its stand-in must be in place.
