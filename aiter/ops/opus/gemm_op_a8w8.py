@@ -654,16 +654,24 @@ def a8w8_mxfp8_kid_runs(
     instance, M: int, N: int, K: int, split_k: int = 0, layout: str = "NT"
 ) -> bool:
     """Whether a8w8_mxfp8(_bpreshuffle) kid ``instance`` runs (M, N, K) in
-    ``layout`` (NT / NN / TT / TN) with ``split_k``. The 32-bit buffer ranges
-    bound A / B to 2 GiB, one C tile to 2 GiB (C itself may exceed 4 GiB) and
-    the split-K workspace to 4 GiB."""
+    ``layout`` (NT / NN / TT / TN) with ``split_k``. A / B are based per tile,
+    so they may exceed 4 GiB: the 32-bit buffer ranges bound one tile of an
+    operand (B_M / B_N rows of K, or B_K rows of a stored [K, M] / [K, N]) and
+    its scales, one C tile to 2 GiB (C itself may exceed 4 GiB) and the
+    split-K workspace to 4 GiB."""
+    a_t, b_t = layout.upper()[0] == "T", layout.upper()[1] == "N"
     # A stored [K, M] needs M % 16 (B stored [K, N] N % 16, as every N below).
-    if layout.upper()[0] == "T" and M % 16:
+    if a_t and M % 16:
         return False
     if K <= 0 or K % _MXFP8_K_ALIGN:
         return False
+    limit = (1 << 31) - 1
+    for transposed, rows, tile_rows in ((a_t, M, instance.B_M), (b_t, N, instance.B_N)):
+        tile_bytes = (instance.B_K + 1) * rows if transposed else tile_rows * K
+        if tile_bytes > limit or rows * (K // 32) > limit:
+            return False
     # C: a whole tile whatever M is (see the launcher's check).
-    if max(M * K, N * K, 2 * ((instance.B_M - 1) * N + instance.B_N)) > (1 << 31) - 1:
+    if 2 * ((instance.B_M - 1) * N + instance.B_N) > limit:
         return False
     if instance.co_variant == "nob":
         if M % instance.B_M or N % instance.B_N:

@@ -635,8 +635,8 @@ __device__ __forceinline__ void gemm_a8w8_mxfp8_body(opus_gemm_mxfp8_kargs_gfx95
     const int k_split = T::SPLITK ? static_cast<int>(block_id_x()) % split_k : 0;
     const int kt0 = k_split * loops;
     // A_T / B_T: K tile kt0 starts at k row kt0 * B_K.
-    const int a_k0 = !T::SPLITK ? 0 : T::A_T ? kt0 * T::B_K * kargs.stride_a : kt0 * T::B_K_BYTES;
-    const int b_k0 = !T::SPLITK ? 0 : T::B_T ? kt0 * T::B_K * kargs.stride_b : kt0 * T::B_K_BYTES * (T::B_SHUF ? 16 : 1);
+    const int a_k0 = !T::SPLITK || T::A_T ? 0 : kt0 * T::B_K_BYTES;   // A_T / B_T: kt0 goes into the K tile base (below)
+    const int b_k0 = !T::SPLITK || T::B_T ? 0 : kt0 * T::B_K_BYTES * (T::B_SHUF ? 16 : 1);
     const int sf_k0 = T::SPLITK ? kt0 * T::NUM_KGROUPS : 0;
     const int wave_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
     // Persistent: lane id from mbcnt over an opaque all-ones mask, so the lane-dependent offsets are recomputed per tile
@@ -653,15 +653,28 @@ __device__ __forceinline__ void gemm_a8w8_mxfp8_body(opus_gemm_mxfp8_kargs_gfx95
     // columns past N are masked per 16-byte store.  A_T / B_T: the columns past M / N of a k row read the next k row (only
     // C rows / columns past M / N use them, and those are not stored); the range ends with the matrix.
     const int rows_in = T::BOUNDARY ? kargs.m - row : T::B_M, cols_in = T::BOUNDARY ? kargs.n - col : T::B_N;
-    auto g_a = make_gmem(reinterpret_cast<const D_AB*>(kargs.ptr_a) + batch_id * kargs.stride_a_batch + (T::A_T ? row : row * kargs.stride_a) + a_k0,
-                         T::BOUNDARY ? (T::A_T ? static_cast<unsigned int>(kargs.k - kt0 * T::B_K) * static_cast<unsigned int>(kargs.stride_a) - row
-                                               : static_cast<unsigned int>(rows_in) * static_cast<unsigned int>(kargs.stride_a) - a_k0)
-                                     : 0xffffffffu);
+    // A / B are based in 64 bits so that the 32-bit buffer offsets cover one tile whatever the size of the operand (as C
+    // below).  Row-major A [M, K] / B [N, K] (shuffled B too): the base is the tile's first row and the offsets span its
+    // B_M / B_N rows of K; the range is what is left of the operand, saturated to 32 bits (only a last, ragged tile ends
+    // inside it).  A_T / B_T (stored [K, M] / [K, N]): a tile's columns are spread over all K rows, so the base is moved
+    // to each K tile (a_k_base / b_k_base below) and the offsets span its B_K rows of M / N.
+    auto range_u32 = [](long bytes) { return static_cast<unsigned int>(bytes < 0 ? 0 : bytes > 0xffffffffl ? 0xffffffffl : bytes); };
+    const D_AB* const a_base = reinterpret_cast<const D_AB*>(kargs.ptr_a) + static_cast<long>(batch_id) * kargs.stride_a_batch +
+                               (T::A_T ? static_cast<long>(row) : static_cast<long>(row) * kargs.stride_a) + a_k0;
+    const D_AB* const b_base = reinterpret_cast<const D_AB*>(kargs.ptr_b) + static_cast<long>(batch_id) * kargs.stride_b_batch +
+                               (T::B_T ? static_cast<long>(col) : static_cast<long>(col) * kargs.stride_b) + b_k0;
     // B_SHUF: 16 rows of the shuffled [N, K] are one block of 16 K bytes, so row col still starts at col * K.
-    auto g_b = make_gmem(reinterpret_cast<const D_AB*>(kargs.ptr_b) + batch_id * kargs.stride_b_batch + (T::B_T ? col : col * kargs.stride_b) + b_k0,
-                         T::BOUNDARY ? (T::B_T ? static_cast<unsigned int>(kargs.k - kt0 * T::B_K) * static_cast<unsigned int>(kargs.stride_b) - col
-                                               : static_cast<unsigned int>(cols_in) * static_cast<unsigned int>(kargs.stride_b) - b_k0)
-                                     : 0xffffffffu);
+    auto g_a = make_gmem(a_base, T::BOUNDARY ? range_u32(static_cast<long>(rows_in) * kargs.stride_a - a_k0) : 0xffffffffu);
+    auto g_b = make_gmem(b_base, T::BOUNDARY ? range_u32(static_cast<long>(cols_in) * kargs.stride_b - b_k0) : 0xffffffffu);
+    // A_T / B_T buffer of the K tile being copied: from its first k row, column row / col, to the end of the matrix.  The
+    // copies run through the K tiles of this block's K segment in order (prefetch_a / prefetch_b: half 0 then half 1 of
+    // tiles 0, 1, 2, ...), so the base and what is left of the matrix are stepped by one K tile after each half 1 --
+    // no 64-bit multiply in the loop.  BOUNDARY: the columns past M / N of a k row read the next k row (only C rows /
+    // columns past M / N use them, and those are not stored), and past the last k row nothing.
+    const long a_k_step = static_cast<long>(T::B_K) * kargs.stride_a, b_k_step = static_cast<long>(T::B_K) * kargs.stride_b;
+    const D_AB* a_k_base = a_base + kt0 * a_k_step;
+    const D_AB* b_k_base = b_base + kt0 * b_k_step;
+    long a_k_left = (kargs.k / T::B_K - kt0) * a_k_step - row, b_k_left = (kargs.k / T::B_K - kt0) * b_k_step - col;
     // C: 64-bit tile base and a buffer range bounded to this output tile (as the blockscale 4wave_pin_agpr WIDE_OUTPUT), so
     // the 32-bit range and offsets cover one tile whatever the size of C; the host keeps one tile under 2 GiB.  BOUNDARY:
     // the range ends at the last valid element of the tile (rows past M start beyond it since stride_c >= cols_in).
@@ -729,12 +742,12 @@ __device__ __forceinline__ void gemm_a8w8_mxfp8_body(opus_gemm_mxfp8_kargs_gfx95
 
     // ---- offsets ----
     auto ga_offset = [&](int half_tile_m, int tile_k) {
-        if constexpr (T::A_T) return tile_k * T::B_K * kargs.stride_a + half_tile_m * T::HALF_B_M;
+        if constexpr (T::A_T) return half_tile_m * T::HALF_B_M;   // the K tile is in the buffer base (a_k_base)
         else return half_tile_m * T::HALF_B_M * kargs.stride_a + tile_k * T::B_K_BYTES;
     };
     // Shuffled B: a K tile is 128 / 32 = 4 blocks of 512 bytes inside each 16-row block (16 K bytes per row).
     auto gb_offset = [&](int half_tile_n, int tile_k) {
-        if constexpr (T::B_T) return tile_k * T::B_K * kargs.stride_b + half_tile_n * T::HALF_B_N;
+        if constexpr (T::B_T) return half_tile_n * T::HALF_B_N;   // the K tile is in the buffer base (b_k_base)
         else return half_tile_n * T::HALF_B_N * kargs.stride_b + tile_k * T::B_K_BYTES * (T::B_SHUF ? 16 : 1);
     };
     auto sa_offset = [&](int stage, int half_tile_m) { return (stage * 2 + half_tile_m) * smem_a_elem; };
@@ -756,6 +769,7 @@ __device__ __forceinline__ void gemm_a8w8_mxfp8_body(opus_gemm_mxfp8_kargs_gfx95
         if constexpr (T::A_T) {
             char* const base = reinterpret_cast<char*>(s_a.ptr) + sa_offset(stage, half_tile_m) + tt_w * 4 * T::smem_linear_wave_a;
             const int kr = lane_id / 8, slot = lane_id % 8;
+            auto g_at = make_gmem(a_k_base, T::BOUNDARY ? range_u32(a_k_left) : 0xffffffffu);
             opus::static_for<4>([&](auto i_) {
                 constexpr int i = decltype(i_)::value;
                 constexpr int io = i * T::smem_linear_wave_a;
@@ -763,8 +777,9 @@ __device__ __forceinline__ void gemm_a8w8_mxfp8_body(opus_gemm_mxfp8_kargs_gfx95
                 constexpr int MG = T::HALF_B_M / 16;
                 const int mg = slot ^ f;
                 const int gofs = (tt_w * 32 + i * 8 + kr) * kargs.stride_a + (MG == 8 || mg < MG ? mg : mg - (8 - MG)) * T::VEC_A;
-                g_a.template async_load<T::VEC_A>(base, gofs - io, ga_offset(half_tile_m, tile), opus::number<io>{});
+                g_at.template async_load<T::VEC_A>(base, gofs - io, ga_offset(half_tile_m, tile), opus::number<io>{});
             });
+            if (half_tile_m == 1) { a_k_base += a_k_step; a_k_left -= a_k_step; }   // next K tile
         } else {
             async_load_imm<T::VEC_A>(g_a, s_a.ptr, u_ga, u_sa + sa_offset(stage, half_tile_m), ga_offset(half_tile_m, tile));
         }
@@ -775,6 +790,7 @@ __device__ __forceinline__ void gemm_a8w8_mxfp8_body(opus_gemm_mxfp8_kargs_gfx95
         if constexpr (T::B_T) {
             char* const base = reinterpret_cast<char*>(s_b.ptr) + sb_offset(stage, half_tile_n) + nn_w * 4 * T::smem_linear_wave_b;
             const int kr = lane_id / 8, slot = lane_id % 8;
+            auto g_bt = make_gmem(b_k_base, T::BOUNDARY ? range_u32(b_k_left) : 0xffffffffu);
             opus::static_for<4>([&](auto i_) {
                 constexpr int i = decltype(i_)::value;
                 constexpr int io = i * T::smem_linear_wave_b;
@@ -782,8 +798,9 @@ __device__ __forceinline__ void gemm_a8w8_mxfp8_body(opus_gemm_mxfp8_kargs_gfx95
                 constexpr int NG = T::HALF_B_N / 16;
                 const int ng = slot ^ f;
                 const int gofs = (nn_w * 32 + i * 8 + kr) * kargs.stride_b + (NG == 8 || ng < NG ? ng : ng - (8 - NG)) * T::VEC_B;
-                g_b.template async_load<T::VEC_B>(base, gofs - io, gb_offset(half_tile_n, tile), opus::number<io>{});
+                g_bt.template async_load<T::VEC_B>(base, gofs - io, gb_offset(half_tile_n, tile), opus::number<io>{});
             });
+            if (half_tile_n == 1) { b_k_base += b_k_step; b_k_left -= b_k_step; }   // next K tile
         } else {
             async_load_imm<T::VEC_B>(g_b, s_b.ptr, u_gb, u_sb + sb_offset(stage, half_tile_n), gb_offset(half_tile_n, tile));
         }
@@ -1526,7 +1543,7 @@ __device__ __forceinline__ void gemm_a8w8_mxfp8_body(opus_gemm_mxfp8_kargs_gfx95
 
     // ===== Epilogue =====
     // 1. Second-to-last tile: C10, C01, C11 of it and C00 of the last tile; no more copies.
-    if (TRANS || tile + 1 < loops) {   // transposed: always (K % 256 == 0 -> loops >= 2, here tile == loops - 2)
+    if (TRANS || tile + 1 < loops) {   // transposed: always (loops is even and >= 2, here tile == loops - 2)
         const int next_stage = (tile & 1) ^ 1;
         views(s_a.ptr + sa_offset(next_stage, 0), s_b.ptr + sb_offset(next_stage, 0), s_sfa.ptr, s_sfb.ptr,
               [&](auto& rd_a, auto& rd_b, auto& rd_sfa, auto& rd_sfb) {

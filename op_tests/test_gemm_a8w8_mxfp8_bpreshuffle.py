@@ -13,8 +13,8 @@ by shuffle_mxfp8_bpreshuffle_scale (whose layout test_w_scale_layout checks).
 gfx950 also checks the OPUS MXFP8 1x32 backends: every kid of a8w8_mxfp8
 (plain NT / NN / TT / TN) and of a8w8_mxfp8_bpreshuffle (NT, shuffled B)
 (split-K kids at S = 2 / 4), the public route of a libtype "opus" tuned row
-(injected, not read from the production CSVs), outputs of 4 GiB and more, the
-shapes the launchers must reject and the gemm_a8w8_mxfp8_opus API.
+(injected, not read from the production CSVs), outputs and operands of 4 GiB
+and more, the shapes the launchers must reject and the gemm_a8w8_mxfp8_opus API.
 """
 
 import argparse
@@ -133,6 +133,10 @@ DEFAULT_OPUS_MNK = [
 # A 4 GiB C: a 32-bit buffer range over all of C wraps here, so these need the
 # kernel's per-tile 64-bit C base (and fault or drop rows without it).
 DEFAULT_OPUS_LARGE_MNK = [(32768, 65536, 256)]
+# A / B over 4 GiB (tile-aligned, so the "nob" kid runs them too): 32-bit
+# offsets from the start of the operand wrap here, so these need the kernel's
+# 64-bit base per tile (row-major operand) or per K tile (stored [K, M] / [K, N]).
+DEFAULT_OPUS_LARGE_AB_MNK = [(1050624, 256, 4096), (256, 1050624, 4096)]
 OPUS_LAYOUTS = ["NT", "NN", "TT", "TN"]
 PLAIN, BPRESHUFFLE = "a8w8_mxfp8", "a8w8_mxfp8_bpreshuffle"
 
@@ -147,14 +151,22 @@ def opus_inputs(m, n, k, layout, family=PLAIN):
     """Quantized operands as the layout stores them: A [M, K] or the [M, K] view
     of A stored [K, M]; B [N, K] or the [N, K] view of B stored [K, N]
     (a8w8_mxfp8_bpreshuffle: NT, B the shuffle_weight of [N, K])."""
-    x = torch.randn(m, k, dtype=dtypes.bf16)
-    w = torch.randn(n, k, dtype=dtypes.bf16)
-    xq, x_scale = per_group_quant_hip(
-        x, quant_dtype=dtypes.fp8, group_size=32, scale_type=dtypes.fp8_e8m0
-    )
-    wq, w_scale = per_group_quant_hip(
-        w, quant_dtype=dtypes.fp8, group_size=32, scale_type=dtypes.fp8_e8m0
-    )
+
+    def quant(rows):
+        # Row blocks: a multi-GiB operand's bf16 source does not have to fit.
+        parts = [
+            per_group_quant_hip(
+                torch.randn(min(8192, rows - r), k, dtype=dtypes.bf16),
+                quant_dtype=dtypes.fp8,
+                group_size=32,
+                scale_type=dtypes.fp8_e8m0,
+            )
+            for r in range(0, rows, 8192)
+        ]
+        return torch.cat([p[0] for p in parts]), torch.cat([p[1] for p in parts])
+
+    xq, x_scale = quant(m)
+    wq, w_scale = quant(n)
     a = xq if layout[0] == "N" else xq.T.contiguous().T
     if family == BPRESHUFFLE:
         b = shuffle_weight(wq, layout=(16, 16))
@@ -224,6 +236,40 @@ def test_opus(m, n, k, family, layout, kid, split_k):
         "us": round(us, 2),
         "TFLOPS": round(2 * m * n * k / us / 1e6, 1),
         "TB/s": round((m * k + n * k + m * n * 2) / us / 1e6, 2),
+        "err": err,
+    }
+
+
+@benchmark()
+def test_opus_large_operand(m, n, k, family, layout, kid):
+    """An A or B over 4 GiB. The reference covers the rows (columns) where an
+    addressing error shows: both ends of the operand and the rows on either
+    side of each 2 GiB multiple of its byte offset."""
+    xq, x_scale, wq, w_scale, a, b = opus_inputs(m, n, k, layout, family)
+    y = torch.full((m, n), float("nan"), dtype=dtypes.bf16)
+    run_opus(a, b, y, x_scale, w_scale, kid, 0, family)
+    torch.cuda.synchronize()
+    assert not bool(y.isnan().any()), f"{family} kid {kid} {layout}: unwritten C"
+
+    def sample(rows):
+        edges = [0, rows] + [(g << 31) // k for g in range(1, rows * k >> 31)]
+        picked = torch.cat(
+            [torch.arange(max(0, e - 256), min(rows, e + 256)) for e in edges]
+        )
+        return picked.unique()
+
+    rows, cols = sample(m), sample(n)
+    err = checkAllclose(
+        run_torch(xq[rows], x_scale[rows], wq[cols], w_scale[cols], (1, 32)),
+        y[rows][:, cols].float(),
+        printLog=False,
+    )
+    assert err == 0, f"OPUS {family} kid {kid} {layout} M={m} N={n} K={k}: err {err}"
+    return {
+        "kernel": opus_registry(family)[kid].name,
+        "layout": layout,
+        "A GiB": round(m * k / 2**30, 2),
+        "B GiB": round(n * k / 2**30, 2),
         "err": err,
     }
 
@@ -496,6 +542,13 @@ def main():
         help="gfx950 OPUS shapes with a C of 4 GiB or more",
     )
     parser.add_argument(
+        "--opus_large_ab_mnk",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=DEFAULT_OPUS_LARGE_AB_MNK,
+        help="gfx950 OPUS shapes with an A or B of 4 GiB or more",
+    )
+    parser.add_argument(
         "-l",
         "--layout",
         nargs="*",
@@ -544,6 +597,22 @@ def main():
         if opus_registry(c[3])[c[5]].co_variant != "sk"
     ]
     summarize("OPUS MXFP8 1x32 large outputs", [test_opus(*c) for c in large])
+    # Both operands row-major (plain NT, bpreshuffle NT) and both stored
+    # transposed (plain TN), on the boundary-free and the first boundary kid.
+    large_ab = [
+        c[:6]
+        for cases in (
+            opus_cases(args.opus_large_ab_mnk, PLAIN, ["NT", "TN"]),
+            opus_cases(args.opus_large_ab_mnk, BPRESHUFFLE, ["NT"]),
+        )
+        for c in cases
+        if opus_registry(c[3])[c[5]].co_variant in ("nob", "np")
+        and (opus_registry(c[3])[c[5]].B_M, opus_registry(c[3])[c[5]].B_N) == (256, 256)
+    ]
+    summarize(
+        "OPUS MXFP8 1x32 large operands",
+        [test_opus_large_operand(*c) for c in large_ab],
+    )
     kids = opus_registry(BPRESHUFFLE)
     # Each row must be one the kid runs (K % (split_k * 256) for split-K):
     # the injected config skips the tuned-row check the real lookup makes.

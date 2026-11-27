@@ -3622,14 +3622,13 @@ void
     const int N = WQ.size(1);
     AITER_CHECK(K % {2 * k.B_K} == 0, "{k.name} needs K % {2 * k.B_K} == 0 (K=", K, ")");
     {align_code}
-    // 32-bit buffer ranges: A / B and one C tile (the kernel bases C per tile in 64 bits) stay under 2 GiB.
+    // 32-bit buffer ranges: one C tile (the kernel bases C per tile in 64 bits) stays under 2 GiB.
     // C is bounded on a whole {k.B_M}-row tile whatever M is: the epilogue stores every tile row at
     // r * N + c (+ 2^30 elements for a masked column) and the buffer range drops the rows past M, so
     // that offset must not wrap back into the range.
-    AITER_CHECK((int64_t)M * K <= INT32_MAX && (int64_t)N * K <= INT32_MAX &&
-                    2 * ((int64_t)({k.B_M} - 1) * N + {k.B_N}) <= INT32_MAX &&
+    AITER_CHECK(2 * ((int64_t)({k.B_M} - 1) * N + {k.B_N}) <= INT32_MAX &&
                     (batch == 1 || (int64_t)M * N <= INT32_MAX),
-                "{k.name}: M=", M, " N=", N, " K=", K, " batch=", batch, " exceeds the 32-bit buffer ranges");
+                "{k.name}: M=", M, " N=", N, " batch=", batch, " exceeds the 32-bit buffer ranges of C");
     // Layout from strides: operand [rows, K] is dense K-contiguous (stored [rows, K]) or dense
     // rows-contiguous (stored [K, rows]); batch strides rows * K (checked only for batch > 1).
     auto transposed = [&](const aiter_tensor_t& t, int64_t rows, const char* what) {{
@@ -3650,6 +3649,18 @@ void
     // A / B stored [K, M] / [K, N]: 16-byte rows of M / N.
     AITER_CHECK(!a_t || M % 16 == 0, "{k.name}: A stored [K, M] needs M % 16 == 0 (M=", M, ")");
     AITER_CHECK(!b_t || N % 16 == 0, "{k.name}: B stored [K, N] needs N % 16 == 0 (N=", N, ")");
+    // A / B are based in 64 bits per tile (row-major [rows, K], the shuffled B too: per tile of rows; stored
+    // [K, rows]: per K tile), so an operand may exceed 4 GiB and only one tile of it -- {k.B_M} / {k.B_N} rows of K, or
+    // {k.B_K} k rows of M / N -- and its e8m0 scales (based per row in 32 bits) are bounded. batch > 1: the
+    // 32-bit batch strides keep the whole operand under 2 GiB.
+    auto operand_fits = [&](bool t, int64_t rows, int64_t tile_rows) {{
+        if (batch > 1) return rows * K * batch <= INT32_MAX;
+        return (t ? ({k.B_K} + 1) * rows : tile_rows * K) <= INT32_MAX && rows * (K / 32) <= INT32_MAX;
+    }};
+    AITER_CHECK(operand_fits(a_t, M, {k.B_M}), "{k.name}: A M=", M, " K=", K, " batch=", batch,
+                " exceeds the 32-bit buffer ranges");
+    AITER_CHECK(operand_fits(b_t, N, {k.B_N}), "{k.name}: B N=", N, " K=", K, " batch=", batch,
+                " exceeds the 32-bit buffer ranges");
     static AiterAsmKernelFast* kKernels[4] = {{}};   // loaded on first use (the module cache is thread-safe)
     if (!kKernels[layout])
         kKernels[layout] = &opus_gfx950_co::co_kernel(kImages[layout], "{co_dir}/" + std::string(kImages[layout]) + ".co");
@@ -3667,14 +3678,14 @@ void
     kargs.stride_a = a_t ? M : K;  // row stride of the stored A (bytes)
     kargs.stride_b = b_t ? N : K;  // row stride of the stored B (bpreshuffle: of B [N, K] before the shuffle)
     kargs.stride_c = N;
-    kargs.stride_a_batch = M * K;
-    kargs.stride_b_batch = N * K;
-    // batch == 1: unused (batch_id is 0), and M * N may exceed int.
+    // batch == 1: the batch strides are unused (batch_id is 0), and M * K / N * K / M * N may exceed int.
+    kargs.stride_a_batch = batch == 1 ? 0 : M * K;
+    kargs.stride_b_batch = batch == 1 ? 0 : N * K;
     kargs.stride_c_batch = batch == 1 ? 0 : M * N;
     kargs.stride_sfa = K / 32;  // row-major [rows, K/32] e8m0
     kargs.stride_sfb = K / 32;
-    kargs.stride_sfa_batch = M * (K / 32);
-    kargs.stride_sfb_batch = N * (K / 32);
+    kargs.stride_sfa_batch = batch == 1 ? 0 : M * (K / 32);
+    kargs.stride_sfb_batch = batch == 1 ? 0 : N * (K / 32);
     const int tiles = ((M + {k.B_M} - 1) / {k.B_M}) * ((N + {k.B_N} - 1) / {k.B_N}) * batch;
     kargs.grid_blocks = tiles;
     kargs.split_k = 1;

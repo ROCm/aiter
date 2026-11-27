@@ -7,11 +7,11 @@
     "-std=c++17",
     "-cuid=<symbol>"
   ],
-  "device_clang": "clang version 24.0.0git (/root/workspace/llvm-src 49c41889681640665400cb01c9fbb4c0a024cde4)",
-  "hip_clang_path": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
+  "device_clang": "clang version 24.0.0git (https://github.com/yuyzhang512/llvm-project.git 49c41889681640665400cb01c9fbb4c0a024cde4)",
+  "hip_clang_path": "/root/llvm-project/build/bin",
   "kernels": [
     {
-      "co_sha256": "92968d67ea6d174aba81c8111885125bd4d5493f3fcdaa7486b65a617b306eb0",
+      "co_sha256": "2e666408712e1159ecbea162eda790160d6c8eea967819cb3de8820237c3d81b",
       "device_flags": [
         "-ffast-math"
       ],
@@ -27,7 +27,7 @@
       ],
       "layout": "nn",
       "offload_arch": "gfx950",
-      "sgpr_count": 72,
+      "sgpr_count": 70,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x256x128_nob_nn",
@@ -43,7 +43,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "3479650571315cffc8baf5b6d11269eb75c4fc649e20415b61bcb746f31fbdb0",
+      "co_sha256": "04e7bda3e87b46e7ffdbe170904a72c3c93636d45390caa805af2851f8231514",
       "device_flags": [
         "-ffast-math"
       ],
@@ -75,7 +75,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "2ad2c74b009af4cb190435afc0f53f321c1219b2e064ca00ed32c68435e618ba",
+      "co_sha256": "4d96fa6a4971cbe2af9ed278197dd916c05514949f5a259a7c7ca52937da1874",
       "device_flags": [
         "-ffast-math"
       ],
@@ -91,7 +91,7 @@
       ],
       "layout": "tn",
       "offload_arch": "gfx950",
-      "sgpr_count": 70,
+      "sgpr_count": 72,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x256x128_nob_tn",
@@ -107,7 +107,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "617d99ab2626b8c0d0525e7919a1d936ddc93ee177874c63dfaaad392c1b3cf2",
+      "co_sha256": "23e1f573ceb0145bdb62ba6e80c87e6890e896a7f55ed7163fd260725c9c4140",
       "device_flags": [
         "-ffast-math"
       ],
@@ -139,7 +139,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "64b00e907dff3cd07e37003c04259599b8870a5dd8c8b5bba5754565f21e410e",
+      "co_sha256": "669b16bf3bdbf124c5800b816083bf672b665c5d7a679fd36c205dab295473d9",
       "device_flags": [
         "-ffast-math"
       ],
@@ -155,7 +155,7 @@
       ],
       "layout": "nn",
       "offload_arch": "gfx950",
-      "sgpr_count": 72,
+      "sgpr_count": 84,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x256x128_np_nn",
@@ -171,7 +171,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "f4df0a182fd448537eaf1ec20f6bbfc05d0c71559e4fcfb792f570c4b8e9107d",
+      "co_sha256": "8e10bbc7ecf42657f34f321e156a5c489a989b73da433200d0404b28a1bc63da",
       "device_flags": [
         "-ffast-math"
       ],
@@ -203,7 +203,7 @@
       "vgpr_spill_count": 2
     },
     {
-      "co_sha256": "87411b7af0cb921713909f2aee1bedee9ff21fc125930644ff4069f3e2a13adb",
+      "co_sha256": "d29cea134e48ac2e02cb4d084757b294c779ffee27197546779fcc5367e1cfe5",
       "device_flags": [
         "-ffast-math"
       ],
@@ -219,7 +219,7 @@
       ],
       "layout": "tn",
       "offload_arch": "gfx950",
-      "sgpr_count": 72,
+      "sgpr_count": 88,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x256x128_np_tn",
@@ -235,7 +235,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "bac6ec02f140961e7a32ebc5ee1922313611d392701e09aad89976c16c933786",
+      "co_sha256": "5de76f9053682d5872525b3b2e40784ca1de75538826e165d2dcbc8069e2e042",
       "device_flags": [
         "-ffast-math"
       ],
@@ -251,7 +251,7 @@
       ],
       "layout": "tt",
       "offload_arch": "gfx950",
-      "sgpr_count": 70,
+      "sgpr_count": 84,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x256x128_np_tt",
@@ -267,7 +267,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "5e0446937613c34f4a08c9269820442813ba757ef178925c2338f58fe263e977",
+      "co_sha256": "476a41cada6720f4afef57b39b507e496afc9f909d8cd0bfcde5ee89bd8fe487",
       "device_flags": [
         "-ffast-math"
       ],
@@ -283,7 +283,7 @@
       ],
       "layout": "nn",
       "offload_arch": "gfx950",
-      "sgpr_count": 72,
+      "sgpr_count": 82,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x128x128_np_nn",
@@ -299,7 +299,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "98892a65551751ec00da26d7d035ce7594de9ca18e1f8945b634025b3672acae",
+      "co_sha256": "632073f5bc3a801a978d9ce4c69428c3a9fc4f429178b633ae1bcba4dc17cfd8",
       "device_flags": [
         "-ffast-math"
       ],
@@ -331,7 +331,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "bc0bd83ffa8130418a7527d8c56a970d81befb5de81633dd270daea6f1a496ae",
+      "co_sha256": "96df78107e99d340b4fcf43da2cf7625bde2cba39f31544c0ed23629cd804a03",
       "device_flags": [
         "-ffast-math"
       ],
@@ -347,7 +347,7 @@
       ],
       "layout": "tn",
       "offload_arch": "gfx950",
-      "sgpr_count": 72,
+      "sgpr_count": 86,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x128x128_np_tn",
@@ -363,7 +363,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "1ea42f2b0afd4cd3abbadd1ec4b8e5062ddb7f9a5d8ca774db7bc0e1b1bc34e7",
+      "co_sha256": "e4ac23c3d6ee4ee8969681c3c01ff9426ae412fbc7694dd8965c1e1a1556e09c",
       "device_flags": [
         "-ffast-math"
       ],
@@ -379,7 +379,7 @@
       ],
       "layout": "tt",
       "offload_arch": "gfx950",
-      "sgpr_count": 69,
+      "sgpr_count": 80,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x128x128_np_tt",
@@ -395,7 +395,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "c62ac47f09d87adde2a96f41cee05d9bf2740913fbe8d874fe6472b8da763886",
+      "co_sha256": "920f1eea0d623b2cb3326568ca96fbb297d91f42ac863707c0c7e73a9465f047",
       "device_flags": [
         "-ffast-math"
       ],
@@ -411,7 +411,7 @@
       ],
       "layout": "nn",
       "offload_arch": "gfx950",
-      "sgpr_count": 71,
+      "sgpr_count": 82,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x256x128_np_nn",
@@ -427,7 +427,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "f9c2e08fdc3b8a5f6290476ac369d47390411ca08f384f1e8a2088d26551ca8b",
+      "co_sha256": "bf55d70f6c466c2b1b6420e6f7d45c3988886b7c579f78d7631c6f0da3c21b6a",
       "device_flags": [
         "-ffast-math"
       ],
@@ -443,7 +443,7 @@
       ],
       "layout": "nt",
       "offload_arch": "gfx950",
-      "sgpr_count": 66,
+      "sgpr_count": 70,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x256x128_np_nt",
@@ -459,7 +459,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "3eb217a835425cc40180defd031b3553c118ead231e513bee263e2d6e88506a8",
+      "co_sha256": "2f820670cb38adefdd9fcb478e33396bd206c12f101caa280193558f9d16f7f4",
       "device_flags": [
         "-ffast-math"
       ],
@@ -475,7 +475,7 @@
       ],
       "layout": "tn",
       "offload_arch": "gfx950",
-      "sgpr_count": 72,
+      "sgpr_count": 86,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x256x128_np_tn",
@@ -491,7 +491,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "7341edead0a99e1ae2cc9a34caafdacfe66334392003ac71029b71d1b8d03152",
+      "co_sha256": "7b574fab40bc6fe542a405d184fa7ef764863a8f194d398dcb869b669b9230c0",
       "device_flags": [
         "-ffast-math"
       ],
@@ -507,7 +507,7 @@
       ],
       "layout": "tt",
       "offload_arch": "gfx950",
-      "sgpr_count": 70,
+      "sgpr_count": 80,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x256x128_np_tt",
@@ -523,7 +523,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "50bb20a2b7c014d357033b288796cf625bc851aea3b0970550edd30e4efa8b06",
+      "co_sha256": "ab3c0ecb1f478624d616773eb7ff76b9a0040f6a4dc48017c86058e37b1839b5",
       "device_flags": [
         "-ffast-math"
       ],
@@ -539,7 +539,7 @@
       ],
       "layout": "nn",
       "offload_arch": "gfx950",
-      "sgpr_count": 71,
+      "sgpr_count": 80,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x128x128_np_nn",
@@ -555,7 +555,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "0dd1f83c1991e605e0e941c96629b7854e558e84ef2b79d27071bff92e4d6e6d",
+      "co_sha256": "9de4936e1dbeb44977817dda68c88a9f44a06c76637fe2462611a0e6fabee824",
       "device_flags": [
         "-ffast-math"
       ],
@@ -587,7 +587,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "72692c43ce5c98aee960cb3a01905deaf179ce5baee79db1fcfc289f0be6f34b",
+      "co_sha256": "1ff349e0bdc14ca5f9c1b9480e2a6e668c1c08d1deab324f972e8cd698e81615",
       "device_flags": [
         "-ffast-math"
       ],
@@ -603,7 +603,7 @@
       ],
       "layout": "tn",
       "offload_arch": "gfx950",
-      "sgpr_count": 72,
+      "sgpr_count": 84,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x128x128_np_tn",
@@ -619,7 +619,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "fc977e9bf1343fd47029b7e747607f2937573de4a4d21f9ca7e3d5d1b05bde2b",
+      "co_sha256": "f9641ffb9e6549dce9ac8b72dd7c1950b398390c4d10e2dc3b60a0dd5ece9005",
       "device_flags": [
         "-ffast-math"
       ],
@@ -635,7 +635,7 @@
       ],
       "layout": "tt",
       "offload_arch": "gfx950",
-      "sgpr_count": 69,
+      "sgpr_count": 79,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x128x128_np_tt",
@@ -651,7 +651,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "9584e3ec086817ec8c49d122a8d9e69427f3569ca7d7bf18ec48bcb0c39b37be",
+      "co_sha256": "8e3f059b6ca2c26709a7a31cf5dae17277f172a95ac9f4f4ac5ce81f215cf421",
       "device_flags": [
         "-ffast-math"
       ],
@@ -667,7 +667,7 @@
       ],
       "layout": "nn",
       "offload_arch": "gfx950",
-      "sgpr_count": 70,
+      "sgpr_count": 82,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_192x256x128_np_nn",
@@ -683,7 +683,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "d5549b9283d1dc886c7e9cb61cb7a4ec81c697c17381d6092f1ed8ae5bff1194",
+      "co_sha256": "532f262fa7baddf1c2f0df2ff80983557ec68d8cf66d57f8d459b5fad60da06d",
       "device_flags": [
         "-ffast-math"
       ],
@@ -699,7 +699,7 @@
       ],
       "layout": "nt",
       "offload_arch": "gfx950",
-      "sgpr_count": 62,
+      "sgpr_count": 66,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_192x256x128_np_nt",
@@ -715,7 +715,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "554f3cab8b4b50113038f504e9c29429513c0dec9c25373fb41727631023c830",
+      "co_sha256": "d63e314050393088195fc36560332eb379a545f6a58ac190ac93a6542cc80c3b",
       "device_flags": [
         "-ffast-math"
       ],
@@ -731,7 +731,7 @@
       ],
       "layout": "tn",
       "offload_arch": "gfx950",
-      "sgpr_count": 72,
+      "sgpr_count": 88,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_192x256x128_np_tn",
@@ -747,7 +747,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "41548b7294e6928a92c2d42d8324d1251a7473137afef607564c2245693866e1",
+      "co_sha256": "a3445c9fcfecf31a9ea53462902f6e85c2df513c7e9ac8cce80f0bebefec0d44",
       "device_flags": [
         "-ffast-math"
       ],
@@ -763,7 +763,7 @@
       ],
       "layout": "tt",
       "offload_arch": "gfx950",
-      "sgpr_count": 70,
+      "sgpr_count": 84,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_192x256x128_np_tt",
@@ -779,7 +779,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "488ba0a348e3d215d3fd82a8ef781919b3988cfea05c9400272af9acb2b716fc",
+      "co_sha256": "3274c5592b1030c929a52335ef8058cc86bf0b5fa988ecd9041e1fe78cb68283",
       "device_flags": [
         "-ffast-math"
       ],
@@ -795,7 +795,7 @@
       ],
       "layout": "nn",
       "offload_arch": "gfx950",
-      "sgpr_count": 72,
+      "sgpr_count": 84,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x192x128_np_nn",
@@ -811,7 +811,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "333b0a377e5cc9d8f630e64a850c33a010667aa60fab21c5f9fc3fa868a9f599",
+      "co_sha256": "9ec860f7ab6b889c6bfec8724906c44c6f2db1ef52511fee09c940a4273f7092",
       "device_flags": [
         "-ffast-math"
       ],
@@ -827,7 +827,7 @@
       ],
       "layout": "nt",
       "offload_arch": "gfx950",
-      "sgpr_count": 66,
+      "sgpr_count": 68,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x192x128_np_nt",
@@ -843,7 +843,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "f1f9571246b3e9882a77c559e08fa3930be39cb1fa463b77bc1608df2b646a2e",
+      "co_sha256": "a88c4e2cd14223990628f5a337187121637555b58cdb80e2f60ec567451ef1fd",
       "device_flags": [
         "-ffast-math"
       ],
@@ -859,7 +859,7 @@
       ],
       "layout": "tn",
       "offload_arch": "gfx950",
-      "sgpr_count": 72,
+      "sgpr_count": 88,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x192x128_np_tn",
@@ -875,7 +875,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "7608e9038a867690d308cd5066fd25e052b34d8943d629708a82d2b56585cb4f",
+      "co_sha256": "6e952f1bdbb44275bdaf847af30d3d4b04f81deebecf20bbd774942c49e3094e",
       "device_flags": [
         "-ffast-math"
       ],
@@ -891,7 +891,7 @@
       ],
       "layout": "tt",
       "offload_arch": "gfx950",
-      "sgpr_count": 68,
+      "sgpr_count": 82,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x192x128_np_tt",
@@ -907,7 +907,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "93435738c69d974d9946ba0b994efa8f9b5ec2843b777fc8002dff3c768a4930",
+      "co_sha256": "a855909c3bc65dcf0ee68a8397dfd91b3da47fcc84af3b57562b47475f1c724e",
       "device_flags": [
         "-ffast-math"
       ],
@@ -924,7 +924,7 @@
       "layout": "nn",
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 8,
+      "sgpr_spill_count": 15,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x128x128_nn",
       "tile": [
@@ -939,7 +939,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "2fd8a607b659b6ce56d19901092e5a22f0ab32e629efe84c68a067a710c859fe",
+      "co_sha256": "f186a6a879180773aeec477dad5e36f1456b86713411254223b7e3475d0823db",
       "device_flags": [
         "-ffast-math"
       ],
@@ -971,7 +971,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "46f3fba3c0c1fd24666cef517f067c05e379be12a2d82f7f73327ae107da253b",
+      "co_sha256": "3aa727f14176d0530d624b93caf7ce66c8466b66f94fd02d8fa7e36372fe83f0",
       "device_flags": [
         "-ffast-math"
       ],
@@ -988,7 +988,7 @@
       "layout": "tn",
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 9,
+      "sgpr_spill_count": 31,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x128x128_tn",
       "tile": [
@@ -1003,7 +1003,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "f4af7de1d5f0cffc39ac14608f73beaca12b54843c8dbaa4edc3393cc6174eda",
+      "co_sha256": "1f5bf494d1aad9a1e3a7a5d02bffd949e132abe189715b604336155f0fc105b9",
       "device_flags": [
         "-ffast-math"
       ],
@@ -1020,7 +1020,7 @@
       "layout": "tt",
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 5,
+      "sgpr_spill_count": 12,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x128x128_tt",
       "tile": [
@@ -1035,7 +1035,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "d7b058fbdcb539735389151787c8a5a9c8395b6b3a5decbac6c61a56c60ae093",
+      "co_sha256": "5dbfb705c35fef4f7c9f7c64958a1aba63144ab22229fd441c0fa624065b9fbe",
       "device_flags": [
         "-ffast-math"
       ],
@@ -1052,7 +1052,7 @@
       "layout": "nn",
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 8,
+      "sgpr_spill_count": 15,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x256x128_nn",
       "tile": [
@@ -1067,7 +1067,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "e488455454bb78d3d114902a4b14000da2839f9d6cc0c9e567a070d2f2489cb9",
+      "co_sha256": "b729869689443c4ddd915e6078a98bf5e679ab3410d111062aa84bfc0f4201d2",
       "device_flags": [
         "-ffast-math"
       ],
@@ -1084,7 +1084,7 @@
       "layout": "nt",
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 9,
+      "sgpr_spill_count": 7,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x256x128_nt",
       "tile": [
@@ -1099,7 +1099,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "ca095bbac81ebf7393c4b4ab41ffa27d2c188a24d234d6878ae76ea0492911ea",
+      "co_sha256": "40fdea6e5cb8b9d3521fd097e8c0da21d94f08c8a24d8cb99165029bbfd82955",
       "device_flags": [
         "-ffast-math"
       ],
@@ -1116,7 +1116,7 @@
       "layout": "tn",
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 9,
+      "sgpr_spill_count": 36,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x256x128_tn",
       "tile": [
@@ -1131,7 +1131,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "419a4111c773f01b7fe8c474ca6b588683510e17c30219b6f21feb5d5d6890d7",
+      "co_sha256": "0669a3b4ec8f8af8bbde6dae8f3e68ab8b903386dda702e93dd6b08d155222c2",
       "device_flags": [
         "-ffast-math"
       ],
@@ -1148,7 +1148,7 @@
       "layout": "tt",
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 7,
+      "sgpr_spill_count": 16,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x256x128_tt",
       "tile": [
@@ -1163,7 +1163,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "1723ac429f8fecdb102bcc319259406bc78bbab0dd565c56b451ec09f44745f3",
+      "co_sha256": "b281fa007d427223458f476469c259bc5d5580e80f9f490ab3589e42d90129f2",
       "device_flags": [
         "-ffast-math"
       ],
@@ -1180,7 +1180,7 @@
       "layout": "nn",
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 7,
+      "sgpr_spill_count": 16,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x128x128_nn",
       "tile": [
@@ -1195,7 +1195,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "b777c72fec69aa2ebd5ab4dcba3610c4fd2c051be083e5e3f09a52e499d0f340",
+      "co_sha256": "de2b7600e45f55696e1e9d53b1d2a24a28e6c9a93a488a186c0f1fe30598efb7",
       "device_flags": [
         "-ffast-math"
       ],
@@ -1212,7 +1212,7 @@
       "layout": "nt",
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 5,
+      "sgpr_spill_count": 2,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x128x128_nt",
       "tile": [
@@ -1227,7 +1227,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "c292140fe561fd3eb8114ac599a5a9a3acd709595d58605e35e250698dc0ef3c",
+      "co_sha256": "dbddeeb283d0338459a06b6e062127499d5f16abd3410636ce3c0e4c35afd9c4",
       "device_flags": [
         "-ffast-math"
       ],
@@ -1244,7 +1244,7 @@
       "layout": "tn",
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 9,
+      "sgpr_spill_count": 31,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x128x128_tn",
       "tile": [
@@ -1259,7 +1259,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "2086ef2c1950366d763c9615123ade5e5b20167f41551e1e72bf6aad6ff9570b",
+      "co_sha256": "505873317d64f5cad2fc273f3e2581f0b583bb7cbb9acf190e019ffc827aab15",
       "device_flags": [
         "-ffast-math"
       ],
@@ -1276,7 +1276,7 @@
       "layout": "tt",
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 4,
+      "sgpr_spill_count": 14,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x128x128_tt",
       "tile": [
@@ -1291,7 +1291,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "00a50c1b301eded729c871d93b16c0c4725f496157d89bbcd01ee4b46ad04545",
+      "co_sha256": "d5d65d4344b4daaf5b4cdd455b3031eaa5e62dcb251440ba59dc3a1c4264eed0",
       "device_flags": [
         "-ffast-math"
       ],
@@ -1308,7 +1308,7 @@
       "layout": "nn",
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 3,
+      "sgpr_spill_count": 19,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_192x256x128_nn",
       "tile": [
@@ -1323,7 +1323,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "2485486805b5595a6a779c48b9fef73ee78df80a58ba7a36ceecd53ee0316287",
+      "co_sha256": "0d60e7937c54834c6e4d569dc3bdd2585a818e769a3f42345210f5f53542ae3b",
       "device_flags": [
         "-ffast-math"
       ],
@@ -1340,7 +1340,7 @@
       "layout": "nt",
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 4,
+      "sgpr_spill_count": 2,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_192x256x128_nt",
       "tile": [
@@ -1355,7 +1355,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "62eda3ccec0f7c192919e34591096afc3401f1ee0a06fa2cd684eb70cfe6f49b",
+      "co_sha256": "6a8ed8a3f4fd43c51dff744f40f2235a603ea1f93e11428f9f9311ddba5e9f15",
       "device_flags": [
         "-ffast-math"
       ],
@@ -1372,7 +1372,7 @@
       "layout": "tn",
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 10,
+      "sgpr_spill_count": 36,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_192x256x128_tn",
       "tile": [
@@ -1387,7 +1387,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "aedd7e47ca272ac3dc9b994be209882c6af3aca34db948b35a7ed81b42fd5fb8",
+      "co_sha256": "7d80585b08c0cdaa79d8879381b62d3d64ebed748524a79bee482083b5838fd4",
       "device_flags": [
         "-ffast-math"
       ],
@@ -1404,7 +1404,7 @@
       "layout": "tt",
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 7,
+      "sgpr_spill_count": 15,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_192x256x128_tt",
       "tile": [
@@ -1419,7 +1419,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "c0021b9a148e92f1a7c10d2aa131bc0a65057c509d378012457a2440aee0d096",
+      "co_sha256": "cc026b9dac68152697cba17ac181b04759183799aac3742bf4cccf13b6edf000",
       "device_flags": [
         "-ffast-math"
       ],
@@ -1436,7 +1436,7 @@
       "layout": "nn",
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 9,
+      "sgpr_spill_count": 23,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x192x128_nn",
       "tile": [
@@ -1451,7 +1451,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "816b8e52ae4a610be88675b444ad927b9196e37af6503e024fcd1afb5194202c",
+      "co_sha256": "1edd0afeb3bc8a82eee32050c2690ca83e8e1af5b00ae856474715c8d2e9824d",
       "device_flags": [
         "-ffast-math"
       ],
@@ -1483,7 +1483,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "8a5b54b0d7c123889ec2b2909abc806810b67ca03bdb066b4e5544b4fa1e4795",
+      "co_sha256": "b2035f0950b16a2eb31b7157c7a292a1f577f0c1fd604f0eb987cad7485fdf06",
       "device_flags": [
         "-ffast-math"
       ],
@@ -1500,7 +1500,7 @@
       "layout": "tn",
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 10,
+      "sgpr_spill_count": 36,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x192x128_tn",
       "tile": [
@@ -1515,7 +1515,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "d505212913008eee16b4078eba2780fca66b4fedc3632a6e833312cc0ddba52c",
+      "co_sha256": "22b5431ae74cc30ac362cd0c9d84a19d4ed772cfd5450faf0af203a42cc05d53",
       "device_flags": [
         "-ffast-math"
       ],
@@ -1532,7 +1532,7 @@
       "layout": "tt",
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 2,
+      "sgpr_spill_count": 18,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x192x128_tt",
       "tile": [
@@ -1547,7 +1547,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "6567da2813bf3854c3f0054082d119c3f75037d7624d0aa33372486aa5c004e4",
+      "co_sha256": "469f9bb3890b1052144814784dbdb7f2f42b013b362e137bb1f299abe12eb128",
       "device_flags": [
         "-ffast-math"
       ],
@@ -1563,7 +1563,7 @@
       ],
       "layout": "nn",
       "offload_arch": "gfx950",
-      "sgpr_count": 80,
+      "sgpr_count": 88,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x128x128_sk_nn",
@@ -1579,7 +1579,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "bddd1632251dad0aae17a46cf90e70b63167dcb00ff890de764d307a0417adb9",
+      "co_sha256": "ddac7019d8171a596d819cf0a08a6a7e980766eff7bce4b9b6ad516af18b6b8b",
       "device_flags": [
         "-ffast-math"
       ],
@@ -1595,7 +1595,7 @@
       ],
       "layout": "nt",
       "offload_arch": "gfx950",
-      "sgpr_count": 74,
+      "sgpr_count": 77,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x128x128_sk_nt",
@@ -1611,7 +1611,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "f769375222bcd4c68c9133ffdd22fd286a3a460d2eb5c320fcd6ea219af54e4e",
+      "co_sha256": "7a3f30506fa5ccf90901a12ed5c4a5ea7fe93b3033e58cb64d8db4da35da7b37",
       "device_flags": [
         "-ffast-math"
       ],
@@ -1627,7 +1627,7 @@
       ],
       "layout": "tn",
       "offload_arch": "gfx950",
-      "sgpr_count": 77,
+      "sgpr_count": 92,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x128x128_sk_tn",
@@ -1643,7 +1643,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "1990cee29b7284d39c12d33fec90b5f5a8c0433b442bcf288da02305892e1982",
+      "co_sha256": "b6465734ca7cfd0a712f206e5eed2dbf73627af17f0630ce70483c29fde0f510",
       "device_flags": [
         "-ffast-math"
       ],
@@ -1659,7 +1659,7 @@
       ],
       "layout": "tt",
       "offload_arch": "gfx950",
-      "sgpr_count": 78,
+      "sgpr_count": 86,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x128x128_sk_tt",
@@ -1675,7 +1675,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "6b230cc5890551d90486bc14a2eb993f6edb169b4512f7bb5482d39d9098afc4",
+      "co_sha256": "d5c26a19e8e5e22548a3c41023705f40803e5ab106c5ebda88d2b5ff2e649491",
       "device_flags": [
         "-ffast-math"
       ],
@@ -1691,7 +1691,7 @@
       ],
       "layout": "nn",
       "offload_arch": "gfx950",
-      "sgpr_count": 78,
+      "sgpr_count": 88,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x256x128_sk_nn",
@@ -1707,7 +1707,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "745c91d5585b7fe7ebf57e12311ce385ade743f9e31bda886a746dea4330f0b3",
+      "co_sha256": "ab59bcf0a6b32bc00e0b6b5105f71e6b231fe4d205565df5a561bc6a90870a37",
       "device_flags": [
         "-ffast-math"
       ],
@@ -1723,7 +1723,7 @@
       ],
       "layout": "nt",
       "offload_arch": "gfx950",
-      "sgpr_count": 76,
+      "sgpr_count": 79,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x256x128_sk_nt",
@@ -1739,7 +1739,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "574650ae51a4edf07b2ed50721d93a3a948307faa77296cff425081c77386125",
+      "co_sha256": "646abddf21ac2bc769a92a10d20ab78ce3a983b2fc766fe32e4740ca0e87426b",
       "device_flags": [
         "-ffast-math"
       ],
@@ -1755,7 +1755,7 @@
       ],
       "layout": "tn",
       "offload_arch": "gfx950",
-      "sgpr_count": 77,
+      "sgpr_count": 92,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x256x128_sk_tn",
@@ -1771,7 +1771,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "acefff8880182960bb24fef6dd6cfe47bbaf102c8d243f685969137d6cc84bf5",
+      "co_sha256": "65768576a5dcc7c4ad2dbf6c6adcce535d8b0f2b0034d2f96d2a1799195716b3",
       "device_flags": [
         "-ffast-math"
       ],
@@ -1787,7 +1787,7 @@
       ],
       "layout": "tt",
       "offload_arch": "gfx950",
-      "sgpr_count": 78,
+      "sgpr_count": 86,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x256x128_sk_tt",
@@ -1803,7 +1803,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "6f0a9de402a8be2da3bed154d72cd4fec00432220bda69fddf290848ba583b3c",
+      "co_sha256": "121f4ef97c23c2f672b7ee616d0c65985d906cf1ba36bc32316787cc93cafcaa",
       "device_flags": [
         "-ffast-math"
       ],
@@ -1819,7 +1819,7 @@
       ],
       "layout": "nn",
       "offload_arch": "gfx950",
-      "sgpr_count": 78,
+      "sgpr_count": 86,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x128x128_sk_nn",
@@ -1835,7 +1835,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "a3a88263351719136b9d701c023bd0109655c9aa7d66e30f4cdb7cd115dd9571",
+      "co_sha256": "c7f65fa0ae77e894cf14a8db993c93f52958f45110801aada29174628d9399cc",
       "device_flags": [
         "-ffast-math"
       ],
@@ -1851,7 +1851,7 @@
       ],
       "layout": "nt",
       "offload_arch": "gfx950",
-      "sgpr_count": 74,
+      "sgpr_count": 77,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x128x128_sk_nt",
@@ -1867,7 +1867,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "9328fc871047b7bb74a13677c2526c5182060290a2039ad30fd617059f0532a2",
+      "co_sha256": "033e0b5a41f52da8c3ad3ecc558b76dc887573e0e68494ba84bd35c7f60b7b6b",
       "device_flags": [
         "-ffast-math"
       ],
@@ -1883,7 +1883,7 @@
       ],
       "layout": "tn",
       "offload_arch": "gfx950",
-      "sgpr_count": 77,
+      "sgpr_count": 90,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x128x128_sk_tn",
@@ -1899,7 +1899,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "bc0b790636bed8a38a69817a8844cdd301ad6a8dcd9370c814d4a6e78bee8fe5",
+      "co_sha256": "ef8c8e35f9193ba3d6e5dd284f0f107e5bbe5988cdd2e51fd3ce808521f84970",
       "device_flags": [
         "-ffast-math"
       ],
@@ -1915,7 +1915,7 @@
       ],
       "layout": "tt",
       "offload_arch": "gfx950",
-      "sgpr_count": 78,
+      "sgpr_count": 86,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_128x128x128_sk_tt",
@@ -1931,7 +1931,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "906ae2caaff665a07db8a6291f9479c0b72e2d40a1db0e9c89ba12f45455cd46",
+      "co_sha256": "cc009b555cefb9a5435e0df6023c154f59a1949b05a3efb5bbee6f4069e6b8d0",
       "device_flags": [
         "-ffast-math"
       ],
@@ -1947,7 +1947,7 @@
       ],
       "layout": "nn",
       "offload_arch": "gfx950",
-      "sgpr_count": 76,
+      "sgpr_count": 90,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_192x256x128_sk_nn",
@@ -1963,7 +1963,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "5f1830d1f35152e9d327c44d3e06be4696dc94dfaecc9cd17084d602e855875b",
+      "co_sha256": "d681fe2a509e2a4cf1ca34abf076038c9bc36e135c635408dce4ebf6e33478cc",
       "device_flags": [
         "-ffast-math"
       ],
@@ -1979,7 +1979,7 @@
       ],
       "layout": "nt",
       "offload_arch": "gfx950",
-      "sgpr_count": 68,
+      "sgpr_count": 76,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_192x256x128_sk_nt",
@@ -1995,7 +1995,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "82ac1a4d2705c7958dd6ce6fb96e4a03fa16672f586bb48e390103a200d5d5c5",
+      "co_sha256": "37c7aae61d7baadaf817066e424bd499b24a30ffcb1a267ade66147a8528ad5b",
       "device_flags": [
         "-ffast-math"
       ],
@@ -2011,7 +2011,7 @@
       ],
       "layout": "tn",
       "offload_arch": "gfx950",
-      "sgpr_count": 77,
+      "sgpr_count": 94,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_192x256x128_sk_tn",
@@ -2027,7 +2027,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "9a38dba2424d73ee158fc893cc07ddbc4219c1603e85bd5ec82e21d8b060ebd6",
+      "co_sha256": "a4903c13aa00121dfefcfbe32fd43d849e5080445c7dd2788017d1d7ac30e2b7",
       "device_flags": [
         "-ffast-math"
       ],
@@ -2043,7 +2043,7 @@
       ],
       "layout": "tt",
       "offload_arch": "gfx950",
-      "sgpr_count": 78,
+      "sgpr_count": 90,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_192x256x128_sk_tt",
@@ -2059,7 +2059,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "807539cf061aabbf68b66d0ee9534d97b5bc6183c0a2546f8a742835ffd0b461",
+      "co_sha256": "17e71066a03b7e513219e1ee90ce01733fe8fd1ec14358d1aa4d65be233fbae2",
       "device_flags": [
         "-ffast-math"
       ],
@@ -2075,7 +2075,7 @@
       ],
       "layout": "nn",
       "offload_arch": "gfx950",
-      "sgpr_count": 80,
+      "sgpr_count": 90,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x192x128_sk_nn",
@@ -2091,7 +2091,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "f275602e6ea7907e7e201fa93b40520f0ba2dbad753e4d50ac8f1e98eefe46a2",
+      "co_sha256": "c6764c5ef234de8bb78b4077176d095e05a5b76c3b20dd28985dd5251579be1e",
       "device_flags": [
         "-ffast-math"
       ],
@@ -2107,7 +2107,7 @@
       ],
       "layout": "nt",
       "offload_arch": "gfx950",
-      "sgpr_count": 74,
+      "sgpr_count": 76,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x192x128_sk_nt",
@@ -2123,7 +2123,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "f61309c6da40d9c7e2e8097ad5e4c6eca1ebb75493868009d99c4b3dfab231f5",
+      "co_sha256": "352e132009ab41f8834d770b61781592f739f357e72d0bf50b3bea3ff3e39c12",
       "device_flags": [
         "-ffast-math"
       ],
@@ -2139,7 +2139,7 @@
       ],
       "layout": "tn",
       "offload_arch": "gfx950",
-      "sgpr_count": 77,
+      "sgpr_count": 94,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x192x128_sk_tn",
@@ -2155,7 +2155,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "54cd5e8fc5b4c6aa6c060ba2e57a5868ff5f2176e565883c7d1aff41a12a6c7d",
+      "co_sha256": "d6a5f1980be2cf2c1eb28ff7cdb8728724793f7badf28cb89903f9031286a197",
       "device_flags": [
         "-ffast-math"
       ],
@@ -2171,7 +2171,7 @@
       ],
       "layout": "tt",
       "offload_arch": "gfx950",
-      "sgpr_count": 76,
+      "sgpr_count": 90,
       "sgpr_spill_count": 0,
       "status": "ready",
       "symbol": "opus_gemm_gfx950_a8w8_mxfp8_co_256x192x128_sk_tt",
