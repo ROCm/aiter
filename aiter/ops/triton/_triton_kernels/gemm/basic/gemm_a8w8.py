@@ -394,8 +394,7 @@ def _get_config(M: int, N: int, K: int, shuffle: bool = False):
 
 @triton.jit
 def _negate_k_tail_kernel(x_ptr, y_ptr, n, k_words, k0_words, BLOCK: tl.constexpr):
-    # Copy x (viewed as int32 words, n of them, k_words per row) with the sign bits of the FP8 bytes of
-    # columns k0_words.. of each row flipped: the gfx1250 PTPC GEMM then runs the second half of K negated.
+    # Copy x as int32 words with the FP8 sign bits of columns k0_words.. of each row flipped.
     offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n
     v = tl.load(x_ptr + offs, mask=mask)

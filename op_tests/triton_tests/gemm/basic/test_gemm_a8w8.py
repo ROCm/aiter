@@ -211,8 +211,8 @@ def test_gemm_fp8(in_dtype, m, n, k, impl: str):
 def get_ptpc_x_vals():
     x_vals = [(1, 16, 128), (3, 5, 2)]  # one tile, irregular shape
     x_vals += [(8, 80, 1000)]  # partial M, N and K tiles
-    x_vals += [(m, 12448, 7168) for m in (8, 128, 1024)]  # Kimi-K3.1 in_proj, TP4
-    x_vals += [(m, 6288, 7168) for m in (16, 600)]  # Kimi-K3.1 in_proj, TP8
+    x_vals += [(m, 12448, 7168) for m in (8, 128, 1024)]  # in_proj, TP4
+    x_vals += [(m, 6288, 7168) for m in (16, 600)]  # in_proj, TP8
     x_vals += [(4096, 1024, 2048)]
     return x_vals
 

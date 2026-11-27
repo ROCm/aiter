@@ -37,7 +37,21 @@ _gemm_a8w8_ptpc_bandwidth_bound_repr = make_kernel_repr(
     "_gemm_a8w8_ptpc_gfx1250_bandwidth_bound_kernel", _REPR_KEYS + ["NUM_KSUB"]
 )
 _gemm_a8w8_ptpc_pipelined_repr = make_kernel_repr(
-    "_gemm_a8w8_ptpc_gfx1250_pipelined_kernel", _REPR_KEYS + ["SLICED_K"]
+    "_gemm_a8w8_ptpc_gfx1250_pipelined_kernel", _REPR_KEYS + ["SLICED_K", "NUM_KSUB"]
+)
+_gemm_a8w8_ptpc_persistent_repr = make_kernel_repr(
+    "_gemm_a8w8_ptpc_gfx1250_persistent_kernel",
+    [
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLOCK_K",
+        "NUM_BUFFERS",
+        "NUM_CTAS",
+        "FUSED_LOAD",
+        "REGISTER_STORE",
+        "ADD_BIAS",
+        "GRID",
+    ],
 )
 
 _WMMA_INSTR_SHAPE = [16, 16, 128]
@@ -140,8 +154,6 @@ def create_ptpc_layouts(
                 [[cta_n, 8]], [BLOCK_M, BLOCK_N], [1, 0], cga
             )
 
-    # The second half of K negates the smaller operand of the CTA in LDS, as int32 words,
-    # in K chunks of at most 16 words for each thread.
     neg_b = BLOCK_N // ctas_n < BLOCK_M // ctas_m
     cta_rows = BLOCK_N // ctas_n if neg_b else BLOCK_M // ctas_m
     neg_layout = layouts["SHARED_LAYOUT_B" if neg_b else "SHARED_LAYOUT_A"]
@@ -213,10 +225,6 @@ def _negate_slot(
     NEG_SHARED_LAYOUT: gl.constexpr,
     NEG_LAYOUT: gl.constexpr,
 ):
-    """Flip the sign bits of the FP8 slot of A, or of B, in LDS.
-
-    NEG_WORDS == 0: the second half of K of A or of B is already negated in memory.
-    """
     if NEG_WORDS > 0:
         if NEG_B:
             slot = b_slot
@@ -670,10 +678,7 @@ def _gemm_a8w8_ptpc_bandwidth_bound_kernel(
     if NUM_CTAS > 1:
         gl.amd.gfx1250.cluster.arrive()
 
-    # The FP8 WMMA truncates its products toward -inf. The second half of K runs with one operand
-    # and the accumulator negated, so that half truncates toward +inf and the two biases cancel.
     num_main = gl.cdiv(K_local, BLOCK_K) - (NUM_BUFFERS - 1)
-    # first_tiles is the K stage where a weight with a pre-negated K tail changes sign.
     half = gl.minimum(gl.cdiv(K_local, BLOCK_K) // 2, first_tiles)
     num_first = gl.maximum(gl.minimum(half, num_main), 0)
     # Main loop. The cluster barrier stops a multicast load from filling a slot that a CTA still reads.
@@ -790,6 +795,148 @@ def _gemm_a8w8_ptpc_bandwidth_bound_kernel(
     )
 
 
+@gluon.jit
+def _pipelined_ksub2_loop(
+    accumulator,
+    a_desc,
+    b_desc,
+    a_buffer,
+    b_buffer,
+    a_scale_ptr,
+    b_scale_ptr,
+    pid_m,
+    pid_n,
+    M,
+    N,
+    stride_a_scale,
+    stride_b_scale,
+    bias_ptr,
+    stride_bias,
+    as_buffer,
+    bs_buffer,
+    num_first,
+    num_main,
+    load_idx,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    NUM_BUFFERS: gl.constexpr,
+    EVEN_K: gl.constexpr,
+    FUSED_LOAD: gl.constexpr,
+    NUM_CTAS: gl.constexpr,
+    OPERAND_LAYOUT_A: gl.constexpr,
+    OPERAND_LAYOUT_B: gl.constexpr,
+    OUT_LAYOUT: gl.constexpr,
+    ADD_BIAS: gl.constexpr,
+    SCALE_TDM: gl.constexpr,
+):
+    """K loop with each stage in two K sub-steps of BLOCK_K // 2; the NUM_BUFFERS stages are issued.
+
+    The TDM issue and the cluster barrier run once per two sub-steps. A CTA arrives at the cluster
+    barrier as soon as it has issued the last reads of a slot (during the first sub-step), a whole
+    sub-step before the wait that guards the refill of that slot. The scheduling barrier before the
+    wait keeps the register use below 1024 VGPRs at BLOCK 1024x1024 with 16 CTAs.
+    Needs the K tail negated in memory (no LDS negation).
+    """
+    TDM_OPS: gl.constexpr = 1 if FUSED_LOAD else 2
+    KSUB: gl.constexpr = BLOCK_K // 2
+    compute_idx = 0
+    cur_a, cur_b = _read_stage(
+        a_buffer.index(0).slice(0, KSUB, 1),
+        b_buffer.index(0).slice(0, KSUB, 1),
+        OPERAND_LAYOUT_A,
+        OPERAND_LAYOUT_B,
+        False,
+    )
+    for phase in gl.static_range(2):
+        if phase == 1:
+            accumulator = -accumulator
+        for i in range(num_first * phase, num_first + (num_main - num_first) * phase):
+            slot = compute_idx % NUM_BUFFERS
+            accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+            cur_a, cur_b = _read_stage(
+                a_buffer.index(slot).slice(KSUB, KSUB, 1),
+                b_buffer.index(slot).slice(KSUB, KSUB, 1),
+                OPERAND_LAYOUT_A,
+                OPERAND_LAYOUT_B,
+                False,
+            )
+            if NUM_CTAS > 1:
+                gl.amd.gfx1250.cluster.arrive()
+            accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+            if NUM_CTAS > 1:
+                gl.amd.hint.sched_barrier()
+                gl.amd.gfx1250.cluster.wait()
+            slot = load_idx % NUM_BUFFERS
+            a_desc, b_desc = _issue_stage(
+                a_desc,
+                b_desc,
+                a_buffer.index(slot),
+                b_buffer.index(slot),
+                BLOCK_K,
+                EVEN_K,
+                FUSED_LOAD,
+            )
+            gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * TDM_OPS)
+            load_idx += 1
+            slot = (compute_idx + 1) % NUM_BUFFERS
+            cur_a, cur_b = _read_stage(
+                a_buffer.index(slot).slice(0, KSUB, 1),
+                b_buffer.index(slot).slice(0, KSUB, 1),
+                OPERAND_LAYOUT_A,
+                OPERAND_LAYOUT_B,
+                False,
+            )
+            compute_idx += 1
+    if NUM_CTAS > 1:
+        gl.amd.gfx1250.cluster.arrive()
+        gl.amd.gfx1250.cluster.wait()
+    # Drain: no more loads.
+    for st in gl.static_range(NUM_BUFFERS):
+        slot = compute_idx % NUM_BUFFERS
+        accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+        cur_a, cur_b = _read_stage(
+            a_buffer.index(slot).slice(KSUB, KSUB, 1),
+            b_buffer.index(slot).slice(KSUB, KSUB, 1),
+            OPERAND_LAYOUT_A,
+            OPERAND_LAYOUT_B,
+            False,
+        )
+        accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+        if st < NUM_BUFFERS - 1:
+            gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - st) * TDM_OPS)
+            slot = (compute_idx + 1) % NUM_BUFFERS
+            cur_a, cur_b = _read_stage(
+                a_buffer.index(slot).slice(0, KSUB, 1),
+                b_buffer.index(slot).slice(0, KSUB, 1),
+                OPERAND_LAYOUT_A,
+                OPERAND_LAYOUT_B,
+                False,
+            )
+            compute_idx += 1
+    # The scales are read after the drain: fewer live registers under the last WMMAs.
+    a_scale, b_scale, bias = _load_scales(
+        a_scale_ptr,
+        b_scale_ptr,
+        pid_m,
+        pid_n,
+        M,
+        N,
+        stride_a_scale,
+        stride_b_scale,
+        bias_ptr,
+        stride_bias,
+        BLOCK_M,
+        BLOCK_N,
+        OUT_LAYOUT,
+        ADD_BIAS,
+        as_buffer,
+        bs_buffer,
+        SCALE_TDM,
+    )
+    return accumulator, a_scale, b_scale, bias
+
+
 @triton.heuristics({"EVEN_K": _even_k})
 @gluon.jit(repr=_gemm_a8w8_ptpc_pipelined_repr)
 def _gemm_a8w8_ptpc_pipelined_kernel(
@@ -845,10 +992,12 @@ def _gemm_a8w8_ptpc_pipelined_kernel(
     NEG_WORDS: gl.constexpr = 4,
     NEG_SHARED_LAYOUT: gl.constexpr = None,
     NEG_LAYOUT: gl.constexpr = None,
+    NUM_KSUB: gl.constexpr = 1,
 ):
     """Same result as the bandwidth_bound kernel; stage i + 1 is read from LDS during the WMMA of stage i.
 
     SLICED_K=True gives each warp one K slice of each stage and adds the warp partials through LDS.
+    NUM_KSUB=2 runs each stage as two K sub-steps (see _pipelined_ksub2_loop).
     """
     gl.static_assert(NUM_BUFFERS >= 2, "the pipelined kernel needs NUM_BUFFERS >= 2")
     if SLICED_K:
@@ -856,6 +1005,10 @@ def _gemm_a8w8_ptpc_pipelined_kernel(
             BLOCK_K % (128 * gl.num_warps()) == 0,
             "sliced_k needs BLOCK_K % (128 * num_warps) == 0",
         )
+    gl.static_assert(
+        (NUM_KSUB == 1) | ((NUM_KSUB == 2) & (NEG_WORDS == 0) & (not SLICED_K)),
+        "NUM_KSUB=2 needs a K tail negated in memory and no sliced_k",
+    )
     TDM_OPS: gl.constexpr = 1 if FUSED_LOAD else 2
     pid_m, pid_n, K_local, c_ptr, a_desc, b_desc, a_buffer, b_buffer = _init_tile(
         a_ptr,
@@ -938,48 +1091,99 @@ def _gemm_a8w8_ptpc_pipelined_kernel(
             NEG_SHARED_LAYOUT,
             NEG_LAYOUT,
         )
-    cur_a, cur_b = _read_stage(
-        a_buffer.index(slot),
-        b_buffer.index(slot),
-        OPERAND_LAYOUT_A,
-        OPERAND_LAYOUT_B,
-        SLICED_K,
-    )
-    if NUM_CTAS > 1:
-        gl.amd.gfx1250.cluster.arrive()
+    if NUM_KSUB == 1:
+        cur_a, cur_b = _read_stage(
+            a_buffer.index(slot),
+            b_buffer.index(slot),
+            OPERAND_LAYOUT_A,
+            OPERAND_LAYOUT_B,
+            SLICED_K,
+        )
+        if NUM_CTAS > 1:
+            gl.amd.gfx1250.cluster.arrive()
 
-    # Main loop: WMMA of cur, refill its slot, wait, read the next stage.
-    for phase in gl.static_range(2):
-        if phase == 1:
-            # See the bandwidth_bound kernel. cur was read negated in the last phase-0 iteration.
-            accumulator = -accumulator
-        for i in range(num_first * phase, num_first + (num_main - num_first) * phase):
-            accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
-            # Each CTA has read the slot of cur before a multicast load fills it.
-            if NUM_CTAS > 1:
-                gl.amd.gfx1250.cluster.wait()
-            slot = load_idx % NUM_BUFFERS
-            a_desc, b_desc = _issue_stage(
-                a_desc,
-                b_desc,
-                a_buffer.index(slot),
-                b_buffer.index(slot),
-                BLOCK_K,
-                EVEN_K,
-                FUSED_LOAD,
-            )
-            gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * TDM_OPS)
-            load_idx += 1
-            slot = (compute_idx + 1) % NUM_BUFFERS
-            if phase == 1 or i == num_first - 1:
-                _negate_slot(
+        # Main loop: WMMA of cur, refill its slot, wait, read the next stage.
+        for phase in gl.static_range(2):
+            if phase == 1:
+                # See the bandwidth_bound kernel. cur was read negated in the last phase-0 iteration.
+                accumulator = -accumulator
+            for i in range(
+                num_first * phase, num_first + (num_main - num_first) * phase
+            ):
+                accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+                # Each CTA has read the slot of cur before a multicast load fills it.
+                if NUM_CTAS > 1:
+                    gl.amd.gfx1250.cluster.wait()
+                slot = load_idx % NUM_BUFFERS
+                a_desc, b_desc = _issue_stage(
+                    a_desc,
+                    b_desc,
                     a_buffer.index(slot),
                     b_buffer.index(slot),
-                    NEG_B,
-                    NEG_WORDS,
-                    NEG_SHARED_LAYOUT,
-                    NEG_LAYOUT,
+                    BLOCK_K,
+                    EVEN_K,
+                    FUSED_LOAD,
                 )
+                gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * TDM_OPS)
+                load_idx += 1
+                slot = (compute_idx + 1) % NUM_BUFFERS
+                if phase == 1 or i == num_first - 1:
+                    _negate_slot(
+                        a_buffer.index(slot),
+                        b_buffer.index(slot),
+                        NEG_B,
+                        NEG_WORDS,
+                        NEG_SHARED_LAYOUT,
+                        NEG_LAYOUT,
+                    )
+                cur_a, cur_b = _read_stage(
+                    a_buffer.index(slot),
+                    b_buffer.index(slot),
+                    OPERAND_LAYOUT_A,
+                    OPERAND_LAYOUT_B,
+                    SLICED_K,
+                )
+                compute_idx += 1
+                if NUM_CTAS > 1:
+                    gl.amd.gfx1250.cluster.arrive()
+
+        if NUM_CTAS > 1:
+            gl.amd.gfx1250.cluster.wait()
+
+        # The scale loads run under the last WMMAs.
+        a_scale, b_scale, bias = _load_scales(
+            a_scale_ptr,
+            b_scale_ptr,
+            pid_m,
+            pid_n,
+            M,
+            N,
+            stride_a_scale,
+            stride_b_scale,
+            bias_ptr,
+            stride_bias,
+            BLOCK_M,
+            BLOCK_N,
+            OUT_LAYOUT,
+            ADD_BIAS,
+            as_buffer,
+            bs_buffer,
+            SCALE_TDM,
+        )
+
+        # Drain: no more loads.
+        for i in gl.static_range(NUM_BUFFERS - 1):
+            accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+            gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - i) * TDM_OPS)
+            slot = (compute_idx + 1) % NUM_BUFFERS
+            _negate_slot(
+                a_buffer.index(slot),
+                b_buffer.index(slot),
+                NEG_B,
+                NEG_WORDS,
+                NEG_SHARED_LAYOUT,
+                NEG_LAYOUT,
+            )
             cur_a, cur_b = _read_stage(
                 a_buffer.index(slot),
                 b_buffer.index(slot),
@@ -988,55 +1192,42 @@ def _gemm_a8w8_ptpc_pipelined_kernel(
                 SLICED_K,
             )
             compute_idx += 1
-            if NUM_CTAS > 1:
-                gl.amd.gfx1250.cluster.arrive()
-
-    if NUM_CTAS > 1:
-        gl.amd.gfx1250.cluster.wait()
-
-    # The scale loads run under the last WMMAs.
-    a_scale, b_scale, bias = _load_scales(
-        a_scale_ptr,
-        b_scale_ptr,
-        pid_m,
-        pid_n,
-        M,
-        N,
-        stride_a_scale,
-        stride_b_scale,
-        bias_ptr,
-        stride_bias,
-        BLOCK_M,
-        BLOCK_N,
-        OUT_LAYOUT,
-        ADD_BIAS,
-        as_buffer,
-        bs_buffer,
-        SCALE_TDM,
-    )
-
-    # Drain: no more loads.
-    for i in gl.static_range(NUM_BUFFERS - 1):
         accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - i) * TDM_OPS)
-        slot = (compute_idx + 1) % NUM_BUFFERS
-        _negate_slot(
-            a_buffer.index(slot),
-            b_buffer.index(slot),
-            NEG_B,
-            NEG_WORDS,
-            NEG_SHARED_LAYOUT,
-            NEG_LAYOUT,
-        )
-        cur_a, cur_b = _read_stage(
-            a_buffer.index(slot),
-            b_buffer.index(slot),
+    else:
+        accumulator, a_scale, b_scale, bias = _pipelined_ksub2_loop(
+            accumulator,
+            a_desc,
+            b_desc,
+            a_buffer,
+            b_buffer,
+            a_scale_ptr,
+            b_scale_ptr,
+            pid_m,
+            pid_n,
+            M,
+            N,
+            stride_a_scale,
+            stride_b_scale,
+            bias_ptr,
+            stride_bias,
+            as_buffer,
+            bs_buffer,
+            num_first,
+            num_main,
+            load_idx,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K,
+            NUM_BUFFERS,
+            EVEN_K,
+            FUSED_LOAD,
+            NUM_CTAS,
             OPERAND_LAYOUT_A,
             OPERAND_LAYOUT_B,
-            SLICED_K,
+            OUT_LAYOUT,
+            ADD_BIAS,
+            SCALE_TDM,
         )
-        compute_idx += 1
-    accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
     # The last sign change goes into the row scale: fewer instructions than a negated accumulator.
     a_scale = -a_scale
 
@@ -1075,11 +1266,398 @@ def _gemm_a8w8_ptpc_pipelined_kernel(
     )
 
 
+@gluon.jit
+def _persistent_tile(
+    a_ptr,
+    b_ptr,
+    a_scale_ptr,
+    b_scale_ptr,
+    tile,
+    k0,
+    M: gl.constexpr,
+    N: gl.constexpr,
+    K,
+    stride_am: gl.constexpr,
+    stride_bn: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    SHARED_LAYOUT_A: gl.constexpr,
+    SHARED_LAYOUT_B: gl.constexpr,
+):
+    """Tile -> (pid_m, pid_n) and operand descriptors from K offset k0.
+
+    Tiles walk M first; the N columns are rotated by one, so the first num_pid_m tiles (one per
+    cluster) are the last, partial N column: the clusters that start there run out of phase with
+    the others, and their output stores overlap the K loops of the others.
+    """
+    num_pid_m: gl.constexpr = (M + BLOCK_M - 1) // BLOCK_M
+    num_pid_n: gl.constexpr = (N + BLOCK_N - 1) // BLOCK_N
+    pid_m = tile % num_pid_m
+    pid_n = (tile // num_pid_m + num_pid_n - 1) % num_pid_n
+    m_off = pid_m * BLOCK_M
+    n_off = pid_n * BLOCK_N
+    a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=a_ptr + m_off.to(gl.int64) * stride_am + k0,
+        shape=(M - m_off, K - k0),
+        strides=(stride_am, 1),
+        block_shape=(BLOCK_M, BLOCK_K),
+        layout=SHARED_LAYOUT_A,
+    )
+    b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=b_ptr + n_off.to(gl.int64) * stride_bn + k0,
+        shape=(N - n_off, K - k0),
+        strides=(stride_bn, 1),
+        block_shape=(BLOCK_N, BLOCK_K),
+        layout=SHARED_LAYOUT_B,
+    )
+    return pid_m, pid_n, a_desc, b_desc
+
+
+@gluon.jit
+def _persistent_prologue(
+    a_ptr,
+    b_ptr,
+    a_scale_ptr,
+    b_scale_ptr,
+    tile,
+    M: gl.constexpr,
+    N: gl.constexpr,
+    K,
+    stride_am: gl.constexpr,
+    stride_bn: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    SHARED_LAYOUT_A: gl.constexpr,
+    SHARED_LAYOUT_B: gl.constexpr,
+    SCALE_LAYOUT_A: gl.constexpr,
+    SCALE_LAYOUT_B: gl.constexpr,
+    a_buffer,
+    b_buffer,
+    as_buffer,
+    bs_buffer,
+    NUM_BUFFERS: gl.constexpr,
+    FUSED_LOAD: gl.constexpr,
+):
+    """Issue the scale loads and the first NUM_BUFFERS stages of a tile."""
+    pid_m, pid_n, a_desc, b_desc = _persistent_tile(
+        a_ptr,
+        b_ptr,
+        a_scale_ptr,
+        b_scale_ptr,
+        tile,
+        0,
+        M,
+        N,
+        K,
+        stride_am,
+        stride_bn,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+        SHARED_LAYOUT_A,
+        SHARED_LAYOUT_B,
+    )
+    m_off = pid_m * BLOCK_M
+    n_off = pid_n * BLOCK_N
+    as_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=a_scale_ptr + m_off,
+        shape=(1, M - m_off),
+        strides=(M, 1),
+        block_shape=(1, BLOCK_M),
+        layout=SCALE_LAYOUT_A,
+    )
+    bs_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=b_scale_ptr + n_off,
+        shape=(1, N - n_off),
+        strides=(N, 1),
+        block_shape=(1, BLOCK_N),
+        layout=SCALE_LAYOUT_B,
+    )
+    gl.amd.gfx1250.tdm.async_load_fused(
+        [(as_desc, as_buffer, 0b01), (bs_desc, bs_buffer, 0b10)]
+    )
+    for st in gl.static_range(NUM_BUFFERS):
+        a_desc, b_desc = _issue_stage(
+            a_desc,
+            b_desc,
+            a_buffer.index(st),
+            b_buffer.index(st),
+            BLOCK_K,
+            True,
+            FUSED_LOAD,
+        )
+
+
+@gluon.jit(repr=_gemm_a8w8_ptpc_persistent_repr)
+def _gemm_a8w8_ptpc_persistent_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    a_scale_ptr,
+    b_scale_ptr,
+    bias_ptr,
+    M: gl.constexpr,
+    N: gl.constexpr,
+    K,
+    stride_am: gl.constexpr,
+    stride_bn: gl.constexpr,
+    stride_cm: gl.constexpr,
+    first_tiles: gl.constexpr,
+    num_tiles: gl.constexpr,
+    GRID: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    NUM_BUFFERS: gl.constexpr,
+    SHARED_LAYOUT_A: gl.constexpr,
+    SHARED_LAYOUT_B: gl.constexpr,
+    SHARED_LAYOUT_C: gl.constexpr,
+    WMMA_LAYOUT: gl.constexpr,
+    OPERAND_LAYOUT_A: gl.constexpr,
+    OPERAND_LAYOUT_B: gl.constexpr,
+    OUT_LAYOUT: gl.constexpr,
+    SCALE_LAYOUT_A: gl.constexpr,
+    SCALE_LAYOUT_B: gl.constexpr,
+    STORE_LAYOUT: gl.constexpr = None,
+    STAGE_LAYOUT: gl.constexpr = None,
+    NUM_CTAS: gl.constexpr = 16,
+    FUSED_LOAD: gl.constexpr = 1,
+    REGISTER_STORE: gl.constexpr = 2,
+    ADD_BIAS: gl.constexpr = False,
+):
+    """Persistent compute_bound kernel: GRID clusters walk the tiles tile, tile + GRID, ...
+
+    Each stage runs as two K sub-steps with the early cluster arrive of _pipelined_ksub2_loop.
+    The scales and the first NUM_BUFFERS stages of the next tile are issued before the output store
+    of the current tile. x and w need the K tail negated in memory; first_tiles is the phase change.
+    M, N and the strides are constexpr: with runtime values the kernel spills. Needs M % BLOCK_M == 0
+    (a partial M tile spills).
+    """
+    gl.static_assert(NUM_CTAS > 1, "the persistent kernel needs a cluster")
+    TDM_OPS: gl.constexpr = 1 if FUSED_LOAD else 2
+    NB: gl.constexpr = NUM_BUFFERS
+    KSUB: gl.constexpr = BLOCK_K // 2
+    a_buffer = gl.allocate_shared_memory(
+        a_ptr.type.element_ty, shape=[NB, BLOCK_M, BLOCK_K], layout=SHARED_LAYOUT_A
+    )
+    b_buffer = gl.allocate_shared_memory(
+        b_ptr.type.element_ty, shape=[NB, BLOCK_N, BLOCK_K], layout=SHARED_LAYOUT_B
+    )
+    as_buffer = gl.allocate_shared_memory(
+        gl.float32, [1, 1, BLOCK_M], SCALE_LAYOUT_A
+    ).index(0)
+    bs_buffer = gl.allocate_shared_memory(
+        gl.float32, [1, 1, BLOCK_N], SCALE_LAYOUT_B
+    ).index(0)
+    start = gl.program_id(axis=0)
+    _persistent_prologue(
+        a_ptr,
+        b_ptr,
+        a_scale_ptr,
+        b_scale_ptr,
+        start,
+        M,
+        N,
+        K,
+        stride_am,
+        stride_bn,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+        SHARED_LAYOUT_A,
+        SHARED_LAYOUT_B,
+        SCALE_LAYOUT_A,
+        SCALE_LAYOUT_B,
+        a_buffer,
+        b_buffer,
+        as_buffer,
+        bs_buffer,
+        NB,
+        FUSED_LOAD,
+    )
+    num_main = gl.cdiv(K, BLOCK_K) - NB
+    num_first = gl.maximum(gl.minimum(first_tiles, num_main), 0)
+    for tile in range(start, num_tiles, GRID):
+        pid_m, pid_n, a_desc, b_desc = _persistent_tile(
+            a_ptr,
+            b_ptr,
+            a_scale_ptr,
+            b_scale_ptr,
+            tile,
+            NB * BLOCK_K,
+            M,
+            N,
+            K,
+            stride_am,
+            stride_bn,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K,
+            SHARED_LAYOUT_A,
+            SHARED_LAYOUT_B,
+        )
+        # The scale load was issued before the stages.
+        gl.amd.gfx1250.tdm.async_wait((NB - 1) * TDM_OPS)
+        compute_idx = 0
+        load_idx = NB
+        accumulator = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
+        cur_a, cur_b = _read_stage(
+            a_buffer.index(0).slice(0, KSUB, 1),
+            b_buffer.index(0).slice(0, KSUB, 1),
+            OPERAND_LAYOUT_A,
+            OPERAND_LAYOUT_B,
+            False,
+        )
+        for phase in gl.static_range(2):
+            if phase == 1:
+                accumulator = -accumulator
+            for i in range(
+                num_first * phase, num_first + (num_main - num_first) * phase
+            ):
+                slot = compute_idx % NB
+                accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+                cur_a, cur_b = _read_stage(
+                    a_buffer.index(slot).slice(KSUB, KSUB, 1),
+                    b_buffer.index(slot).slice(KSUB, KSUB, 1),
+                    OPERAND_LAYOUT_A,
+                    OPERAND_LAYOUT_B,
+                    False,
+                )
+                gl.amd.gfx1250.cluster.arrive()
+                accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+                gl.amd.hint.sched_barrier()
+                gl.amd.gfx1250.cluster.wait()
+                lslot = load_idx % NB
+                a_desc, b_desc = _issue_stage(
+                    a_desc,
+                    b_desc,
+                    a_buffer.index(lslot),
+                    b_buffer.index(lslot),
+                    BLOCK_K,
+                    True,
+                    FUSED_LOAD,
+                )
+                gl.amd.gfx1250.tdm.async_wait((NB - 1) * TDM_OPS)
+                load_idx += 1
+                slot = (compute_idx + 1) % NB
+                cur_a, cur_b = _read_stage(
+                    a_buffer.index(slot).slice(0, KSUB, 1),
+                    b_buffer.index(slot).slice(0, KSUB, 1),
+                    OPERAND_LAYOUT_A,
+                    OPERAND_LAYOUT_B,
+                    False,
+                )
+                compute_idx += 1
+        for st in gl.static_range(NB):
+            slot = compute_idx % NB
+            accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+            cur_a, cur_b = _read_stage(
+                a_buffer.index(slot).slice(KSUB, KSUB, 1),
+                b_buffer.index(slot).slice(KSUB, KSUB, 1),
+                OPERAND_LAYOUT_A,
+                OPERAND_LAYOUT_B,
+                False,
+            )
+            accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+            if st < NB - 1:
+                gl.amd.gfx1250.tdm.async_wait((NB - 2 - st) * TDM_OPS)
+                slot = (compute_idx + 1) % NB
+                cur_a, cur_b = _read_stage(
+                    a_buffer.index(slot).slice(0, KSUB, 1),
+                    b_buffer.index(slot).slice(0, KSUB, 1),
+                    OPERAND_LAYOUT_A,
+                    OPERAND_LAYOUT_B,
+                    False,
+                )
+                compute_idx += 1
+        a_scale, b_scale, bias = _load_scales(
+            a_scale_ptr,
+            b_scale_ptr,
+            pid_m,
+            pid_n,
+            M,
+            N,
+            1,
+            1,
+            bias_ptr,
+            1,
+            BLOCK_M,
+            BLOCK_N,
+            OUT_LAYOUT,
+            ADD_BIAS,
+            as_buffer,
+            bs_buffer,
+            1,
+        )
+        # Every CTA of the cluster has read its slots and scales: the next tile's multicast loads may start.
+        gl.amd.gfx1250.cluster.arrive()
+        gl.amd.gfx1250.cluster.wait()
+        nxt = tile + GRID
+        if nxt < num_tiles:
+            _persistent_prologue(
+                a_ptr,
+                b_ptr,
+                a_scale_ptr,
+                b_scale_ptr,
+                nxt,
+                M,
+                N,
+                K,
+                stride_am,
+                stride_bn,
+                BLOCK_M,
+                BLOCK_N,
+                BLOCK_K,
+                SHARED_LAYOUT_A,
+                SHARED_LAYOUT_B,
+                SCALE_LAYOUT_A,
+                SCALE_LAYOUT_B,
+                a_buffer,
+                b_buffer,
+                as_buffer,
+                bs_buffer,
+                NB,
+                FUSED_LOAD,
+            )
+        # The last sign change goes into the row scale.
+        _scale_and_store(
+            None,
+            accumulator,
+            -a_scale,
+            b_scale,
+            bias,
+            c_ptr,
+            pid_m,
+            pid_n,
+            M,
+            N,
+            stride_cm,
+            1,
+            BLOCK_M,
+            BLOCK_N,
+            NUM_CTAS,
+            OUT_LAYOUT,
+            SHARED_LAYOUT_C,
+            REGISTER_STORE,
+            STORE_LAYOUT,
+            STAGE_LAYOUT,
+            ADD_BIAS,
+        )
+
+
 _KERNEL_MAP = {
     "bandwidth_bound": _gemm_a8w8_ptpc_bandwidth_bound_kernel,
     "compute_bound": _gemm_a8w8_ptpc_pipelined_kernel,
     "sliced_k": _gemm_a8w8_ptpc_pipelined_kernel,
+    "compute_bound_persistent": _gemm_a8w8_ptpc_persistent_kernel,
 }
 
 # Smallest NUM_BUFFERS of each kernel type.
-_MIN_BUFFERS = {"bandwidth_bound": 1, "compute_bound": 2, "sliced_k": 2}
+_MIN_BUFFERS = {
+    "bandwidth_bound": 1,
+    "compute_bound": 2,
+    "sliced_k": 2,
+    "compute_bound_persistent": 2,
+}

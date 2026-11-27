@@ -4,7 +4,6 @@
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8 import _negate_k_tail_kernel
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
 )
@@ -12,6 +11,7 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8 import (
     _gemm_a8w8_kernel,
     _gemm_a8w8_preshuffle_kernel,
     _get_config,
+    _negate_k_tail_kernel,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.device_info import get_num_xcds
@@ -65,9 +65,88 @@ def _negate_k_tail(x: torch.Tensor, k0: int) -> torch.Tensor:
     n = M * K // 4
     BLOCK = 4096
     _negate_k_tail_kernel[(triton.cdiv(n, BLOCK),)](
-        x.view(torch.int32), y.view(torch.int32), n, K // 4, k0 // 4, BLOCK=BLOCK, num_warps=8
+        x.view(torch.int32),
+        y.view(torch.int32),
+        n,
+        K // 4,
+        k0 // 4,
+        BLOCK=BLOCK,
+        num_warps=8,
     )
     return y
+
+
+_PERSISTENT_LAYOUT_KEYS = (
+    "SHARED_LAYOUT_A",
+    "SHARED_LAYOUT_B",
+    "SHARED_LAYOUT_C",
+    "WMMA_LAYOUT",
+    "OPERAND_LAYOUT_A",
+    "OPERAND_LAYOUT_B",
+    "OUT_LAYOUT",
+    "SCALE_LAYOUT_A",
+    "SCALE_LAYOUT_B",
+    "STORE_LAYOUT",
+    "STAGE_LAYOUT",
+)
+
+
+def _launch_ptpc_persistent(
+    x,
+    w,
+    c,
+    x_scale,
+    w_scale,
+    bias,
+    config,
+    layouts,
+    num_buffers,
+    register_store,
+    first_tiles,
+):
+    """Launch the persistent compute_bound kernel: one cluster per num_ctas CUs walks the tiles."""
+    from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a8w8_ptpc import (
+        _gemm_a8w8_ptpc_persistent_kernel,
+    )
+
+    M, K = x.shape
+    N = w.shape[0]
+    BLOCK_M = config["BLOCK_M"]
+    BLOCK_N = config["BLOCK_N"]
+    num_ctas = config["num_ctas"]
+    num_tiles = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
+    num_cus = torch.cuda.get_device_properties(x.device).multi_processor_count
+    grid = min(num_tiles, max(num_cus // num_ctas, 1))
+    _gemm_a8w8_ptpc_persistent_kernel[(grid,)](
+        x,
+        w,
+        c,
+        x_scale,
+        w_scale,
+        bias,
+        M,
+        N,
+        K,
+        x.stride(0),
+        w.stride(0),
+        c.stride(0),
+        first_tiles,
+        num_tiles,
+        grid,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=config["BLOCK_K"],
+        NUM_BUFFERS=num_buffers,
+        NUM_CTAS=num_ctas,
+        FUSED_LOAD=config["FUSED_LOAD"],
+        REGISTER_STORE=register_store,
+        ADD_BIAS=bias is not None,
+        num_warps=config["num_warps"],
+        num_ctas=num_ctas,
+        waves_per_eu=config["waves_per_eu"],
+        **{k: v for k, v in layouts.items() if k in _PERSISTENT_LAYOUT_KEYS},
+    )
+    return c
 
 
 def _gemm_a8w8_ptpc_gfx1250(
@@ -86,7 +165,7 @@ def _gemm_a8w8_ptpc_gfx1250(
 
     w_k_tail_negated: w comes from gemm_a8w8_negate_w_k_tail.
     """
-    from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a8w8 import (
+    from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a8w8_ptpc import (
         _KERNEL_MAP,
         _MIN_BUFFERS,
         create_ptpc_layouts,
@@ -100,7 +179,16 @@ def _gemm_a8w8_ptpc_gfx1250(
     assert x.stride(1) == 1 and w.stride(1) == 1, "x and w must be contiguous along K"
 
     if config is None:
-        config, _ = get_gemm_config("GEMM-A8W8", M, N, K, backend="gluon")
+        config, _ = get_gemm_config("GEMM-A8W8-PTPC", M, N, K, backend="gluon")
+    if bias is not None and config["NUM_KSUB"] == 2 and config["BLOCK_K"] == 256:
+        config = dict(
+            config,
+            kernel_type="compute_bound",
+            BLOCK_K=128,
+            NUM_BUFFERS=3,
+            NUM_KSUB=1,
+            FUSED_LOAD=0,
+        )
     kernel_type = config["kernel_type"]
     assert (
         kernel_type in _KERNEL_MAP
@@ -112,9 +200,6 @@ def _gemm_a8w8_ptpc_gfx1250(
     num_warps = config["num_warps"]
     num_ctas = config["num_ctas"]
     register_store = config["REGISTER_STORE"]
-
-    # Split-K: each split does a whole number of BLOCK_K stages.
-    # A pre-negated weight has one sign change, so it runs without split-K.
     k_stages = triton.cdiv(K, BLOCK_K)
     num_ksplit_cfg = 1 if w_k_tail_negated else max(config["NUM_KSPLIT"], 1)
     stages_per_split = triton.cdiv(k_stages, num_ksplit_cfg)
@@ -123,9 +208,7 @@ def _gemm_a8w8_ptpc_gfx1250(
     if num_ksplit == 1:
         splitk_block_size = 0
 
-    # The pipeline cannot be deeper than the number of K stages of a split.
     num_buffers = min(config["NUM_BUFFERS"], stages_per_split)
-    # The kernel changes phase at half of the K stages, or at the sign change of the weight.
     first_tiles = k_stages
     if w_k_tail_negated:
         k0 = gemm_a8w8_neg_k_start(K)
@@ -133,7 +216,6 @@ def _gemm_a8w8_ptpc_gfx1250(
             k0 % BLOCK_K == 0
         ), f"BLOCK_K={BLOCK_K} must divide the sign change column {k0} of the weight"
         first_tiles = k0 // BLOCK_K
-        # The phase change is in the main loop: keep the pipeline out of the first phase.
         in_flight = k_stages - first_tiles
         if kernel_type == "bandwidth_bound":
             in_flight += 1
@@ -149,11 +231,30 @@ def _gemm_a8w8_ptpc_gfx1250(
             num_buffers,
         )
         kernel_type = "bandwidth_bound"
-    # The coalesced register store has no fp32 layout. The sliced_k tile is already coalesced.
     if register_store in (2, 3) and (kernel_type == "sliced_k" or num_ksplit > 1):
         register_store = 1
 
-    # Split-K writes fp32 partials, then a reduce kernel adds them and the bias.
+    neg_in_memory = w_k_tail_negated or (
+        config["PRE_NEG"] and num_ksplit == 1 and K % 4 == 0
+    )
+    num_ksub = config["NUM_KSUB"]
+    if (
+        kernel_type in ("compute_bound", "compute_bound_persistent")
+        and not neg_in_memory
+    ):
+        num_ksub = 1
+    if kernel_type == "compute_bound_persistent" and not (
+        M % BLOCK_M == 0
+        and num_ctas > 1
+        and num_ksplit == 1
+        and num_ksub == 2
+        and _scale_stride(x_scale, M) == 1
+        and _scale_stride(w_scale, N) == 1
+        and (bias is None or _scale_stride(bias, N) == 1)
+        and (y is None or y.stride(1) == 1)
+    ):
+        kernel_type = "compute_bound"
+
     if num_ksplit > 1:
         c = torch.empty((num_ksplit, M, N), dtype=torch.float32, device=x.device)
     else:
@@ -170,8 +271,6 @@ def _gemm_a8w8_ptpc_gfx1250(
         register_store,
         config["CTAS_M"],
     )
-    # PRE_NEG: negate the second half of K of x in memory (one elementwise pass) instead of
-    # flipping an LDS slot per K stage in the kernel; the kernel then only negates the accumulator.
     if w_k_tail_negated:
         layouts = dict(layouts, NEG_WORDS=0)
     elif config["PRE_NEG"] and num_ksplit == 1 and K % 4 == 0:
@@ -179,7 +278,9 @@ def _gemm_a8w8_ptpc_gfx1250(
         in_flight = num_buffers - 1 if kernel_type == "bandwidth_bound" else num_buffers
         num_first = max(min(k_tiles // 2, k_tiles - in_flight), 0)
         x = _negate_k_tail(x, min(num_first * BLOCK_K, K))
-        layouts = dict(layouts, NEG_WORDS=0)  # create_ptpc_layouts is cached: do not mutate its dict
+        layouts = dict(
+            layouts, NEG_WORDS=0
+        )  # create_ptpc_layouts is cached: do not mutate its dict
     _LOGGER.info(
         "GEMM_A8W8 [gluon/gfx1250]: x=%s w=%s kernel=%s",
         tuple(x.shape),
@@ -187,12 +288,29 @@ def _gemm_a8w8_ptpc_gfx1250(
         kernel_type,
     )
 
+    x_scale_stride = _scale_stride(x_scale, M)
+    w_scale_stride = _scale_stride(w_scale, N)
+    if kernel_type == "compute_bound_persistent":
+        return _launch_ptpc_persistent(
+            x,
+            w,
+            c,
+            x_scale,
+            w_scale,
+            bias,
+            config,
+            layouts,
+            num_buffers,
+            register_store,
+            min(k_stages // 2, first_tiles),
+        )
     if kernel_type == "bandwidth_bound":
         variant_args = {"NUM_KSUB": config["NUM_KSUB"]}
     else:
-        variant_args = {"SLICED_K": kernel_type == "sliced_k"}
-    x_scale_stride = _scale_stride(x_scale, M)
-    w_scale_stride = _scale_stride(w_scale, N)
+        variant_args = {
+            "SLICED_K": kernel_type == "sliced_k",
+            "NUM_KSUB": num_ksub if kernel_type == "compute_bound" else 1,
+        }
     grid_2d = num_ctas == 1 and num_ksplit == 1 and config["GROUP_SIZE_M"] == 0
     if grid_2d:
         grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
