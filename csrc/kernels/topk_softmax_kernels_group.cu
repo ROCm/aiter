@@ -2185,6 +2185,10 @@ void biased_grouped_topk(const aiter_tensor_t& gating_output,   // [num_tokens, 
     bool use_opt_sort = (topk == 8) && (num_expert_group == 8) && (num_experts == 256) &&
                         (topk_grp == 4) && (isBiased == true) && (get_warp_size_func() == 64);
 
+    // No tokens (for example an idle data-parallel rank): a zero-size grid is an invalid launch.
+    if(num_tokens == 0)
+        return;
+
     dim3 grid(num_tokens);
     dim3 block(get_warp_size_func());
     size_t shared_mem_size =
@@ -2234,6 +2238,10 @@ void grouped_topk(const aiter_tensor_t& gating_output, // [num_tokens, num_exper
 
     // TODO: expand usage in the future
     bool use_opt_sort = false;
+
+    // No tokens (for example an idle data-parallel rank): a zero-size grid is an invalid launch.
+    if(num_tokens == 0)
+        return;
 
     dim3 grid(num_tokens);
     dim3 block(get_warp_size_func());

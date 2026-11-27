@@ -291,7 +291,7 @@ def _wrapper_main_kernel_params(T: int, H: int, D: int):
 
     Must stay in sync with ``pa_decode_sparse``'s (always exp2) block_k logic.
     """
-    use_gluon = arch_info.get_arch() == "gfx1250"
+    use_gluon = arch_info.get_arch() in ("gfx1250", "gfx1250-strict")
     use_exp2 = True
     if use_gluon:
         if H >= 128:

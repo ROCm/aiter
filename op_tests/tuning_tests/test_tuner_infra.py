@@ -10,6 +10,7 @@ import argparse
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import pandas as pd
 
@@ -32,6 +33,69 @@ class TestFlydslA8w8BpreshuffleCandidates(unittest.TestCase):
             any(ki.use_async_copy for ki in kernels_list_950.values()),
             "gfx950 supports async copy and must keep those tuning candidates",
         )
+
+    def test_int8_4wave_pipeline_follows_the_existing_pipelines(self):
+        from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
+            PIPELINES,
+        )
+
+        self.assertEqual(
+            [pipeline.name for pipeline in PIPELINES],
+            ["preshuffle", "8wave", "int8_4wave"],
+        )
+        ids = [set(pipeline.kernels_list) for pipeline in PIPELINES]
+        self.assertFalse(ids[0] & ids[1] or ids[0] & ids[2] or ids[1] & ids[2])
+
+    def test_generic_int8_candidates_are_named_for_replay(self):
+        from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
+            kernel_name_for_quant_dtype,
+            kernels_list_950,
+        )
+
+        generic = next(iter(kernels_list_950.values()))
+        self.assertIn("_I8_I8_", kernel_name_for_quant_dtype(generic, "int8"))
+
+    def test_int8_4wave_candidates_encode_k_topology_and_persistence(self):
+        from aiter.ops.flydsl.gemm_tune import (
+            flydsl_gemm_a8w8_bpreshuffle_common as common,
+        )
+
+        def candidates(cu_num, m, n, k):
+            common.ensure_int8_4wave_candidates(cu_num, k)
+            return [
+                (kernel_id, kernel)
+                for kernel_id, kernel in common.kernels_list_int8_4wave.items()
+                if kernel.cu_num == cu_num
+                and common.kernel_fits_shape_int8_4wave(kernel, m, n, k)
+            ]
+
+        with mock.patch.object(common, "get_gfx", return_value="gfx950"):
+            square = candidates(256, 9450, 5120, 5120)
+            self.assertEqual({i for i, _ in square}, {1_000_044, 1_000_045})
+            self.assertEqual({ki.persistent for _, ki in square}, {False, True})
+            self.assertTrue(all(ki.num_xcds == 8 for _, ki in square))
+            self.assertTrue(all("_k5120" in ki.name for _, ki in square))
+
+            long_k = candidates(256, 9450, 5120, 13824)
+            self.assertEqual({i for i, _ in long_k}, {1_000_046, 1_000_047})
+
+            small_grid = candidates(256, 512, 5120, 5120)
+            self.assertEqual([ki.persistent for _, ki in small_grid], [False])
+
+            for cu_num, num_xcds in ((96, 3), (128, 4), (160, 5)):
+                topology = candidates(cu_num, 9450, 5120, 5120)
+                self.assertEqual(len(topology), 2)
+                self.assertTrue(all(ki.num_xcds == num_xcds for _, ki in topology))
+                self.assertTrue(
+                    all(ki.name.endswith(f"_xcd{num_xcds}") for _, ki in topology)
+                )
+
+            for k in (1024, 8192):
+                self.assertEqual(
+                    sorted(ki.k for _, ki in candidates(256, 9450, 5120, k)), [k, k]
+                )
+            self.assertEqual(candidates(256, 9450, 5119, 5120), [])
+            self.assertEqual(candidates(256, 9450, 5120, 128), [])
 
 
 class _StubTuner:
@@ -271,19 +335,95 @@ class TestPostProcess(unittest.TestCase):
         self.assertEqual(float(resultdf.iloc[0]["us"]), 8.0)
 
     def test_filters_invalid_and_inf_times(self):
-        """us=-1 (error) and us=inf (timeout) should be excluded."""
+        """Non-positive and non-finite measurements should be excluded."""
         tuner = _StubTuner.get()
         args = self._make_args()
         rets = [
             self._make_result((TEST_GFX, 304, 1, 1024, 512), 0, 0, -1, err=0.0),
+            self._make_result((TEST_GFX, 304, 1, 1024, 512), 1, 0, 0, err=0.0),
             self._make_result(
-                (TEST_GFX, 304, 1, 1024, 512), 1, 0, float("inf"), err=0.0
+                (TEST_GFX, 304, 1, 1024, 512), 2, 0, float("inf"), err=0.0
             ),
-            self._make_result((TEST_GFX, 304, 1, 1024, 512), 2, 0, 7.0, err=0.01),
+            self._make_result(
+                (TEST_GFX, 304, 1, 1024, 512), 3, 0, float("nan"), err=0.0
+            ),
+            self._make_result((TEST_GFX, 304, 1, 1024, 512), 4, 0, 7.0, err=0.01),
         ]
         resultdf = tuner.post_process(rets, args, topk=1)
         self.assertEqual(len(resultdf), 1)
         self.assertEqual(float(resultdf.iloc[0]["us"]), 7.0)
+
+    def test_nan_between_valid_times_does_not_break_selection(self):
+        """A NaN timing must not disturb the order of the valid candidates."""
+        tuner = _StubTuner.get()
+        args = self._make_args()
+        shape = (TEST_GFX, 304, 1, 1024, 512)
+        for times in (
+            [8.0, float("nan"), 5.0],
+            [9.0, float("nan"), 8.0, 5.0],
+        ):
+            rets = [
+                self._make_result(shape, kid, 0, us, err=0.0)
+                for kid, us in enumerate(times)
+            ]
+            resultdf = tuner.post_process(rets, args, topk=1)
+            self.assertEqual(len(resultdf), 1)
+            self.assertEqual(float(resultdf.iloc[0]["us"]), 5.0)
+            self.assertEqual(int(resultdf.iloc[0]["kernelId"]), len(times) - 1)
+
+    def test_all_zero_measurements_produce_failed_fallback(self):
+        tuner = _StubTuner.get()
+        args = self._make_args()
+        shape = (TEST_GFX, 304, 1, 1024, 512)
+        rets = [
+            self._make_result(shape, 0, 0, 0, err=0.0),
+            self._make_result(shape, 1, 0, 0, err=0.0),
+        ]
+
+        resultdf = tuner.post_process(rets, args, topk=1)
+
+        self.assertEqual(len(resultdf), 1)
+        self.assertEqual(float(resultdf.iloc[0]["us"]), tuner.INVALID_TIME)
+        self.assertEqual(float(resultdf.iloc[0]["errRatio"]), 1.0)
+
+    def test_zero_measurement_does_not_overwrite_tuned_config(self):
+        tuner = _StubTuner.get()
+        old = pd.DataFrame(
+            [
+                {
+                    "gfx": TEST_GFX,
+                    "cu_num": 304,
+                    "M": 1,
+                    "N": 1024,
+                    "K": 512,
+                    "kernelId": 7,
+                    "splitK": 0,
+                    "us": 12.5,
+                    "kernelName": "existing",
+                    "tflops": 1.0,
+                    "bw": 1.0,
+                    "errRatio": 0.0,
+                }
+            ],
+            columns=tuner.columns,
+        )
+        zero = old.copy()
+        zero.loc[0, ["kernelId", "us", "kernelName"]] = [8, 0.0, "zero"]
+
+        with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as f:
+            path = f.name
+        try:
+            old.to_csv(path, index=False)
+            tuner.result_to_csv(zero, path)
+            written = pd.read_csv(path)
+
+            self.assertEqual(len(written), 1)
+            self.assertEqual(int(written.iloc[0]["kernelId"]), 7)
+            self.assertEqual(float(written.iloc[0]["us"]), 12.5)
+            self.assertEqual(len(tuner.failed), 1)
+            self.assertEqual(float(tuner.failed.iloc[0]["us"]), 0.0)
+        finally:
+            os.unlink(path)
 
     def test_topk_not_leak_across_shapes(self):
         """BUG REGRESSION: topk must not leak between shapes.

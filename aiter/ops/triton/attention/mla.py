@@ -44,7 +44,7 @@ from aiter.ops.triton.utils.config_utils import (
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 DEVICE_ARCH = arch_info.get_arch()
-IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
+IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
 
 
@@ -83,6 +83,8 @@ def select_3d_config(
     reduce_waves_per_eu = 2
     num_segments = 0
     TILE_SIZE = block_size
+    seg_cap = 128
+    tuned = None
     if IS_DEVICE_ARCH_GFX12:
         # If we cannot infer max_seqlen_k during graph capture
         maybe_guess_max_seqlen_k = 128000 if max_seqlen_k == 0 else max_seqlen_k
@@ -110,25 +112,43 @@ def select_3d_config(
         num_segments = max(1, target_num_prgms // 4 * occ // max(1, num_2d_prgms))
         num_segments = min(MAX_SEGMENTS, num_segments)
         num_segments = triton.next_power_of_2(num_segments)
+    else:
+        # Tuned split-KV launch values, per KV cache dtype. Only archs and KV
+        # dtypes with a tuned entry use them.
+        tuned = load_config_json(
+            f"{resolve_config_dir('attention', 'MLA_DECODE')}/DEFAULT.json",
+            required=False,
+        )
+        if tuned is not None:
+            tuned = tuned.get(str(kv_dtype).removeprefix("torch."))
+        if tuned is not None:
+            attn_num_warps = tuned["attn"]["num_warps"]
+            seg_cap = tuned["attn"]["MAX_SEGMENTS"]
 
     MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
     if num_segments == 0:
         num_segments = math.ceil(target_num_prgms / num_2d_prgms) * 2
         num_segments = min(num_segments, MAX_SEGMENTS)
         num_segments = triton.next_power_of_2(num_segments)
-        num_segments = min(num_segments, 128)
+        num_segments = min(num_segments, seg_cap)
         MIN_SEGMENTS = max(8, num_segments)
         num_segments = max(num_segments, MIN_SEGMENTS)
 
         if num_segments == MIN_SEGMENTS:
             reduce_num_warps = 1
+        if tuned is not None:
+            # The reduce kernel holds a [NUM_SEGMENTS, KV_LORA_RANK] fp32 tile.
+            # One warp spills it to scratch from 16 segments, much more from 32.
+            reduce_num_warps = tuned["reduce"]["num_warps"]
 
     attn_config = {
         "TILE_SIZE": TILE_SIZE,
         "NUM_SEGMENTS_PER_SEQ": num_segments,
         "num_warps": attn_num_warps,
         "waves_per_eu": attn_waves_per_eu,
-        "num_stages": 2 if DEVICE_ARCH in ("gfx1250", "gfx950") else 1,
+        "num_stages": (
+            2 if DEVICE_ARCH in ("gfx1250", "gfx1250-strict", "gfx950") else 1
+        ),
     }
     reduce_config = {
         "TILE_SIZE": TILE_SIZE,
@@ -443,7 +463,7 @@ def mla_decode_fwd(
 
     selected_num_segments = attn_config["NUM_SEGMENTS_PER_SEQ"]
     use_lds_pipeline = (
-        DEVICE_ARCH == "gfx1250"
+        DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
         and ALL_DECODE
         and total_num_tokens == num_seqs
         and shuffled_kv_cache

@@ -24,9 +24,10 @@ from .gemm_common_gfx1250 import (
     pipeline_fence,
     pipeline_fence_signal,
     pipeline_fence_wait,
+    prefetch_kernel_code,
     workgroup_barrier,
 )
-from .gfx1250_cluster import compute_mcast_masks
+from .gfx1250_cluster import compute_mcast_masks_runtime
 from .kernels_common import format_kernel_name
 from .splitk_fused_epilogue_gfx1250 import emit_fused_splitk_epilogue
 
@@ -58,6 +59,7 @@ def launch_gemm_a4w4_256x256(
     i32_lda: fx.Int32,
     i32_ldc: fx.Int32,
     arg_out: fx.Pointer,
+    i32_cm: fx.Int32,
     tile_m: Constexpr[int],
     tile_n: Constexpr[int],
     tile_k: Constexpr[int],
@@ -65,14 +67,15 @@ def launch_gemm_a4w4_256x256(
     n_warp: Constexpr[int],
     out_is_f16: Constexpr[int],
     num_buffers: Constexpr[int],
-    cluster_m: Constexpr[int],
     cluster_n: Constexpr[int],
     split_k: Constexpr[int] = 1,
     a_preshuffle: Constexpr[bool] = False,
     fused_splitk: Constexpr[bool] = False,
-    bounded_m: Constexpr[bool] = True,
 ):
     """Launch the A4W4 kernel.
+
+    A launch clusters ``i32_cm`` rows, the cluster_m that fits M, so no ``.cluster_dims`` is
+    compiled in. It is always a real cluster (``i32_cm * cluster_n >= 2``).
 
     N must cover whole ``tile_n * cluster_n`` groups. M is unrestricted;
     preshuffled A must pad an odd M to a whole row pair. K per split must be a
@@ -85,9 +88,7 @@ def launch_gemm_a4w4_256x256(
         and tile_k in (128, 256)
         and (m_warp, n_warp, num_buffers) == (2, 2, 4)
     ), "supported tile profiles are 128/192/256 x 128/256 x 128/256 with 2x2 waves and 4 buffers"
-    assert (
-        1 <= cluster_m < 16 and 1 <= cluster_n < 16 and 1 < cluster_m * cluster_n <= 16
-    ), f"cluster_m*cluster_n must be 2..16, got {cluster_m}x{cluster_n}"
+    assert 1 <= cluster_n < 16, f"cluster_n must be 1..15, got {cluster_n}"
     assert split_k >= 1, f"split_k must be positive, got {split_k}"
     assert not fused_splitk or (
         split_k in (2, 4, 8) and tile_m % split_k == 0
@@ -99,11 +100,13 @@ def launch_gemm_a4w4_256x256(
     cluster_splitk = fused_splitk and split_k > 1
     cluster_k = split_k if cluster_splitk else 1
     assert (
-        cluster_m * cluster_n * cluster_k <= 16
+        cluster_n * cluster_k <= 16
     ), "all K splits must fit in a 16-workgroup cluster"
     cluster_sync_revs = 8
     # The four-quadrant software pipeline; other profiles run the sequential K-tile schedule.
     scheduled = tile_m in (192, 256) and tile_n == 256 and tile_k == 256
+    # The tail modes launched below, in the order their kernels are defined in the module.
+    tail_modes = (2, 0, -1) if scheduled else (-1,)
     FENCE_WAIT_POS = 7  # WMMAs of slack between the READY signal and its matching wait
     WMMA_M = 32
     WMMA_N = 16
@@ -165,7 +168,7 @@ def launch_gemm_a4w4_256x256(
     kernel_name = format_kernel_name(
         f"gemm_a4w4_mx32_compute_t{tile_m}x{tile_n}x{tile_k}"
         f"_mw{m_warp}_nw{n_warp}_nb{num_buffers}_sk{split_k}"
-        f"_cm{cluster_m}_cn{cluster_n}"
+        f"_cn{cluster_n}"
         + ("_apre" if a_preshuffle else "")
         + ("_fsk" if cluster_splitk else "")
     )
@@ -183,8 +186,10 @@ def launch_gemm_a4w4_256x256(
         i32_lda: fx.Int32,
         i32_ldc: fx.Int32,
         arg_out: fx.Pointer,
+        i32_cm: fx.Int32,
         tail_mode: Constexpr[int],
     ):
+        prefetch_kernel_code(num_waves, tail_modes.index(tail_mode))
 
         K_TILES = i32_k // (tile_k * split_k)
         k64 = fx.Int64(i32_k)
@@ -211,10 +216,12 @@ def launch_gemm_a4w4_256x256(
         wave_m = wave // n_warp
         wave_n = wave % n_warp
         local_x, local_y = cluster.compute_cluster_position()
-        a_mask, b_mask = compute_mcast_masks(local_x, local_y, cluster_m, cluster_n)
+        a_mask, b_mask = compute_mcast_masks_runtime(
+            local_x, local_y, i32_cm, cluster_n
+        )
         if const_expr(cluster_splitk):
             cluster_plane = fx.Int32(rocdl.cluster_workgroup_id_z()) * (
-                cluster_m * cluster_n
+                i32_cm * cluster_n
             )
             a_mask = fx.Int32(a_mask) << cluster_plane
             b_mask = fx.Int32(b_mask) << cluster_plane
@@ -834,37 +841,42 @@ def launch_gemm_a4w4_256x256(
                 split_idx=split_idx,
                 mn_oob=mn_oob,
                 flat_tile=flat_tile,
-                bounded_m=bounded_m,
             )
         else:
             if const_expr(split_k > 1):
                 c_off_rt += fx.Int64(split_idx) * fx.Int64(i32_m) * ldc64
+            C_TILE = (tile_m, C_LDS_ROW)
             gtC = _gv(
                 fx.recast_iter(partial_elem, arg_c),
                 c_off_rt,
-                (tile_m, C_LDS_ROW),
-                (C_LDS_ROW, 1),
+                (mn_oob, tile_n),
+                (ldc64, 1),
             )
-            atomC = fx.rocdl.make_tdm_atom(
-                gtC, [mn_oob, tile_n], strides=[ldc64, None], num_warps=num_waves
-            )
-            fx.copy(
-                atomC,
-                _view(
-                    fx.recast_iter(partial_elem, base_ptr),
-                    (tile_m, C_LDS_ROW),
-                    (C_LDS_ROW, 1),
-                ),
+            atomC, coordC = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                fx.rocdl.TensorStore(),
                 gtC,
+                fx.make_layout(C_TILE, (C_LDS_ROW, 1)),
+                C_TILE,
+                num_warps=num_waves,
             )
-            tdm_ops.tensor_wait(0)
+            blkC = fx.zipped_divide(coordC, C_TILE)[None, (0, None)]
+            sC = _view(
+                fx.recast_iter(partial_elem, base_ptr),
+                (C_TILE, 1),
+                ((C_LDS_ROW, 1), tile_m * C_LDS_ROW),
+            )
+            tCs, tCg = fx.rocdl.cdna5.tdm_partition(
+                atomC, wave, fx.make_layout(num_waves, 1), sC, blkC
+            )
+            fx.copy(atomC, tCs[None, 0], tCg[None, 0])
+            rocdl.s_wait_tensorcnt(0)
 
     grid_arg = make_gemm_grid(
         i32_m,
         N,
         tile_m,
         tile_n,
-        cluster_m,
+        i32_cm,
         split_k=split_k,
         fused_splitk=cluster_splitk,
     )
@@ -884,13 +896,13 @@ def launch_gemm_a4w4_256x256(
             i32_lda,
             i32_ldc,
             arg_out,
+            i32_cm,
             tail_mode,
-            value_attrs={"rocdl.cluster_dims": f"{cluster_m},{cluster_n},{cluster_k}"},
         ).launch(
             grid=grid_arg,
             block=(block, 1, 1),
             stream=stream,
-            cluster=(cluster_m, cluster_n, cluster_k),
+            cluster=(i32_cm, cluster_n, cluster_k),
         )
 
     if const_expr(scheduled):

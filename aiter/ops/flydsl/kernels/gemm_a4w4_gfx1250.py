@@ -24,7 +24,7 @@ from .gemm_common_gfx1250 import (
     pipeline_fence,
     workgroup_barrier,
 )
-from .gfx1250_cluster import compute_mcast_masks
+from .gfx1250_cluster import compute_mcast_masks_runtime
 from .kernels_common import format_kernel_name
 from .splitk_fused_epilogue_gfx1250 import emit_fused_splitk_epilogue
 
@@ -43,6 +43,7 @@ def launch_gemm_a4w4(
     lda: fx.Int32,
     ldc: fx.Int32,
     arg_out: fx.Pointer,
+    i32_cm: fx.Int32,
     tile_m: Constexpr[int] = 32,
     tile_n: Constexpr[int] = 128,
     tile_k: Constexpr[int] = 256,
@@ -50,21 +51,27 @@ def launch_gemm_a4w4(
     n_warp: Constexpr[int] = 4,
     out_is_f16: Constexpr[bool] = False,
     num_buffers: Constexpr[int] = 3,
-    cluster_m: Constexpr[int] = 1,
+    use_cluster: Constexpr[bool] = False,
     cluster_n: Constexpr[int] = 1,
     split_k: Constexpr[int] = 1,
 ):
-    """C = (A * SA) @ (B * SB), with FP32 accumulation and fused split-K."""
+    """C = (A * SA) @ (B * SB), with FP32 accumulation and fused split-K.
+
+    A launch clusters ``i32_cm`` rows, the cluster_m that fits M, so no ``.cluster_dims`` is
+    compiled in; ``use_cluster`` is False only for a launch of one workgroup.
+    """
     assert tile_m % (16 * m_warp) == 0 and tile_n % (32 * n_warp) == 0
     assert (tile_m // m_warp) % 32 == 0 or (tile_m == 16 and m_warp == 1)
     assert tile_k in (128, 256, 512, 1024) and 2 <= num_buffers <= 4
-    assert 1 <= cluster_m < 16 and 1 <= cluster_n < 16 and cluster_m * cluster_n <= 16
+    assert 1 <= cluster_n < 16
     assert split_k in (1, 2, 4, 8)
-    assert cluster_m * cluster_n * split_k <= 16
+    assert cluster_n * split_k <= 16
+    assert (
+        use_cluster or cluster_n * split_k == 1
+    ), "a plain launch has no cluster_n or K splits"
     assert split_k == 1 or (
         tile_m % split_k == 0 and tile_m // split_k >= m_warp * n_warp * 128 // tile_n
     )
-    use_cluster = cluster_m * cluster_n * split_k > 1
     waves, block = m_warp * n_warp, m_warp * n_warp * 32
     wm_rep, wn_rep = tile_m // (16 * m_warp), tile_n // (32 * n_warp)
     ks_count, pack_k = tile_k // 128, tile_k // 2
@@ -86,7 +93,8 @@ def launch_gemm_a4w4(
         )
     name = format_kernel_name(
         f"gemm_a4w4_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
-        f"_nb{num_buffers}_c{cluster_m}x{cluster_n}_sk{split_k}"
+        f"_nb{num_buffers}_cn{cluster_n}_sk{split_k}"
+        + ("" if use_cluster else "_plain")
     )
 
     @flyc.kernel(name=name, known_block_size=[block, 1, 1])
@@ -102,6 +110,7 @@ def launch_gemm_a4w4(
         ld_a: fx.Int32,
         ld_c: fx.Int32,
         out_ptr: fx.Pointer,
+        i32_cm: fx.Int32,
     ):
         tid = fx.thread_idx.x
         bx, by, bz = fx.block_idx
@@ -120,11 +129,9 @@ def launch_gemm_a4w4(
         kp, scale_stride = fx.ceildiv(k, 32) * 16, fx.ceildiv(k, 128) * 128
         if const_expr(use_cluster):
             cx, cy = cluster.compute_cluster_position()
-            amask, bmask = compute_mcast_masks(cx, cy, cluster_m, cluster_n)
+            amask, bmask = compute_mcast_masks_runtime(cx, cy, i32_cm, cluster_n)
             if const_expr(split_k > 1):
-                plane = fx.Int32(rocdl.cluster_workgroup_id_z()) * (
-                    cluster_m * cluster_n
-                )
+                plane = fx.Int32(rocdl.cluster_workgroup_id_z()) * (i32_cm * cluster_n)
                 amask, bmask = fx.Int32(amask) << plane, fx.Int32(bmask) << plane
         else:
             amask, bmask = 0, 0
@@ -457,29 +464,42 @@ def launch_gemm_a4w4(
                                         + fx.Int64(col + j),
                                     )
 
-            # Whole tiles go out through TDM with bounds equal to the tile, so no
-            # out-of-range clamp is relied on; edge tiles keep the guarded stores.
+            # Tiles with whole N go out through TDM. The view holds only the rows below
+            # m, so an M-tail tile is clipped by the TDM bound as the compute kernel's
+            # store is; the per-vector guarded stores of a tail tile run serially and
+            # made it the slowest workgroup. Edge-N tiles keep the guarded stores.
             if const_expr(tile_m % waves == 0):
-                if (bm + tile_m <= m) & (bn + tile_n <= n) & (ld_c % 8 == 0):
-                    out_layout = fx.make_layout((tile_m, c_lds_row), (c_lds_row, 1))
+                if (bm < m) & (bn + tile_n <= n) & (ld_c % 8 == 0):
+                    C_TILE = (tile_m, c_lds_row)
                     tile_out = fx.Tensor(
                         fx.make_view(
                             out + fx.Int64(bm) * fx.Int64(ld_c) + fx.Int64(bn),
-                            out_layout,
+                            fx.make_layout(
+                                (fx.min(m - bm, tile_m), tile_n), (fx.Int64(ld_c), 1)
+                            ),
                         )
                     )
-                    store_atom = fx.rocdl.make_tdm_atom(
+                    store_atom, out_coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                        fx.rocdl.TensorStore(),
                         tile_out,
-                        [tile_m, tile_n],
-                        strides=[fx.Int64(ld_c), None],
+                        fx.make_layout(C_TILE, (c_lds_row, 1)),
+                        C_TILE,
                         num_warps=waves,
                     )
-                    fx.copy(
-                        store_atom,
-                        fx.Tensor(fx.make_view(fx.recast_iter(elem, base), out_layout)),
-                        tile_out,
+                    out_blk = fx.zipped_divide(out_coord, C_TILE)[None, (0, None)]
+                    sC = fx.Tensor(
+                        fx.make_view(
+                            fx.recast_iter(elem, base),
+                            fx.make_layout(
+                                (C_TILE, 1), ((c_lds_row, 1), tile_m * c_lds_row)
+                            ),
+                        )
                     )
-                    tdm_ops.tensor_wait(0)
+                    tCs, tCg = fx.rocdl.cdna5.tdm_partition(
+                        store_atom, wave, fx.make_layout(waves, 1), sC, out_blk
+                    )
+                    fx.copy(store_atom, tCs[None, 0], tCg[None, 0])
+                    rocdl.s_wait_tensorcnt(0)
                 else:
                     store_guarded()
             else:
@@ -501,12 +521,12 @@ def launch_gemm_a4w4(
                 split_idx=split,
                 mn_oob=m - bm,
                 flat_tile=fx.Int64(by) * fx.Int64(fx.grid_dim.x) + fx.Int64(bx),
-                bounded_m=True,
                 n_oob=n - bn,
             )
 
+    cm = i32_cm if const_expr(use_cluster) else 1
     grid = make_gemm_grid(
-        M, N, tile_m, tile_n, cluster_m, split_k=split_k, fused_splitk=split_k > 1
+        M, N, tile_m, tile_n, cm, split_k=split_k, fused_splitk=split_k > 1
     )
     grid = (grid[0], fx.ceildiv(fx.ceildiv(N, tile_n), cluster_n) * cluster_n, grid[2])
     kernel(
@@ -521,16 +541,12 @@ def launch_gemm_a4w4(
         lda,
         ldc,
         arg_out,
-        value_attrs={
-            "rocdl.cluster_dims": (
-                f"{cluster_m},{cluster_n},{split_k}" if use_cluster else None
-            )
-        },
+        i32_cm,
     ).launch(
         grid=grid,
         block=(block, 1, 1),
         stream=stream,
-        cluster=(cluster_m, cluster_n, split_k) if use_cluster else None,
+        cluster=(cm, cluster_n, split_k) if use_cluster else None,
     )
 
 

@@ -461,13 +461,33 @@ void opus_gemm_a8w8_blockscale_bpreshuffle_launch(
     aiter_tensor_t &x_scale,
     aiter_tensor_t &w_scale,
     aiter_tensor_t &Y,
-    int kid)
+    int kid,
+    std::optional<aiter_tensor_t> workspace)
 {
   aiter_detail::g_aiter_can_throw = true;
   constexpr const char* entry =
       "opus_gemm_a8w8_blockscale_bpreshuffle_launch";
   opus_check_a8_family_tensors(entry, XQ, WQ, Y);
   opus_check_a8_scale_devices(entry, XQ, x_scale, w_scale);
+
+#ifdef OPUS_BUILD_HAS_GFX950
+  if (opus_get_gfx_arch() == OpusGfxArch::Gfx950 &&
+      opus_a8w8_blockscale_bpreshuffle_has_workspace_kernel_gfx950(kid))
+  {
+    AITER_CHECK(workspace.has_value(),
+                entry, ": workspace kid ", kid, " requires a workspace tensor");
+    AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16,
+                entry, ": workspace kid requires bf16 Y, got ",
+                AiterDtype_to_str(Y.dtype()));
+    AITER_CHECK(workspace->is_gpu() && workspace->device_id == XQ.device_id,
+                entry, ": workspace device must match XQ.device_id=", XQ.device_id);
+    opus_a8w8_blockscale_bpreshuffle_workspace_kid_dispatch_gfx950(kid)(
+        XQ, WQ, x_scale, w_scale, Y, workspace.value());
+    return;
+  }
+#endif
+  AITER_CHECK(!workspace.has_value(),
+              entry, ": non-workspace kid ", kid, " requires workspace=None");
 
   if (Y.dtype() == AITER_DTYPE_bf16)
   {

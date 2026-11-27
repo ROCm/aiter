@@ -35,15 +35,16 @@ from aiter.ops.flydsl.grouped_moe_gfx1250 import (
     _build_g2l_lut,
     _grouped_a8w4_preshuffle_e8m0_scale,
 )
+from aiter.ops.flydsl.herd_topk import herd_route_psum
 from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
     build_moe_contiguous_psum_module,
     build_moe_contiguous_psum_remap_ep_module,
     build_moe_contiguous_psum_remap_module,
     build_moe_route_psum_fused_module,
-    build_moe_route_psum_herd_module,
 )
 from aiter.ops.flydsl.kernels.moe_g2l_lut import build_moe_g2l_lut_module
 from aiter.ops.flydsl.kernels.moe_gather_reduce import build_moe_gather_reduce_module
+from aiter.ops.flydsl.kernels.moe_herd_route_psum import HERD_ROUTE_BLOCK
 from aiter.ops.flydsl.kernels.moe_route_maps import (
     DROPPED_ROUTE_ROW,
     build_moe_route_g2l_fused_module,
@@ -555,7 +556,7 @@ def test_route_g2l(numel, E_global, n_buckets, variant, w_dtype):
     # keeps the pre-ep_rowmap signature. Null tensor hoisted out of fn() so nothing
     # allocates under CUDA-graph capture.
     _ep_null = torch.empty(0, dtype=I32)
-    _ep_tail = (ptr_arg(_ep_null), 0) if variant == "lds" else ()
+    _ep_tail = (ptr_arg(_ep_null), 0, ptr_arg(_ep_null), 0) if variant == "lds" else ()
 
     def fn():
         launch(
@@ -653,11 +654,15 @@ def test_scatter_copy_token(num_dst, row_bytes):
 
 
 @benchmark()
-def test_gather_reduce(tokens, model_dim, topk, vec_dwords, dtype, w_dtype):
-    """Weighted gather-reduce epilogue: out[t] = sum_k w(t,k) * grouped[row(t,k)]."""
+def test_gather_reduce(
+    tokens, model_dim, topk, vec_dwords, dtype, w_dtype, addend_scale=None
+):
+    """Weighted gather-reduce epilogue: out[t] = sum_k w(t,k) * grouped[row(t,k)].
+    With addend_scale, out = out * addend_scale + addend in the same pass: the
+    bytes of the plain reduce followed by those two torch ops."""
     out_dtype = "bf16" if dtype == torch.bfloat16 else "f16"
     launch = build_moe_gather_reduce_module(
-        model_dim, topk, out_dtype, 1, vec_dwords, w_dtype
+        model_dim, topk, out_dtype, 1, vec_dwords, w_dtype, addend_scale
     )
     wdt = {"f32": torch.float32, "bf16": torch.bfloat16, "f16": torch.float16}[w_dtype]
     rows_total = max(64, tokens * topk)
@@ -668,8 +673,9 @@ def test_gather_reduce(tokens, model_dim, topk, vec_dwords, dtype, w_dtype):
     nvt = torch.tensor([tokens], dtype=I32)
     ref = run_torch_gather_reduce(grouped, rmap, w, dtype)
     out = torch.full((tokens, model_dim), 7.0, dtype=dtype)
+    addend = torch.empty(0)  # no addend: null pointer
 
-    def fn():
+    def fn(launch=launch):
         launch(
             ptr_arg(grouped),
             ptr_arg(rmap),
@@ -678,8 +684,23 @@ def test_gather_reduce(tokens, model_dim, topk, vec_dwords, dtype, w_dtype):
             tokens,
             rows_total * (model_dim // 2),
             ptr_arg(nvt),
+            ptr_arg(addend),
             stream=torch.cuda.current_stream().cuda_stream,
         )
+
+    if addend_scale is not None:
+        fn(
+            build_moe_gather_reduce_module(
+                model_dim, topk, out_dtype, 1, vec_dwords, w_dtype
+            )
+        )
+        ref = out.clone()
+        addend = (torch.randn(tokens, model_dim) * 0.5).to(dtype)
+        ref = ref * addend_scale + addend
+        fn()
+        assert torch.equal(
+            out.view(torch.int16), ref.view(torch.int16)
+        ), f"gather_reduce addend x{addend_scale}: not the bytes of the torch ops"
 
     esz = grouped.element_size()
     # topk source rows read + one row written per token, plus the (t,k) maps
@@ -922,63 +943,52 @@ def test_route_psum_fused(numel, E, tile_m, topk=0):
 
 
 @benchmark()
-def test_route_psum_herd(tokens, E, topk, tile_m):
-    launch = build_moe_route_psum_herd_module(topk)
+def test_herd_route_psum(tokens, E, topk, tile_m):
+    """HERD drop + route + tile-aligned psum + row remap in one workgroup, on
+    the Top-(K+1) candidates the gfx1250 grouped MoE takes with herd_topk=K."""
     kp1 = topk + 1
     scale = 2.5
-    max_m = max(512, 4 * tokens * topk // E)
     cand_ids = torch.rand(tokens, E).topk(kp1, dim=1).indices.to(I32)
     cand_scores = torch.rand(tokens, kp1, dtype=torch.float32)
     kept_ids, kept_w = run_torch_herd_drop(cand_ids, cand_scores, E, scale)
     counts = torch.bincount(kept_ids.reshape(-1).long(), minlength=E).to(I32)
     ref_starts, ref_psum, _ = run_torch_psum(counts, tile_m)
 
+    # herd_route_psum allocates its outputs, as the grouped MoE calls it; each
+    # candidate keeps the ones its last call (or graph capture) wrote.
+    outs = {}
+
+    def call(name):
+        def fn():
+            outs[name] = herd_route_psum(cand_scores, cand_ids, E, tile_m, scale)
+
+        return fn
+
     numel = tokens * topk
-    rows = torch.full((numel,), -99, dtype=I32)
-    gw = torch.full((numel,), -99.0, dtype=torch.float32)
-    masked = torch.full((E,), -99, dtype=I32)
-    starts = torch.full((E,), -99, dtype=I32)
-    psum = torch.full((E,), -99, dtype=I32)
-    # Unread without has_num_valid_rows; a null pointer stands in for it.
-    no_count = torch.empty(0, dtype=I32)
-
-    def fn():
-        launch(
-            ptr_arg(cand_ids),
-            ptr_arg(cand_scores),
-            ptr_arg(rows),
-            ptr_arg(gw),
-            ptr_arg(masked),
-            ptr_arg(starts),
-            ptr_arg(psum),
-            tokens,
-            E,
-            max_m,
-            tile_m,
-            scale,
-            ptr_arg(no_count),
-            stream=torch.cuda.current_stream().cuda_stream,
-        )
-
-    nbytes = tokens * kp1 * 2 * 4 + numel * 2 * 4 + E * 3 * 4
+    nbytes = tokens * kp1 * 2 * 4 + numel * 3 * 4 + E * 2 * 4
     ret = {"gfx": get_gfx()}
-    candidates = {"eager": fn, "cudagraph": _graph_runner(fn)}
+    candidates = {"eager": call("eager"), "cudagraph": _graph_runner(call("cudagraph"))}
     for name, run in candidates.items():
-        rows.fill_(-99)
         _, us = run_perftest(run)
+        gw, ids_out, masked, rows, psum = outs[name]
         err = checkAllclose(
             counts.float(), masked.float(), rtol=0, atol=0, msg=f"{name}: masked_m"
         )
         checkAllclose(
-            ref_starts.float(), starts.float(), rtol=0, atol=0, msg=f"{name}: starts"
+            ref_starts.float(),
+            (psum - masked).float(),
+            rtol=0,
+            atol=0,
+            msg=f"{name}: starts",
         )
         checkAllclose(
             ref_psum.float(), psum.float(), rtol=0, atol=0, msg=f"{name}: psum"
         )
         checkAllclose(
-            kept_w.reshape(-1), gw, rtol=1e-6, atol=1e-6, msg=f"{name}: gather_w"
+            kept_ids.float(), ids_out.float(), rtol=0, atol=0, msg=f"{name}: topk_ids"
         )
-        r = rows.cpu().long()
+        checkAllclose(kept_w, gw, rtol=1e-6, atol=1e-6, msg=f"{name}: topk_weights")
+        r = rows.reshape(-1).cpu().long()
         ids = kept_ids.reshape(-1).cpu().long()
         lo = ref_starts.cpu().long()[ids]
         assert bool(
@@ -1230,6 +1240,15 @@ def main():
             if wd in ("f32", d)
         ],
     )
+    summarize(
+        "moe_gather_reduce + addend",
+        [
+            test_gather_reduce(t, md, 4, v, dmap[d], "f32", s)
+            for d, s, t, md, v in itertools.product(
+                args.dtype, (1.0, 0.5), args.tokens, args.model_dim, args.vec
+            )
+        ],
+    )
     # Real decode shape (model_dim=7168) at both vector widths -- swept apart from
     # the cross-product above so the big rows are actually visible in the table.
     summarize(
@@ -1300,19 +1319,38 @@ def main():
         "moe_route_psum_fused (M3 decode)",
         [test_route_psum_fused(t * 5, 129, 64, topk=5) for t in (1, 4, 16)],
     )
-    summarize(
-        "moe_route_psum_herd",
-        [
-            test_route_psum_herd(t, E, tk, tm)
-            for t, E, tk, tm in itertools.product(
-                args.tokens + [128],
-                [e for e in args.experts if e <= 512] + [256],
-                args.topk + [6],
-                args.tile_m,
-            )
-            if tk + 1 <= E
-        ],
-    )
+    # The HERD route stages HERD_ROUTE_BLOCK rows of candidates in LDS, sized
+    # for gfx1250, the one arch whose grouped MoE launches it.
+    if get_gfx() == "gfx1250":
+        summarize(
+            "moe_herd_route_psum",
+            [
+                test_herd_route_psum(t, E, tk, tm)
+                for t, E, tk, tm in itertools.product(
+                    [t for t in args.tokens if t <= HERD_ROUTE_BLOCK] + [128],
+                    [e for e in args.experts if e <= HERD_ROUTE_BLOCK] + [256],
+                    args.topk + [6],
+                    args.tile_m,
+                )
+                if tk + 1 <= E
+            ],
+        )
+        # Kimi-K3 TP decode: Top-17 candidates over 896 experts, 16 routes kept.
+        summarize(
+            "moe_herd_route_psum (Kimi-K3 decode)",
+            [
+                test_herd_route_psum(t, 896, 16, tm)
+                for t, tm in itertools.product(
+                    [16, 128, 512, HERD_ROUTE_BLOCK], args.tile_m
+                )
+            ],
+        )
+    else:
+        aiter.logger.warning(
+            "%s: skipping moe_herd_route_psum, which only the gfx1250 grouped "
+            "MoE launches",
+            get_gfx(),
+        )
     summarize(
         "moe_route_g2l_fused",
         [

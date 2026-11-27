@@ -228,6 +228,12 @@ def _e8m0_from_amax(amax_f32, max_norm=6.0):
     return e8m0, qscale
 
 
+def _e8m0_byte_to_f32(packed_i32, byte_pos):
+    shift = byte_pos * fx.Int32(8)
+    b = packed_i32.shrui(shift) & fx.Int32(0xFF)
+    return (b << fx.Int32(23)).bitcast(fx.Float32)
+
+
 def _inline_e8m0(amax_u16_i32, max_norm=6.0):
     bits = (fx.Int32(amax_u16_i32) & 0xFFFF) << 16
     return _e8m0_roundup(bits.bitcast(fx.Float32), max_norm=max_norm)
@@ -398,3 +404,15 @@ def fp8out_row_bytes(model_dim, scale_blk=None, pitch_align=FP8OUT_PITCH_ALIGN):
     if align <= 0:
         return pitch
     return ((pitch + align - 1) // align) * align
+
+
+def fp4out_row_bytes(model_dim, pitch_align=FP8OUT_PITCH_ALIGN):
+    """MXFP4 route row: model_dim/2 packed e2m1 bytes, then one e8m0 per 32 columns."""
+    model_dim = int(model_dim)
+    if model_dim % FP8OUT_SCALE_BLK:
+        raise ValueError(
+            f"model_dim {model_dim} must be a multiple of {FP8OUT_SCALE_BLK}"
+        )
+    pitch = model_dim // 2 + model_dim // FP8OUT_SCALE_BLK
+    align = int(pitch_align)
+    return pitch if align <= 0 else ((pitch + align - 1) // align) * align

@@ -24,7 +24,7 @@ else:
         check=False,
     ).stdout.strip()
 
-print(f"======== SEVEN GATES ({W}) ========")
+print(f"======== EIGHT GATES ({W}) ========")
 res = _lib.run_gates(W, PROJ)
 npass = 0
 for name, rc, first, full in res:

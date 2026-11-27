@@ -1,0 +1,49 @@
+name: Pytest Manifest Runner Selftest
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/scripts/run_pytest_manifest.py'
+      - '.github/scripts/run_pytest_manifest_selftest.py'
+      - '.github/test-manifests/**'
+      - '.github/workflows/pytest-manifest-selftest.yaml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/scripts/run_pytest_manifest.py'
+      - '.github/scripts/run_pytest_manifest_selftest.py'
+      - '.github/test-manifests/**'
+      - '.github/workflows/pytest-manifest-selftest.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install pytest
+        run: python3 -m pip install pytest==8.3.4
+
+      - name: Run runner scenarios
+        run: python3 .github/scripts/run_pytest_manifest_selftest.py
+
+      - name: Check the MI450 manifests parse and their files exist
+        # Collection needs the GPU image; this catches renamed or moved files.
+        run: |
+          python3 - <<'PY'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, ".github/scripts")
+          import run_pytest_manifest as runner
+          for path in sorted(Path(".github/test-manifests").glob("*.txt")):
+              expectations = runner.read_manifest(path)
+              print(f"{path}: {len(expectations)} selectors")
+          PY

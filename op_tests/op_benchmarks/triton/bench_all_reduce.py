@@ -26,10 +26,9 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     get_rot_bufs_kwargs,
     override_parser_action,
 )
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    do_bench_aiter_triton_synced,
-    generate_rotating_buffers_pool,
-    get_caller_name_no_ext,
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
 )
 
 WORLD_SIZE = 4
@@ -58,6 +57,10 @@ def benchmark(args, rank, device, tp, inboxes, calls):
         args={},
     )
 
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
+
     @triton.testing.perf_report([config])
     def _run(tokens, provider):
         numel = tokens * args.hidden
@@ -66,15 +69,8 @@ def benchmark(args, rank, device, tp, inboxes, calls):
             x = torch.randn(numel, dtype=torch.bfloat16, device=device)
             return x, torch.empty_like(x)
 
-        bufs = generate_rotating_buffers_pool(
-            [gen], [["x", "out"]], **get_rot_bufs_kwargs(args)
-        )
-        ms = do_bench_aiter_triton_synced(
-            fns[provider],
-            bufs,
-            dist_group=tp.cpu_group,
-            **get_do_bench_graph_kwargs(args),
-        )
+        bencher.build_pool([gen], [["x", "out"]])
+        ms = bencher.bench_synced(fns[provider], dist_group=tp.cpu_group)
         per_rank = [None] * WORLD_SIZE
         dist.all_gather_object(per_rank, ms, group=tp.cpu_group)
         ms = max(per_rank)

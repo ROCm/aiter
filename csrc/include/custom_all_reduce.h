@@ -16,6 +16,7 @@
  * limitations under the License.
  */
 #include <cstdint>
+#include <optional>
 #include <vector>
 #include "aiter_tensor.h"
 
@@ -38,12 +39,25 @@ void all_reduce(fptr_t _fa,
                 bool open_fp8_quant,
                 int64_t reg_inp_ptr,
                 int64_t reg_inp_bytes);
+// All-reduce of (inp + addend). reg_inp_ptr must be the registered input
+// buffer; it stages the sum for kernels that read peer inputs over IPC.
+void all_reduce_add(fptr_t _fa,
+                    const aiter_tensor_t& inp,
+                    const aiter_tensor_t& addend,
+                    const aiter_tensor_t& out,
+                    bool use_new,
+                    bool open_fp8_quant,
+                    int64_t reg_inp_ptr,
+                    int64_t reg_inp_bytes);
 void all_reduce_residual(fptr_t _fa,
                          const aiter_tensor_t& inp,
                          const aiter_tensor_t& out,
                          const aiter_tensor_t& residual,
                          int64_t reg_inp_ptr,
                          int64_t reg_inp_bytes);
+// Whether all_reduce(inp, use_new=True) runs a one-shot kernel (lamport
+// one-shot, LL, LL128 or 1-stage). registered_input is reg_inp_ptr == 0 in all_reduce.
+bool all_reduce_one_shot(fptr_t _fa, const aiter_tensor_t& inp, bool registered_input);
 // reduce_scatter dispatcher. (m, n, k, split_dim) describe the canonical
 // shape the Python wrapper collapsed the input to:
 //   split_dim = 0 (kFirst): only `k` (= numel) used
@@ -64,6 +78,13 @@ void all_gather_reg(fptr_t _fa,
                     const aiter_tensor_t& inp,
                     const aiter_tensor_t& out,
                     int64_t dim);
+void all_gather_lastdim_add(fptr_t _fa,
+                            const aiter_tensor_t& inp,
+                            const aiter_tensor_t& out,
+                            const aiter_tensor_t& add_b,
+                            std::optional<aiter_tensor_t> add_c,
+                            int64_t reg_ptr,
+                            int64_t reg_bytes);
 void all_gather_unreg(fptr_t _fa,
                       const aiter_tensor_t& inp,
                       int64_t reg_buffer,
@@ -140,7 +161,8 @@ void fused_allreduce_rmsnorm_mxfp4_quant(fptr_t _fa,
                                          int64_t reg_bytes,
                                          bool use_1stage,
                                          int64_t bf16_out_ptr = 0,
-                                         bool gemma_norm      = false);
+                                         bool gemma_norm      = false,
+                                         bool hadamard_rotate = false);
 void fused_qknorm_allreduce(fptr_t _fa,
                             const aiter_tensor_t& qkv_in,
                             const aiter_tensor_t& q_w,
@@ -167,6 +189,13 @@ void fused_qknorm_allreduce_rope(fptr_t _fa,
                                  int64_t reg_bytes);
 void dispose(fptr_t _fa);
 int64_t meta_size();
+int64_t lamportBufferSize(int64_t world_size);
+void initLamport(fptr_t _fa,
+                 int64_t self_ptr,
+                 const std::vector<int64_t>& ipc_handle_ptrs,
+                 const std::vector<int64_t>& offsets);
+int64_t lamportKernel(fptr_t _fa, int64_t numel);
+void lamportAllReduce(fptr_t _fa, const aiter_tensor_t& inp, const aiter_tensor_t& out, int64_t kernel);
 void register_input_buffer(fptr_t _fa,
                            int64_t self_ptr,
                            const std::vector<int64_t>& ipc_handle_ptrs,

@@ -64,7 +64,7 @@ def _validate_pagesize1_inputs(
 ):
     arch = str(get_rocm_arch() or "").split(":", 1)[0]
     _require_runtime(
-        arch == "gfx1250",
+        arch in ("gfx1250", "gfx1250-strict"),
         f"expected gfx1250, got {arch or 'unknown'}",
     )
     softmax_scale = float(softmax_scale)

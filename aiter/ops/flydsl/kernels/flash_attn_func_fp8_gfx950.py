@@ -15,6 +15,8 @@ import math
 
 import torch
 
+from aiter.ops.flydsl.aot_cache import FlyDSLAotCache
+from aiter.ops.flydsl.aot_launch import bind_aot
 from aiter.ops.flydsl.kernels.fmha_gfx950.op_combine import (
     dualwave_splitk_workspace_elems,
 )
@@ -223,6 +225,9 @@ def _fp8_auto_kv_splits(
     return best if makespan(best) <= _FP8_AUTOSPLIT_DENSE_MARGIN * makespan(1) else 1
 
 
+_FP8_AOT_CACHE = FlyDSLAotCache("flash_attn_fp8_gfx950")
+
+
 @functools.lru_cache(maxsize=128)
 def _build_fp8(
     num_heads: int,
@@ -247,7 +252,7 @@ def _build_fp8(
         build_flash_attn_dualwave_swp_fp8_module,
     )
 
-    return build_flash_attn_dualwave_swp_fp8_module(
+    launch = build_flash_attn_dualwave_swp_fp8_module(
         num_heads=num_heads,
         head_dim=head_dim,
         head_dim_v=head_dim_v,
@@ -265,6 +270,30 @@ def _build_fp8(
         batch_interleave_group=batch_interleave_group,
         return_lse=return_lse,
     )
+    # The key holds every argument of this factory.
+    bind_aot(
+        launch.launcher,
+        _FP8_AOT_CACHE,
+        (
+            num_heads,
+            num_kv_heads,
+            causal,
+            rescale_threshold,
+            daz,
+            lazy_rescale,
+            setprio,
+            enable_stagger,
+            head_dim,
+            head_dim_v,
+            varlen,
+            cross_seqlen,
+            num_kv_splits,
+            block_m,
+            batch_interleave_group,
+            return_lse,
+        ),
+    )
+    return launch
 
 
 def flydsl_flash_attn_fp8_func(
