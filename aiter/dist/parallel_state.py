@@ -198,6 +198,91 @@ def fused_allreduce_rmsnorm_(
     )
 
 
+def _group(group_name: str):
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group
+
+
+def sp_fused_allreduce_rmsnorm_fake(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+    gemma_norm: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(inp), torch.empty_like(res_inp)
+
+
+@torch_compile_guard(gen_fake=sp_fused_allreduce_rmsnorm_fake, mutates_args=[])
+def sp_fused_allreduce_rmsnorm_(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+    gemma_norm: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _group(group_name).device_communicator.sp_fused_allreduce_rmsnorm(
+        inp, res_inp, w, eps, gemma_norm
+    )
+
+
+def sp_fused_allreduce_rmsnorm_mxfp8_quant_fake(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+    gemma_norm: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    from aiter.utility.dtypes import fp8, fp8_e8m0
+
+    return (
+        torch.empty_like(inp, dtype=fp8),
+        torch.empty_like(res_inp),
+        torch.empty(
+            inp.shape[:-1] + (inp.shape[-1] // 32,), dtype=fp8_e8m0, device=inp.device
+        ),
+    )
+
+
+@torch_compile_guard(
+    gen_fake=sp_fused_allreduce_rmsnorm_mxfp8_quant_fake, mutates_args=[]
+)
+def sp_fused_allreduce_rmsnorm_mxfp8_quant_(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+    gemma_norm: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _group(
+        group_name
+    ).device_communicator.sp_fused_allreduce_rmsnorm_mxfp8_quant(
+        inp, res_inp, w, eps, gemma_norm
+    )
+
+
+def sp_allreduce_add_residual_fake(
+    inp: torch.Tensor, res_inp: torch.Tensor, w: torch.Tensor, group_name: str
+) -> torch.Tensor:
+    return torch.empty_like(res_inp)
+
+
+@torch_compile_guard(gen_fake=sp_allreduce_add_residual_fake, mutates_args=[])
+def sp_allreduce_add_residual_(
+    inp: torch.Tensor, res_inp: torch.Tensor, w: torch.Tensor, group_name: str
+) -> torch.Tensor:
+    return _group(group_name).device_communicator.sp_allreduce_add_residual(
+        inp, res_inp, w
+    )
+
+
 def fused_allreduce_rmsnorm_quant_fake(
     inp: torch.Tensor,
     res_inp: torch.Tensor,
@@ -236,6 +321,59 @@ def fused_allreduce_rmsnorm_quant_(
         raise ValueError(f"Group {group_name} is destroyed.")
     return group._fused_allreduce_rmsnorm_quant_out_place(
         inp, res_inp, w, eps, prefill_support, gemma_norm=gemma_norm
+    )
+
+
+def fused_allreduce_rmsnorm_mxfp8_quant_fake(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+    prefill_support: bool = False,
+    gemma_norm: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Declare native MXFP8 values and row-major group-32 E8M0 scales."""
+    from aiter.utility.dtypes import fp8, fp8_e8m0
+
+    del w, eps, group_name, prefill_support, gemma_norm
+    return (
+        torch.empty_like(inp, dtype=fp8),
+        torch.empty_like(res_inp),
+        torch.empty(
+            inp.shape[:-1] + (inp.shape[-1] // 32,),
+            dtype=fp8_e8m0,
+            device=inp.device,
+        ),
+    )
+
+
+# mutates_args=[]: the op writes no argument, and Inductor does not decompose an
+# auto_functionalized_v2 that returns E8M0 ("auto_functionalized_v2 was not
+# removed" at the first compile of a graph that holds it).
+@torch_compile_guard(
+    gen_fake=fused_allreduce_rmsnorm_mxfp8_quant_fake, mutates_args=[]
+)
+def fused_allreduce_rmsnorm_mxfp8_quant_(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+    prefill_support: bool = False,
+    gemma_norm: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._fused_allreduce_rmsnorm_mxfp8_quant_out_place(
+        inp,
+        res_inp,
+        w,
+        eps,
+        prefill_support,
+        gemma_norm=gemma_norm,
     )
 
 
@@ -913,6 +1051,35 @@ class GroupCoordinator:
             gemma_norm=gemma_norm,
         )
 
+    def sp_fused_allreduce_rmsnorm(
+        self, input_, residual_inp_, weight_, eps, gemma_norm=False
+    ):
+        return sp_fused_allreduce_rmsnorm_(
+            input_,
+            residual_inp_,
+            weight_,
+            eps,
+            group_name=self.unique_name,
+            gemma_norm=gemma_norm,
+        )
+
+    def sp_fused_allreduce_rmsnorm_mxfp8_quant(
+        self, input_, residual_inp_, weight_, eps, gemma_norm=False
+    ):
+        return sp_fused_allreduce_rmsnorm_mxfp8_quant_(
+            input_,
+            residual_inp_,
+            weight_,
+            eps,
+            group_name=self.unique_name,
+            gemma_norm=gemma_norm,
+        )
+
+    def sp_allreduce_add_residual(self, input_, residual_inp_, weight_):
+        return sp_allreduce_add_residual_(
+            input_, residual_inp_, weight_, group_name=self.unique_name
+        )
+
     def fused_allreduce_rmsnorm_quant(
         self,
         input_: torch.Tensor,
@@ -928,9 +1095,26 @@ class GroupCoordinator:
         hadamard_rotate: bool = False,
     ):
         # quant_type arrives already canonicalized to a string ("per_token"/
-        # "per_group"/"mxfp4") from the public API and the mxfp4 helper.
+        # "mxfp8"/"per_group"/"mxfp4") from the public API and helpers.
         if hadamard_rotate and quant_type != "mxfp4":
             raise ValueError("hadamard_rotate is MXFP4-only")
+        if quant_type == "mxfp8":
+            if group_size != 32:
+                raise ValueError("mxfp8 requires group_size=32")
+            if emit_bf16 or transpose_scale or hadamard_rotate:
+                raise ValueError(
+                    "mxfp8 does not support emit_bf16, transpose_scale, "
+                    "or hadamard_rotate"
+                )
+            return fused_allreduce_rmsnorm_mxfp8_quant_(
+                input_,
+                residual_inp_,
+                weight_,
+                eps,
+                group_name=self.unique_name,
+                prefill_support=prefill_support,
+                gemma_norm=gemma_norm,
+            )
         if quant_type == "per_token" and group_size == 128:
             # Both paths go through torch.library-registered ops so they lower
             # into the compiled graph (Dynamo-traceable + CUDAGraph-capturable).
@@ -1122,6 +1306,26 @@ class GroupCoordinator:
             eps,
             prefill_support,
             emit_bf16=emit_bf16,
+            gemma_norm=gemma_norm,
+        )
+
+    def _fused_allreduce_rmsnorm_mxfp8_quant_out_place(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+        prefill_support: bool = False,
+        gemma_norm: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.fused_allreduce_rmsnorm_mxfp8_quant(
+            input_,
+            residual_inp_,
+            weight_,
+            eps,
+            prefill_support,
             gemma_norm=gemma_norm,
         )
 
