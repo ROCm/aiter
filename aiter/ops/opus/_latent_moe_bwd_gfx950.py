@@ -96,42 +96,18 @@ def backward(x, weight, dy, offsets):
         launch(_GENERIC + "tn_f32", (n, e, 1), 256, args)
         return dx, dw
 
-    tuned = e in (112, 224, 448, 896) and r in (1024, 16384, 140000)
-    descriptors = tuned and (
-        (r == 1024 and (e == 896 or (e == 112 and n == 3584)))
-        or (r == 140000 and e == 896 and n == 3072)
-    )
-    stream_tn = tuned and (r != 1024 or e == 896)
+    counts = torch.empty(e, dtype=torch.int32, device=x.device)
     table = torch.empty((e, 4), dtype=torch.int32, device=x.device)
+    plan = _PlanArgs(offsets.data_ptr(), counts.data_ptr(), table.data_ptr(), e)
+    launch(_PLAN, ((e + 255) // 256, 1, 1), 256, plan)
+
     capacity = (r + 255 * e) // 256
     columns = k // 256
-    if descriptors:
-        desc = torch.empty((capacity, 128), dtype=torch.uint8, device=x.device)
-        rows = desc.data_ptr()
-        args = _DescArgs(
-            dy.data_ptr(),
-            weight.data_ptr(),
-            dx.data_ptr(),
-            offsets.data_ptr(),
-            table.data_ptr(),
-            rows,
-            e,
-            n,
-            k,
-            capacity,
-        )
-        launch(_DESC, (1, 1, 1), 1024, args)
-    else:
-        counts = torch.empty(e, dtype=torch.int32, device=x.device)
-        rows = counts.data_ptr()
-        args = _PlanArgs(offsets.data_ptr(), rows, table.data_ptr(), e)
-        launch(_PLAN, ((e + 255) // 256, 1, 1), 256, args)
-
     nn = _MArgs(
         dy.data_ptr(),
         weight.data_ptr(),
         dx.data_ptr(),
-        rows,
+        counts.data_ptr(),
         offsets.data_ptr(),
         n * k,
         r,
@@ -160,20 +136,6 @@ def backward(x, weight, dy, offsets):
         1,
     )
     tiles = columns * (n // 256)
-    dgrad = (
-        (_NN + "_descriptor", (columns, capacity, 1))
-        if descriptors
-        else (_NN + "_compact", (columns * capacity, 1, 1))
-    )
-    wgrad = (
-        (_TN + "_stream", (tiles, e, 1))
-        if stream_tn
-        else (_TN, (tiles * e, 1, 1))
-    )
-    if stream_tn and (r == 140000 or (r == 16384 and e == 896)):
-        launch(*wgrad, 256, tn)
-        launch(*dgrad, 256, nn)
-    else:
-        launch(*dgrad, 256, nn)
-        launch(*wgrad, 256, tn)
+    launch(_TN + "_stream", (tiles, e, 1), 256, tn)
+    launch(_NN + "_compact", (columns * capacity, 1, 1), 256, nn)
     return dx, dw
