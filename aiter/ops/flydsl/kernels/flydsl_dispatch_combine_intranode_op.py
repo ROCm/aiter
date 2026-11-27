@@ -744,6 +744,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
         }
         for _attr, _src in _fx_srcs.items():
             setattr(self, _attr, fx.Int64(_src.data_ptr()))
+        self._fx_rank = fx.Int32(config.rank)
 
         self._gm = None
         if getattr(config, "enable_group_major", False):
@@ -1414,6 +1415,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 fx.Int64(prx_ptr),
                 *std,
                 cur_tok,
+                self._fx_rank,
                 stream,
             )
         else:
@@ -1425,6 +1427,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 prx_ptr,
                 *std,
                 cur_tok,
+                self._fx_rank,
                 stream,
             )
 
@@ -1532,7 +1535,6 @@ class FlyDSLDispatchCombineIntraNodeOp:
         fn = self._comb_jit_cache.get(key)
         if fn is None:
             fn = _make_combine_jit(
-                rank=cfg.rank,
                 npes=cfg.world_size,
                 experts_per_token=cfg.num_experts_per_token,
                 hidden_dim=cfg.hidden_dim,
@@ -1681,7 +1683,6 @@ class FlyDSLDispatchCombineIntraNodeOp:
         fn = self._comb_jit_cache.get(key)
         if fn is None:
             fn = _make_combine_jit(
-                rank=cfg.rank,
                 npes=cfg.world_size,
                 experts_per_token=cfg.num_experts_per_token,
                 hidden_dim=cfg.hidden_dim,
@@ -1726,6 +1727,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
             fx.Int64(0),
             *std,
             _cur_tok,
+            self._fx_rank,
             torch.cuda.current_stream(),
         )
         self._comb_compiled_cache[key] = compiled

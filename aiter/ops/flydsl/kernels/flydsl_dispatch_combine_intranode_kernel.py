@@ -416,7 +416,6 @@ def make_dispatch_kernel(
 
 def make_combine_kernel(
     *,
-    rank: int,
     npes: int,
     experts_per_token: int,
     hidden_dim: int,
@@ -650,6 +649,7 @@ def make_combine_kernel(
         addr_inp_disp_tok_map: fx.Int64,  # dispTokToEpSlotMap (i64[max_recv * top_k])
         addr_inp_disp_wts: fx.Int64,  # dispatch output weights (f32[max_recv * top_k])
         cur_rank_num_token: fx.Int32,  # local token count m_local; Stage-3 loop bound
+        i32_rank: fx.Int32,
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -729,7 +729,7 @@ def make_combine_kernel(
                         dest_lid = dest_tok_enc % max_tok_per_rank
                     wt_pe_base = fx.memref_load(_lds_p2p_wt_bases, dest_pe)
                     wt_dest_off = (
-                        fx.Int64(rank * max_tok_per_rank + dest_lid) * weight_bytes
+                        fx.Int64(i32_rank * max_tok_per_rank + dest_lid) * weight_bytes
                     )
                     wt_dest_addr = wt_pe_base + wt_dest_off
                     wt_src_addr = addr_inp_wts + fx.Int64(recv_tok_id) * weight_bytes
@@ -764,7 +764,7 @@ def make_combine_kernel(
                 else:
                     peer_base = fx.memref_load(_lds_p2p_bases, dest_pe)
                     dest_byte_off = (
-                        fx.Int64(rank * max_tok_per_rank + dest_lid) * nbytes
+                        fx.Int64(i32_rank * max_tok_per_rank + dest_lid) * nbytes
                     )
                     dest_tok_addr = peer_base + dest_byte_off
                 rsrc_dst = create_buffer_resource_from_addr(dest_tok_addr)
@@ -816,7 +816,8 @@ def make_combine_kernel(
                     else:
                         wt_pe_base = fx.memref_load(_lds_p2p_wt_bases, dest_pe)
                         wt_dest_off = (
-                            fx.Int64(rank * max_tok_per_rank + dest_lid) * weight_bytes
+                            fx.Int64(i32_rank * max_tok_per_rank + dest_lid)
+                            * weight_bytes
                         )
                         wt_dest_addr = wt_pe_base + wt_dest_off
                     wt_src_addr = addr_inp_wts + fx.Int64(recv_tok_id) * weight_bytes
@@ -842,7 +843,7 @@ def make_combine_kernel(
                     dest_pe = dest_tok_enc // max_tok_per_rank
                     dest_lid = dest_tok_enc % max_tok_per_rank
                 peer_base = fx.memref_load(_lds_p2p_bases, dest_pe)
-                dest_off = fx.Int64(rank * max_tok_per_rank + dest_lid) * nbytes
+                dest_off = fx.Int64(i32_rank * max_tok_per_rank + dest_lid) * nbytes
                 dest_tok_addr = peer_base + dest_off
                 src_tok_addr = (
                     addr_inp_tok + fx.Int64(recv_tok_id) * inp_nbytes
@@ -881,7 +882,7 @@ def make_combine_kernel(
                 if const_expr(enable_weights):
                     wt_pe_base = fx.memref_load(_lds_p2p_wt_bases, dest_pe)
                     wt_dest_off = (
-                        fx.Int64(rank * max_tok_per_rank + dest_lid) * weight_bytes
+                        fx.Int64(i32_rank * max_tok_per_rank + dest_lid) * weight_bytes
                     )
                     wt_dest_addr = wt_pe_base + wt_dest_off
                     wt_src_addr = addr_inp_wts + fx.Int64(recv_tok_id) * weight_bytes
@@ -907,7 +908,7 @@ def make_combine_kernel(
             buffer_store(fx.Int32(0), _r_comb_bar, 0)
             xdb_remote_addr = (
                 buffer_load(_r_p2p_xdb, grid_thread_id, vec_width=1, dtype=T.i64)
-                + fx.Int64(rank) * 8
+                + fx.Int64(i32_rank) * 8
             )
             store_i64_global_system(xdb_remote_addr, xdb_cur_flag)
 
@@ -994,7 +995,7 @@ def make_combine_kernel(
                     else:
                         dest_pe_k = enc_k // max_recv
                     vld_k = dest_pe_k < npes  # sentinel = npes
-                    safe_pe = vld_k.select(dest_pe_k, rank)
+                    safe_pe = vld_k.select(dest_pe_k, i32_rank)
                     if const_expr(zero_copy):
                         dtok_global = enc_k % max_recv
                         safe_dtok = vld_k.select(dtok_global, 0)
@@ -1142,7 +1143,7 @@ def make_combine_kernel(
                         else:
                             wt_pe = wt_enc // max_recv
                         wt_vld = wt_pe < npes
-                        wt_safe_pe = wt_vld.select(wt_pe, rank)
+                        wt_safe_pe = wt_vld.select(wt_pe, i32_rank)
                         if const_expr(zero_copy):
                             wt_dtok = wt_enc % max_recv
                             wt_safe_dtok = wt_vld.select(wt_dtok, 0)
@@ -1274,7 +1275,6 @@ def make_dispatch_jit(
 
 def make_combine_jit(
     *,
-    rank,
     npes,
     experts_per_token,
     hidden_dim,
@@ -1298,7 +1298,6 @@ def make_combine_jit(
     _transport_dtype = torch.float8_e4m3fn if fp8_direct_cast else data_type
     hidden_elem_size = torch.tensor([], dtype=_transport_dtype).element_size()
     kernel = make_combine_kernel(
-        rank=rank,
         npes=npes,
         experts_per_token=experts_per_token,
         hidden_dim=hidden_dim,
@@ -1338,6 +1337,7 @@ def make_combine_jit(
         addr_inp_disp_tok_map: fx.Int64,
         addr_inp_disp_wts: fx.Int64,
         cur_rank_num_token: fx.Int32,
+        i32_rank: fx.Int32,
         stream: Stream = Stream(None),  # noqa: B008
     ):
         kernel(
@@ -1360,6 +1360,7 @@ def make_combine_jit(
             addr_inp_disp_tok_map,
             addr_inp_disp_wts,
             cur_rank_num_token,
+            i32_rank,
         ).launch(
             grid=(block_num, 1, 1),
             block=(warp_num_per_block * 64, 1, 1),
