@@ -44,12 +44,18 @@ toolchain (FlyDSL, HIP, Python), the target (arch, CU count) and the
 variables that change what the toolchain makes of any kernel (FlyDSL's own
 list). Each cache also declares the source files its launchers are built
 from and the environment variables those files read, ``AITER_FLYDSL_*``
-included: setting one makes that cache miss and no other (the file creating
-the cache, ``_COMMON_SOURCES`` and ``_COMMON_ENV`` are always among them)::
+included: setting one makes that cache miss and no other. All of it is in
+one table, ``aiter/aot/flydsl/sources.py``, by cache name::
 
-    FlyDSLAotCache("preshuffle_gemm_a8",
-                   sources=["kernels/preshuffle_gemm.py", ...],
-                   env=["MY_TUNING_SWITCH"])
+    AOT_CACHES = {
+        "preshuffle_gemm_a8": {
+            "sources": ["kernels/preshuffle_gemm.py", ...],
+            "env": ["MY_TUNING_SWITCH"],
+        },
+    }
+
+The file creating a cache, ``COMMON_SOURCES`` and ``COMMON_ENV`` of that
+module are always among its inputs.
 
 Their contents and values are hashed into every entry's name, so an edit to a
 declared file, or another value of a declared variable, makes new entries for
@@ -106,6 +112,10 @@ from flydsl.expr.typing import Constexpr
 from flydsl.utils import env as fly_env
 
 from aiter import logger
+from aiter.aot.flydsl.sources import AOT_CACHES
+from aiter.aot.flydsl.sources import COMMON_ENV as _COMMON_ENV
+from aiter.aot.flydsl.sources import COMMON_SOURCES as _COMMON_SOURCES
+from aiter.aot.flydsl.sources import ENV_NOT_CODE as _ENV_NOT_CODE
 
 __all__ = ["FlyDSLAotCache", "aot_cache_mode", "cache_root", "fingerprint"]
 
@@ -131,7 +141,7 @@ def _flydsl_cache_env() -> tuple | None:
 
 # The fingerprint holds the variables that change what the toolchain makes of
 # any kernel: FlyDSL's own list, and these. A variable that kernel code reads
-# is not here: the cache of that kernel declares it (``env=``), so setting it
+# is not here: the cache of that kernel declares it (``sources.py``), so setting it
 # makes that cache miss and no other.
 _FLYDSL_ENV = _flydsl_cache_env()
 _ENV_FINGERPRINT = frozenset(
@@ -153,39 +163,6 @@ _ENV_IGNORED = frozenset(
         "FLYDSL_RUNTIME_RUN_ONLY",
         "FLYDSL_GPU_ARCH",
     }
-)
-
-# Variables aiter's FlyDSL code reads that cannot change generated code, or
-# that reach an entry's identity another way. The check of a cache's sources
-# (``_undeclared_env``) accepts them without a declaration.
-_ENV_NOT_CODE = frozenset(
-    {
-        # Whether to launch; the cache's own switches.
-        "COMPILE_ONLY",
-        "AITER_FLYDSL_AOT_CACHE",
-        "AITER_FLYDSL_AOT_CACHE_DIR",
-        "AITER_FLYDSL_AOT_MAX_RETRIES",
-        "AITER_FLYDSL_AOT_TIMEOUT",
-        "AITER_FLYDSL_AOT_TRACEBACK",
-        # The target: hashed as the arch and CU count they select.
-        "FLYDSL_GPU_ARCH",
-        "GPU_ARCHS",
-        "AITER_GPU_ARCHS",
-        "CU_NUM",
-        "AITER_AOT_REPLAY",
-        # FlyDSL's own cache.
-        "FLYDSL_RUNTIME_CACHE_DIR",
-        "FLYDSL_RUNTIME_ENABLE_CACHE",
-        "FLYDSL_RUNTIME_RUN_ONLY",
-    }
-)
-
-# Variables the common sources read (``_COMMON_SOURCES``): inputs of every
-# cache, like those files.
-_COMMON_ENV = (
-    "AITER_FLYDSL_KERNARG_PRELOAD",
-    "AITER_FLYDSL_KERNARG_PRELOAD_COUNT",
-    "AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE",
 )
 
 
@@ -389,20 +366,6 @@ _DERIVED = {"get_gfx()": _get_gfx}
 def _input(name: str):
     """The current value of a declared input: a variable or a ``_DERIVED`` one."""
     return _DERIVED[name]() if name in _DERIVED else os.environ.get(name)
-
-
-# Sources of every cache, so that no cache has to list them: the helpers
-# nearly every kernel is built with, and the per-arch hardware constants
-# kernels size themselves by (LDS capacity, CUs per XCD), which are outside
-# ``aiter/ops/flydsl/kernels``, the only place the import check looks. A
-# cache declares only the files specific to it.
-_COMMON_SOURCES = (
-    "kernels/kernels_common.py",
-    "kernels/tensor_shim.py",
-    "kernels/buffer_ops.py",
-    "../../jit/utils/chip_info.py",
-    "../../jit/utils/lds_capacity.py",
-)
 
 
 def _source_files(sources) -> list:
@@ -841,7 +804,7 @@ def _is_object(path: Path) -> bool:
 
 
 class _SourceListError(RuntimeError):
-    """A cache's ``sources=`` names a file that is not there. A launch takes
+    """A cache's source list names a file that is not there. A launch takes
     the JIT path; a prebuild fails."""
 
 
@@ -876,15 +839,37 @@ def _creation_file() -> str:
 class FlyDSLAotCache:
     """Persistent ``export_to_c`` cache for one launcher family."""
 
-    def __init__(self, name: str, sources=(), env=()):
-        """``sources``: the files the launchers of this cache are built from,
-        besides the one creating it and ``_COMMON_SOURCES``: each relative to ``aiter/ops/flydsl`` or
-        absolute; a directory stands for every ``.py`` below it. ``env``: the environment variables those
-        files read, besides ``_COMMON_ENV`` and what the fingerprint holds,
-        and ``"get_gfx()"`` if their code picks by ``chip_info.get_gfx()``. An edit
-        to a source, or another value of an input, makes new entries."""
+    def __init__(self, name: str, sources=None, env=None):
+        """What the cache declares is read from ``AOT_CACHES[name]``
+        (``aiter/aot/flydsl/sources.py``): the files its launchers are built
+        from, besides the one creating it and the common ones, and the
+        environment variables those files read. An edit to a source, or
+        another value of a variable, makes new entries.
+
+        ``sources`` and ``env`` are for a cache that is not in that table (a
+        test, code outside aiter): paths relative to ``aiter/ops/flydsl`` or
+        absolute, a directory standing for every ``.py`` below it, and
+        variable names (``"get_gfx()"`` for ``chip_info.get_gfx()``)."""
         if not re.fullmatch(r"[A-Za-z0-9_]+", name):
             raise ValueError(f"cache name must be a C identifier fragment: {name!r}")
+        declared = AOT_CACHES.get(name)
+        if declared is not None:
+            if sources is not None or env is not None:
+                raise ValueError(
+                    f"FlyDSL AOT cache {name!r} is declared in "
+                    f"aiter/aot/flydsl/sources.py; do not pass sources= or env="
+                )
+            sources, env = declared.get("sources", ()), declared.get("env", ())
+        elif _creation_file().startswith(os.path.dirname(__file__) + os.sep):
+            # A name that was not entered there (or was misspelled here) would
+            # quietly depend on its own file and the common ones only.
+            raise ValueError(
+                f"FlyDSL AOT cache {name!r} is not declared in "
+                f"aiter/aot/flydsl/sources.py (AOT_CACHES): add what it is "
+                f"built from there"
+            )
+        sources = () if sources is None else sources
+        env = () if env is None else env
         if isinstance(sources, (str, os.PathLike)):
             sources = (sources,)
         site = _creation_file()
@@ -1027,6 +1012,24 @@ class FlyDSLAotCache:
                             return
                         self._mem[key] = kernel
         kernel(*args)
+
+    def preload(self, key, make_exe, *args):
+        """Load the entry for ``key`` into this process without launching it,
+        and return the loaded function; None if there is none to load (no
+        entry, mode ``0``, a prebuild). For a caller that warms a launcher up
+        before serving."""
+        if _MODE == "0" or _prebuilding():
+            return None
+        kernel = self._mem.get(key)
+        if kernel is None:
+            with self._lock:
+                kernel = self._mem.get(key)
+                if kernel is None:
+                    kernel = self._kernel(key, make_exe, args)
+                    if kernel is None:  # COMPILE_ONLY was set meanwhile
+                        return None
+                    self._mem[key] = kernel
+        return None if isinstance(kernel, _JitKernel) else kernel
 
     def _prebuild(self, key, make_exe, args) -> None:
         """Build the entry for ``key`` without launching, e.g. in an AOT replay.
@@ -1206,22 +1209,24 @@ class FlyDSLAotCache:
                 raise _UndeclaredSourceError(
                     f"[FlyDSL AOT] cache {self.name!r} does not declare "
                     f"{[_portable(f) for f in missing]}, which its sources import: "
-                    f"add them to its sources="
+                    f"add them to its sources in aiter/aot/flydsl/sources.py"
                 )
             unread = _undeclared_env(self._files, self._env)
             if unread:
                 raise _UndeclaredSourceError(
                     f"[FlyDSL AOT] cache {self.name!r} does not declare the "
                     f"variables {unread}, which its sources read: add them to "
-                    f"its env= (or, if one cannot change generated code, to "
-                    f"aot_cache._ENV_NOT_CODE)"
+                    f"its env in aiter/aot/flydsl/sources.py (or, if one cannot "
+                    f"change generated code, to "
+                    f"ENV_NOT_CODE there)"
                 )
             self._imports_checked = True
         missing = sorted(set(libs) - set(self._files))
         if missing:
             raise _UndeclaredSourceError(
                 f"[FlyDSL AOT] cache {self.name!r} links {missing}, which it "
-                f"does not declare: add the bitcode to its sources="
+                f"does not declare: add the bitcode to its sources in "
+                f"aiter/aot/flydsl/sources.py"
             )
 
     def _verify(self, exe, args, sym, stem) -> None:

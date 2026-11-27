@@ -7,7 +7,7 @@ import itertools
 import logging
 import os
 import sys
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 
 import pandas as pd
 import torch
@@ -121,6 +121,26 @@ def parse_num_expert_activated():
 
 
 AITER_MOE_NUM_EXPERT_ACTIVATED = parse_num_expert_activated()
+
+
+@contextmanager
+def _record_fmoe_g1u1_launches(launches):
+    """Append the kernel name of every aiter.fmoe_g1u1 launch inside the block.
+
+    fused_moe_1stage looks fmoe_g1u1 up on the aiter module at call time, so this
+    sees the 1-stage kernel that actually ran, whichever activation selected it.
+    """
+    real = aiter.fmoe_g1u1
+
+    def recording(*args, **kwargs):
+        launches.append(kwargs.get("kernelName", args[12] if len(args) > 12 else ""))
+        return real(*args, **kwargs)
+
+    aiter.fmoe_g1u1 = recording
+    try:
+        yield
+    finally:
+        aiter.fmoe_g1u1 = real
 
 
 @benchmark()
@@ -625,17 +645,28 @@ def test_fmoe(
             "us_stage2": us2_stage,
         }
 
-    out2_ck, us2 = run_perftest(
-        fused_moe,
-        input,
-        w1_qt_aiter,
-        w2_qt_aiter,
-        topk_weights,
-        topk_ids,
-        num_iters=5,
-        num_warmup=2,
-        **_fused_moe_kwargs,
-    )
+    fmoe_launches = []
+    with (
+        _record_fmoe_g1u1_launches(fmoe_launches)
+        if expected_kernel1 is not None
+        else nullcontext()
+    ):
+        out2_ck, us2 = run_perftest(
+            fused_moe,
+            input,
+            w1_qt_aiter,
+            w2_qt_aiter,
+            topk_weights,
+            topk_ids,
+            num_iters=5,
+            num_warmup=2,
+            **_fused_moe_kwargs,
+        )
+    if expected_kernel1 is not None:
+        launched = sorted(set(fmoe_launches))
+        assert launched == [
+            expected_kernel1
+        ], f"{token=}: expected 1-stage {expected_kernel1}, launched {launched or 'no fmoe_g1u1'}"
     # Regression guard for aiter #3117 (MXFP4 fused-MoE stage2 EP-prefill):
     # the unfixed K-padding tail-tile path leaves the padded lanes uninitialized,
     # producing NaN in the fused_moe output. checkAllclose's err/logits_diff can be
@@ -808,8 +839,9 @@ parser.add_argument(
     "--hidden_intermediate_pad",
     type=dtypes.str2tuple,
     nargs="*",
-    default=[(192, 128)],
-    help="""Hidden intermediate pad.
+    default=None,
+    help="""Hidden intermediate pad. Default is [(192, 128)] for bf16/fp8
+    activations and [(0, 0)] for a4w4.
     e.g.: -hip 0,0""",
 )
 parser.add_argument(
@@ -969,12 +1001,58 @@ def _row_to_kwargs(row):
     }
 
 
+# vLLM stores the MoE intermediate width rounded up to this and passes the
+# zero-filled tail as intermediate_pad.
+_STORED_INTER_ALIGN = 128
+# 160, 256, 320 and 512 minus this are not multiples of the 160, 128/256, 160/320
+# and 256 tiles tuned at those widths.
+_STORED_ROW_PAD = 64
+
+
+def _iter_padded_flat_cases(row, kwargs, kernel_name1, seen_stored_rows):
+    """Rerun a FLAT/EMSORT MXFP4 row with a non-zero intermediate_pad.
+
+    A row tuned at the logical width is called with the stored layout and must be
+    found by the logical-width retry. A row tuned at the stored width is called
+    with a pad that leaves the logical width off the tile grid; its grid rounds up
+    into the zero pad. Both must dispatch the row's kernel.
+    """
+    flat = row.get("flat", 0)
+    if not (
+        kernel_name1.startswith("_ZN5aiter")
+        and pd.notna(flat)
+        and int(flat) in (AsmMoeMode.NO_SORT, AsmMoeMode.EMSORT)
+        and kwargs["WQDType"] == dtypes.fp4x2
+        and kwargs["actType"] in (aiter.ActivationType.Silu, aiter.ActivationType.Gelu)
+    ):
+        return
+    inter_dim = kwargs["inter_dim"]
+    stored = -(-inter_dim // _STORED_INTER_ALIGN) * _STORED_INTER_ALIGN
+    if stored != inter_dim:
+        yield {
+            **kwargs,
+            "inter_dim": stored,
+            "intermediate_pad": stored - inter_dim,
+            "expected_kernel1": kernel_name1,
+        }
+    # One stored-width case per kernel and shape keeps the large shapes cheap.
+    key = (kernel_name1, kwargs["model_dim"], inter_dim)
+    if inter_dim > _STORED_ROW_PAD and key not in seen_stored_rows:
+        seen_stored_rows.add(key)
+        yield {
+            **kwargs,
+            "intermediate_pad": _STORED_ROW_PAD,
+            "expected_kernel1": kernel_name1,
+        }
+
+
 def _iter_csv_cases():
     """Yield FlyDSL/Opus and SwiGLU OAI asm FLAT cases from every selected model CSV."""
     cu = get_cu_num()
     merged_csv = AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
     df_csv = pd.read_csv(merged_csv)
     rows = df_csv[df_csv["cu_num"] == cu]
+    seen_stored_rows = set()
     for _, row in rows.iterrows():
         tag = row.get("_tag", "")
         if pd.notna(tag) and str(tag).strip():
@@ -1095,10 +1173,15 @@ def _iter_csv_cases():
             kwargs["disable_stage2_bias"] = True
             kwargs["check_aot_cache"] = False
             kwargs["expected_kernel1"] = kernel_name1
-        yield kwargs, {
+        extras = {
             "kernelName1": kernel_name1,
             "kernelName2": kernel_name2,
         }
+        yield kwargs, extras
+        for padded_kwargs in _iter_padded_flat_cases(
+            row, kwargs, kernel_name1, seen_stored_rows
+        ):
+            yield padded_kwargs, extras
 
 
 _PER1X32_BF16_FP4 = (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2)
@@ -1420,7 +1503,9 @@ def _iter_legacy_cases():
                 for act_type in args.act
                 if act_type in (aiter.ActivationType.Swiglu, aiter.ActivationType.Relu2)
             ] or [aiter.ActivationType.Swiglu]
-            for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
+            for hidden_pad, intermediate_pad in args.hidden_intermediate_pad or [
+                (192, 128)
+            ]:
                 for act_type in bf16_fp4_acts:
                     for m in args.tokenNum:
                         yield _kw(
@@ -1440,7 +1525,9 @@ def _iter_legacy_cases():
                             disable_stage2_bias=not stage2_bias,
                         ), extras
         elif triple == _PER1X32_FP8_FP4:
-            for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
+            for hidden_pad, intermediate_pad in args.hidden_intermediate_pad or [
+                (192, 128)
+            ]:
                 for act_type in args.act:
                     for m in args.tokenNum:
                         yield _kw(
@@ -1460,7 +1547,9 @@ def _iter_legacy_cases():
                             **_situv2_beta_kwargs(act_type),
                         ), extras
         elif triple == _PER1X32_FP4_FP4:
-            for preshuffle in args.preshuffle:
+            for (hidden_pad, intermediate_pad), preshuffle in itertools.product(
+                args.hidden_intermediate_pad or [(0, 0)], args.preshuffle
+            ):
                 for act_type in args.act:
                     if act_type == aiter.ActivationType.Relu2:
                         continue
@@ -1478,8 +1567,8 @@ def _iter_legacy_cases():
                                 act_type,
                                 use_g1u1=True,
                                 preshuffle=preshuffle,
-                                hidden_pad=0,
-                                intermediate_pad=0,
+                                hidden_pad=hidden_pad,
+                                intermediate_pad=intermediate_pad,
                                 disable_stage1_bias=not stage1_bias,
                                 disable_stage2_bias=not stage2_bias,
                                 **_situv2_beta_kwargs(act_type),
