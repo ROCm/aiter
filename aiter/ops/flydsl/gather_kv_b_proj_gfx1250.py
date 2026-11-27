@@ -46,8 +46,8 @@ def _num_cus(device_index: int) -> int:
 def _use_head_loop(output_fp8: bool, n_heads: int) -> bool:
     """FP8 outputs take the A-resident head-loop kernel (one 256-token tile per
     workgroup, all its heads); AITER_GATHER_KVB_HEAD_LOOP=0 restores the tile
-    kernel. It needs an even head count: heads run in pairs so K is written in
-    whole 128 B lines."""
+    kernel. It needs an even head count: each head pair runs as a K step and a
+    V step, so V is written in whole 256 B blocks and K in whole 128 B lines."""
     return (
         output_fp8
         and n_heads % 2 == 0

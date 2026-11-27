@@ -1,23 +1,29 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MLA gather projection, gfx1250: A-resident head loop.
+"""MLA gather projection, gfx1250: A-resident head loop over pair-type steps.
 
-One workgroup owns a 256-token M tile and loops over ``i32_hpg`` heads (an even
-count, so a head pair never straddles two workgroups):
-  * the tile's 512-wide FP8 latent is TDM-gathered into LDS ONCE and stays
-    resident; RoPE is gathered once and parked, already scaled to FP8, in the K
-    staging rows;
-  * per head only the 256x512 weight slab streams through a 3-slot B ring;
-    K tiles 0..2 of the next head are in flight before this head's stores;
-  * the epilogue folds the ptpc row scale, activation scale and output descale
-    into one factor per column and converts with v_cvt_scalef32_pk8_fp8_f32
-    (after an explicit E4M3 clamp), stages the tile and hands it to TDM stores;
-  * K stores are cut on 128 B line boundaries: per head pair (2j, 2j+1) the K row
-    span [384j, 384j+384) = nope(2j) | rope | nope(2j+1) | rope is written as
-    L0 = nope(2j) by the even head and L1 = rope|nope(2j+1)[:64],
-    L2 = nope(2j+1)[64:]|rope by the odd head, from one staging layout in which
-    the rope bytes never move. No partial-line writes -> no DRAM read-modify-write.
+One workgroup owns a 256-token M tile and loops over its heads in pairs (2j, 2j+1);
+each pair is computed as two 256-column steps:
+  * K step [nope(2j) | nope(2j+1)], V step [v(2j) | v(2j+1)]: per step the same
+    256 x 512 weight slab and GEMM shape as one head, but the V step's row is one
+    256 B-aligned 256 B segment (whole 256 B blocks), and the K step writes the pair's
+    384 B K span as three 128 B lines L0 = nope(2j), L1 = rope|nope(2j+1)[:64],
+    L2 = nope(2j+1)[64:]|rope;
+  * the tile's 512-wide FP8 latent is TDM-gathered into LDS ONCE and stays resident;
+    per step only the weight slab streams through a 3-slot B ring, two K tiles ahead;
+  * one 320 B staging row per token serves both step types:
+        K step: [rope | nope(2j+1)[:64] | nope(2j) | nope(2j+1)[64:] of the next row]
+        V step: [rope | v(2j) | v(2j+1)]
+    RoPE is converted once and parked at [0, 64); L2 is the 128 B window that starts
+    64 B before a row (64 B guard before row 0);
+  * the epilogue folds the ptpc row scale, activation scale and output descale into
+    one factor per column, clamps to E4M3 and converts with
+    v_cvt_scalef32_pk8_fp8_f32;
+  * stores are TDM stores with the non-temporal hint: a store that covers only part
+    of a 256 B block otherwise makes L2 fetch the block from HBM first (one read per
+    128 B line written); NT stores skip that fill;
+  * SCHED_MODE's WMMA multi-cycle arbitration stall is disabled.
 FP8 output only.
 """
 
@@ -55,6 +61,8 @@ _TILE_K = 128
 _M_WARP = 4
 _N_WARP = 2
 _NB = 3  # B ring slots
+_STG_ROW = 320  # staging pitch (see module docstring)
+_STORE_NT = 1  # TDM store cache policy: TH = non-temporal (no write-allocate fill)
 
 
 def _sat(v):
@@ -133,15 +141,14 @@ def launch_gather_kv_b_proj_hl_gfx1250(
     B_LDS_ROW = tile_k * 16
     STAGE_A = ((A_LDS_ROWS * A_LDS_ROW + 15) // 16) * 16
     STAGE_B = ((tile_n // 16) * B_LDS_ROW + 15) // 16 * 16
-    CK_ROW = 192  # K staging pitch: [rope(64) | nope(128)] (even) / rotated (odd)
-    CV_ROW = 128
+    SR = _STG_ROW
     A_BASE = 0
     B_BASE = A_BASE + K_TILES * STAGE_A
-    CK_GUARD = B_BASE + nb * STAGE_B  # 64 B: row 0's odd-head nope[64:128]
-    CK0 = CK_GUARD + 64  # row r of the K staging starts at CK0 + r * CK_ROW
-    CV_BASE = CK0 + tile_m * CK_ROW
-    ROPE_TMP = CV_BASE  # raw rope rows, consumed before the first V staging
-    ARENA_B = CV_BASE + tile_m * CV_ROW
+    CK_GUARD = B_BASE + nb * STAGE_B  # 64 B: row 0's L2 window starts here
+    CK0 = CK_GUARD + 64  # staging row r starts at CK0 + r * SR
+    ROPE_TMP = CK0  # raw rope rows (16 KB), converted into place before the first step
+    # +64: the dense 320 B TDM window of the V store (LDS offset 64) ends 64 B past row 255
+    ARENA_B = CK0 + tile_m * SR + 64
     arch = get_rocm_arch().split(":", 1)[0]
     lds_cap = get_lds_capacity_bytes(arch)
     if ARENA_B > lds_cap:
@@ -152,7 +159,7 @@ def launch_gather_kv_b_proj_hl_gfx1250(
     kernel_name = format_kernel_name(
         "gather_kv_b_proj_hl"
         f"_t{tile_m}x{tile_n}x{tile_k}"
-        f"_mw{m_warp}_nw{n_warp}_nb{nb}_h{n_heads}_fp8"
+        f"_mw{m_warp}_nw{n_warp}_nb{nb}_h{n_heads}_pairstep_nt_fp8"
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
@@ -217,6 +224,10 @@ def launch_gather_kv_b_proj_hl_gfx1250(
             )
         )
         index_rsrc = ptr_rsrc(arg_indices, num_records_bytes=fx.Int64(i32_m) * 4)
+
+        # SCHED_MODE: no WMMA multi-cycle arbitration stall (other waves' VALU / LDS
+        # work issues while a WMMA is in flight).
+        rocdl.disable_xdl_arb_stall()
 
         # ---------------- prologue: A (all K) + RoPE gathers, once ----------------
         zero_indices = [fx.Int32(0) for _ in range_constexpr(A_GATHER_ROWS)]
@@ -324,16 +335,22 @@ def launch_gather_kv_b_proj_hl_gfx1250(
             )
         rocdl.sched_barrier(0)
 
-        # ---------------- B ring (weight slab of one head per 4 K tiles) ----------------
+        # ---------------- B ring: one 256-column weight slab per step ----------------
+        # Step s of pair j: columns [nope(2j) | nope(2j+1)] (s even) or [v(2j) | v(2j+1)]
+        # (s odd), i.e. 16-column groups 32j + 8 (s & 1) + 16 c + [0, 8) for halves c = 0, 1
+        # = 16 s - 8 (s & 1) + 16 c + [0, 8). Wave w loads groups 2 (w % 4) + {0, 1} of
+        # half w // 4 into slot rows 2w, 2w + 1.
         B_ROWS_PER_WAVE = (tile_n // 16) // num_waves
         b_wave_row = wave * B_ROWS_PER_WAVE
+        b_wave_grp = (wave // 4) * 16 + (wave % 4) * B_ROWS_PER_WAVE
         B_TILE = (B_ROWS_PER_WAVE, tile_k * 16)
 
-        def issue_b(head, kt, slot):
-            """One TDM load per wave: this wave's rows of head ``head`` K tile ``kt``."""
+        def issue_b(step, kt, slot):
+            """One TDM load per wave: this wave's rows of step ``step`` K tile ``kt``."""
+            grp = step * 16 - (step & 1) * 8 + b_wave_grp
             gB = _gv(
                 gB_base,
-                (fx.Int64(head) * (tile_n // 16) + fx.Int64(b_wave_row)) * (k64 * 16),
+                fx.Int64(grp) * (k64 * 16),
                 (B_ROWS_PER_WAVE, K_TILES * tile_k * 16),
                 (k64 * 16, 1),
             )
@@ -357,14 +374,14 @@ def launch_gather_kv_b_proj_hl_gfx1250(
             )
             fx.copy(atomB, tBg[None, fx.Int32(kt)], tBs[None, 0])
 
-        last_head = head0 + (i32_hpg - 1)
+        last_step = head0 + (i32_hpg - 1)
         rocdl.sched_barrier(0)
         issue_b(head0, 0, 0)
         issue_b(head0, 1, 1)
         issue_b(head0, 2, 2)
         rocdl.sched_barrier(0)
 
-        # ---------------- fragments / MMA (stock order) ----------------
+        # ---------------- fragments / MMA ----------------
         wmb = wave_m * warp_tile_m
         wnb = wave_n * warp_tile_n
         a_pair_base = fx.Int64(
@@ -451,13 +468,14 @@ def launch_gather_kv_b_proj_hl_gfx1250(
         sb_tiles = fx.logical_divide(sb_buf, sb_lay)
         sb_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
 
-        def issue_weight_scale_loads(head):
+        def issue_weight_scale_loads(step):
             def _issue(tile_idx):
                 r = fx.make_rmem_tensor(sb_lay, fx.Float32)
                 fx.copy_atom_call(sb_atom, fx.slice(sb_tiles, (None, tile_idx)), r)
                 return r
 
-            col4 = head * (tile_n // 4) + wave_n * (warp_tile_n // 4) + kgrp * 2
+            # first column of this wave's half: 16 * (16 s - 8 (s & 1) + 16 wave_n)
+            col4 = step * 64 - (step & 1) * 32 + wave_n * 64 + kgrp * 2
             return [
                 (_issue(col4 + wn * 4), _issue(col4 + wn * 4 + 1))
                 for wn in range_constexpr(wmma_n_rep)
@@ -472,34 +490,32 @@ def launch_gather_kv_b_proj_hl_gfx1250(
             1.0 / ptr_buf_tensor(p, fx.Float32, n=1, num_records_bytes=4)[0]
             for p in (arg_k_out_scale, arg_v_out_scale)
         )
-        sainv_vec = fx.full(
-            8,
-            fx.Float32(
-                activation_scale * fx.Float32((wave_n == 0).select(inv_k, inv_v))
-            ),
-            fx.Float32,
-        )
-        is_k = wave_n == 0
+        sa_inv_k = fx.Float32(activation_scale * inv_k)
+        sa_inv_v = fx.Float32(activation_scale * inv_v)
+        wn1 = wave_n == 1
 
-        def stage_c(sb_r, odd):
-            """K-nope waves (wave_n 0) -> K staging in the parity's layout, V waves -> V staging.
+        def epi_layout(is_v):
+            """Wave-uniform staging base / odd-nope shift of this step (pitch SR).
+            K step: nope(2j) (wave_n 0) at +128, nope(2j+1) (wave_n 1) at +64, its cols
+            >= 64 shifted -192 B into the previous row's tail. V step: v(2j) at +64,
+            v(2j+1) at +192."""
+            base = is_v.select(
+                wn1.select(fx.Int32(CK0 + 192), fx.Int32(CK0 + 64)),
+                wn1.select(fx.Int32(CK0 + 64), fx.Int32(CK0 + 128)),
+            )
+            hi_shift = is_v.select(fx.Int32(0), wn1.select(fx.Int32(-192), fx.Int32(0)))
+            sainv = fx.full(8, fx.Float32(is_v.select(sa_inv_v, sa_inv_k)), fx.Float32)
+            return base, hi_shift, sainv
 
-            even head: nope col c at CK0 + 192 r + 64 + c
-            odd head:  nope col c at CK0 + 192 r + 64 + c   (c < 64)
-                                     CK0 + 192 r - 128 + c  (c >= 64; lands in row r-1's tail)
-            """
-            sb = [
-                sb_r[wn][0].load().shuffle(sb_r[wn][1].load(), list(range(8)))
+        def stage_c(sb_r, is_v):
+            """Scale, clamp, convert and stage every accumulator; zero them for the next step."""
+            base, hi_shift, sainv = epi_layout(is_v)
+            fac = [
+                sb_r[wn][0].load().shuffle(sb_r[wn][1].load(), list(range(8))) * sainv
                 for wn in range_constexpr(wmma_n_rep)
             ]
-            fac = [sb[wn] * sainv_vec for wn in range_constexpr(wmma_n_rep)]
-            # Wave-uniform pieces: row base/pitch by K-or-V wave, and the odd-head shift
-            # (-192 B) for nope cols >= 64, all scalar so each store adds one VGPR.
-            pitch = is_k.select(fx.Int32(CK_ROW), fx.Int32(CV_ROW))
-            base = is_k.select(fx.Int32(CK0 + 64), fx.Int32(CV_BASE))
-            hi_shift = (is_k & odd).select(fx.Int32(-192), fx.Int32(0))
             for wm in range_constexpr(wmma_m_rep):
-                row_off = base + (wmb + wm * 16 + lane16) * pitch
+                row_off = base + (wmb + wm * 16 + lane16) * SR
                 for wn in range_constexpr(wmma_n_rep):
                     idx = wm * wmma_n_rep + wn
                     h = _cvt8(c_frags[idx].load() * fac[wn])
@@ -515,73 +531,82 @@ def launch_gather_kv_b_proj_hl_gfx1250(
         blk_m64 = fx.Int64(blk_m)
         ST_TILE = (
             tile_m,
-            CK_ROW,
-        )  # dense LDS window, clipped to 128 B by the global view
-        V_TILE = (tile_m, CV_ROW)
-        sV = _lv(  # noqa: F841
-            fx.add_offset(lds_i8, CV_BASE), (V_TILE, 1), ((CV_ROW, 1), tile_m * CV_ROW)
-        )
+            SR,
+        )  # dense LDS window, clipped to the row segment by the global view
 
-        def _tdm_store(g_base, g_off, ld, lds_off, tile, pitch):
-            gt = _gv(g_base, g_off, (mn_oob, 128), (fx.Int64(ld), 1))
+        def _tdm_store(g_base, g_off, ld, lds_off, width):
+            gt = _gv(g_base, g_off, (mn_oob, width), (fx.Int64(ld), 1))
             atom, coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
-                fx.rocdl.TensorStore(),
+                fx.rocdl.TensorStore(cache_modifier=_STORE_NT),
                 gt,
-                fx.make_layout(tile, (pitch, 1)),
-                tile,
+                fx.make_layout(ST_TILE, (SR, 1)),
+                ST_TILE,
                 num_warps=num_waves,
             )
-            blk = fx.zipped_divide(coord, tile)[None, (0, None)]
+            blk = fx.zipped_divide(coord, ST_TILE)[None, (0, None)]
             s = _lv(
-                fx.add_offset(lds_i8, lds_off), (tile, 1), ((pitch, 1), tile_m * pitch)
+                fx.add_offset(lds_i8, lds_off), (ST_TILE, 1), ((SR, 1), tile_m * SR)
             )
             ts, tg = fx.rocdl.cdna5.tdm_partition(
                 atom, wave, fx.make_layout(num_waves, 1), s, blk
             )
             fx.copy(atom, ts[None, 0], tg[None, 0])
 
-        def store_c(head, odd):
-            """even: L0 = nope (1 store); odd: L1, L2 (2 stores); then V. All 128 B lines."""
-            kg = blk_m64 * ldk + fx.Int64(head) * 192
-            if odd:
-                _tdm_store(gK_base, kg - 64, ldk, CK0, ST_TILE, CK_ROW)
-                _tdm_store(gK_base, kg + 64, ldk, CK0 - 64, ST_TILE, CK_ROW)
+        def store_c(step, is_v):
+            """K step: L0, L1, L2 (128 B lines of the pair's 384 B K span); V step: the
+            pair's V as one 256 B-aligned 256 B row segment per token."""
+            pair = fx.Int64(step >> 1)
+            kg = blk_m64 * ldk + pair * 384
+            vg = blk_m64 * ldv + pair * 256
+            if is_v:
+                _tdm_store(gV_base, vg, ldv, CK0 + 64, 256)
             else:
-                _tdm_store(gK_base, kg, ldk, CK0 + 64, ST_TILE, CK_ROW)
-            vg = blk_m64 * ldv + fx.Int64(head) * 128
-            _tdm_store(gV_base, vg, ldv, CV_BASE, V_TILE, CV_ROW)
+                _tdm_store(gK_base, kg, ldk, CK0 + 128, 128)
+                _tdm_store(gK_base, kg + 128, ldk, CK0, 128)
+                _tdm_store(gK_base, kg + 256, ldk, CK0 - 64, 128)
 
         def rope_to_staging():
-            """Raw RoPE rows (ROPE_TMP) -> scaled fp8 at CK0 + 192 r + [0, 64)."""
-            rope_scale = fx.full(8, fx.Float32(activation_scale * inv_k), fx.Float32)
+            """Raw RoPE rows (ROPE_TMP, 64 B each) -> scaled fp8 at CK0 + SR r + [0, 64).
+            ROPE_TMP overlaps the staging rows, so all rows are read before any is written.
+            """
+            rope_scale = fx.full(8, sa_inv_k, fx.Float32)
             row = tid  # 256 threads, one row each
-            for j in range_constexpr(_ROPE_WIDTH // 8):
-                words = Vec(
+            words = [
+                Vec(
                     lds_load_b64(
                         lds_base, fx.Int64(ROPE_TMP + row * _ROPE_WIDTH + j * 8)
                     )
                 )
+                for j in range_constexpr(_ROPE_WIDTH // 8)
+            ]
+            rocdl.s_wait_dscnt(0)
+            gpu.barrier()
+            for j in range_constexpr(_ROPE_WIDTH // 8):
                 values = Vec(
                     cvt_scale_pk8_f32_fp8(
-                        T.vec(8, T.f32), words.ir_value(), fx.Int32(127).ir_value(), 0
+                        T.vec(8, T.f32),
+                        words[j].ir_value(),
+                        fx.Int32(127).ir_value(),
+                        0,
                     )
                 )
                 packed = _pack_fp8x8(values * rope_scale)
-                fx.ptr_store(packed, base_ptr + CK0 + j * 8 + row * CK_ROW)
+                fx.ptr_store(packed, base_ptr + CK0 + j * 8 + row * SR)
 
-        # ---------------- main loop over head pairs ----------------
-        # Per-wave TDM issue order (steady, head h):
-        #   epi(h-1): B(h,2) S(h-1) | c1: B(h,3) | c2: B(h+1,0) | c3: B(h+1,1) | epi(h): B(h+1,2) S(h)
-        # fence(h,kt) leaves what was issued after B(h,kt): kt0 -> 2+S, kt1/kt2 -> 1+S, kt3 -> 1,
-        # where S = stores of head h-1 (3 if odd, 2 if even). fence(h,3) implies S(h-1) done.
-        S_OF = (2, 3)  # TDM stores per head by parity
+        # ---------------- main loop over steps ----------------
+        # Per-wave TDM issue order (steady, step s):
+        #   epi(s-1): B(s,2) S(s-1) | c1: B(s,3) | c2: B(s+1,0) | c3: B(s+1,1) | epi(s): B(s+1,2) S(s)
+        # fence(s,kt) leaves what was issued after B(s,kt): kt0 -> 2+S, kt1/kt2 -> 1+S, kt3 -> 1,
+        # where S = stores of step s-1 (3 after a K step, 1 after a V step).
+        # fence(s,3) implies S(s-1) done, so the staging is free after K tile 3.
         LOAD_AFTER = (2, 1, 1, 1)
+        S_AFTER_K, S_AFTER_V = 3, 1
 
         for hh in range(i32_hpg):
-            head = head0 + hh
-            odd = (head & 1) == 1
-            nxt = head + 1
-            nxt = (nxt < last_head).select(nxt, last_head)
+            step = head0 + hh
+            is_v = (step & 1) == 1
+            nxt = step + 1
+            nxt = (nxt < last_step).select(nxt, last_step)
             sb_regs = None
             for kt in range_constexpr(K_TILES):
                 if const_expr(kt == 3):
@@ -589,10 +614,10 @@ def launch_gather_kv_b_proj_hl_gfx1250(
                 else:
                     if hh == 0:
                         tdm_ops.tensor_wait(LOAD_AFTER[kt])
-                    elif odd:  # previous head even: 2 stores
-                        tdm_ops.tensor_wait(LOAD_AFTER[kt] + S_OF[0])
-                    else:  # previous head odd: 3 stores
-                        tdm_ops.tensor_wait(LOAD_AFTER[kt] + S_OF[1])
+                    elif is_v:  # previous step was a K step
+                        tdm_ops.tensor_wait(LOAD_AFTER[kt] + S_AFTER_K)
+                    else:
+                        tdm_ops.tensor_wait(LOAD_AFTER[kt] + S_AFTER_V)
                 rocdl.s_wait_dscnt(0)
                 gpu.barrier()
                 if const_expr(kt == 0):  # noqa: SIM102
@@ -601,21 +626,21 @@ def launch_gather_kv_b_proj_hl_gfx1250(
                 g = hh * K_TILES + kt
                 slot = g % nb
                 pslot = (g + 2) % nb
-                p_head = head if const_expr(kt + 2 < K_TILES) else nxt
+                p_step = step if const_expr(kt + 2 < K_TILES) else nxt
                 p_kt = (kt + 2) % K_TILES
 
-                def _prefetch(p_head=p_head, p_kt=p_kt, pslot=pslot, kt=kt):
+                def _prefetch(p_step=p_step, p_kt=p_kt, pslot=pslot, kt=kt):
                     if const_expr(kt > 0):
-                        issue_b(p_head, p_kt, pslot)
+                        issue_b(p_step, p_kt, pslot)
 
                 if const_expr(kt == 2):
-                    sb_regs = issue_weight_scale_loads(head)
+                    sb_regs = issue_weight_scale_loads(step)
                 compute_ktile(kt, slot, _prefetch)
-            stage_c(sb_regs, odd)
+            stage_c(sb_regs, is_v)
             rocdl.s_wait_dscnt(0)
             gpu.barrier()
             issue_b(nxt, 2, (hh * K_TILES + K_TILES + 2) % nb)
-            store_c(head, odd)
+            store_c(step, is_v)
         tdm_ops.tensor_wait(0)
 
     gx = (i32_m + (tile_m - 1)) // tile_m
