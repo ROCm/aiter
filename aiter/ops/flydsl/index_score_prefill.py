@@ -164,6 +164,29 @@ def index_topk_prefill_chunk_blocks(
     return chunk
 
 
+# Where the fused op is the faster indexer (MI455X, 11-27, 4 index heads, the
+# fused op at fold_max + pad_lds against the scorer at block_q=128,waves=2,
+# ring=2,fold_max,pad_lds + ATOM's Triton selector at tile 256, us):
+#     32.7K rows on 384K / 600K / 300K context  2897 / 4362 / 2537 vs 3370 / 5994 / 2889
+#     32.7K rows on 150K                        1310 vs 1322
+#     32.7K rows on 50K                          587 vs  408
+#     2K rows on 384K, 8K rows on 600K           354 vs  269, 1364 vs 1426
+# A short context or few rows leave the fused op's per-chunk selection passes
+# (its lists restart a chunk) a large share; there the two launches win.
+TOPK_PREFERRED_MIN_ROWS = 8192
+TOPK_PREFERRED_MIN_BLOCKS = 1024
+
+
+def index_topk_prefill_nvfp4_preferred(idx_q, max_block) -> bool:
+    """Whether the fused op is the faster prefill indexer for this call (rows of
+    ``idx_q``, ``max_block`` 128-token blocks); a performance choice, not a
+    limit: :func:`index_topk_prefill_nvfp4_supported` says what it serves."""
+    return (
+        idx_q.shape[0] >= TOPK_PREFERRED_MIN_ROWS
+        and max_block >= TOPK_PREFERRED_MIN_BLOCKS
+    )
+
+
 def index_topk_prefill_nvfp4_supported(idx_q, payload, scale, topk, max_block) -> bool:
     """Whether :func:`index_topk_prefill_nvfp4` serves this call: what the scorer
     serves, 16 blocks a row and block ids that fit the key's 16 bits."""
