@@ -17,7 +17,7 @@ from ..jit.utils.asm_guard import require_gfx1250_asm
 from ..jit.utils.build_targets import base_gfx_arch
 from ..jit.utils.chip_info import get_cu_num
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
-from ..ops.gemm_op_common import get_padded_m
+from ..ops.gemm_op_common import get_padded_m, log_tuned_config_miss
 from ..utility import dtypes
 
 _FLYDSL_AVAILABLE = importlib.util.find_spec("flydsl") is not None
@@ -152,8 +152,10 @@ def get_GEMM_config(M: int, N: int, K: int):
                 )
             break
     else:
-        logger.info(
-            f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in {tuned_file}, will use default config!"
+        log_tuned_config_miss(
+            "a4w4",
+            (tuned_file, gfx, cu_num, N, K),
+            f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in {tuned_file}, will use default config!",
         )
     return config
 

@@ -17,6 +17,7 @@ from ..jit.core import (
 from ..jit.utils.chip_info import get_cu_num
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..utility import dtypes
+from .gemm_op_common import log_tuned_config_miss
 
 
 def gen_batched_gemm_bf16_tune_fake_tensor(
@@ -98,8 +99,10 @@ def get_CKBatchedGEMM_config(
         config["tile_n"] = int(mnk[1])
         config["tile_k"] = int(mnk[2])
     else:
-        logger.info(
-            f"shape is B:{B}, M:{M}, N:{N}, K:{K} dtype is bf16, not found tuned config in CKGEMM, will use default config!"
+        log_tuned_config_miss(
+            "batched_bf16",
+            (gfx, cu_num, B, N, K),
+            f"shape is B:{B}, M:{M}, N:{N}, K:{K} dtype is bf16, not found tuned config in CKGEMM, will use default config!",
         )
     return config
 

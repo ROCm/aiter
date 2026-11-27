@@ -3,11 +3,40 @@
 
 from aiter import logger
 
-from ..jit.core import compile_ops
+from ..jit.core import AITER_LOG_TUNED_CONFIG, compile_ops
 
 
 @compile_ops("module_gemm_common", fc_name="getPaddedM", ffi_type="ctypes")
 def get_padded_m(M: int, N: int, K: int, gl: int) -> int: ...
+
+
+# Misses already reported, as (family, *key). Per process, like the lookup caches.
+_REPORTED_TUNED_CONFIG_MISSES: set = set()
+
+
+def log_tuned_config_miss(family: str, key: tuple, message: str) -> bool:
+    """Report a tuned-config lookup miss; True when a line was logged.
+
+    Serving sees a new M on nearly every batch, so logging each (M, N, K) miss
+    floods the log. Unless AITER_LOG_TUNED_CONFIG=1, a miss is logged once per
+    ``(family, *key)``; ``key`` is everything the tuned row is keyed on except
+    M (gfx, cu_num, N, K, dtypes, ...). With AITER_LOG_TUNED_CONFIG=1 every
+    miss is logged, as every hit is. Only the log line is affected: recording
+    untuned shapes (AITER_TUNE_GEMM) is done elsewhere and does not call this.
+    """
+    if AITER_LOG_TUNED_CONFIG:
+        logger.info(message)
+        return True
+    report_key = (family, *key)
+    if report_key in _REPORTED_TUNED_CONFIG_MISSES:
+        return False
+    _REPORTED_TUNED_CONFIG_MISSES.add(report_key)
+    logger.info(
+        f"{message} (Logged once per N/K; other M are not logged and may pick a "
+        "different default. "
+        "Set AITER_LOG_TUNED_CONFIG=1 to log every miss.)"
+    )
+    return True
 
 
 def find_padded_m_row(tuned: dict, key, m: int, n: int, k: int):

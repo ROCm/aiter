@@ -27,6 +27,7 @@ from ..jit.utils.torch_guard import torch_compile_guard
 from ..ops.gemm_op_common import (
     find_padded_m_row,
     get_padded_m,
+    log_tuned_config_miss,
     mxscale_w_scale_block,
     with_mxscale_w_scale_block,
 )
@@ -636,8 +637,10 @@ def get_CKGEMM_config(
                 )
             break
     if config is None:
-        logger.info(
-            f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in {tuned_file}, will use default config!"
+        log_tuned_config_miss(
+            "a8w8_ck",
+            (tuned_file, gfx, cu_num, N, K),
+            f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in {tuned_file}, will use default config!",
         )
     return config
 
@@ -706,8 +709,10 @@ def get_GEMM_config_with_quant_type(
                 logger.info(msg)
             break
     if config is None:
-        logger.info(
-            f"shape is M:{M}, N:{N}, K:{K}, q_dtype_w:{q_dtype_w}, not found tuned config in {tuned_file}, will use default config!"
+        log_tuned_config_miss(
+            "a8w8_quant_type",
+            (tuned_file, gfx, cu_num, N, K, str(q_dtype_w)),
+            f"shape is M:{M}, N:{N}, K:{K}, q_dtype_w:{q_dtype_w}, not found tuned config in {tuned_file}, will use default config!",
         )
     return config
 
@@ -2797,9 +2802,11 @@ def get_mxfp8_gemm_config(
                 f"splitK is {config['splitK']}!"
             )
         return config
-    logger.info(
+    log_tuned_config_miss(
+        "a8w8_mxfp8",
+        (tuned_file, gfx, N, K, str(b_intype), int(bool(a_preshuffle)), str(dtype)),
         f"shape is M:{M}, N:{N}, K:{K}, b_intype:{b_intype}, a_preshuffle:{a_preshuffle}, "
-        f"not found usable exact/padded-M config in {tuned_file}, will use default config!"
+        f"not found usable exact/padded-M config in {tuned_file}, will use default config!",
     )
     return None
 

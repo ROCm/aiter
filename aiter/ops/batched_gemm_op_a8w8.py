@@ -19,7 +19,11 @@ from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..plugin import route as _route
 from ..utility import dtypes
-from .gemm_op_common import mxscale_bmm_groups_of_block, mxscale_w_scale_block
+from .gemm_op_common import (
+    log_tuned_config_miss,
+    mxscale_bmm_groups_of_block,
+    mxscale_w_scale_block,
+)
 from .opus.policy import (
     resolve_a8w8_mxscale_bmm_plan as _resolve_a8w8_mxscale_bmm_plan,
 )
@@ -119,8 +123,10 @@ def get_CKBatchedGEMM_config(
         config["tile_n"] = int(mnk[1])
         config["tile_k"] = int(mnk[2])
     else:
-        logger.info(
-            f"shape is B:{B}, M:{M}, N:{N}, K:{K}, not found tuned config in CKGEMM, will use default config!"
+        log_tuned_config_miss(
+            "batched_a8w8",
+            (gfx, cu_num, B, N, K),
+            f"shape is B:{B}, M:{M}, N:{N}, K:{K}, not found tuned config in CKGEMM, will use default config!",
         )
     return config
 
