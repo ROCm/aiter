@@ -425,6 +425,51 @@ def _flydsl_moe_sorting(
     return ret
 
 
+def _flydsl_moe_sorting_onewg(topk_ids, topk_weights, num_experts, block_size):
+    """One-workgroup FlyDSL sort (E == 128, M <= 512, no output clearing); None when the shape is not covered.
+
+    The order of the (token, slot) pairs inside one expert is unspecified; see ``moe_sorting(unordered=True)``.
+    """
+    from aiter.ops.flydsl.kernels.moe_sorting_onewg import (
+        moe_sorting_onewg,
+        onewg_supported,
+    )
+
+    M, topk = topk_ids.shape
+    if not (
+        topk_ids.dtype == dtypes.i32
+        and topk_weights.dtype == dtypes.fp32
+        and topk_ids.is_cuda
+        and topk_weights.device == topk_ids.device
+        and topk_ids.is_contiguous()
+        and topk_weights.is_contiguous()
+        and onewg_supported(M, num_experts, topk, block_size)
+    ):
+        return None
+    device = topk_ids.device
+    # same capacity contract as _moe_sorting_impl / _flydsl_moe_sorting
+    max_num_tokens_padded = int(M * topk + num_experts * block_size - topk)
+    max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
+    max_num_tokens_padded = max_num_m_blocks * block_size
+    sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
+    sorted_weights = torch.empty(
+        max_num_tokens_padded, dtype=dtypes.fp32, device=device
+    )
+    sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
+    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
+    moe_sorting_onewg(
+        topk_ids,
+        topk_weights,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        num_experts,
+        block_size,
+    )
+    return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids
+
+
 def moe_sorting(
     topk_ids,
     topk_weights,
@@ -440,8 +485,36 @@ def moe_sorting(
     flat: AsmMoeMode | int = AsmMoeMode.SORTED,
     output_aux=False,
     output=None,
+    unordered=False,
 ):
+    """Sort ``topk_ids`` into the padded per-expert layout the MoE GEMMs consume.
+
+    ``unordered=True`` (with ``accumulate=False``, no EP mask, E == 128, M <= 512, gfx950) lets the sort use the
+    one-workgroup kernel; the order of the pairs inside an expert is then unspecified and may vary from run to
+    run (callers must give every (token, slot) pair its own output row), and every id must be in ``[0, E)``.
+    """
     asm_mode = AsmMoeMode(flat)
+    if (
+        unordered
+        and not accumulate
+        and dispatch_policy == 0
+        and not _USE_CK_MOE_SORTING
+        and expert_mask is None
+        and num_local_tokens is None
+        and not return_local_topk_ids
+        and not output_aux
+        and asm_mode.requires_host_sort
+    ):
+        # The caller does not depend on the row order inside an expert (every (token, slot) pair owns its own
+        # output row): E == 128 up to 512 tokens sorts in one workgroup, 2-3x faster than the multi-phase sorts.
+        sorted_out = _flydsl_moe_sorting_onewg(
+            topk_ids, topk_weights, num_experts, block_size
+        )
+        if sorted_out is not None:
+            return (
+                *sorted_out,
+                torch.empty((0, 0), dtype=moebuf_dtype, device=topk_ids.device),
+            )
     if (
         not _USE_CK_MOE_SORTING
         and _USE_FLYDSL_MOE_SORTING
