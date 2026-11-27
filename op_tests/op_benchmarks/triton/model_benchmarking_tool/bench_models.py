@@ -54,8 +54,8 @@ from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w8_blockscale import (
 )
 from op_tests.op_benchmarks.triton.bench_rmsnorm import main as bench_rmsnorm_main
 from op_tests.op_benchmarks.triton.bench_rope import main as bench_rope_main
+from op_tests.op_benchmarks.triton.bench_unified_attention import DEFAULT_BLOCK_SIZE
 from op_tests.op_benchmarks.triton.bench_unified_attention import (
-    DEFAULT_BLOCK_SIZE,
     main as bench_unified_attention_main,
 )
 
