@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""MoE token permute / unpermute (aiter.ops.opus.moe_permute): plan, forward and backward.
+"""MoE token permute / unpermute (aiter.ops.opus.moe_token_reorder): sort, forward and backward.
 
 The torch reference follows the numeric rules of the kernels (see the module docstring of
-aiter/ops/opus/moe_permute.py), so every kernel output is required to match it exactly (err == 0).
+aiter/ops/opus/moe_token_reorder.py), so every kernel output is required to match it exactly (err == 0).
 The reference backward is also checked against autograd of a float64 forward, with a tolerance:
 autograd adds in its own order.
 """
@@ -18,22 +18,22 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.ops.opus import moe_permute as mp
-from aiter.ops.opus.moe_permute import (
+from aiter.ops.opus import moe_token_reorder as mp
+from aiter.ops.opus.moe_token_reorder import (
     DW_THREADS,
     DW_VEC,
     GROUP_ALIGN,
     moe_permute,
-    moe_permute_plan,
-    moe_permute_rows,
+    moe_sort,
+    moe_sort_rows,
     moe_unpermute,
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 
-# The reference's own plan: the row of every token, written the direct way.
-RefPlan = namedtuple("RefPlan", "row_of_token token_of_row grouped_layout group_rows")
+# The reference's own sort: the row of every token, written the direct way.
+RefSort = namedtuple("RefSort", "row_of_token token_of_row grouped_layout group_rows")
 
 SUPPORTED_GFX = ["gfx950"]
 DISTS = ["uniform", "skewed", "empty", "one"]
@@ -69,7 +69,7 @@ def make_expert_ids(n, experts, dist, seed=0):
     """expert_ids [N] int32.
     uniform: every expert equally likely; skewed: expert e with weight 1 / (e + 1);
     empty: the odd experts get no token; one: every token goes to one expert;
-    invalid: uniform over -3 .. E + 4 plus some INT_MAX / INT_MIN (ids that are not experts; plan only).
+    invalid: uniform over -3 .. E + 4 plus some INT_MAX / INT_MIN (ids that are not experts; sort only).
     """
     g = torch.Generator(device="cuda").manual_seed(seed)
     if dist == "uniform":
@@ -97,8 +97,8 @@ def make_rows(rows, hidden):
 # ---- torch reference (not timed) -------------------------------------------
 
 
-def run_torch_plan(expert_ids, num_experts, table_rows=None):
-    """table_rows: rows of the [R] tables; None: moe_permute_rows(N, E), the tables of exact=False."""
+def run_torch_sort(expert_ids, num_experts, table_rows=None):
+    """table_rows: rows of the [R] tables; None: moe_sort_rows(N, E), the tables of exact=False."""
     ids = expert_ids.flatten().long()
     n = ids.numel()
     tok = torch.nonzero(
@@ -111,21 +111,21 @@ def run_torch_plan(expert_ids, num_experts, table_rows=None):
     start = padded.cumsum(0) - padded
     e_sorted = e[order]
     rows = start[e_sorted] + torch.arange(e.numel()) - (cnt.cumsum(0) - cnt)[e_sorted]
-    n_rows = moe_permute_rows(n, num_experts) if table_rows is None else table_rows
+    n_rows = moe_sort_rows(n, num_experts) if table_rows is None else table_rows
     row_of_token = torch.full((n,), -1, dtype=torch.long)
     row_of_token[tok[order]] = rows
     token_of_row = torch.full((n_rows,), -1, dtype=torch.long)
     token_of_row[rows] = tok[order]
     grouped_layout = torch.full((n_rows,), -1, dtype=torch.long)
     grouped_layout[rows] = e_sorted
-    return RefPlan(
+    return RefSort(
         row_of_token.int(), token_of_row.int(), grouped_layout.int(), cnt.int()
     )
 
 
-def _scatter_rows(src, plan, scale=None):
+def _scatter_rows(src, sort, scale=None):
     """[R, H]: row r = src[token of r] (times scale[token]), padding rows 0."""
-    tok = plan.token_of_row.long()
+    tok = sort.token_of_row.long()
     valid = tok >= 0
     dst = torch.zeros((tok.numel(), src.shape[1]), dtype=src.dtype)
     if scale is None:
@@ -137,26 +137,26 @@ def _scatter_rows(src, plan, scale=None):
     return dst
 
 
-def run_torch_permute_fwd(x, plan):
-    return _scatter_rows(x, plan)
+def run_torch_permute_fwd(x, sort):
+    return _scatter_rows(x, sort)
 
 
-def run_torch_permute_bwd(d_perm, plan):
-    return d_perm[plan.row_of_token.long()]
+def run_torch_permute_bwd(d_perm, sort):
+    return d_perm[sort.row_of_token.long()]
 
 
-def run_torch_unpermute_fwd(y_perm, plan, weights=None):
-    rows = y_perm[plan.row_of_token.long()]
+def run_torch_unpermute_fwd(y_perm, sort, weights=None):
+    rows = y_perm[sort.row_of_token.long()]
     if weights is None:
         return rows
     return (weights.flatten()[:, None] * rows.to(dtypes.fp32)).to(y_perm.dtype)
 
 
-def run_torch_unpermute_bwd(d_out, y_perm, plan, weights=None, batch=1024):
+def run_torch_unpermute_bwd(d_out, y_perm, sort, weights=None, batch=1024):
     """(d_perm, d_weights); weights None: d_perm only (the copy)."""
     if weights is None:
-        return _scatter_rows(d_out, plan)
-    d_perm = _scatter_rows(d_out, plan, weights)
+        return _scatter_rows(d_out, sort)
+    d_perm = _scatter_rows(d_out, sort, weights)
 
     # d_weights: thread i of DW_THREADS adds the products of chunks i, i + DW_THREADS, ... (DW_VEC
     # elements each) in ascending element order; the partial sums are added in ascending thread order.
@@ -167,7 +167,7 @@ def run_torch_unpermute_bwd(d_out, y_perm, plan, weights=None, batch=1024):
     for t0 in range(0, n, batch):
         t1 = min(t0 + batch, n)
         prod = d_out[t0:t1].to(dtypes.fp32) * y_perm[
-            plan.row_of_token[t0:t1].long()
+            sort.row_of_token[t0:t1].long()
         ].to(dtypes.fp32)
         prod = prod.view(t1 - t0, chunks, DW_VEC)
         partial = None
@@ -186,17 +186,17 @@ def run_torch_unpermute_bwd(d_out, y_perm, plan, weights=None, batch=1024):
     return d_perm, d_weights.view(weights.shape)
 
 
-def check_plan(plan, expert_ids, num_experts):
-    """Properties every valid plan has, whatever produced it."""
+def check_sort(sort, expert_ids, num_experts):
+    """Properties every valid sort has, whatever produced it."""
     ids = expert_ids.flatten().long()
     n = ids.numel()
-    rows = plan.row_of_token.long()
-    tok = plan.token_of_row.long()
-    layout = plan.grouped_layout.long()
+    rows = sort.row_of_token.long()
+    tok = sort.token_of_row.long()
+    layout = sort.grouped_layout.long()
     has_row = (ids >= 0) & (ids < num_experts)
     cnt = torch.bincount(ids[has_row], minlength=num_experts)
-    assert tok.numel() == layout.numel() <= moe_permute_rows(n, num_experts)
-    assert torch.equal(plan.group_rows.long(), cnt)
+    assert tok.numel() == layout.numel() <= moe_sort_rows(n, num_experts)
+    assert torch.equal(sort.group_rows.long(), cnt)
     assert torch.equal(rows >= 0, has_row)  # an id that is not an expert gets no row
     assert torch.equal(
         tok[rows[has_row]], torch.nonzero(has_row).flatten()
@@ -215,10 +215,10 @@ def check_plan(plan, expert_ids, num_experts):
     )  # token order
 
 
-def check_kernel_plan(got, ref, tail=True):
-    """The plan kernels against the reference plan: every field, every element (padding rows included).
+def check_kernel_sort(got, ref, tail=True):
+    """The sort kernels against the reference sort: every field, every element (padding rows included).
     tail False (ids that are not experts, outside the precondition of the op): the [R] tables are compared up
-    to the rows in use only. Such ids take no row, so the tail is longer than the 128 E rows the plan fills,
+    to the rows in use only. Such ids take no row, so the tail is longer than the 128 E rows the sort fills,
     and the rows behind that are not written (the same at 84371a7f2)."""
     # rows in use: every group with its padding; the rows from there on are the tail
     used = int(
@@ -247,22 +247,22 @@ def check_kernel_plan(got, ref, tail=True):
         assert f.dtype == torch.int32
 
 
-def make_reference(x, y_perm, d_perm, d_out, plan, weights):
+def make_reference(x, y_perm, d_perm, d_out, sort, weights):
     return {
-        "permute_fwd": run_torch_permute_fwd(x, plan),
-        "permute_bwd": run_torch_permute_bwd(d_perm, plan),
-        "unpermute_fwd": run_torch_unpermute_fwd(y_perm, plan, weights),
-        "unpermute_bwd": run_torch_unpermute_bwd(d_out, y_perm, plan, weights),
-        "unpermute_fwd_noweight": run_torch_unpermute_fwd(y_perm, plan),
-        "unpermute_bwd_noweight": run_torch_unpermute_bwd(d_out, y_perm, plan),
+        "permute_fwd": run_torch_permute_fwd(x, sort),
+        "permute_bwd": run_torch_permute_bwd(d_perm, sort),
+        "unpermute_fwd": run_torch_unpermute_fwd(y_perm, sort, weights),
+        "unpermute_bwd": run_torch_unpermute_bwd(d_out, y_perm, sort, weights),
+        "unpermute_fwd_noweight": run_torch_unpermute_fwd(y_perm, sort),
+        "unpermute_bwd_noweight": run_torch_unpermute_bwd(d_out, y_perm, sort),
     }
 
 
-def check_grad_parity(x, y_perm, d_perm, d_out, plan, weights, ref):
+def check_grad_parity(x, y_perm, d_perm, d_out, sort, weights, ref):
     """Reference backward vs autograd of a float64 forward (tolerance: different summation order)."""
-    tok = plan.token_of_row.long()
+    tok = sort.token_of_row.long()
     valid = tok >= 0
-    rows = plan.row_of_token.long()
+    rows = sort.row_of_token.long()
     xd = x.double().requires_grad_()
     x_perm = torch.zeros((tok.numel(), x.shape[1]), dtype=torch.float64)
     x_perm[valid] = xd[tok[valid]]
@@ -296,14 +296,14 @@ def check_grad_parity(x, y_perm, d_perm, d_out, plan, weights, ref):
 # ---- candidates --------------------------------------------------------------
 
 
-def _torch_index_candidates(x, y_perm, d_perm, d_out, plan, weights):
+def _torch_index_candidates(x, y_perm, d_perm, d_out, sort, weights):
     """Baseline: plain torch indexing (index_select). Compared with a tolerance."""
     n = x.shape[0]
-    tok = plan.token_of_row.long()
+    tok = sort.token_of_row.long()
     token_of_row = torch.where(
         tok >= 0, tok, n
     )  # padding rows read an appended zero row
-    rows = plan.row_of_token.long()
+    rows = sort.row_of_token.long()
     w_row = torch.cat([weights, torch.zeros(1)])[token_of_row][:, None]
     x_pad = torch.cat([x, torch.zeros_like(x[:1])])
     d_out_pad = torch.cat([d_out, torch.zeros_like(d_out[:1])])
@@ -324,9 +324,9 @@ def _torch_index_candidates(x, y_perm, d_perm, d_out, plan, weights):
     }
 
 
-def _opus_candidates(x, y_perm, d_perm, d_out, plan, weights):
+def _opus_candidates(x, y_perm, d_perm, d_out, sort, weights):
     """The kernels K2 .. K5, launched directly into preallocated outputs (what the autograd.Functions call).
-    plan: a MoEPermutePlan. moe_unpermute without weights is the copy kernels of K3 (forward) / K2 (backward).
+    sort: a MoESortResult. moe_unpermute without weights is the copy kernels of K3 (forward) / K2 (backward).
     """
     x_perm, dx, out = torch.empty_like(y_perm), torch.empty_like(x), torch.empty_like(x)
     dp, dw = torch.empty_like(y_perm), torch.empty_like(weights)
@@ -337,29 +337,29 @@ def _opus_candidates(x, y_perm, d_perm, d_out, plan, weights):
 
     return {
         "permute_fwd": lambda: run(
-            mp._permute_fwd_launch, x, plan.sorted_token_ids, x_perm, ret=x_perm
+            mp._permute_fwd_launch, x, sort.sorted_token_ids, x_perm, ret=x_perm
         ),
         "permute_bwd": lambda: run(
-            mp._permute_bwd_launch, d_perm, plan.reverse_sorted, dx, ret=dx
+            mp._permute_bwd_launch, d_perm, sort.reverse_sorted, dx, ret=dx
         ),
         "unpermute_fwd": lambda: run(
-            mp._unpermute_fwd_launch, y_perm, plan.reverse_sorted, weights, out, ret=out
+            mp._unpermute_fwd_launch, y_perm, sort.reverse_sorted, weights, out, ret=out
         ),
         "unpermute_bwd": lambda: run(
             mp._unpermute_bwd_launch,
             d_out,
             y_perm,
             weights,
-            plan.sorted_token_ids,
+            sort.sorted_token_ids,
             dp,
             dw,
             ret=(dp, dw),
         ),
         "unpermute_fwd_noweight": lambda: run(
-            mp._permute_bwd_launch, y_perm, plan.reverse_sorted, out, ret=out
+            mp._permute_bwd_launch, y_perm, sort.reverse_sorted, out, ret=out
         ),
         "unpermute_bwd_noweight": lambda: run(
-            mp._permute_fwd_launch, d_out, plan.sorted_token_ids, dp, ret=dp
+            mp._permute_fwd_launch, d_out, sort.sorted_token_ids, dp, ret=dp
         ),
     }
 
@@ -394,22 +394,22 @@ def check_stage(stage, got, ref, what):
     ), f"{what}: {stage} differs from the reference"
 
 
-def check_public_api(x, y_perm, d_perm, d_out, expert_ids, experts, weights, plan, ref):
+def check_public_api(x, y_perm, d_perm, d_out, expert_ids, experts, weights, sort, ref):
     """moe_permute / moe_unpermute and their autograd backward against the reference, with ids / weights
     given as [N] and as [N, 1], and moe_unpermute without weights."""
     for column in (False, True):
         ids = expert_ids.view(-1, 1) if column else expert_ids
         w = weights.view(-1, 1) if column else weights
         xr = x.detach().requires_grad_()
-        x_perm, got_plan = moe_permute(xr, ids, experts, exact=False)
-        check_kernel_plan(got_plan, plan)
+        x_perm, got_sort = moe_permute(xr, ids, experts, exact=False)
+        check_kernel_sort(got_sort, sort)
         (dx,) = torch.autograd.grad(x_perm, xr, d_perm)
         yr, wr = y_perm.detach().requires_grad_(), w.detach().requires_grad_()
-        out = moe_unpermute(yr, got_plan, wr)
+        out = moe_unpermute(yr, got_sort, wr)
         dp, dw = torch.autograd.grad(out, (yr, wr), d_out)
         assert dw.shape == w.shape, "d_weights has the shape of weights"
         yr = y_perm.detach().requires_grad_()
-        out_noweight = moe_unpermute(yr, got_plan)
+        out_noweight = moe_unpermute(yr, got_sort)
         (dp_noweight,) = torch.autograd.grad(out_noweight, yr, d_out)
         got = {
             "permute_fwd": x_perm,
@@ -426,26 +426,26 @@ def check_public_api(x, y_perm, d_perm, d_out, expert_ids, experts, weights, pla
                 ref[stage],
                 "moe_permute API" + (" ([N, 1])" if column else ""),
             )
-    # a plan computed before is reused; the weights argument of moe_permute is not read
-    x_perm, same_plan = moe_permute(x, None, experts, weights, plan=got_plan)
-    assert same_plan is got_plan
-    check_stage("permute_fwd", x_perm, ref["permute_fwd"], "moe_permute(plan=)")
+    # a sort computed before is reused; the weights argument of moe_permute is not read
+    x_perm, same_sort = moe_permute(x, None, experts, weights, sort=got_sort)
+    assert same_sort is got_sort
+    check_stage("permute_fwd", x_perm, ref["permute_fwd"], "moe_permute(sort=)")
 
 
 @benchmark()
 def test_moe_permute(n, experts, hidden, dist):
     expert_ids = make_expert_ids(n, experts, dist)
-    n_rows = moe_permute_rows(n, experts)
+    n_rows = moe_sort_rows(n, experts)
     x, d_out = make_rows(n, hidden), make_rows(n, hidden)
     y_perm, d_perm = make_rows(n_rows, hidden), make_rows(n_rows, hidden)
     weights = torch.rand(n) + 0.5
 
-    plan = run_torch_plan(expert_ids, experts)
-    check_plan(plan, expert_ids, experts)
-    ref = make_reference(x, y_perm, d_perm, d_out, plan, weights)
-    check_grad_parity(x, y_perm, d_perm, d_out, plan, weights, ref)
-    check_public_api(x, y_perm, d_perm, d_out, expert_ids, experts, weights, plan, ref)
-    kplan = moe_permute_plan(expert_ids, experts, exact=False)
+    sort = run_torch_sort(expert_ids, experts)
+    check_sort(sort, expert_ids, experts)
+    ref = make_reference(x, y_perm, d_perm, d_out, sort, weights)
+    check_grad_parity(x, y_perm, d_perm, d_out, sort, weights, ref)
+    check_public_api(x, y_perm, d_perm, d_out, expert_ids, experts, weights, sort, ref)
+    ksort = moe_sort(expert_ids, experts, exact=False)
 
     row_bytes = hidden * x.element_size()
     moved = {  # bytes read + written (padding rows are written, not read)
@@ -458,16 +458,16 @@ def test_moe_permute(n, experts, hidden, dist):
     }
     ret = {"gfx": get_gfx_runtime(), "rows": n_rows}
 
-    # plan: the plan kernels against the torch sort
-    got, us = run_perftest(lambda: moe_permute_plan(expert_ids, experts, exact=False))
-    check_kernel_plan(got, plan)
-    ret["opus plan us"] = us
-    _, ret["torch plan us"] = run_perftest(lambda: run_torch_plan(expert_ids, experts))
+    # sort: the sort kernels against the torch sort
+    got, us = run_perftest(lambda: moe_sort(expert_ids, experts, exact=False))
+    check_kernel_sort(got, sort)
+    ret["opus sort us"] = us
+    _, ret["torch sort us"] = run_perftest(lambda: run_torch_sort(expert_ids, experts))
 
     candidates = {
-        "opus": (_opus_candidates(x, y_perm, d_perm, d_out, kplan, weights), True),
+        "opus": (_opus_candidates(x, y_perm, d_perm, d_out, ksort, weights), True),
         "torch": (
-            _torch_index_candidates(x, y_perm, d_perm, d_out, plan, weights),
+            _torch_index_candidates(x, y_perm, d_perm, d_out, sort, weights),
             False,
         ),
     }
@@ -503,30 +503,30 @@ def test_moe_permute(n, experts, hidden, dist):
 
 
 def _check_shape(n, experts, hidden, dist, seed=0):
-    """Plan and K2 .. K5 through the public API against the reference, for one shape (not timed)."""
+    """Sort and K2 .. K5 through the public API against the reference, for one shape (not timed)."""
     expert_ids = make_expert_ids(n, experts, dist, seed)
-    n_rows = moe_permute_rows(n, experts)
+    n_rows = moe_sort_rows(n, experts)
     x, d_out = make_rows(n, hidden), make_rows(n, hidden)
     y_perm, d_perm = make_rows(n_rows, hidden), make_rows(n_rows, hidden)
     w = torch.randn(n)
-    plan = run_torch_plan(expert_ids, experts)
-    ref = make_reference(x, y_perm, d_perm, d_out, plan, w)
-    check_public_api(x, y_perm, d_perm, d_out, expert_ids, experts, w, plan, ref)
+    sort = run_torch_sort(expert_ids, experts)
+    ref = make_reference(x, y_perm, d_perm, d_out, sort, w)
+    check_public_api(x, y_perm, d_perm, d_out, expert_ids, experts, w, sort, ref)
 
 
-def test_plan_grid():
-    """The plan for every (N, E) of the grid and every distribution, ids that are not experts included:
+def test_sort_grid():
+    """The sort for every (N, E) of the grid and every distribution, ids that are not experts included:
     N across bitmap words and token blocks (one block, several, more than one batch of block counts), E below
-    and above the 256-token-block limit of the plan and not a multiple of its fill group.
+    and above the 256-token-block limit of the sort and not a multiple of its fill group.
     """
     for i, (n, experts) in enumerate(itertools.product(GRID_N, GRID_E)):
         for dist in DISTS + ["invalid"]:
             expert_ids = make_expert_ids(n, experts, dist, seed=i)
-            ref = run_torch_plan(expert_ids, experts)
-            check_plan(ref, expert_ids, experts)
+            ref = run_torch_sort(expert_ids, experts)
+            check_sort(ref, expert_ids, experts)
             for ids in (expert_ids, expert_ids.view(-1, 1)):
-                check_kernel_plan(
-                    moe_permute_plan(ids, experts, exact=False),
+                check_kernel_sort(
+                    moe_sort(ids, experts, exact=False),
                     ref,
                     tail=dist != "invalid",
                 )
@@ -536,7 +536,7 @@ def test_small_shapes(max_elements=1 << 26):
     """K2 .. K5 for every (N, E) of the grid; the distributions and the H values that keep [R, H] below
     max_elements in turn (H below, at and above one chunk per thread)."""
     for i, (n, experts) in enumerate(itertools.product(GRID_N, GRID_E)):
-        hs = [h for h in GRID_H if moe_permute_rows(n, experts) * h <= max_elements]
+        hs = [h for h in GRID_H if moe_sort_rows(n, experts) * h <= max_elements]
         _check_shape(n, experts, hs[i % len(hs)], DISTS[i % len(DISTS)], seed=i)
     for i, hidden in enumerate(GRID_H):  # every H with few rows
         _check_shape(
@@ -550,26 +550,24 @@ def test_small_shapes(max_elements=1 << 26):
 
 def test_exact_rows(hidden=64):
     """The default (exact): the [R] tables end at the rows in use, and every output is the one of the
-    upper-bound plan (checked against the reference above) on those rows."""
+    upper-bound sort (checked against the reference above) on those rows."""
     for i, (n, experts) in enumerate(itertools.product(GRID_N, [1, 2, 31, 32, 256])):
         dist = DISTS[i % len(DISTS)]
         ids = make_expert_ids(n, experts, dist, seed=i)
-        bound, plan = moe_permute_plan(ids, experts, exact=False), moe_permute_plan(
-            ids, experts
-        )
-        rows = plan.sorted_token_ids.numel()
+        bound, sort = moe_sort(ids, experts, exact=False), moe_sort(ids, experts)
+        rows = sort.sorted_token_ids.numel()
         assert (
             rows == max(int(bound.num_valid_ids), GROUP_ALIGN)
             and rows % GROUP_ALIGN == 0
         )
-        assert bound.sorted_token_ids.numel() == moe_permute_rows(n, experts) >= rows
-        assert torch.equal(plan.sorted_token_ids, bound.sorted_token_ids[:rows])
-        assert torch.equal(plan.grouped_layout, bound.grouped_layout[:rows])
+        assert bound.sorted_token_ids.numel() == moe_sort_rows(n, experts) >= rows
+        assert torch.equal(sort.sorted_token_ids, bound.sorted_token_ids[:rows])
+        assert torch.equal(sort.grouped_layout, bound.grouped_layout[:rows])
         assert bool((bound.sorted_token_ids[rows:] == -1).all()) and bool(
             (bound.grouped_layout[rows:] == -1).all()
         )
-        assert torch.equal(plan.reverse_sorted, bound.reverse_sorted) and torch.equal(
-            plan.group_rows, bound.group_rows
+        assert torch.equal(sort.reverse_sorted, bound.reverse_sorted) and torch.equal(
+            sort.group_rows, bound.group_rows
         )
         if n * hidden > 1 << 24:
             continue
@@ -581,7 +579,7 @@ def test_exact_rows(hidden=64):
         for p in (bound, None):
             r = rows if p is None else y_perm.shape[0]
             xr = x.detach().requires_grad_()
-            x_perm, p = moe_permute(xr, ids, experts, plan=p)
+            x_perm, p = moe_permute(xr, ids, experts, sort=p)
             (dx,) = torch.autograd.grad(x_perm, xr, d_perm[:r].contiguous())
             yr, wr = (
                 y_perm[:r].contiguous().requires_grad_(),
@@ -593,10 +591,10 @@ def test_exact_rows(hidden=64):
             assert x_perm.shape[0] == r
         assert all(
             _same_bits(a, b) for a, b in zip(*got)
-        ), f"exact rows differ from the upper-bound plan: N {n} E {experts} {dist}"
+        ), f"exact rows differ from the upper-bound sort: N {n} E {experts} {dist}"
 
 
-# A source larger than this (OPUS_MOE_PERMUTE_LLC_BYTES) is loaded non-temporal: different code from there on,
+# A source larger than this (OPUS_MOE_TOKEN_REORDER_LLC_BYTES) is loaded non-temporal: different code from there on,
 # and the small shapes do not reach it.
 STREAM_BYTES = 256 << 20
 
@@ -618,37 +616,35 @@ def test_large_buffers(hidden=6144, n=350000, experts=32):
 
 
 def test_api_rejects_bad_inputs():
-    rows = moe_permute_rows(64, 32)
-    plan = moe_permute_plan(make_expert_ids(64, 32, "uniform"), 32, exact=False)
+    rows = moe_sort_rows(64, 32)
+    sort = moe_sort(make_expert_ids(64, 32, "uniform"), 32, exact=False)
     for bad in (
-        lambda: moe_permute(torch.zeros(64, 64), None, 32, plan=plan),  # fp32 x
+        lambda: moe_permute(torch.zeros(64, 64), None, 32, sort=sort),  # fp32 x
         lambda: moe_permute(
-            torch.zeros(63, 64, dtype=dtypes.bf16), None, 32, plan=plan
+            torch.zeros(63, 64, dtype=dtypes.bf16), None, 32, sort=sort
         ),  # tokens
         lambda: moe_permute(
-            torch.zeros(64, 60, dtype=dtypes.bf16), None, 32, plan=plan
+            torch.zeros(64, 60, dtype=dtypes.bf16), None, 32, sort=sort
         ),  # H % 8
         lambda: moe_unpermute(
-            torch.zeros(rows - 1, 64, dtype=dtypes.bf16), plan, torch.zeros(64)
+            torch.zeros(rows - 1, 64, dtype=dtypes.bf16), sort, torch.zeros(64)
         ),
         lambda: moe_unpermute(
             torch.zeros(rows, 64, dtype=dtypes.bf16),
-            plan,
+            sort,
             torch.zeros(64, dtype=dtypes.bf16),
         ),
         lambda: moe_unpermute(
-            torch.zeros(rows, 64, dtype=dtypes.bf16), plan, torch.zeros(63)
+            torch.zeros(rows, 64, dtype=dtypes.bf16), sort, torch.zeros(63)
         ),  # weights per token
         lambda: moe_unpermute(
-            torch.zeros(rows, 64, dtype=dtypes.bf16), plan, torch.zeros(32, 2)
+            torch.zeros(rows, 64, dtype=dtypes.bf16), sort, torch.zeros(32, 2)
         ),  # top-k weights
-        lambda: moe_permute_plan(torch.zeros(64, dtype=torch.int64), 32),
-        lambda: moe_permute_plan(
-            torch.zeros(64, 8, dtype=torch.int32), 32
-        ),  # top-k ids
-        lambda: moe_permute_plan(torch.zeros(64, dtype=torch.int32), 0),
-        lambda: moe_permute_plan(
-            torch.zeros(64, dtype=torch.int32), mp.PLAN_MAX_EXPERTS + 1
+        lambda: moe_sort(torch.zeros(64, dtype=torch.int64), 32),
+        lambda: moe_sort(torch.zeros(64, 8, dtype=torch.int32), 32),  # top-k ids
+        lambda: moe_sort(torch.zeros(64, dtype=torch.int32), 0),
+        lambda: moe_sort(
+            torch.zeros(64, dtype=torch.int32), mp.SORT_MAX_EXPERTS + 1
         ),  # experts
     ):
         try:
@@ -674,7 +670,7 @@ def main():
         )
         return
     test_api_rejects_bad_inputs()
-    test_plan_grid()
+    test_sort_grid()
     test_exact_rows()
     test_small_shapes()
     test_stream_shapes()

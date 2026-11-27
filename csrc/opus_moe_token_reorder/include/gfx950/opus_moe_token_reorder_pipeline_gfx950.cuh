@@ -3,7 +3,7 @@
 #pragma once
 
 // __HIP_DEVICE_COMPILE__.
-#include "opus_moe_permute_traits_gfx950.cuh"
+#include "opus_moe_token_reorder_traits_gfx950.cuh"
 #include <hip/hip_runtime.h>
 
 // K4 / K5 round a product to fp32 before anything is added to it: never contract a * b + c into an FMA.
@@ -292,8 +292,8 @@ __device__ inline auto make_layout_lds_expert(int expert) {
 }
 
 // Launch 1: counts[e][block] = tokens of the block with expert e.
-__device__ __forceinline__ void plan_count_body(const opus_moe_permute_plan_kargs& k) {
-    using T = plan_traits;
+__device__ __forceinline__ void sort_count_body(const opus_moe_sort_kargs& k) {
+    using T = sort_traits;
     const int tid = opus::thread_id_x();
     const int wave_id = tid / T::WARP_SIZE, lane_id = tid % T::WARP_SIZE;
     const unsigned block = opus::block_id_x();
@@ -341,14 +341,14 @@ __device__ __forceinline__ void plan_count_body(const opus_moe_permute_plan_karg
     }
 }
 
-__global__ void __launch_bounds__(workgroup_traits::BLOCK_SIZE) moe_permute_plan_count(opus_moe_permute_plan_kargs k) {
-    plan_count_body(k);
+__global__ void __launch_bounds__(workgroup_traits::BLOCK_SIZE) moe_sort_count(opus_moe_sort_kargs k) {
+    sort_count_body(k);
 }
 
 // Launch 2: the row of every token. The workgroups behind the token blocks are fill workgroups (8 experts each):
 // group_rows and the -1 of the padding rows.
-__device__ __forceinline__ void plan_rows_body(const opus_moe_permute_plan_kargs& k) {
-    using T = plan_traits;
+__device__ __forceinline__ void sort_rows_body(const opus_moe_sort_kargs& k) {
+    using T = sort_traits;
     const int tid = opus::thread_id_x();
     const int wave_id = tid / T::WARP_SIZE, lane_id = tid % T::WARP_SIZE;
     const unsigned block = opus::block_id_x();
@@ -482,8 +482,8 @@ __device__ __forceinline__ void plan_rows_body(const opus_moe_permute_plan_kargs
     }
 }
 
-__global__ void __launch_bounds__(workgroup_traits::BLOCK_SIZE) moe_permute_plan_rows(opus_moe_permute_plan_kargs k) {
-    plan_rows_body(k);
+__global__ void __launch_bounds__(workgroup_traits::BLOCK_SIZE) moe_sort_rows(opus_moe_sort_kargs k) {
+    sort_rows_body(k);
 }
 
 } // namespace opus_moe_permute

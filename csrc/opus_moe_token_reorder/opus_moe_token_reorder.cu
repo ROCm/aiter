@@ -2,11 +2,11 @@
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // gfx950 MoE token permute / unpermute: host checks and launches. Device code:
-// include/gfx950/opus_moe_permute_pipeline_gfx950.cuh.
+// include/gfx950/opus_moe_token_reorder_pipeline_gfx950.cuh.
 
-#include "opus_moe_permute.h"
+#include "opus_moe_token_reorder.h"
 
-#include "gfx950/opus_moe_permute_pipeline_gfx950.cuh"
+#include "gfx950/opus_moe_token_reorder_pipeline_gfx950.cuh"
 
 #include "aiter_hip_common.h"
 #include "aiter_stream.h"
@@ -17,7 +17,7 @@ namespace {
 
 using namespace opus_moe_permute;
 
-constexpr int64_t VEC = OPUS_MOE_PERMUTE_VEC;
+constexpr int64_t VEC = OPUS_MOE_TOKEN_REORDER_VEC;
 
 inline bool is_rows(const aiter_tensor_t& t) {
     // a row is addressed with 32-bit byte offsets, a buffer [rows, H] of any size with one 64-bit base per row
@@ -41,7 +41,7 @@ inline void launch(Kernel kernel, int64_t workgroups, const Kargs& kargs, hipStr
 
 // A gather source is read once per call: non-temporal when it does not fit the last-level cache.
 inline int streams(const aiter_tensor_t& src) {
-    return src.size(0) * src.size(1) * 2 > OPUS_MOE_PERMUTE_LLC_BYTES;
+    return src.size(0) * src.size(1) * 2 > OPUS_MOE_TOKEN_REORDER_LLC_BYTES;
 }
 
 // K2 / K3 / K4: dst[b] = src[index[b]] (times weights[b]), one workgroup per row of dst.
@@ -68,7 +68,7 @@ inline void move_rows(Kernel kernel, const char* what, aiter_tensor_t& src, aite
 
 } // namespace
 
-void opus_moe_permute_plan(aiter_tensor_t& expert_ids,
+void opus_moe_sort(aiter_tensor_t& expert_ids,
                            aiter_tensor_t& counts,
                            aiter_tensor_t& reverse_sorted,
                            aiter_tensor_t& sorted_token_ids,
@@ -77,29 +77,30 @@ void opus_moe_permute_plan(aiter_tensor_t& expert_ids,
                            aiter_tensor_t& num_valid_ids) {
     const int64_t N = expert_ids.numel(), E = group_rows.numel(), R = sorted_token_ids.numel();
     AITER_CHECK(is_i32(expert_ids, N) && is_i32(reverse_sorted, N),
-                "moe_permute plan: expert_ids / reverse_sorted must be contiguous int32 [N]");
-    AITER_CHECK(is_i32(group_rows, E) && E > 0 && E <= OPUS_MOE_PERMUTE_PLAN_EXPERTS,
-                "moe_permute plan: group_rows must be contiguous int32 [E], E up to ", OPUS_MOE_PERMUTE_PLAN_EXPERTS);
+                "moe_sort: expert_ids / reverse_sorted must be contiguous int32 [N]");
+    AITER_CHECK(is_i32(group_rows, E) && E > 0 && E <= OPUS_MOE_SORT_EXPERTS,
+                "moe_sort: group_rows must be contiguous int32 [E], E up to ", OPUS_MOE_SORT_EXPERTS);
     // R: the most rows N tokens can take: N rounded up to GROUP_ALIGN, plus GROUP_ALIGN rows for every expert
     // but one (a multiple of GROUP_ALIGN). The rows in use are a multiple of GROUP_ALIGN and at least N, so fewer
     // than GROUP_ALIGN E rows are left past them: what the fill workgroups cover. The kernels write the two [R]
     // tables through views with 32-bit byte offsets.
-    const int64_t n_aligned = (N + OPUS_MOE_PERMUTE_GROUP_ALIGN - 1) / OPUS_MOE_PERMUTE_GROUP_ALIGN * OPUS_MOE_PERMUTE_GROUP_ALIGN;
+    const int64_t align = OPUS_MOE_TOKEN_REORDER_GROUP_ALIGN;
+    const int64_t n_aligned = (N + align - 1) / align * align;
     AITER_CHECK(is_i32(sorted_token_ids, R) && is_i32(grouped_layout, R) &&
-                    R == n_aligned + OPUS_MOE_PERMUTE_GROUP_ALIGN * (E - 1) && R < (1ll << 30),
-                "moe_permute plan: sorted_token_ids / grouped_layout must be contiguous int32 [N rounded up to 128, + 128 (E - 1)], below 2^30 rows");
-    const int64_t blocks = (N + OPUS_MOE_PERMUTE_PLAN_TOKENS - 1) / OPUS_MOE_PERMUTE_PLAN_TOKENS;
+                    R == n_aligned + align * (E - 1) && R < (1ll << 30),
+                "moe_sort: sorted_token_ids / grouped_layout must be contiguous int32 [N rounded up to 128, + 128 (E - 1)], below 2^30 rows");
+    const int64_t blocks = (N + OPUS_MOE_SORT_TOKENS - 1) / OPUS_MOE_SORT_TOKENS;
     const int64_t block_stride =
-        (blocks + OPUS_MOE_PERMUTE_PLAN_COUNT_BATCH - 1) / OPUS_MOE_PERMUTE_PLAN_COUNT_BATCH * OPUS_MOE_PERMUTE_PLAN_COUNT_BATCH;
+        (blocks + OPUS_MOE_SORT_COUNT_BATCH - 1) / OPUS_MOE_SORT_COUNT_BATCH * OPUS_MOE_SORT_COUNT_BATCH;
     AITER_CHECK(counts.dim() == 1 && is_i32(counts, counts.numel()) && counts.numel() >= block_stride * E,
-                "moe_permute plan: counts must be contiguous int32 [E * blocks rounded up to ", OPUS_MOE_PERMUTE_PLAN_COUNT_BATCH, "]");
-    AITER_CHECK(is_i32(num_valid_ids, 1), "moe_permute plan: num_valid_ids must be int32 [1]");
+                "moe_sort: counts must be contiguous int32 [E * blocks rounded up to ", OPUS_MOE_SORT_COUNT_BATCH, "]");
+    AITER_CHECK(is_i32(num_valid_ids, 1), "moe_sort: num_valid_ids must be int32 [1]");
     for (const aiter_tensor_t* t : {&counts, &reverse_sorted, &sorted_token_ids, &grouped_layout, &group_rows, &num_valid_ids})
-        AITER_CHECK(t->device_id == expert_ids.device_id, "moe_permute plan: all tensors must be on one device");
+        AITER_CHECK(t->device_id == expert_ids.device_id, "moe_sort: all tensors must be on one device");
 
     HipDeviceGuard device_guard(expert_ids.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
-    opus_moe_permute_plan_kargs k{};
+    opus_moe_sort_kargs k{};
     k.expert_ids = static_cast<const int*>(expert_ids.data_ptr());
     k.counts = static_cast<int*>(counts.data_ptr());
     k.reverse_sorted = static_cast<int*>(reverse_sorted.data_ptr());
@@ -110,9 +111,9 @@ void opus_moe_permute_plan(aiter_tensor_t& expert_ids,
     k.tokens = static_cast<int>(N), k.experts = static_cast<int>(E), k.rows = static_cast<int>(R);
     k.blocks = static_cast<int>(blocks);
     // rows launch: the token blocks, then the fill workgroups
-    const int64_t rows_grid = blocks + (E + OPUS_MOE_PERMUTE_PLAN_FILL_EXPERTS - 1) / OPUS_MOE_PERMUTE_PLAN_FILL_EXPERTS;
-    launch(moe_permute_plan_count, blocks, k, stream);
-    launch(moe_permute_plan_rows, rows_grid, k, stream);
+    const int64_t rows_grid = blocks + (E + OPUS_MOE_SORT_FILL_EXPERTS - 1) / OPUS_MOE_SORT_FILL_EXPERTS;
+    launch(moe_sort_count, blocks, k, stream);
+    launch(moe_sort_rows, rows_grid, k, stream);
 }
 
 void opus_moe_permute_fwd(aiter_tensor_t& x, aiter_tensor_t& sorted_token_ids, aiter_tensor_t& x_perm) {

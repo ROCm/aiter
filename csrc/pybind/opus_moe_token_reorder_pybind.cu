@@ -2,12 +2,12 @@
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "rocm_ops.hpp"
 #include "aiter_stream.h"
-#include "opus_moe_permute.h"
+#include "opus_moe_token_reorder.h"
 
 PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     AITER_SET_STREAM_PYBIND
-    m.def("opus_moe_permute_plan", &opus_moe_permute_plan, py::arg("expert_ids"), py::arg("counts"),
+    m.def("opus_moe_sort", &opus_moe_sort, py::arg("expert_ids"), py::arg("counts"),
           py::arg("reverse_sorted"), py::arg("sorted_token_ids"), py::arg("grouped_layout"), py::arg("group_rows"),
           py::arg("num_valid_ids"));
     m.def("opus_moe_permute_fwd", &opus_moe_permute_fwd, py::arg("x"), py::arg("sorted_token_ids"), py::arg("x_perm"));
