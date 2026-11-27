@@ -77,7 +77,7 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.benchmark_reporting import print_json_table
-from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 HC = 4
@@ -437,7 +437,7 @@ def flydsl_bytes_moved(m, hidden_size, mode):
 @benchmark()
 def test_mhc_fused_post_pre_delayed(m, hidden_size=5120, mode="post", seed=0):
     inp = make_inputs(m, hidden_size, seed=seed)
-    ret = {"gfx": get_gfx()}
+    ret = {"gfx": get_gfx_runtime()}
     ok = True
     # ASM, Triton and aiter's unfused ops: hidden_size 5120 with the post block only.
     if mode != "no_post" and aiter.mhc_fused_post_pre_delayed_asm_supported(
@@ -575,7 +575,7 @@ def test_mhc_seam_fused_part(m, kernel="fused", seed=0):
     guard = bool((buf[n:] == -7.0).all())
     tflops, tbs = perf(m, hidden_size, us)
     return {
-        "gfx": get_gfx(),
+        "gfx": get_gfx_runtime(),
         "kernel": kernel,
         "us": us,
         "TFLOPS": tflops,
@@ -992,7 +992,9 @@ def check_flydsl_norm_paths(seed):
     failed = 0
     for m in (37, 333, 1024):
         for norm in ("fused", "separate"):
-            cfg = get_mhc_seam_config(m, 5120, get_gfx(), get_cu_num(), norm=norm)
+            cfg = get_mhc_seam_config(
+                m, 5120, get_gfx_runtime(), get_cu_num(), norm=norm
+            )
             inp = make_inputs(m, 5120, seed=seed + m)
             call, args = seam_flydsl(inp, "post", config=dict(cfg, NORM=norm))
             tag = f"m={m} NORM={norm} "
@@ -1238,7 +1240,7 @@ def flydsl_config_error(m, hidden_size, mode, config):
             cfg["BLOCK_M"],
             cfg["CHUNK_C"],
             cfg["SPLITS"],
-            lds_bytes=get_lds_capacity_bytes(get_gfx()),
+            lds_bytes=get_lds_capacity_bytes(get_gfx_runtime()),
             fast_fp_math=cfg["FAST_FP_MATH"],
             fast_narrow=cfg["FAST_NARROW"],
         )
@@ -1333,7 +1335,7 @@ def check_flydsl_input_errors(hidden_size):
     from aiter.jit.utils.chip_info import get_cu_num
     from aiter.ops.flydsl.mhc_seam_kernels import get_mhc_seam_config
 
-    policy = get_mhc_seam_config(m, hidden_size, get_gfx(), get_cu_num())
+    policy = get_mhc_seam_config(m, hidden_size, get_gfx_runtime(), get_cu_num())
     tile = {"BLOCK_M": policy["BLOCK_M"], "CHUNK_C": policy["CHUNK_C"]}
     bad_splits = next(
         sp
@@ -1413,10 +1415,10 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
-    if get_gfx() != "gfx942":
+    if get_gfx_runtime() != "gfx942":
         aiter.logger.warning(
             "the ASM and FlyDSL delayed seams run on gfx942 only, skipping on %s",
-            get_gfx(),
+            get_gfx_runtime(),
         )
         return 0
 
