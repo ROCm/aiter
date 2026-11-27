@@ -21,7 +21,7 @@ from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
 from .. import buffer_ops
 from ..mxfp4_gemm_common import _lds_ptr3
-from ..tensor_shim import GTensor, _run_compiled
+from ..tensor_shim import GTensor, _run_compiled, buf_base_i64, ptr_arg
 
 Vec = fx.Vector
 
@@ -208,7 +208,7 @@ def _build_kernel(ctx_stride: int):
     @flyc.kernel(name=kernel_name, known_block_size=[THREADS, 1, 1])
     def kernel(
         Q: fx.Tensor,
-        KV_cache: fx.Tensor,
+        KV_cache: fx.Pointer,
         weights: fx.Tensor,
         out_logits: fx.Tensor,
         context_lens: fx.Tensor,
@@ -233,7 +233,7 @@ def _build_kernel(ctx_stride: int):
         pid_split = udiv(bid, batch_size)
 
         q_t = GTensor(Q, dtype=T.i32, shape=(-1,))
-        kv_t = GTensor(KV_cache, dtype=T.i32, shape=(-1,))
+        kv_base = buf_base_i64(KV_cache)
         w_t = GTensor(weights, dtype=T.i32, shape=(-1,))
         context_t = GTensor(context_lens, dtype=T.i32, shape=(-1,))
         table_t = GTensor(kv_indices, dtype=T.i32, shape=(-1,))
@@ -315,15 +315,17 @@ def _build_kernel(ctx_stride: int):
 
         def _copy_page(bank_base, page, copy_tid, copy_threads, reps):
             physical = _load_physical(page)
+            page_base = kv_base + fx.Int64(fx.Uint32(physical)) * fx.Int64(PAGE_BYTES)
+            page_rsrc = buffer_ops.create_buffer_resource_from_addr(page_base)
             for rep in range_constexpr(reps):
                 ci = copy_tid + rep * copy_threads
                 pred = ci < PAGE_CHUNKS
 
-                def _copy(_chunk=ci, _physical=physical):
+                def _copy(_chunk=ci, _rsrc=page_rsrc):
                     _issue_dma(
-                        kv_t.rsrc,
+                        _rsrc,
                         bank_base + _chunk * 16,
-                        _physical * PAGE_BYTES + _chunk * 16,
+                        _chunk * 16,
                         aux=2,
                     )
 
@@ -543,6 +545,10 @@ def flydsl_fp8_paged_mqa_logits(
         raise ValueError(f"q_fp8 must be native FP8 E4M3, got {q_fp8.dtype}")
     if kv_cache.dtype != torch.uint8 or not kv_cache.is_contiguous():
         raise ValueError("kv_cache must be contiguous preshuffled uint8 FP8 data")
+    if kv_cache.device != q_fp8.device:
+        raise ValueError(f"kv_cache must be on {q_fp8.device}, got {kv_cache.device}")
+    if kv_cache.data_ptr() % 16 != 0:
+        raise ValueError("kv_cache base pointer must be 16-byte aligned")
     _, block_size, one, index_dim = kv_cache.shape
     if (block_size, one, index_dim) != (KV_BLOCK_SIZE, 1, INDEX_DIM):
         raise ValueError(f"unexpected KV cache shape {tuple(kv_cache.shape)}")
@@ -611,7 +617,7 @@ def flydsl_fp8_paged_mqa_logits(
         _run_compiled(
             launcher,
             q_fp8,
-            kv_cache.reshape(-1),
+            ptr_arg(kv_cache, fx.Int32),
             weights,
             out_logits,
             context_lens,

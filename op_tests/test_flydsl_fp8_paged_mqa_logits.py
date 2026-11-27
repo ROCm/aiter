@@ -30,11 +30,12 @@ import random
 from typing import NamedTuple
 
 import pandas as pd
+import pytest
 import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops.flydsl import flydsl_fp8_paged_mqa_logits
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_common import benchmark, checkAllclose, run_perftest
@@ -699,11 +700,10 @@ def test_fp8_paged_mqa_logits_wide_out(batch, kv_len, kv_block_size=KV_BLOCK_SIZ
     )
 
 
-@benchmark()
-def test_fp8_paged_mqa_logits_big_cache(batch, kv_len, kv_block_size):
-    """A KV pool past 2 GiB: pages scattered over it need 64-bit cache offsets."""
+def _prepare_big_cache_case(batch, kv_len, kv_block_size):
+    """Build a >4 GiB KV pool where scattered pages need 64-bit cache offsets."""
     page_bytes = kv_block_size * INDEX_DIM
-    pool_blocks = (5 << 30) // (2 * page_bytes)  # ~2.5 GiB of FP8 pages
+    pool_blocks = (9 << 30) // (2 * page_bytes)  # ~4.5 GiB of FP8 pages
     inp = _build_inputs(
         batch,
         1,
@@ -714,7 +714,7 @@ def test_fp8_paged_mqa_logits_big_cache(batch, kv_len, kv_block_size):
         block_size=kv_block_size,
         pool_blocks=pool_blocks,
     )
-    assert inp.kv_cache_fp8.numel() > (1 << 31)
+    assert inp.kv_cache_fp8.numel() > (1 << 32)
     kv_cache_kernel, out = _kernel_inputs(inp, batch, 1, HEAD_DIM)
     ref = run_torch(
         inp.q,
@@ -725,6 +725,36 @@ def test_fp8_paged_mqa_logits_big_cache(batch, kv_len, kv_block_size):
         inp.max_model_len,
         inp.fp8_dtype,
         block_size=kv_block_size,
+    )
+    return inp, kv_cache_kernel, out, ref
+
+
+def _check_fp8_paged_mqa_logits_big_cache(batch, kv_len, kv_block_size):
+    """Untimed correctness check for a KV pool past 2 GiB."""
+    inp, kv_cache_kernel, out, ref = _prepare_big_cache_case(
+        batch, kv_len, kv_block_size
+    )
+    out.fill_(float("-inf"))
+    with torch.inference_mode():
+        flydsl_fp8_paged_mqa_logits(
+            inp.q_fp8,
+            kv_cache_kernel,
+            inp.weights,
+            out,
+            inp.context_lens,
+            inp.block_tables,
+            inp.max_model_len,
+            Preshuffle=True,
+            KVBlockSize=kv_block_size,
+        )
+    _grade(ref, out, "flydsl: paged big_cache")
+
+
+@benchmark()
+def _bench_fp8_paged_mqa_logits_big_cache(batch, kv_len, kv_block_size):
+    """A KV pool past 2 GiB: pages scattered over it need 64-bit cache offsets."""
+    inp, kv_cache_kernel, out, ref = _prepare_big_cache_case(
+        batch, kv_len, kv_block_size
     )
 
     def flydsl():
@@ -747,6 +777,16 @@ def test_fp8_paged_mqa_logits_big_cache(batch, kv_len, kv_block_size):
     return _time_candidates(
         {"flydsl": (flydsl, out)}, ref, flops, nbytes, "paged big_cache"
     )
+
+
+@pytest.mark.parametrize("batch,kv_len,kv_block_size", [(1, 8192, 64)])
+def test_fp8_paged_mqa_logits_big_cache(batch, kv_len, kv_block_size):
+    """A KV pool past 2 GiB: pages scattered over it need 64-bit cache offsets."""
+    pytest.importorskip("flydsl")
+    gfx = get_gfx_runtime()
+    if gfx not in SUPPORTED_GFX:
+        pytest.skip(f"fp8_paged_mqa_logits unsupported on {gfx}")
+    _check_fp8_paged_mqa_logits_big_cache(batch, kv_len, kv_block_size)
 
 
 def _summarize(name, rows):
@@ -1024,8 +1064,8 @@ def main():
         "--big-cache-batch",
         type=int,
         nargs="*",
-        default=[4] if get_gfx() == "gfx1250" else [],
-        help="Batch for the >2 GiB KV-pool table (gfx1250).",
+        default=[4] if get_gfx_runtime() in ("gfx950", "gfx1250") else [],
+        help="Batch for the >2 GiB KV-pool table.",
     )
     parser.add_argument(
         "--hist-nq",
@@ -1102,7 +1142,7 @@ def main():
         _summarize("fp8_paged_mqa_logits_wide_out", wide)
 
     big = [
-        test_fp8_paged_mqa_logits_big_cache(batch, 8192, kvb)
+        _bench_fp8_paged_mqa_logits_big_cache(batch, 8192, kvb)
         for kvb, batch in itertools.product(kvbs, args.big_cache_batch)
     ]
     if big:
