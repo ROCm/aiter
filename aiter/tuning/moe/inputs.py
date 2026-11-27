@@ -3,6 +3,7 @@
 
 """Input generators of the fused MoE tuner: weights, routing and per-stage data."""
 
+import hashlib
 import os
 
 import torch
@@ -59,6 +60,88 @@ _GEN_DATA_1STAGE_KEYS = [
     "w1_scale_shuffled",  # 19
     "w2_scale_shuffled",  # 20
 ]
+
+
+def _balanced_topk_ids(token, global_e, topk, seed, device):
+    """Balanced routing of amd_moe_bench_share/bench_moe.py make_input().
+
+    Tokens take ``topk`` experts at a time from a stream of random permutations
+    of the ``global_e`` experts, so every token picks distinct experts and the
+    global expert loads differ by at most one. When ``global_e % topk == 0``
+    the ids equal the bench's for the same ``seed``; otherwise a token spanning
+    two permutations takes the rest of one and the first experts of the next
+    that it does not already hold.
+    """
+    if topk > global_e:
+        raise ValueError(f"topk={topk} exceeds the {global_e} global experts")
+    text = f"routes|{seed}|{global_e}|{topk}|{token}"
+    digest = hashlib.sha256(text.encode()).digest()[:8]
+    route_seed = int.from_bytes(digest, "little") & ((1 << 63) - 1)
+    gen = torch.Generator(device=device).manual_seed(route_seed)
+    ids = torch.empty((token, topk), dtype=dtypes.i32, device=device)
+    slots = torch.arange(topk, device=device)[None, :]
+    carry = slots.new_empty(0)
+    start = 0
+    while start < token:
+        perm = torch.randperm(global_e, generator=gen, device=device)
+        if carry.numel():
+            held = torch.isin(perm, carry)
+            perm = torch.cat((perm[~held], perm[held]))
+            head = topk - carry.numel()
+            ids[start] = torch.cat((carry, perm[:head]))
+            perm = perm[head:]
+            start += 1
+        count = min(perm.numel() // topk, token - start)
+        block = perm[: count * topk].reshape(count, topk)
+        offsets = torch.randint(0, topk, (count, 1), generator=gen, device=device)
+        ids[start : start + count] = torch.gather(block, 1, (slots + offsets) % topk)
+        start += count
+        carry = perm[count * topk :]
+    return ids
+
+
+def _ep_route(inp, expert, topk, ep, seed=0):
+    """Routing of EP rank 0 after dispatch.
+
+    ``inp.shape[0]`` is the dispatch buffer row count, which equals the global
+    source token count. The source tokens route over the ``expert * ep`` global
+    experts as amd_moe_bench_share/bench_moe.py does (_balanced_topk_ids, route
+    weights 1/topk), and rank 0 owns global experts [0, expert). As in
+    op_tests/test_moe_ep.py --ep-mode real, the tokens that own at least one
+    local expert fill the first ``total_recv`` rows, and the remaining rows are
+    dead padding skipped through ``num_local_tokens``.
+    The routing depends only on the row count and ``seed``.
+    """
+    device = inp.device
+    token = inp.shape[0]
+    global_e = expert * ep
+    # One extra masked slot, so moe_sorting sees the runtime's global expert count.
+    expert_mask = torch.zeros(global_e + 1, dtype=dtypes.i32, device=device)
+    expert_mask[:expert] = 1
+    src_ids = _balanced_topk_ids(token, global_e, topk, seed, device)
+    recv = expert_mask[src_ids.long()].bool().any(dim=1)
+    total_recv = int(recv.sum().item())
+    # Padding routes to the masked slot; id 0 would be rank 0's local expert 0.
+    topk_ids = torch.full_like(src_ids, global_e)
+    topk_ids[:total_recv] = src_ids[recv]
+    topk_weights = torch.zeros((token, topk), dtype=dtypes.fp32, device=device)
+    topk_weights[:total_recv] = 1.0 / topk
+    is_local = expert_mask[topk_ids.long()].bool()
+    local_topk_ids = torch.where(is_local, topk_ids, -1)
+    num_local_tokens = torch.tensor([total_recv], dtype=dtypes.i32, device=device)
+    return topk_weights, topk_ids, local_topk_ids, expert_mask, num_local_tokens
+
+
+def _ep_route_stats(token, expert, topk, ep, seed):
+    """(total_recv, local_routes, active_experts) of _ep_route for ``seed``."""
+    inp = torch.empty((token, 16), dtype=dtypes.bf16)
+    _, _, local_topk_ids, _, num_local_tokens = _ep_route(inp, expert, topk, ep, seed)
+    local = local_topk_ids[local_topk_ids >= 0]
+    return (
+        int(num_local_tokens.item()),
+        int(local.numel()),
+        int(torch.unique(local).numel()),
+    )
 
 
 def weight_quant(

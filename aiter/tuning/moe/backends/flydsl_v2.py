@@ -8,7 +8,8 @@ import functools
 import torch
 
 import aiter
-from aiter import QuantType, dtypes
+from aiter import ActivationType, QuantType, dtypes
+from aiter.fused_moe import moe_sorting, torch_moe_stage1, torch_moe_stage2
 from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_BETA,
     DEFAULT_SITUV2_LINEAR_BETA,
@@ -19,7 +20,10 @@ from aiter.ops.flydsl.moe_kernels import (
     get_flydsl_stage1_kernels,
     get_flydsl_stage2_v2_kernels,
 )
+from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 from aiter.test_common import cosine_diff_compare
+from aiter.tuning.moe import mxfp4_v2_tune_utils as _v2u
+from aiter.tuning.moe.inputs import _ep_route
 from aiter.tuning.moe.mxfp4_v2_tune_utils import (
     build_v2_inputs as _v2_build_inputs,
 )
@@ -32,7 +36,170 @@ from aiter.tuning.moe.mxfp4_v2_tune_utils import (
 from aiter.tuning.moe.mxfp4_v2_tune_utils import (
     v2_stage1_sorted_ref as _v2_stage1_ref,
 )
+from aiter.utility import fp4_utils
 from aiter.utility.fp4_utils import moe_mxfp4_sort
+
+
+def _v2_gen_ep(
+    token,
+    model_dim,
+    inter_dim,
+    E,
+    topk,
+    ep,
+    ep_seed=0,
+    adtype="fp8",
+    b_dtype="fp4",
+    activation=ActivationType.Silu,
+    situ_beta=DEFAULT_SITUV2_BETA,
+    situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+):
+    """mxfp4_v2_tune_utils.gen() with EP routing (see _ep_route).
+
+    Builds only the fields the flydslv2 tasks read. ``topk_ids`` holds global
+    expert ids for the sort; the torch references use ``local_topk_ids``, where
+    remote routes and padding rows are -1.
+    """
+    torch.manual_seed(0)
+    inp = torch.randn((token, model_dim), dtype=dtypes.bf16) / 10
+    w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtypes.bf16) / 10
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtypes.bf16) / 10
+    topk_weights, topk_ids, local_topk_ids, expert_mask, num_local_tokens = _ep_route(
+        inp, E, topk, ep, ep_seed
+    )
+
+    w1_qt, w1_scale = _v2u.quant_w(w1, b_dtype)
+    w2_qt, w2_scale = _v2u.quant_w(w2, b_dtype)
+    a1_qt, a1_scale = _v2u.quant_a(inp, adtype)
+
+    a_deq = _v2u._a_deq(a1_qt, a1_scale, token, model_dim, adtype)
+    w1_deq = (
+        _v2u.dequant_w(w1_qt, w1_scale, b_dtype, E * inter_dim * 2, model_dim)
+        .view(E, inter_dim * 2, model_dim)
+        .to(dtypes.bf16)
+    )
+    w2_deq = (
+        _v2u.dequant_w(w2_qt, w2_scale, b_dtype, E * model_dim, inter_dim)
+        .view(E, model_dim, inter_dim)
+        .to(dtypes.bf16)
+    )
+    ref1 = torch_moe_stage1(
+        a_deq,
+        w1_deq,
+        w2_deq,
+        topk_weights,
+        local_topk_ids,
+        dtype=dtypes.bf16,
+        activation=activation,
+        quant_type=QuantType.No,
+        doweight=False,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+    )
+    ref2 = torch_moe_stage2(
+        ref1,
+        w1_deq,
+        w2_deq,
+        topk_weights,
+        local_topk_ids,
+        dtype=dtypes.bf16,
+        quant_type=QuantType.No,
+        doweight=True,
+    )
+    ref2_quantized = None
+    if b_dtype == "fp8":
+        a2_ref_q, a2_ref_scale = _v2u.quant_a(
+            ref1.contiguous().view(token * topk, inter_dim), adtype
+        )
+        a2_ref_deq = _v2u._a_deq(
+            a2_ref_q, a2_ref_scale, token * topk, inter_dim, adtype
+        ).view(token, topk, inter_dim)
+        ref2_quantized = torch_moe_stage2(
+            a2_ref_deq,
+            w1_deq,
+            w2_deq,
+            topk_weights,
+            local_topk_ids,
+            dtype=dtypes.bf16,
+            quant_type=QuantType.No,
+            doweight=True,
+        )
+
+    if b_dtype == "fp8":
+        w1_qt_shuf = shuffle_weight_a16w4(w1_qt, 16, True)
+        w1_scale_shuf = shuffle_scale_a16w4(w1_scale, E, True)
+        w2_qt_shuf = shuffle_weight_a16w4(w2_qt, 16, False)
+        w2_scale_shuf = fp4_utils.e8m0_shuffle(w2_scale)
+    else:
+        w1_qt_shuf, w1_scale_shuf = _v2u._baseline_w1_shuffle(
+            w1_qt, w1_scale, E, adtype
+        )
+        w2_qt_shuf = _v2u._mxfp4_shuffle_weight_a16w4(w2_qt, gate_up=False)
+        w2_scale_shuf = _v2u._mxfp4_shuffle_scale_a16w4(w2_scale, E, gate_up=False)
+    return {
+        "ref1": ref1,
+        "ref2": ref2,
+        "ref2_quantized": ref2_quantized,
+        "topk_ids": topk_ids,
+        "topk_weights": topk_weights,
+        "local_topk_ids": local_topk_ids,
+        "expert_mask": expert_mask,
+        "num_local_tokens": num_local_tokens,
+        "a1_qt": a1_qt,
+        "a1_scale": a1_scale,
+        "inp": inp,
+        "base": {
+            "w1_qt_shuf": w1_qt_shuf,
+            "w1_scale_shuf": w1_scale_shuf,
+            "w2_qt_shuf": w2_qt_shuf,
+            "w2_scale_shuf": w2_scale_shuf,
+        },
+        "adtype": adtype,
+        "stage2_adtype": adtype,
+        "b_dtype": b_dtype,
+    }
+
+
+def _v2_build_inputs_ep(d, model_dim, inter_dim, BM_S1):
+    """mxfp4_v2_tune_utils.build_v2_inputs() for _v2_gen_ep data.
+
+    Sorts through the runtime moe_sorting with the global expert count,
+    expert_mask and num_local_tokens, as fused_moe does under EP, so the
+    sorted buffers (and hence the GEMM grids) match the runtime sizes.
+    """
+    sti, swt, sei, cumsum, _ = moe_sorting(
+        d["topk_ids"],
+        d["topk_weights"],
+        d["expert_mask"].numel(),
+        model_dim,
+        dtypes.bf16,
+        BM_S1,
+        d["expert_mask"],
+        d["num_local_tokens"],
+    )
+    torch.cuda.synchronize()
+    max_sorted = sti.shape[0]
+    inter_cols = inter_dim if d["stage2_adtype"] == "fp8" else inter_dim // 2
+    isq = torch.zeros((max_sorted, inter_cols), dtype=torch.uint8)
+    isc_cols = inter_dim // 32
+    isr = (
+        (((max_sorted * ((2 * inter_dim) // 64) * 4) + isc_cols - 1) // isc_cols + 31)
+        // 32
+        * 32
+    )
+    iss = torch.zeros((isr, isc_cols), dtype=torch.uint8)
+    return {
+        "w2u8": _v2u._u8v(d["base"]["w2_qt_shuf"]),
+        "w2sc": _v2u._u8v(d["base"]["w2_scale_shuf"]),
+        "sei": sei,
+        "cumsum": cumsum,
+        "sti": sti,
+        "swt": swt,
+        "isq": isq,
+        "iss": iss,
+        "n": int(cumsum[0].item()),
+        "max_sorted": max_sorted,
+    }
 
 
 def generate_v2_stage1_data(
@@ -45,6 +212,8 @@ def generate_v2_stage1_data(
     adtype,
     b_dtype,
     act_type,
+    ep=0,
+    ep_seed=0,
     device="cuda",
 ):
     # Build the SAME inputs the runtime v2 gemm1 path consumes:
@@ -55,20 +224,39 @@ def generate_v2_stage1_data(
     # Generate on the GPU: the CPU fp4 packing of E x 2I x H weights takes
     # tens of minutes per shape at E=385.
     with torch.device(device):
-        d = _v2_gen(
-            token,
-            model_dim,
-            inter_dim,
-            expert,
-            topk,
-            blockM,
-            adtype=adtype,
-            b_dtype=b_dtype,
-            activation=act_type,
-            situ_beta=DEFAULT_SITUV2_BETA,
-            situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
-        )
-    v = _v2_build_inputs(d, token, model_dim, inter_dim, expert, topk, blockM)
+        if ep:
+            d = _v2_gen_ep(
+                token,
+                model_dim,
+                inter_dim,
+                expert,
+                topk,
+                ep,
+                ep_seed,
+                adtype=adtype,
+                b_dtype=b_dtype,
+                activation=act_type,
+                situ_beta=DEFAULT_SITUV2_BETA,
+                situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+            )
+        else:
+            d = _v2_gen(
+                token,
+                model_dim,
+                inter_dim,
+                expert,
+                topk,
+                blockM,
+                adtype=adtype,
+                b_dtype=b_dtype,
+                activation=act_type,
+                situ_beta=DEFAULT_SITUV2_BETA,
+                situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+            )
+    if ep:
+        v = _v2_build_inputs_ep(d, model_dim, inter_dim, blockM)
+    else:
+        v = _v2_build_inputs(d, token, model_dim, inter_dim, expert, topk, blockM)
     # Precompute the sorted A-scale here so it is NOT timed in the run func.
     a1_scale_sort = moe_mxfp4_sort(
         d["a1_scale"][:token, :].view(token, 1, -1),
@@ -94,7 +282,7 @@ def generate_v2_stage1_data(
         "isq": v["isq"],
         "n": v["n"],
         "ref1": d["ref1"],
-        "topk_ids": d["topk_ids"],
+        "topk_ids": d["local_topk_ids"] if ep else d["topk_ids"],
     }
 
 
@@ -162,22 +350,41 @@ def generate_v2_stage2_data(
     adtype,
     b_dtype,
     act_type,
+    ep=0,
+    ep_seed=0,
     device="cuda",
 ):
-    d = _v2_gen(
-        token,
-        model_dim,
-        inter_dim,
-        expert,
-        topk,
-        blockM,
-        adtype=adtype,
-        b_dtype=b_dtype,
-        activation=act_type,
-        situ_beta=DEFAULT_SITUV2_BETA,
-        situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
-    )
-    v = _v2_build_inputs(d, token, model_dim, inter_dim, expert, topk, blockM)
+    if ep:
+        d = _v2_gen_ep(
+            token,
+            model_dim,
+            inter_dim,
+            expert,
+            topk,
+            ep,
+            ep_seed,
+            adtype=adtype,
+            b_dtype=b_dtype,
+            activation=act_type,
+            situ_beta=DEFAULT_SITUV2_BETA,
+            situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+        )
+        v = _v2_build_inputs_ep(d, model_dim, inter_dim, blockM)
+    else:
+        d = _v2_gen(
+            token,
+            model_dim,
+            inter_dim,
+            expert,
+            topk,
+            blockM,
+            adtype=adtype,
+            b_dtype=b_dtype,
+            activation=act_type,
+            situ_beta=DEFAULT_SITUV2_BETA,
+            situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+        )
+        v = _v2_build_inputs(d, token, model_dim, inter_dim, expert, topk, blockM)
     _v2_populate_stage2(d, v, token, topk, blockM)
     return {
         "isq": v["isq"],
@@ -191,6 +398,8 @@ def generate_v2_stage2_data(
         "n": v["n"],
         "max_sorted": v["max_sorted"],
         "ref2": d["ref2_quantized"] if b_dtype == "fp8" else d["ref2"],
+        "expert_mask": d["expert_mask"] if ep else None,
+        "topk_ids": d["topk_ids"] if ep else None,
     }
 
 
@@ -206,6 +415,8 @@ def run_flydsl_v2_stage2_out(
     n,
     max_sorted,
     ref2,
+    expert_mask,
+    topk_ids,
     model_dim,
     inter_dim,
     expert,
@@ -214,6 +425,7 @@ def run_flydsl_v2_stage2_out(
 ):
     from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
 
+    is_ep = expert_mask is not None
     token = ref2.shape[0]
     epilog = kparams["epilog"]
     bm_s2 = kparams["tile_m"]
@@ -234,6 +446,9 @@ def run_flydsl_v2_stage2_out(
     gemm2_out = inter if epilog == "reduce" else (flat if epilog == "scatter" else out)
     if epilog != "reduce":
         out.zero_()
+    elif is_ep:
+        # As _flydsl_v2_stage2_wrapper: EP leaves remote-route slots unwritten.
+        inter.zero_()
     mxfp4_moe_gemm2(
         inter_sorted_quant=isq,
         inter_sorted_shuffled_scale=iss,
@@ -259,7 +474,11 @@ def run_flydsl_v2_stage2_out(
         epilog=epilog,
         SBM=sbm,
         persist=kparams["persist"],
-        n_sorted_padded=n,
+        # The runtime EP call passes no padded count, so the grid is the
+        # M_logical * topk upper bound rather than the valid sorted rows.
+        n_sorted_padded=None if is_ep else n,
+        is_ep=is_ep,
+        use_valid_token_count=is_ep,
         g2_scatter_lds_pairs=kparams.get("scatter_lds_pairs", False),
     )
     if epilog == "scatter":
@@ -287,7 +506,15 @@ def run_flydsl_v2_stage2_out(
     if epilog == "reduce":
         from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
 
-        _run_moe_reduction(inter, out, token, topk, model_dim)
+        _run_moe_reduction(
+            inter,
+            out,
+            token,
+            topk,
+            model_dim,
+            expert_mask=expert_mask,
+            topk_ids=topk_ids,
+        )
     return out
 
 
@@ -309,7 +536,7 @@ def run_v2_stage1_sorted_ref(ref1, topk_ids, sti, sei, n, token, inter_dim, bm_s
     )
 
 
-def gen_flydsl_v2_2stages_task(info, blockMs):
+def gen_flydsl_v2_2stages_task(info, blockMs, ep=0, ep_seed=0):
     tasks = []
     (
         _gfx,
@@ -398,6 +625,8 @@ def gen_flydsl_v2_2stages_task(info, blockMs):
                         adtype,
                         bdtype,
                         act_type,
+                        ep,
+                        ep_seed,
                     ),
                     run_flydsl_v2_stage1_out,
                     (
@@ -461,6 +690,8 @@ def gen_flydsl_v2_2stages_task(info, blockMs):
                         adtype,
                         bdtype,
                         act_type,
+                        ep,
+                        ep_seed,
                     ),
                     run_flydsl_v2_stage2_out,
                     (
@@ -476,6 +707,8 @@ def gen_flydsl_v2_2stages_task(info, blockMs):
                             "n",
                             "max_sorted",
                             "ref2",
+                            "expert_mask",
+                            "topk_ids",
                         ],
                         model_dim,
                         inter_dim,

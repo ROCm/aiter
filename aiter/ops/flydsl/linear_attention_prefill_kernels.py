@@ -18,10 +18,8 @@ import os
 import warnings
 from collections.abc import Sequence
 
-# NOTE: ``get_rocm_arch`` is side-effect-free and does NOT raise on
-# flydsl <0.2.0. The hidden-state kernel's ``>=0.2.0`` requirement is enforced
-# lazily in ``_get_or_compile_opt``, so importing this module for the prepare
-# wrapper alone still works on older flydsl.
+# NOTE: ``get_rocm_arch`` is called per launch, not at import: FlyDSL >= 0.5.1
+# raises when no GPU and no FLYDSL_GPU_ARCH name the target.
 import torch
 import triton
 from flydsl.runtime.device import get_rocm_arch
@@ -35,6 +33,7 @@ from ..triton._triton_kernels.gated_delta_net.utils import (
     prepare_num_chunks,
     prepare_rebased_cu_seqlens,
 )
+from .aot_launch import aot_factory
 from .kernels.gdr_prefill import compile_gdn_prepare
 from .kernels.tensor_shim import _run_compiled
 
@@ -137,11 +136,10 @@ def _hipeq_varlen_host_metadata(chunk_offsets: torch.Tensor) -> tuple[int, int]:
 
 
 # -- Hidden-state host wrapper (K5 opt kernel) ---------------------------
-_OPT_MIN_FLYDSL_VERSION = "0.2.0"
+def _is_gfx942() -> bool:
+    # gfx942 gate for SCHED_GFX942; normalize feature-suffixed arch strings first.
+    return get_rocm_arch().split(":")[0].startswith("gfx942")
 
-# gfx942 gate for SCHED_GFX942; normalize feature-suffixed arch strings first.
-_GFX_ARCH = get_rocm_arch().split(":")[0]
-_IS_GFX942 = _GFX_ARCH.startswith("gfx942")
 
 # Host-path knobs. Heavy dtype/shape/device audit is off by default; set
 # ``AITER_K5_OPT_CHECK=1`` to enable it. k/w/u must still be contiguous.
@@ -405,6 +403,7 @@ def _resolve_snapshot_dtype(snapshot_dtype, input_dtype):
     return resolved
 
 
+@aot_factory("chunk_gated_delta_h")
 @functools.cache
 def _get_or_compile_opt(
     K,
@@ -440,21 +439,9 @@ def _get_or_compile_opt(
     is gathered from an ``initial_state_indices[N]`` int32 array (with in-place
     final-state write-back into the same pool slot), mirroring the HIP kernel.
 
-    The hip compile module + its flydsl>=0.2.0 requirement are imported lazily
-    here, so importing this module for the prepare wrapper alone stays cheap
-    and works on older flydsl.
+    The kernel module is imported lazily here, so importing this module for the
+    prepare wrapper alone stays cheap.
     """
-    import flydsl
-    from packaging.version import Version
-
-    installed = Version(getattr(flydsl, "__version__", "0").split("+")[0])
-    if installed < Version(_OPT_MIN_FLYDSL_VERSION):
-        raise ImportError(
-            "FlyDSL K5 opt fork requires `flydsl` "
-            f">=`{_OPT_MIN_FLYDSL_VERSION}` (for the fx layout / "
-            f"tiled-copy API), but got `{getattr(flydsl, '__version__', 'unknown')}`."
-        )
-
     from .kernels.gdr_prefill import compile_chunk_gated_delta_h
 
     return compile_chunk_gated_delta_h(
@@ -795,7 +782,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
     # SCHED_GFX942 is only enabled on gfx942; other arches (incl. gfx950) pass
     # False, keeping their emitted code byte-identical, and it joins the
     # lru_cache key as a distinct compiled product.
-    launch_fn = _get_or_compile_opt(
+    launch_fn = _get_or_compile_opt.lazy(
         K,
         V,
         BT,
@@ -805,16 +792,16 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
         use_g,
         use_gk,
         use_h0,
-        output_final_state,
-        save_new_value,
+        bool(output_final_state),
+        bool(save_new_value),
         is_varlen,
         True,
         state_bf16=state_bf16,
         g_log2_scaled=g_log2_scaled,
         use_state_indices=use_state_indices,
-        sched_gfx942=_IS_GFX942,
-        g_head_major=g_head_major,
-        bf16_convert_trunc=bf16_convert_trunc,
+        sched_gfx942=_is_gfx942(),
+        g_head_major=bool(g_head_major),
+        bf16_convert_trunc=bool(bf16_convert_trunc),
         snapshot_bf16=snapshot_bf16,
     )
 

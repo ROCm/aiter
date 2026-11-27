@@ -59,10 +59,10 @@ sys.path.insert(0, str(REPO_ROOT))
 
 SNAPSHOT_ENV = "AITER_FMOE_CANDIDATE_SNAPSHOT"
 _SOURCE_DIRS = ("aiter", "csrc")
-# Blob of gemm_moe_tune.py at fb0b937e35, the last main commit that changed it.
+# Blob of gemm_moe_tune.py at 04500613c6, the last main commit that changed it.
 # Update it whenever that file changes, and take the snapshot again.
 _TUNER_PATH = "csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py"
-_BASE_TUNER_BLOB = "dd51167d8e6811b9eaceee9267a6ae1912c07b27"
+_BASE_TUNER_BLOB = "c57fc28b98a10274157c3a2803a037c4769e6359"
 # Version 1 kept only the tags; a snapshot in it has to be taken again.
 _FORMAT = 2
 

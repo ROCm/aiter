@@ -24,10 +24,15 @@ _TASK_PIDS = None
 _ROCPROFILER_ENV = ("ROCPROFILER_REGISTER_LIBRARY", "HSA_TOOLS_ROCPROFILER_V1_TOOLS")
 
 
-def _new_pool(parallel_num, task_start_times, task_pids, default_device=None):
+def clear_inherited_rocprofiler_env():
+    """Call before starting worker processes that run the torch profiler."""
     for name in _ROCPROFILER_ENV:
         os.environ.pop(name, None)
         os.unsetenv(name)
+
+
+def _new_pool(parallel_num, task_start_times, task_pids, default_device=None):
+    clear_inherited_rocprofiler_env()
     return mp.Pool(
         processes=parallel_num,
         initializer=_init_task_start_times,

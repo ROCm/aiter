@@ -106,6 +106,7 @@ from aiter.tuning.moe.compare import (
 )
 from aiter.tuning.moe.flydsl_gfx942 import tune_flydsl_gfx942
 from aiter.tuning.moe.inputs import (
+    _ep_route_stats,
     generate_asm_stage1,
     generate_data,
     generate_data_1stage,
@@ -256,6 +257,10 @@ class FmoeTuner(TunerCommon):
 
         if hasattr(fmoe_module, "cfg_2stages"):
             fmoe_module.cfg_2stages = None
+        # --run_config times the rows of the given table, also with
+        # AITER_FLYDSL_STAGE2_FP8=1: no row of the stage2 FP8 table replaces them.
+        if hasattr(fmoe_module, "cfg_2stages_stage2_fp8"):
+            fmoe_module.cfg_2stages_stage2_fp8 = ({}, {})
         if hasattr(fmoe_module, "get_2stage_cfgs"):
             fmoe_module.get_2stage_cfgs.cache_clear()
 
@@ -277,7 +282,7 @@ class FmoeTuner(TunerCommon):
             "--mxfp4-flydsl",
             action="store_true",
             required=False,
-            help="Tune the FlyDSL mxfp4 a4w4 port as a coupled (g1, g2) unit instead of the normal fmoe tuner.",
+            help="Tune FlyDSL MXFP4 A4W4/A8W4 as a coupled (g1, g2) pipeline.",
         )
         self.parser.add_argument(
             "--mxfp4-search-mode",
@@ -301,6 +306,26 @@ class FmoeTuner(TunerCommon):
             "gate/up clamp. Only CK "
             "2-stage candidates can clamp; results are tagged in a _tag column "
             "and must go to a separate tuned file (-o).",
+        )
+        self.parser.add_argument(
+            "--ep-size",
+            type=int,
+            default=0,
+            help="Tune every row on EP data: token is the dispatch buffer row "
+            "count (global tokens), expert the local expert count; routes span "
+            "expert * ep-size global experts with the balanced routing of "
+            "amd_moe_bench_share/bench_moe.py, and only rank 0's local routes "
+            "are computed, laid out as op_tests/test_moe_ep.py --ep-mode real "
+            "does. Tunes flydslv2 only, or with --mxfp4-flydsl MXMOE GEMM1 "
+            "with atomic/reduce layout GEMM2. 0 (default) keeps the dense data.",
+        )
+        self.parser.add_argument(
+            "--ep-seed",
+            type=int,
+            default=0,
+            help="With --ep-size: routing seed, as bench_moe.py --seed. With "
+            "the same seed, global expert count, topk and token, the routes "
+            "equal the bench's when the global expert count is a multiple of topk.",
         )
 
     def parse_args(self) -> argparse.Namespace:
@@ -330,6 +355,17 @@ class FmoeTuner(TunerCommon):
                 )
             if "_tag" not in self.columns:
                 self.columns = self.columns + ["_tag"]
+        args.ep_size = getattr(args, "ep_size", 0)
+        args.ep_seed = getattr(args, "ep_seed", 0)
+        if args.ep_size < 0:
+            self.parser.error("--ep-size must be >= 0")
+        if args.ep_seed and not args.ep_size:
+            self.parser.error("--ep-seed requires --ep-size")
+        if args.ep_size and (args.grouped_gemm or args.e2e_tune):
+            self.parser.error(
+                "--ep-size applies to the default fmoe tuner and --mxfp4-flydsl "
+                "only, not --grouped-gemm / --e2e_tune"
+            )
         if getattr(args, "fast_scan", False) and not self.SUPPORTS_FAST_SCAN:
             self.parser.error("--fast-scan requires --mxfp4-flydsl")
         if not hasattr(args, "fast_scan"):
@@ -940,6 +976,29 @@ class FmoeTuner(TunerCommon):
                 use_g1u1,
                 doweight_stage1,
             )
+            ep = args.ep_size
+            if ep:
+                if token < ep or token % ep:
+                    print(
+                        f"[ep] skip token={token}: EP{ep} dispatch buffer rows "
+                        f"are a positive multiple of {ep}"
+                    )
+                    continue
+                ep_seed = args.ep_seed
+                recv, routes, active = _ep_route_stats(token, expert, topk, ep, ep_seed)
+                print(
+                    f"[ep] token={token} seed={ep_seed}: total_recv={recv} "
+                    f"local_routes={routes} active_experts={active}/{expert}"
+                )
+                # Runtime EP rejects Opus stage2 configs (and the other families'
+                # EP paths are not modeled here), so EP mode tunes flydslv2 only.
+                ep_tasks = self.gen_flydsl_v2_2stages_task(info, blockMs, ep, ep_seed)
+                print(
+                    f"[ep] ep_size={ep}: {len(ep_tasks)} flydslv2 tasks, "
+                    f"TUNE_ONLY/OPUS_ONLY ignored"
+                )
+                tasks_ck.extend(ep_tasks)
+                continue
             _opus_only = os.environ.get("OPUS_ONLY", "0") == "1"
             # TUNE_ONLY: comma-list subset gate to isolate sources, e.g.
             #   TUNE_ONLY=flydsl  -> only gen_flydsl_2stages_task
@@ -2039,7 +2098,7 @@ def main():
         )
     elif use_mxfp4_flydsl:
         tuner = Mxfp4FlydslTuner(
-            "mxfp4FlydslTuner", key, resultList, "mxfp4 a4w4 flydsl port fmoe tuner"
+            "mxfp4FlydslTuner", key, resultList, "mxfp4 A4W4/A8W4 FlyDSL MoE tuner"
         )
     else:
         tuner = FmoeTuner("fmoeTuner", key, resultList + ["nt"], "fmoe tuner")

@@ -33,7 +33,7 @@ jobs:
   cpu-validation:
     if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'level01' }}
     name: README Level 0+1
-    runs-on: linux-aiter-mi35x-1
+    runs-on: linux-aiter-do-mi350x-dpx-1
     timeout-minutes: 45
     needs: ci_config
     env:
@@ -116,7 +116,7 @@ jobs:
   gpu-pipeline:
     if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'tune_pipeline' }}
     name: README Level 2 Pipeline
-    runs-on: linux-aiter-mi35x-1
+    runs-on: linux-aiter-do-mi350x-dpx-1
     timeout-minutes: 75
     needs: ci_config
     env:
@@ -199,7 +199,7 @@ jobs:
   gpu-run-config:
     if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'run_config' }}
     name: README Level 2 Run Config
-    runs-on: linux-aiter-mi35x-1
+    runs-on: linux-aiter-do-mi350x-dpx-1
     timeout-minutes: 120
     needs: ci_config
     env:

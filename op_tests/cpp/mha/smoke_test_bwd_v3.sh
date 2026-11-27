@@ -181,6 +181,39 @@ run_gfx950_hd192_128_bwd_v3() {
     done
 }
 
+# gfx942 hdim 192 + hdim_v 128: the hd192_128 pssk kernels, batch and group mode. a32 requests
+# (-v3_atomic_fp32=1) run them as well.
+run_gfx942_hd192_128_bwd_v3() {
+    hdim=192
+    hdim_v=128
+
+    for prec in "bf16" "fp16" ; do
+    for mode in 0 1 ; do
+    for v3_atomic_fp32 in 0 1 ; do
+    for v3_bf16_cvt in 0 1 2 ; do
+    for mask in 0 "t" "b" ; do
+    for perm in 0 1 ; do
+    for sq in 62 174 ; do
+    for sk in 65 174 ; do
+
+    if [ $prec = "fp16" ] && [ $v3_bf16_cvt -gt 0 ]; then
+        echo "skip fp16 with bf16_convert cases"
+        continue
+    fi
+
+    $EXE -prec=$prec -b=2 -h=4 -h_k=2 -d=$hdim -d_v=$hdim_v -s=$sq -s_k=$sk -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_atomic_fp32=$v3_atomic_fp32 -v3_bf16_cvt=$v3_bf16_cvt -mode=$mode -kname=$KNAME $COMMON_ARGS
+    $EXE -prec=$prec -b=1 -h=2 -d=$hdim -d_v=$hdim_v -s=$sq -s_k=$sk -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_atomic_fp32=$v3_atomic_fp32 -v3_bf16_cvt=$v3_bf16_cvt -mode=$mode -kname=$KNAME $COMMON_ARGS
+
+    done
+    done
+    done
+    done
+    done
+    done
+    done
+    done
+}
+
 # gfx950 sliding window kernels: top-left (t:) and bottom-right (b:) windows in batch and group mode
 run_gfx950_swa_tests() {
     for prec in "bf16" "fp16" ; do
@@ -204,6 +237,25 @@ run_gfx950_swa_tests() {
     done
 }
 
+# gfx1250 hdim 256 kernels: bf16, atomic32, no mask or bottom-right causal. -init=0, because at the
+# default init most of their dQ/dK/dV values are below the bf16 atol and a halved dQ can still pass.
+run_gfx1250_hd256_bwd_v3() {
+    for mode in 0 1 ; do
+    for perm in 0 1 ; do
+    for mask in 0 "b" ; do
+    for sq in 65 256 301 ; do
+    for sk in 63 256 700 ; do
+
+    $EXE -prec=bf16 -b=2 -h=4 -h_k=2 -d=256 -s=$sq -s_k=$sk -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_atomic_fp32=1 -init=0 -mode=$mode -kname=$KNAME $COMMON_ARGS
+    $EXE -prec=bf16 -b=2 -h=3 -d=256 -s=$sq -s_k=$sk -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_atomic_fp32=1 -init=0 -mode=$mode -kname=$KNAME $COMMON_ARGS
+
+    done
+    done
+    done
+    done
+    done
+}
+
 # usage: smoke_test_bwd_v3.sh [arch], arch defaults to the gfx target of the first GPU
 ARCH=${1:-$(rocminfo 2>/dev/null | grep -m1 -oE "gfx[0-9a-f]+")}
 case "$ARCH" in
@@ -211,6 +263,7 @@ case "$ARCH" in
         run_batch_mode_tests
         run_group_mode_tests
         run_swa_tests
+        run_gfx942_hd192_128_bwd_v3
         ;;
     gfx950)
         run_gfx950_bwd_v3
@@ -218,8 +271,11 @@ case "$ARCH" in
         run_gfx950_hd192_128_bwd_v3
         run_gfx950_swa_tests
         ;;
+    gfx1250)
+        run_gfx1250_hd256_bwd_v3
+        ;;
     *)
-        echo "unsupported arch '$ARCH', expected gfx942 or gfx950"
+        echo "unsupported arch '$ARCH', expected gfx942, gfx950 or gfx1250"
         exit 1
         ;;
 esac

@@ -21,6 +21,7 @@ from packaging.version import Version, parse
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
+from build_targets import base_gfx_arch
 from chip_info import _detect_native, get_gfx, get_gfx_list, get_gfx_runtime
 from cpp_extension import _jit_compile, executable_path, get_hip_version
 from file_baton import FileBaton
@@ -167,6 +168,11 @@ AITER_CONFIG_FMOE_SWIGLU_LIMIT = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_swiglu_limit_fmoe.csv",
 )
 
+AITER_CONFIG_FMOE_STAGE2_FP8 = os.getenv(
+    "AITER_CONFIG_FMOE_STAGE2_FP8",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_stage2_fp8_fmoe.csv",
+)
+
 # NVFP4 MoE kernel rows (aiter/ops/moe_nvfp4_dispatch.py)
 AITER_CONFIG_MOE_NVFP4 = os.getenv(
     "AITER_CONFIG_MOE_NVFP4",
@@ -276,6 +282,12 @@ AITER_CONFIG_DISPATCH_COMBINE_INTRANODE = os.getenv(
 AITER_CONFIG_MEGA_MOE_TP = os.getenv(
     "AITER_CONFIG_MEGA_MOE_TP",
     f"{AITER_ROOT_DIR}/aiter/configs/mega_moe_tp_tuned.csv",
+)
+
+# the small-M schedule's per-batch launch configs (row tile, CTAs, two-shot all-reduce)
+AITER_CONFIG_MEGA_MOE_TP_SM = os.getenv(
+    "AITER_CONFIG_MEGA_MOE_TP_SM",
+    f"{AITER_ROOT_DIR}/aiter/configs/mega_moe_tp_sm_tuned.csv",
 )
 
 AITER_CONFIG_MEGA_MOE_TP_BIGM = os.getenv(
@@ -402,6 +414,14 @@ class AITER_CONFIG:
         )
 
     @property
+    def AITER_CONFIG_FMOE_STAGE2_FP8_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_FMOE_STAGE2_FP8",
+            AITER_CONFIG_FMOE_STAGE2_FP8,
+            "tuned_stage2_fp8_fmoe",
+        )
+
+    @property
     def AITER_CONFIG_FHMOE_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_FHMOE", AITER_CONFIG_FHMOE, "tuned_fhmoe"
@@ -509,6 +529,14 @@ class AITER_CONFIG:
     def AITER_CONFIG_MEGA_MOE_TP_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_MEGA_MOE_TP", AITER_CONFIG_MEGA_MOE_TP, "mega_moe_tp_tuned"
+        )
+
+    @property
+    def AITER_CONFIG_MEGA_MOE_TP_SM_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_MEGA_MOE_TP_SM",
+            AITER_CONFIG_MEGA_MOE_TP_SM,
+            "mega_moe_tp_sm_tuned",
         )
 
     @property
@@ -1073,6 +1101,50 @@ def check_LLVM_MAIN_REVISION():
     return 554785 - 1
 
 
+@functools.lru_cache
+def check_hipblaslt_has_w4a16() -> bool:
+    """Whether the hipBLASLt headers declare the w4a16 API.
+
+    The version number cannot tell: hipBLASLt develop reported 1.5.0 before the
+    API existed. So compile the declarations module_hipbsolgemm uses instead.
+    """
+    import subprocess
+    import tempfile
+
+    probe_src = (
+        "#include <hipblaslt/hipblaslt.h>\n"
+        "int main() {\n"
+        "  hipblasLtInt4Encoding_t e = HIPBLASLT_INT4_ENCODING_UNSIGNED_BIAS8_EXT;\n"
+        "  return (int)e + (int)HIPBLASLT_MATMUL_DESC_A_INT4_ENCODING_EXT\n"
+        "         + (int)HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_16F_ZP_EXT;\n"
+        "}\n"
+    )
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".cpp", delete=False) as tf:
+        tf.write(probe_src)
+        probe_path = tf.name
+    try:
+        subprocess.check_output(
+            [
+                executable_path("hipcc"),
+                "-x",
+                "hip",
+                "-std=c++20",
+                "-fsyntax-only",
+                "-Wno-unused-command-line-argument",
+                probe_path,
+            ],
+            stderr=subprocess.STDOUT,
+        )
+    except (subprocess.CalledProcessError, AssertionError, FileNotFoundError):
+        return False
+    finally:
+        try:
+            os.remove(probe_path)
+        except OSError:
+            pass
+    return True
+
+
 def rename_cpp_to_cu(els, dst, hipify, recursive=False):
     def do_rename_and_mv(name, src, dst, ret):
         newName = name
@@ -1570,6 +1642,19 @@ def build_module(
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()
+        # If GPU_ARCHS has gfx1250 but the GPU is gfx1250-strict, also build for gfx1250-strict.
+        if "native" not in archs:
+            try:
+                runtime_arch = get_gfx_runtime()
+            except Exception:  # noqa: BLE001 -- no GPU visible: keep GPU_ARCHS
+                runtime_arch = None
+            if (
+                runtime_arch
+                and runtime_arch not in archs
+                and base_gfx_arch(runtime_arch) != runtime_arch
+                and base_gfx_arch(runtime_arch) in archs
+            ):
+                archs = archs + [runtime_arch]
         flags_hip += [f"--offload-arch={arch}" for arch in archs]
         flags_hip = sorted(set(flags_hip))  # remove same flags
         flags_hip = [el for el in flags_hip if hip_flag_checker(el)]

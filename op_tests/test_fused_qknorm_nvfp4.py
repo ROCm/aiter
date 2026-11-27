@@ -43,19 +43,31 @@ ONE_SIXTH = torch.tensor(1 / 6, dtype=torch.float32)
 
 
 def ref_quantize(x: torch.Tensor, gs: float):
-    """x fp32 [N, 128] -> (codes int64 [N, 128], e4m3 scale bytes uint8 [N, 8])."""
+    """x fp32 [N, 128] -> (codes int64 [N, 128], e4m3 scale bytes uint8 [N, 8]).
+
+    The kernel's fmaxf / fminf skip a NaN, so a NaN element does not count in the amax (and a NaN
+    scale, which a positive gs cannot give, would be 448); a NaN element then quantizes to code 0
+    with its own sign bit and an infinite one to the largest magnitude. gs must be positive and
+    normal: the kernel's arithmetic on fp32 subnormals is not modelled here."""
     g = x.view(-1, 8, 16)
     gs_t = torch.tensor(gs, dtype=torch.float32)
-    sf = (g.abs().amax(-1) * ONE_SIXTH.to(x.device) * (1.0 / gs_t)).clamp(max=448)
+    amax = torch.where(g.isnan(), torch.zeros_like(g), g.abs()).amax(-1)
+    sf = amax * ONE_SIXTH.to(x.device) * (1.0 / gs_t)
+    sf = torch.fmin(sf, torch.tensor(448.0, device=x.device))
     sf8 = sf.cpu().to(torch.float8_e4m3fn).to(x.device)  # RNE, in range
     sv = sf8.float()
     quant = torch.where(sv != 0, 1.0 / (sv * gs_t), torch.zeros((), device=x.device))
     y = g * quant[..., None]
-    dist = (y.abs()[..., None] - GRID.to(x.device)).abs()
+    # the nearest grid value, ties to the even code; a NaN is code 0 and an infinity the largest
+    # (past 6 the grid distances are no longer exact in fp32: saturate before measuring them)
+    fin = y.isfinite()
+    yf = torch.where(fin, y.abs(), torch.zeros_like(y)).clamp(max=6.0)
+    dist = (yf[..., None] - GRID.to(x.device)).abs()
     is_min = dist == dist.amin(-1, keepdim=True)
     ids = torch.arange(8, device=x.device)
-    even = torch.where(is_min & (ids % 2 == 0), ids, 8).amin(-1)
-    mag = torch.where(even < 8, even, dist.argmin(-1))
+    mag = torch.where(is_min & (ids % 2 == 0), ids, 8).amin(-1)
+    mag = torch.where(mag < 8, mag, dist.argmin(-1))
+    mag = torch.where(fin, mag, torch.where(y.isnan(), 0, 7))
     codes = mag | (torch.signbit(y).long() << 3)
     return codes.reshape(-1, 128), sf8.view(torch.uint8)
 
@@ -156,6 +168,39 @@ def stress_qkv(qkv, nq, nkv, niq):
     v[5, :, 4, 0] = 1.0
     v[6, :, 0] = 1e-3 * mid  # e4m3 subnormal scales
     v[7] = (torch.arange(16) - 7.5) * 0.7
+    if n < 16:
+        return
+    nan, inf = float("nan"), float("inf")
+    v[8, :, 0, 3] = nan  # a NaN next to live values: not in the amax
+    v[8, :, 1] = nan  # a NaN group: amax 0, scale 0
+    v[9, :, 2] = torch.tensor(
+        [inf, -inf] + [1.0] * 14
+    )  # infinities: scale 448, codes +-6
+    v[9, :, 3, 0] = -inf
+    v[10, :, 4] = torch.tensor([nan, -inf] + [0.5] * 14)  # NaN and an infinity together
+    v[11, :, 5] = -0.0  # a group of negative zeros
+    v[11, :, 6] = 1e-39  # bf16 subnormals: scale 0
+    # e4m3 scale ties: amax / 6 = 2^-10 (tie between 0 and the first subnormal, to 0) and
+    # 1.5 * 2^-10 (between the first two, to the even one), 2^-6 (the smallest normal)
+    for h, amax in enumerate(
+        (6 * 2.0**-10, 9 * 2.0**-10, 6 * 2.0**-6, 6 * 1.5 * 2.0**-9)
+    ):
+        v[12, :, h, 0] = amax
+        v[12, :, h, 1:] = -amax * torch.rand(15)
+    v[13, :, 0] = 3e38  # the largest bf16 magnitudes: scale 448, codes saturate
+    v[13, :, 1] = -3e38 * torch.rand(16)
+    # whatever bit patterns come: NaN, infinity, subnormal, both zeros, every exponent
+    g = torch.Generator().manual_seed(5)
+    for r in (14, 15):
+        bits = torch.randint(
+            -(2**15),
+            2**15,
+            (nkv, 8, 16),
+            generator=g,
+            dtype=torch.int16,
+            device="cpu",
+        )
+        v[r] = bits.view(torch.bfloat16)
 
 
 @benchmark()
@@ -387,6 +432,8 @@ REJECT = {  # name -> (kwargs of the op call, message of the refusal); a failed 
     "scale [2]": ({"k_scale": torch.ones(2)}, "one element each"),
     "block 16": ({"block": 16}, "block_size must be 128"),
     "aliased pages": ({"alias": True}, "page stride must be at least the page size"),
+    # a 4 B aligned stride would put the V 16 B loads / 64-bit atomics on misaligned addresses
+    "page stride 4 B aligned": ({"pad_stride": 4}, "(16 B aligned)"),
 }
 
 
@@ -408,6 +455,11 @@ def run_reject(name):
     kw.update(REJECT[name][0])
     block = kw.pop("block", PAGE)
     idx = torch.zeros(kw.pop("idx_bytes", 2 * HEAD_SIDE), dtype=torch.uint8)
+    pad = kw.pop("pad_stride", 0)
+    if pad:
+        kv = torch.zeros(2, 2 * nkv * HEAD_SIDE + pad, dtype=torch.uint8)[
+            :, : 2 * nkv * HEAD_SIDE
+        ]  # page stride 4 B above the page size
     if kw.pop("alias", False):
         kv = kv[:1].expand(2, -1)  # page stride 0: both pages are the same bytes
     aiter.fused_qknorm_idxrqknorm(
@@ -434,13 +486,75 @@ def test_reject():
     return "ok"
 
 
+def test_compile_fullgraph():
+    """The raw front's gate (`not torch.compiler.is_compiling() and _nvfp4_raw_front(...)`) must
+    not graph break under torch.compile(fullgraph=True): _nvfp4_raw_front itself calls
+    Tensor.data_ptr() / get_device(), which Dynamo cannot trace, so the `and` must short-circuit on
+    `is_compiling()` before reaching them. Isolates exactly the gate fused_qknorm_idxrqknorm.py:302
+    adds (the full op is not fullgraph-traceable regardless: fused_qknorm_idxrqknorm itself calls
+    get_gfx_runtime() a few lines below, a separate functools.lru_cache-wrapped, subprocess-backed
+    probe Dynamo always re-traces instead of honoring the cache -- out of scope here, not caused or
+    fixed by this change)."""
+    from aiter.ops.fused_qknorm_idxrqknorm import _nvfp4_raw_front
+
+    n, nkv, niq = 4, 1, 1
+    dtype = torch.bfloat16
+    qn, kn, iqn, ikn = (torch.randn(HEAD_DIM, dtype=dtype) * 0.1 for _ in range(4))
+    cos_sin = (torch.randn(8, 64, dtype=torch.float32) * 0.1).to(dtype)
+    pos = torch.zeros(n, dtype=torch.int64)
+    row = (16 + 2 * nkv + niq + 1) * HEAD_DIM
+    qkv = torch.randn(n, row, dtype=dtype)
+    slots = torch.arange(n, dtype=torch.int64)
+    kv = torch.zeros(2, 2 * nkv * HEAD_SIDE, dtype=torch.uint8)
+    idx = torch.zeros(2, HEAD_SIDE, dtype=torch.uint8)
+    ks, vs = torch.ones(1), torch.ones(1)
+    q_out = torch.zeros(n, 16 * HEAD_DIM, dtype=dtype)
+    iq_out = torch.zeros(n, niq * HEAD_DIM, dtype=torch.float8_e4m3fn)
+    args = (
+        qkv, qn, kn, cos_sin, pos, 1e-6, iqn, ikn, slots, kv, kv, idx, q_out, iq_out, slots, ks, vs,
+    )  # fmt: skip
+
+    # Under AITER_REBUILD=1, _nvfp4_raw_front declines (fused_qknorm_idxrqknorm.py:198-200) until
+    # the marshalled wrapper has rebuilt the module in *this* process; test_reject()'s rebuild runs
+    # in child processes and does not count here. Warm up one real call through the public op first
+    # -- the same way a real caller would reach the raw front -- so that precondition holds under
+    # any AITER_REBUILD setting before we probe the raw front directly below.
+    aiter.fused_qknorm_idxrqknorm(
+        qkv, qn, kn, cos_sin, pos, 16, nkv, 64, 1e-6, iqn, ikn, niq,
+        slots, kv, kv, idx, 128, q_out, iq_out, slots,
+        kv_cache_dtype="nvfp4", index_cache_dtype="nvfp4", k_scale=ks, v_scale=vs,
+    )  # fmt: skip
+    torch.cuda.synchronize()
+
+    # eager: this exact shape really does take the raw front (a meaningless test otherwise)
+    assert _nvfp4_raw_front(*args) is True
+
+    def gate(*a):
+        return bool(not torch.compiler.is_compiling() and _nvfp4_raw_front(*a))
+
+    compiled_gate = torch.compile(gate, fullgraph=True)
+    # compiling: the gate itself must decline without graph-breaking on data_ptr()/get_device()
+    assert compiled_gate(*args) is False
+    return "ok"
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="fused_qknorm_idxrqknorm nvfp4 pages vs the torch reference, byte for byte",
 )
-parser.add_argument("-t", "--tokens", type=int, nargs="*", default=[1, 7, 64, 300])
+parser.add_argument(
+    "-t", "--tokens", type=int, nargs="*", default=[1, 7, 64, 300, 1031, 6150]
+)
 parser.add_argument("-n", "--nkv", type=int, nargs="*", default=[1, 2, 4])
 parser.add_argument("--gs", type=float, nargs="*", default=[1.0, 0.37, 3.0])
+parser.add_argument(
+    "--special_gs",
+    type=float,
+    nargs="*",
+    default=[1e-30, 1e30],
+    help="global scales far from 1 (the e4m3 scale saturates at 448, or underflows to 0),\n"
+    "run on a few shapes (the sweep above keeps to ordinary scales)",
+)
 parser.add_argument(
     "--slots",
     type=str,
@@ -472,10 +586,20 @@ def main():
         )
         return
     aiter.logger.info("reject: %s", test_reject())
+    aiter.logger.info("compile fullgraph: %s", test_compile_fullgraph())
     cases = [
         (t, n, s, gs)
         for t, n, s, gs in itertools.product(args.tokens, args.nkv, args.slots, args.gs)
         if not (s in ("seq_gaps", "mtp") and t < 64)
+    ]
+    cases += [
+        (t, n, s, gs)
+        for gs, t, n, s in itertools.product(
+            args.special_gs,
+            (64,),  # the special V rows need 16 tokens
+            (1, 2),
+            ("scatter", "seq"),
+        )
     ]
     # the layouts the sweep above does not run: padded page stride, index-less (skip) layers
     cases += [

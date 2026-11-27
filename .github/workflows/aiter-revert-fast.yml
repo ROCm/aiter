@@ -1,6 +1,9 @@
 name: aiter-revert-fast
 
 on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+    branches: [main]
   workflow_dispatch:
     inputs:
       ref:
@@ -16,7 +19,7 @@ on:
         required: true
         type: choice
         options:
-          - linux-aiter-mi35x-1
+          - linux-aiter-do-mi350x-dpx-1
           - linux-aiter-oci-mi300x-1
           - linux-aiter-do-mi350x-8
           - linux-aiter-do-mi350x-dpx-8
@@ -34,29 +37,184 @@ permissions:
   contents: read
 
 concurrency:
-  group: aiter-revert-fast-${{ inputs.ref }}-${{ inputs.runner }}
+  group: aiter-revert-fast-${{ github.event.pull_request.number || inputs.ref }}-${{ inputs.runner || 'pr' }}
   cancel-in-progress: false
 
 jobs:
+  resolve:
+    name: Resolve focused validation inputs
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.resolve.outputs.enabled }}
+      ref: ${{ steps.resolve.outputs.ref }}
+      failed_run_id: ${{ steps.resolve.outputs.failed_run_id }}
+      runner: ${{ steps.resolve.outputs.runner }}
+      test_files: ${{ steps.resolve.outputs.test_files }}
+      mori_smoke: ${{ steps.resolve.outputs.mori_smoke }}
+      reason: ${{ steps.resolve.outputs.reason }}
+    steps:
+      - name: Resolve inputs
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || '' }}
+          DISPATCH_FAILED_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.failed_run_id || '' }}
+          DISPATCH_RUNNER: ${{ github.event_name == 'workflow_dispatch' && inputs.runner || '' }}
+          DISPATCH_TEST_FILES: ${{ github.event_name == 'workflow_dispatch' && inputs.test_files || '' }}
+          DISPATCH_MORI_SMOKE: ${{ github.event_name == 'workflow_dispatch' && inputs.mori_smoke && 'true' || 'false' }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_HEAD_REF: ${{ github.head_ref }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+
+          ALLOWED_RUNNERS = {
+              "linux-aiter-do-mi350x-dpx-1",
+              "linux-aiter-oci-mi300x-1",
+              "linux-aiter-do-mi350x-8",
+              "linux-aiter-do-mi350x-dpx-8",
+          }
+
+          def parse_metadata(body: str) -> dict[str, str]:
+              match = re.search(
+                  r"<!--\s*aiter-revert-fast\s*(.*?)\s*-->",
+                  body or "",
+                  flags=re.IGNORECASE | re.DOTALL,
+              )
+              if not match:
+                  return {}
+              data = {}
+              for raw_line in match.group(1).splitlines():
+                  line = raw_line.strip()
+                  if not line or ":" not in line:
+                      continue
+                  key, value = line.split(":", 1)
+                  data[key.strip().lower()] = value.strip()
+              return data
+
+          def parse_branch_metadata(head_ref: str) -> dict[str, str]:
+              data = {}
+              run_match = re.search(r"(?:^|/)revert-[0-9a-f]{7,40}-run-([0-9]+)", head_ref)
+              if run_match:
+                  data["failed_run_id"] = run_match.group(1)
+              for runner_name in ALLOWED_RUNNERS:
+                  if runner_name in head_ref:
+                      data["runner"] = runner_name
+                      break
+              tests_match = re.search(r"(?:^|[-_])tests[-_=]([A-Za-z0-9_.~+,-]+)", head_ref)
+              if tests_match:
+                  data["test_files"] = (
+                      tests_match.group(1)
+                      .replace("+", " ")
+                      .replace(",", " ")
+                      .replace("~", "/")
+                  )
+              if re.search(r"(?:^|[-_])mori(?:[-_]|$)|mori[-_]?smoke", head_ref):
+                  data["mori_smoke"] = "true"
+              return data
+
+          def normalize_test_files(raw: str) -> str:
+              return " ".join(token for token in re.split(r"[\s,]+", raw.strip()) if token)
+
+          def write_output(key: str, value: str) -> None:
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+                  if "\n" in value:
+                      print(f"{key}<<EOF", file=out)
+                      print(value, file=out)
+                      print("EOF", file=out)
+                  else:
+                      print(f"{key}={value}", file=out)
+
+          event_name = os.environ["EVENT_NAME"]
+          enabled = False
+          reason = "not_requested"
+          ref = os.environ.get("DISPATCH_REF", "").strip()
+          failed_run_id = os.environ.get("DISPATCH_FAILED_RUN_ID", "").strip()
+          runner = os.environ.get("DISPATCH_RUNNER", "").strip()
+          test_files = os.environ.get("DISPATCH_TEST_FILES", "").strip()
+          mori_smoke = os.environ.get("DISPATCH_MORI_SMOKE", "false").strip().lower()
+
+          if event_name == "workflow_dispatch":
+              enabled = True
+              reason = "workflow_dispatch"
+          else:
+              title = os.environ.get("PR_TITLE", "")
+              head_ref = os.environ.get("PR_HEAD_REF", "")
+              enabled = head_ref.startswith("aiter-bot/revert-") or bool(
+                  re.search(r"\[bot\s+revert\]", title, flags=re.IGNORECASE)
+              )
+              reason = "bot_revert_pr" if enabled else "not_bot_revert_pr"
+              ref = head_ref
+              meta = parse_branch_metadata(head_ref)
+              meta.update(parse_metadata(os.environ.get("PR_BODY", "")))
+              failed_run_id = meta.get("failed_run_id", "")
+              runner = meta.get("runner", "")
+              test_files = meta.get("test_files", "")
+              mori_smoke = meta.get("mori_smoke", "false").lower()
+
+          test_files = normalize_test_files(test_files)
+          if enabled and not runner:
+              raise SystemExit("revert-fast is enabled but runner is not specified")
+          if enabled and runner not in ALLOWED_RUNNERS:
+              raise SystemExit(f"unsupported revert-fast runner: {runner}")
+          if enabled and mori_smoke not in {"true", "false"}:
+              raise SystemExit("mori_smoke must be true or false")
+          if enabled and mori_smoke != "true" and not test_files:
+              raise SystemExit("revert-fast is enabled but neither test_files nor mori_smoke=true was provided")
+
+          write_output("enabled", str(enabled).lower())
+          write_output("ref", ref)
+          write_output("failed_run_id", failed_run_id)
+          write_output("runner", runner)
+          write_output("test_files", test_files)
+          write_output("mori_smoke", mori_smoke)
+          write_output("reason", reason)
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              print("## Aiter Revert-Fast Inputs", file=summary)
+              print("", file=summary)
+              print(f"- Enabled: {str(enabled).lower()}", file=summary)
+              print(f"- Reason: {reason}", file=summary)
+              print(f"- Ref: {ref or '-'}", file=summary)
+              print(f"- Failed run id: {failed_run_id or '-'}", file=summary)
+              print(f"- Runner: {runner or '-'}", file=summary)
+              print(f"- Test files: {test_files or '-'}", file=summary)
+              print(f"- Mori smoke: {mori_smoke}", file=summary)
+          PY
+
   ci_config:
+    needs: resolve
+    if: ${{ needs.resolve.outputs.enabled == 'true' }}
     uses: ./.github/workflows/ci-config.yaml
 
   focused:
-    name: Focused validation (${{ inputs.runner }})
-    needs: ci_config
-    runs-on: ${{ inputs.runner }}
+    name: Focused validation (${{ needs.resolve.outputs.runner }})
+    needs: [resolve, ci_config]
+    if: ${{ needs.resolve.outputs.enabled == 'true' }}
+    runs-on: ${{ needs.resolve.outputs.runner }}
     timeout-minutes: 120
     env:
       DOCKER_IMAGE: ${{ needs.ci_config.outputs.pytorch_py312_image }}
-      TEST_FILES: ${{ inputs.test_files }}
-      MORI_SMOKE: ${{ inputs.mori_smoke && 'true' || 'false' }}
-      FAILED_RUN_ID: ${{ inputs.failed_run_id }}
+      TEST_FILES: ${{ needs.resolve.outputs.test_files }}
+      MORI_SMOKE: ${{ needs.resolve.outputs.mori_smoke }}
+      FAILED_RUN_ID: ${{ needs.resolve.outputs.failed_run_id }}
     steps:
       - name: Checkout target ref
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ needs.resolve.outputs.ref }}
           persist-credentials: false
+
+      # The runners are persistent, so 3rdparty/ otherwise keeps whatever a
+      # previous job left behind and the JIT build compiles against a stale CK.
+      - name: Sync submodules
+        run: |
+          set -ex
+          git submodule sync
+          git submodule update --init --recursive --depth 1 --jobs 4
+          echo "CK commit: $(git -C 3rdparty/composable_kernel rev-parse HEAD)"
 
       - name: Docker login
         env:

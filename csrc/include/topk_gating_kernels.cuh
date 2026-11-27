@@ -112,6 +112,15 @@ inline bool topk_gating_vwave_arch()
     return cache.get_or_create(device, []() { return get_gpu_arch() == "gfx1250"; });
 }
 
+// The wave64 single-wave path is measured on gfx950 only.
+inline bool topk_gating_gfx950_vwave_arch()
+{
+    static SynchronizedCache<int, bool> cache;
+    int device = -1;
+    HIP_CALL(hipGetDevice(&device));
+    return cache.get_or_create(device, []() { return get_gpu_arch() == "gfx950"; });
+}
+
 // E=512 prefill_n is measured on gfx942 and gfx950. Other archs (gfx1201,
 // gfx1250, ...) stay on the smem fallback until benchmarked.
 // Cached: get_gpu_arch() re-queries the driver on every call.
@@ -684,11 +693,11 @@ __device__ __forceinline__ void loadv(const T* p, T* out)
 // lane on a tie, of each lane's best list front, lowest g on a tie. A list
 // that runs out yields (-inf, id 0, weight 0), as an exhausted lane does in the
 // multiwave argmax. The renorm sum is summed in selection order. No LDS, no
-// barrier. Requires blockDim.x == 32 and topk <= MAXK. VEC_LOAD: the logit
+// barrier. Requires blockDim.x == WARP_SIZE and topk <= MAXK. VEC_LOAD: the logit
 // rows and the bias are aligned to WPT elements.
 //
-// WPT == 1 is topk_gating_kernel_opt on wave32 (strided, one list per lane,
-// same lowest-lane tie order), with the same results. Fewer, longer lists
+// WPT == 1 also serves wave64: it is the register kernel's strided layout,
+// with the same lowest-lane tie order and results. Fewer, longer lists
 // select faster; WPT only sets the order among equal scores (by e % C).
 template <typename DTYPE_I,
           typename DTYPE_B,
@@ -709,7 +718,7 @@ __global__ void topk_gating_kernel_opt_vwave(const DTYPE_I* __restrict__ gating_
                                              const int num_shared_experts,
                                              const int* __restrict__ num_valid_rows)
 {
-    constexpr int LANES = 32;
+    constexpr int LANES = WARP_SIZE;
     constexpr int G     = WPT;             // lists per lane
     constexpr int C     = G * LANES;       // experts per chunk
     constexpr int EPT   = NUM_EXPERTS / C; // list length
@@ -731,6 +740,16 @@ __global__ void topk_gating_kernel_opt_vwave(const DTYPE_I* __restrict__ gating_
 #pragma unroll
         for(int i = 0; i < EPT; i++)
             loadv<VEC_LOAD, G>(correction_bias + i * C + G * lane_id, bias[i]);
+    }
+
+    // Preserve the wave64 register path's early exit for padded rows.
+    if constexpr(LANES == 64)
+    {
+        if(write_if_pad_row(num_valid_rows, token_idx, input_ptr,
+                            topk_weights + token_idx * stride_tk,
+                            topk_ids + token_idx * stride_tk,
+                            NUM_EXPERTS, topk, num_shared_experts))
+            return;
     }
 
     float vals[G][EPT];
@@ -779,8 +798,13 @@ __global__ void topk_gating_kernel_opt_vwave(const DTYPE_I* __restrict__ gating_
             }
         }
         const float max_val   = multithread_reduce_max_dpp<LANES>(cv);
+#if defined(__GFX9__)
+        const uint64_t at_max = __ballot(cv == max_val);
+        const int win_lane   = (at_max != 0) ? __builtin_ctzll(at_max) : 0;
+#else
         const unsigned at_max = static_cast<unsigned>(__ballot(cv == max_val));
         const int win_lane    = (at_max != 0) ? __builtin_ctz(at_max) : 0;
+#endif
 
         const int wg       = __builtin_amdgcn_readlane(cg, win_lane);
         const float weight = __builtin_bit_cast(
@@ -820,7 +844,7 @@ __global__ void topk_gating_kernel_opt_vwave(const DTYPE_I* __restrict__ gating_
     if constexpr(need_renorm)
         out_scale = routed_scaling_factor / fmaxf(sum, RENORM_SUM_FLOOR);
 
-    const bool pad = is_pad_row(num_valid_rows, token_idx);
+    const bool pad = LANES == 64 ? false : is_pad_row(num_valid_rows, token_idx);
     if(lane_id < topk)
     {
         topk_weights[token_idx * stride_tk + lane_id] = pad ? 0.0f : my_w * out_scale;
@@ -1799,10 +1823,14 @@ void topk_gating_launch(const topk_gating_params& p)
             return;                                                         \
         }
             // E=384: WPT=2 (EPT=6) measured fastest on gfx1250 up to T=1024 (WPT=4
-            // and WPT=1 are 5-15% slower); above that prefill_n takes over.
+            // and WPT=1 are 5-15% slower). The single-wave kernel takes every T on
+            // gfx1250: one wave per token and no cross-token work, so it stays ahead
+            // of prefill_n (TPW=1) at large T too, and E=384 gets one tie order at
+            // every T as E=64/128/256 do. Other wave32 targets keep the multiwave
+            // kernel to T=1024, then prefill_n.
+            _DISPATCH_WAVE32_VWAVE_KERNEL(384, 2)
             if(num_tokens <= 1024)
             {
-                _DISPATCH_WAVE32_VWAVE_KERNEL(384, 2)
                 _DISPATCH_WAVE32_MULTIWAVE_KERNEL(384, 4)
             }
             // E=256 WPT=8 (EPT=1) is a low-token decode win on gfx1250 (measured
@@ -1832,6 +1860,17 @@ void topk_gating_launch(const topk_gating_params& p)
             _DISPATCH_WAVE32_VWAVE_KERNEL(128, 1)
             _DISPATCH_WAVE32_VWAVE_KERNEL(256, 1)
 #undef _DISPATCH_WAVE32_VWAVE_KERNEL
+            // gfx950: shift the six-entry lane lists instead of indexing them
+            // with a runtime cursor. Same register layout and tie order.
+            if constexpr(SF == SCORE_SQRTSOFTPLUS)
+            {
+                if(num_experts == 384 && topk <= 8 && topk_gating_gfx950_vwave_arch())
+                {
+                    if(need_renorm) { LAUNCH_TOPK_KERNEL_VWAVE(384, 1, true, SF, false) }
+                    else            { LAUNCH_TOPK_KERNEL_VWAVE(384, 1, false, SF, false) }
+                    return;
+                }
+            }
             _DISPATCH_REG_KERNEL(64)
             _DISPATCH_REG_KERNEL(128)
             _DISPATCH_REG_KERNEL(256)

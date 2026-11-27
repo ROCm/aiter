@@ -7,7 +7,7 @@
 import torch
 import torch.distributed as dist
 
-from aiter.ops.flydsl.ipc_heap import UncachedIpcHeap
+from aiter.ops.flydsl.ipc_heap import IpcHeap
 
 
 class _DeviceBytes:
@@ -39,9 +39,9 @@ class PeerBuffer:
         self._opened: list[int] = []
         self.local, handle, failure = 0, None, None
         try:
-            self.local = UncachedIpcHeap.alloc_uncached(nbytes)
+            self.local = IpcHeap.alloc_uncached(nbytes)
             if npes > 1:
-                handle = UncachedIpcHeap.get_mem_handle_bytes(self.local)
+                handle = IpcHeap.get_mem_handle_bytes(self.local)
         except RuntimeError as err:  # every rank must still reach the agreement
             failure = err
         # Agree before the broadcast: a rank that raised here would leave its
@@ -57,14 +57,14 @@ class PeerBuffer:
         self.bytes = torch.as_tensor(_DeviceBytes(self.local, nbytes), device=device)
         addresses = [self.local]
         if npes > 1:
-            handles = UncachedIpcHeap.gather_object_list_via_broadcast(group, handle)
+            handles = IpcHeap.gather_object_list_via_broadcast(group, handle)
             addresses, failure = [], None
             try:
                 for peer, handle in enumerate(handles):
                     if peer == rank:
                         addresses.append(self.local)
                     else:
-                        base = UncachedIpcHeap.open_mem_handle(handle)
+                        base = IpcHeap.open_mem_handle(handle)
                         self._opened.append(base)
                         addresses.append(base)
             except RuntimeError as err:  # every rank must still reach the agreement
@@ -85,7 +85,7 @@ class PeerBuffer:
         """Close the mappings of every peer buffer."""
         opened, self._opened = self._opened, []
         for base in opened:
-            UncachedIpcHeap.close_mem_handle(base)
+            IpcHeap.close_mem_handle(base)
 
     def close(self) -> None:
         """Close peer mappings and free the local buffer.
@@ -96,7 +96,7 @@ class PeerBuffer:
         self.close_peers()
         self.bytes = None
         if self.local:
-            UncachedIpcHeap.free_device_mem(self.local)
+            IpcHeap.free_device_mem(self.local)
             self.local = 0
         self.addresses = None
 

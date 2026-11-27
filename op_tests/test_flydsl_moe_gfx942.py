@@ -281,8 +281,8 @@ def test_config_strings():
 
 def test_num_local_tokens_dispatch():
     """With num_local_tokens only a clamped SiLU keeps its FlyDSL row. A clamped
-    SiLU with per-token FP8 weights and no FlyDSL row in use takes the FlyDSL
-    default for its token count."""
+    SiLU whose inter_dim CK cannot clamp (not a multiple of 128) and no FlyDSL
+    row in use takes the FlyDSL default for its token count."""
     configs = Path(aiter.__file__).parent / "configs/model_configs"
     qwen_csv = configs / "qwen3_5_35b_fp8_ptpc_tuned_fmoe.csv"
     qwen, v41 = (2048, 512, 257, 9), (5120, 576, 385, 7)
@@ -324,8 +324,13 @@ def test_num_local_tokens_dispatch():
         (512, "64_128_128_True:default:0"),
     ):
         assert kernel(v41, token, 10.0, True) == flydsl(config), token
-    bypassed = kernel(qwen, 1024, 10.0, True, bypass="1")
-    assert bypassed == flydsl("64_128_128_True:default:0")
+    # inter_dim 512 is a multiple of 128, so bypass uses the CK runtime-limit
+    # stage-1. The whole-graph default would clamp BF16 activations.
+    assert kernel(qwen, 1024, 10.0, True, bypass="1") is None
+    # inter_dim 576 is not. Bypass still takes the FlyDSL default.
+    assert kernel(v41, 1024, 10.0, True, bypass="1") == flydsl(
+        "64_128_128_True:default:0"
+    )
     # Not under EP, nor without an active clamp (vLLM sends 0.0 for none).
     assert kernel(qwen, 1, 10.0, True, is_ep=True) is None
     for limit in (None, 0.0):

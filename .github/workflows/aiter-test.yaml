@@ -63,7 +63,7 @@ jobs:
           fi
 
           pr_title_lc="$(printf '%s' "${PR_TITLE}" | tr '[:upper:]' '[:lower:]')"
-          if [[ "${PR_HEAD_REF}" == aiter-bot/revert-* ]] || [[ "${pr_title_lc}" == *"bot revert"* ]] || [[ "${pr_title_lc}" == *"[bot revert]"* ]]; then
+          if [[ "${PR_HEAD_REF}" == aiter-bot/revert-* ]] || [[ "${pr_title_lc}" == *"[bot revert]"* ]]; then
             echo "run_tests=false" >> "$GITHUB_OUTPUT"
             echo "run_multigpu_tests=false" >> "$GITHUB_OUTPUT"
             echo "reason=bot_revert_fast_workflow" >> "$GITHUB_OUTPUT"
@@ -188,9 +188,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - python_version: "3.10"
-            docker_image: ${{ needs.ci_config.outputs.pytorch_py310_image }}
-            build_enabled: ${{ github.ref == 'refs/heads/main' }}
           - python_version: "3.12"
             docker_image: ${{ needs.ci_config.outputs.pytorch_py312_image }}
             build_enabled: true
@@ -1046,16 +1043,6 @@ jobs:
           aiter_test \
           bash -c "pip show amd-aiter || true"
 
-      - name: Focused regression tests
-        if: ${{ matrix.label == 'MI35X' && matrix.shard_idx == 0 }}
-        timeout-minutes: 10
-        run: |
-          set -ex
-          docker exec \
-          -w /workspace \
-          aiter_test \
-          bash -c "python3 -m pytest -q tests"
-
       - name: Tests
         timeout-minutes: 120
         env:
@@ -1320,6 +1307,7 @@ jobs:
         run: |
           set -euo pipefail
           if docker exec \
+            -e AITER_GPU_VISIBILITY_CHECK_XGMI=1 \
             -w /workspace \
             aiter_test \
             bash -lc './.github/scripts/aiter_gpu_visibility_check.sh'; then

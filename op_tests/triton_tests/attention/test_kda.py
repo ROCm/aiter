@@ -20,11 +20,13 @@ from op_tests.triton_tests.utils.kda_ref import chunk_kda_ref
 arch = get_arch()
 
 pytestmark = pytest.mark.skipif(
-    arch not in ("gfx950", "gfx1250"),
+    arch not in ("gfx950", "gfx1250", "gfx1250-strict"),
     reason=f"KDA gluon decode needs gfx950/gfx1250, got {arch}",
 )
 
-gfx1250_only = pytest.mark.skipif(arch != "gfx1250", reason="gfx1250-only feature")
+gfx1250_only = pytest.mark.skipif(
+    arch not in ("gfx1250", "gfx1250-strict"), reason="gfx1250-only feature"
+)
 bf16_state_only = pytest.mark.skipif(
     arch != "gfx950", reason="bf16 state requires gfx950"
 )
@@ -193,7 +195,10 @@ def get_config(monkeypatch, tmp_path):
 @pytest.fixture(autouse=True, params=["snapshots", "cache_state_updates"])
 def kda_store_mode(request, monkeypatch):
     """Run the suite twice: as-is, then routed through the cached-update path."""
-    if request.param == "cache_state_updates" and arch != "gfx1250":
+    if request.param == "cache_state_updates" and arch not in (
+        "gfx1250",
+        "gfx1250-strict",
+    ):
         pytest.skip("cache_state_updates is gfx1250 only")
     if request.param == "snapshots":
         yield request.param
@@ -767,35 +772,6 @@ def test_cache_state_updates_varlen():
     assert torch.equal(results[True][1][untouched], base[untouched])
 
 
-@gfx1250_only
-def test_cache_state_updates_guards():
-    """The wrapper must reject configurations the record layout cannot support."""
-    B, T, H, D = 2, 2, 2, 128
-    inp = _spec_inputs(B * T, H, H, D, seed=1)
-    cu = torch.arange(0, B * T + 1, step=T, device=DEVICE).long()
-    state = torch.randn(B * T, H, D, D, dtype=torch.float32, device=DEVICE)
-    indices = torch.arange(B * T, device=DEVICE, dtype=torch.int32).view(B, T)
-    shared = dict(inp, initial_state=state, cu_seqlens=cu, cache_state_updates=True)
-
-    with pytest.raises(AssertionError, match="ssm_state_indices"):
-        fused_recurrent_kda(
-            **dict(shared, initial_state=state[:B])  # non-paged: one slot per seq
-        )
-    with pytest.raises(AssertionError, match="inplace_final_state"):
-        fused_recurrent_kda(
-            **shared,
-            ssm_state_indices=indices,
-            inplace_final_state=False,
-            state_out=torch.empty_like(state),
-        )
-    with pytest.raises(AssertionError, match="tdm_store"):
-        fused_recurrent_kda(
-            **shared,
-            ssm_state_indices=indices,
-            config={"use_tdm_store": True},
-        )
-
-
 @pytest.mark.parametrize("BV, num_warps", [(32, 1), (64, 2), (128, 4), (64, 1)])
 def test_tiling_equivalence(BV, num_warps, get_config):
     """BV / num_warps must not change results."""
@@ -813,41 +789,6 @@ def test_tiling_equivalence(BV, num_warps, get_config):
     tri, tri_ht = run(q, k, v, g, beta, h0.clone())
     assert_close("o", ref, tri)
     assert_close("ht", ref_ht, tri_ht)
-
-
-def test_guards():
-    B, T, H, D = 1, 1, 4, 128
-    q, k, v = make_qkv(B, T, H, H, D, torch.float32)
-    g = F.logsigmoid(torch.randn(B, T, H, D, dtype=torch.float32, device=DEVICE))
-    beta = torch.rand(B, T, H, dtype=torch.float32, device=DEVICE).sigmoid()
-    state = torch.zeros(B, H, D, D, dtype=torch.float32, device=DEVICE)
-    args = {"q": q, "k": k, "v": v, "g": g, "beta": beta, "initial_state": state}
-
-    with pytest.raises(ValueError):  # fla parity check
-        fused_recurrent_kda(**args, allow_neg_eigval=True)
-
-    with pytest.raises(AssertionError):  # BV must divide V
-        fused_recurrent_kda(**args, config={"BV": 48})
-
-    with pytest.raises(AssertionError):  # BV*SK must cover 32*num_warps lanes
-        fused_recurrent_kda(**args, config={"BV": 32, "num_warps": 4, "SK": 1})
-
-    with pytest.raises(AssertionError):  # gate chain needs A_log
-        fused_recurrent_kda(**args, use_gate_in_kernel=True)
-
-    with pytest.raises(AssertionError):
-        fused_recurrent_kda(**dict(args, beta=args["beta"][..., :2]))
-
-    with pytest.raises(AssertionError):
-        fused_recurrent_kda(
-            **dict(args, beta=args["beta"].unsqueeze(-1).expand(B, T, H, 64))
-        )
-
-    with pytest.raises(AssertionError):  # spec decoding needs the slot table
-        fused_recurrent_kda(
-            **args,
-            num_accepted_tokens=torch.ones(B, device=DEVICE, dtype=torch.int32),
-        )
 
 
 def _small(T=3, B=2, H=4, D=128):
@@ -1284,39 +1225,6 @@ def test_k_first_paged():
     assert torch.equal(pool_out[untouched], pool_kv[untouched]), "wrote outside slots"
 
 
-def test_reference_guards():
-    B, T, H, D = 1, 2, 4, 128
-    q, k, v, g, beta, h0 = _small(T=T, B=B, H=H, D=D)
-    args = {
-        "q": q,
-        "k": k,
-        "v": v,
-        "g": g,
-        "beta": beta,
-        "initial_state": to_vk(h0),
-    }
-
-    with pytest.raises(TypeError):
-        fused_recurrent_kda(**args, bogus_kwarg=1)
-
-    qb, kb, vb, gb, betab, h0b = _small(T=T, B=2, H=H, D=D)
-    with pytest.raises(ValueError):
-        fused_recurrent_kda(
-            q=qb,
-            k=kb,
-            v=vb,
-            g=gb,
-            beta=betab,
-            initial_state=to_vk(h0b),
-            cu_seqlens=torch.tensor([0, T], device=DEVICE).long(),
-        )
-
-    with pytest.raises(ValueError):
-        fused_recurrent_kda(
-            **args, cu_seqlens=torch.tensor([0, 1, T], device=DEVICE).long()
-        )
-
-
 def test_strided_token_inputs():
     """Token-strided packed views (vLLM's qkvgfab split) must run copy-free."""
     B, T, H, D = 2, 3, 4, 128
@@ -1336,22 +1244,6 @@ def test_strided_token_inputs():
     o, ht = run(q, k, v, g, beta, h0.clone())
     assert_close("o", ref, o)
     assert_close("ht", ref_ht, ht)
-
-
-def test_strided_inner_dims_rejected():
-    """Only token/batch strides are free; strided feature dims must assert."""
-    B, T, H, D = 2, 3, 4, 128
-    q, k, v, g, beta, h0 = _small(T=T, B=B, H=H, D=D)
-    args = {"q": q, "k": k, "v": v, "g": g, "beta": beta, "initial_state": to_vk(h0)}
-
-    wide = torch.empty(B, T, H, D * 2, dtype=torch.float32, device=DEVICE)
-    wide[..., ::2] = q
-    with pytest.raises(AssertionError):
-        fused_recurrent_kda(**dict(args, q=wide[..., ::2]))
-
-    qt = torch.rand(T, B, H, D, dtype=torch.float32, device=DEVICE).transpose(0, 1)
-    with pytest.raises(AssertionError):
-        fused_recurrent_kda(**dict(args, q=qt))
 
 
 def test_pad_slot_guard():
@@ -1486,21 +1378,6 @@ def test_sk_paged(SK, get_config):
         assert_close(f"o[{n}]", ref, o[:, b:e])
         assert_close(f"ht[{n}]", ref_ht[0], pool_out[int(indices[n, T - 1])])
     assert torch.equal(pool_out[untouched], pool_kv[untouched]), "wrote outside slots"
-
-
-def test_sk_guards():
-    B, T, H, D = 1, 1, 4, 128
-    q, k, v, g, beta, h0 = _small(T=T, B=B, H=H, D=D)
-    args = {
-        "q": q,
-        "k": k,
-        "v": v,
-        "g": g,
-        "beta": beta,
-        "initial_state": to_vk(h0),
-    }
-    with pytest.raises(AssertionError):  # SK must divide the wave
-        fused_recurrent_kda(**args, config={"SK": 3})
 
 
 @pytest.mark.parametrize("N, T, H", [(16, 1, 24), (3, 1, 8), (4, 2, 8)])

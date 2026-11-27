@@ -11,6 +11,8 @@ from flydsl.expr.typing import ReductionOp, T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 
+from aiter.ops.flydsl.aot_launch import aot_factory
+
 from .. import communication_ops_utils as comm_ops
 from ..dpp_utils import dpp_xor_f32, update_dpp_i32
 from ..tensor_shim import (
@@ -3094,6 +3096,7 @@ def _m64_qdpp_for(i32_cur_tok, kwargs):
     return cur >= _QDPP_M64_MIN_TOK
 
 
+@aot_factory("mega_moe_prepare")
 @functools.cache
 def compile_mega_moe_prepare(
     *,
@@ -4179,7 +4182,7 @@ def run_mega_moe_prepare(
 ):
     if _m64_qdpp_for(i32_cur_tok, kwargs):
         kwargs = {**kwargs, "m64_qdpp": True}
-    launch = compile_mega_moe_prepare(**kwargs)
+    launch = compile_mega_moe_prepare.lazy(**kwargs)
     _run_compiled(
         launch,
         addr_disp,
@@ -4211,7 +4214,7 @@ def preload_mega_moe_prepare(
         # The m64 P32 bucket dispatches one of two variants by live token
         # count; load the qdpp one too so neither JITs on the serving path.
         _preload_compiled(
-            compile_mega_moe_prepare(**kwargs, m64_qdpp=True),
+            compile_mega_moe_prepare.lazy(**kwargs, m64_qdpp=True),
             addr_disp,
             i32_cur_tok,
             addr_in_idx,
@@ -4222,7 +4225,7 @@ def preload_mega_moe_prepare(
             addr_quant_scale,
             stream,
         )
-    launch = compile_mega_moe_prepare(**kwargs)
+    launch = compile_mega_moe_prepare.lazy(**kwargs)
     return _preload_compiled(
         launch,
         addr_disp,
