@@ -467,13 +467,15 @@ def allreduce_add_lamport_gfx1250(
 
 
 # Lamport all-reduce of inp, on the same inbox as the fused AR + RMSNorm above:
-# one-shot, or with two_shot a reduce-scatter and an all-gather (fp16/bf16).
+# one-shot (fp16/bf16), or with two_shot a reduce-scatter and an all-gather
+# (fp16/bf16/fp32), one lane a pack, or with split in wave groups a step.
 @compile_ops(GFX1250_MD_NAME, fc_name="allreduce_lamport", develop=True)
 def allreduce_lamport_gfx1250(
     _fa: int,
     inp: torch.Tensor,
     out: torch.Tensor,
     two_shot: bool,
+    split: bool = False,
 ) -> None: ...
 
 
