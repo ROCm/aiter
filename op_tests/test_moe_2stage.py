@@ -2468,15 +2468,16 @@ def test_gfx942_a16w4_skips_fp4_activation_quant():
     def fp4_quant(*_args, **_kwargs):
         raise AssertionError("FP4 activation quant reached")
 
-    def run(gfx, act, token):
-        q_dtype_a = resolve_activation_dtype(
-            aiter.QuantType.per_1x32,
-            dtypes.fp4x2,
-            activation=act,
-            gate_mode=GateMode.SEPARATED,
-            M=token,
-            gfx=gfx,
-        )
+    def run(gfx, act, token, q_dtype_a=None):
+        if q_dtype_a is None:
+            q_dtype_a = resolve_activation_dtype(
+                aiter.QuantType.per_1x32,
+                dtypes.fp4x2,
+                activation=act,
+                gate_mode=GateMode.SEPARATED,
+                M=token,
+                gfx=gfx,
+            )
         topk_ids = torch.randint(0, E, (token, topk), dtype=dtypes.i32)
         topk_weights = torch.rand(token, topk, dtype=dtypes.fp32)
         sorted_ids, sorted_weights, sorted_eids, num_valid, moe_out = fm.moe_sorting(
@@ -2524,6 +2525,20 @@ def test_gfx942_a16w4_skips_fp4_activation_quant():
         assert "FP4 activation quant reached" in str(e), e
     else:
         raise AssertionError("gfx950 Silu should still quantize its activation to FP4")
+
+    # Direct coverage of the bypass condition itself, not just of what the resolver
+    # currently returns: both bypass sites in fused_moe.py gate on
+    # `q_dtype_a in [dtypes.bf16, dtypes.fp16]`, but resolve_activation_dtype never
+    # resolves fp16 on gfx942 (only bf16), so that half of the gate is otherwise dead
+    # in CI. Pass q_dtype_a=fp16 straight to fused_moe_2stages, bypassing the resolver,
+    # to prove the gate still opens (neither site reaches the FP4 quant) on that input.
+    # The emitted a1/a2 dtype is unaffected by q_dtype_a here -- both sites cast to
+    # moe_out.dtype (bf16, fixed by this test's moe_sorting call above), not to
+    # q_dtype_a -- so the expectation is the same `want` as the bf16 cases.
+    for act in (aiter.ActivationType.Silu, aiter.ActivationType.Swiglu):
+        got = run("gfx942", act, _swiglu_split_tokens()[0], q_dtype_a=dtypes.fp16)
+        assert got == want, f"gfx942 {act.name} fp16 bypass: {got}"
+
     aiter.logger.info("moe_2stage: gfx942 a16w4 skips FP4 activation quant passed")
 
 
