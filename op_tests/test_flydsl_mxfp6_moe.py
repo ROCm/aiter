@@ -25,8 +25,9 @@ Correctness against torch references and timing, one markdown table per test fun
                       the heuristic's kernels, with both timed in alternating rounds
   test_fused_moe      aiter.fused_moe on the prepared (tagged) weights: bitwise equal
                       to the op called directly, also into output= (a buffer, and
-                      hidden_states itself), under torch.inference_mode() and with
-                      the neutral spellings of the other arguments; both timed in
+                      hidden_states itself), under torch.inference_mode(), with
+                      the neutral spellings of the other arguments, and on a layer
+                      prepared from weights that are MXFP6 already; both timed in
                       alternating rounds
 No GPU needed (aiter's dry run):
   test_agpr_form      the 256x256 tiles keep their accumulators in AGPRs through
@@ -45,7 +46,9 @@ No GPU needed (aiter's dry run):
                       every argument this path does not implement is refused, and so
                       are weights that are not one prepared layer (a copy without
                       the tag, tags that differ, scales missing or swapped); weight
-                      preparation on the CPU and its refusals
+                      preparation on the CPU and its refusals, from float weights
+                      and from weights that are MXFP6 already (packed codes and
+                      scales): both give the same layer
   test_tuned_dispatch the tuned config: a row is picked for exactly its device and
                       shape and the heuristic for every other call; a malformed row
                       and one whose kernels do not fit the layer are refused before a
@@ -90,6 +93,7 @@ from aiter.ops.flydsl import (
     Mxfp6MoeWeights,
     flydsl_mxfp6_moe,
     mxfp6_moe,
+    prepare_mxfp6_moe_packed_weights,
     prepare_mxfp6_moe_weights,
 )
 from aiter.ops.flydsl import mxfp6_moe_kernels as mk
@@ -920,6 +924,44 @@ _FUSED_NEUTRAL = (
 )
 
 
+def _stored_mx(w1, w2, wfmt):
+    """A layer's weights as an MXFP6 checkpoint stores them: (w1, w1_scale, w2,
+    w2_scale) with the 6-bit codes packed four to three bytes and one E8M0 scale per
+    32."""
+    c1, s1 = q.quant_mx(w1, wfmt)
+    c2, s2 = q.quant_mx(w2, wfmt)
+    return q.pack6(c1), s1, q.pack6(c2), s2
+
+
+def _stored_codes(packed):
+    """The 6-bit codes of packed bytes, read as the stored layout is documented:
+    element j of each four at bits [6j, 6j + 6) of three little-endian bytes."""
+    b = packed.reshape(*packed.shape[:-1], -1, 3)
+    b0, b1, b2 = b[..., 0], b[..., 1], b[..., 2]
+    codes = (
+        b0 & 63,
+        ((b1 & 15) << 2) | (b0 >> 6),
+        ((b2 & 3) << 4) | (b1 >> 4),
+        b2 >> 2,
+    )
+    return torch.stack(codes, -1).reshape(*packed.shape[:-1], -1)
+
+
+def _same_layer(a, b):
+    """Two prepared layers hold the same fields, tensors bit for bit, tags too."""
+    return all(
+        (
+            (
+                torch.equal(x, y)
+                and getattr(x, "mxfp6_fmt", None) == getattr(y, "mxfp6_fmt", None)
+            )
+            if isinstance(x, torch.Tensor)
+            else x == y
+        )
+        for x, y in zip(dataclasses.astuple(a), dataclasses.astuple(b))
+    )
+
+
 def _fused_args(x, st, w, ids):
     """Keyword arguments of the aiter.fused_moe call on the prepared layer st."""
     return {
@@ -1115,6 +1157,34 @@ def test_contract(hidden, inter, experts, topk, tokens, afmt):
     got["integer w1 refused"] = _refused(prep, w1.int(), w2)
     got["unknown a_fmt refused"] = _refused(prep, w1, w2, a_fmt="e2m1")
     got["e4m3 weights refused"] = _refused(prep, w1, w2, w_fmt="e4m3")
+
+    # weights that are MXFP6 already: the stored bytes and scales, only preshuffled
+    packed = prepare_mxfp6_moe_packed_weights
+    p1, s1, p2, s2 = stored = _stored_mx(w1, w2, "e2m3")
+    got["stored bytes hold the codes in the documented layout"] = torch.equal(
+        _stored_codes(p1), q.quant_mx(w1, "e2m3")[0]
+    )
+    got["packed weights give the layer of the float weights"] = _same_layer(
+        packed(*stored, a_fmt=afmt), cpu
+    )
+    got["packed e3m2 weights give the layer of the float weights"] = _same_layer(
+        packed(*_stored_mx(w1, w2, "e3m2"), a_fmt=afmt, w_fmt="e3m2"),
+        prep(w1, w2, a_fmt=afmt, w_fmt="e3m2"),
+    )
+    refusals = {
+        "float w1": (w1, s1, p2, s2),
+        "unpacked codes as w1": (_stored_codes(p1), s1, p2, s2),
+        "swapped scales": (p1, s2, p2, s1),
+        "int32 w1_scale": (p1, s1.int(), p2, s2),
+        "w2 of another expert count": (p1, s1, p2[:1], s2[:1]),
+        "an odd row count": (p1[:, :-1], s1[:, :-1], p2, s2),
+        "hidden of 192": (p1[..., :144], s1[..., :6], p2[:, :192], s2[:, :192]),
+        "2-D w1": (p1[0], s1, p2, s2),
+    }
+    for name, tensors in refusals.items():
+        got[f"packed: {name} refused"] = _refused(packed, *tensors)
+    got["packed: unknown a_fmt refused"] = _refused(packed, *stored, a_fmt="e2m1")
+    got["packed: e4m3 weights refused"] = _refused(packed, *stored, w_fmt="e4m3")
     bad = [k for k, v in got.items() if not v]
     assert not bad, f"op contract, {afmt}: {bad}"
     return {"gfx": SUPPORTED_GFX[0], "checks": len(got), "err": float(len(bad))}
@@ -1435,6 +1505,14 @@ def test_fused_moe(tokens, hidden, inter, experts, topk, wfmt, afmt):
     assert fused(output=buf) is buf, "fused_moe did not return its output= buffer"
     assert torch.equal(buf, want), "fused_moe output=: bits differ from the op's"
     assert torch.equal(inference_mode(), want), "inference_mode: bits differ"
+    # a layer prepared from the weights as an MXFP6 checkpoint stores them
+    pk = prepare_mxfp6_moe_packed_weights(
+        *_stored_mx(w1, w2, wfmt), a_fmt=afmt, w_fmt=wfmt
+    )
+    assert torch.equal(
+        fused_moe(**_fused_args(x, pk, w, ids)), want
+    ), "fused_moe on packed weights: output bits differ from the op's"
+    del pk
     xc = x.clone()  # in place: the result is copied once the kernels are done
     assert fused(hidden_states=xc, output=xc) is xc, "output=x: not returned"
     assert torch.equal(xc, want), "fused_moe output=x: bits differ from the op's"

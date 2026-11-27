@@ -105,6 +105,10 @@ _LAZY_IMPORTS = {
     "Mxfp6MoeWeights": (".mxfp6_moe", "Mxfp6MoeWeights"),
     "Mxfp6StageConfig": (".mxfp6_moe_policy", "Mxfp6StageConfig"),
     "flydsl_mxfp6_moe": (".mxfp6_moe", "flydsl_mxfp6_moe"),
+    "prepare_mxfp6_moe_packed_weights": (
+        ".mxfp6_moe",
+        "prepare_mxfp6_moe_packed_weights",
+    ),
     "prepare_mxfp6_moe_weights": (".mxfp6_moe", "prepare_mxfp6_moe_weights"),
     "flydsl_pa_mqa_logits_fp4": (
         ".kernels.mqa_logits.pa_mqa_logits_fp4",
@@ -316,6 +320,7 @@ __all__ = [
     "pa_decode_nhd_max_query_length",
     "plan_pa_decode",
     "prepare_gemm_a16wfp4_weight",
+    "prepare_mxfp6_moe_packed_weights",
     "prepare_mxfp6_moe_weights",
     "prepare_pa_decode_plan",
     "sparse_pa_nvfp4_decode",

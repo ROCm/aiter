@@ -699,7 +699,8 @@ def fused_moe(
 
     ``w1`` / ``w2`` tagged ``mxfp6_fmt`` select the gfx950 MXFP6 MoE
     (:mod:`aiter.ops.flydsl.mxfp6_moe`): the ``w1_frags`` / ``w2_frags`` of
-    ``prepare_mxfp6_moe_weights``, with its ``w1_scales`` / ``w2_scales`` as
+    ``prepare_mxfp6_moe_weights`` (or of ``prepare_mxfp6_moe_packed_weights``, for
+    weights that are MXFP6 already), with its ``w1_scales`` / ``w2_scales`` as
     ``w1_scale`` / ``w2_scale`` and ``quant_type=QuantType.per_1x32``. A copy of a
     tensor does not carry the tag: 5-D weights without it are refused.
     """

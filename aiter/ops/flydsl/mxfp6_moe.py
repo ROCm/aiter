@@ -12,14 +12,17 @@ reference (scale 2^ceil(log2(amax / 7.5)), round-half-even onto the grid, clamp)
 Usage:
     weights = prepare_mxfp6_moe_weights(w1, w2, a_fmt="e2m3")  # once per layer
     y = flydsl_mxfp6_moe(x, weights, topk_weight, topk_ids)   # per step
+or, for a layer whose weights are already MXFP6 (a quantized checkpoint):
+    weights = prepare_mxfp6_moe_packed_weights(w1, w1_scale, w2, w2_scale)
 or, through aiter.fused_moe, which sends weights tagged by the preparation here:
     y = fused_moe(x, weights.w1_frags, weights.w2_frags, topk_weight, topk_ids,
                   quant_type=QuantType.per_1x32,
                   w1_scale=weights.w1_scales, w2_scale=weights.w2_scales)
 
-`prepare_mxfp6_moe_weights` quantizes and preshuffles a layer's weights (torch only);
-`flydsl_mxfp6_moe` runs a call (all FlyDSL, on the current stream, no host syncs,
-bitwise deterministic):
+`prepare_mxfp6_moe_weights` quantizes and preshuffles a layer's weights and
+`prepare_mxfp6_moe_packed_weights` preshuffles weights that are quantized already
+(both torch only); `flydsl_mxfp6_moe` runs a call (all FlyDSL, on the current stream,
+no host syncs, bitwise deterministic):
   1. route: counting sort by expert (one block, or histogram / scan / scatter above
      32k entries) -> gather index, tile -> expert map, used-tile count, pos[t, j] (the
      slot order within an expert does not affect bits)
@@ -60,6 +63,7 @@ __all__ = [
     "SUPPORTED_GFX",
     "Mxfp6MoeWeights",
     "flydsl_mxfp6_moe",
+    "prepare_mxfp6_moe_packed_weights",
     "prepare_mxfp6_moe_weights",
 ]
 
@@ -74,7 +78,8 @@ _ID_DTYPES = (torch.int32, torch.int64)
 
 @dataclass(frozen=True, eq=False)
 class Mxfp6MoeWeights:
-    """One layer's weights as prepare_mxfp6_moe_weights lays them out for the kernels.
+    """One layer's weights as prepare_mxfp6_moe_weights and
+    prepare_mxfp6_moe_packed_weights lay them out for the kernels.
 
     w1_frags [E][2I/BN1][H/128][BN1/16][1536] uint8 (gate / up fragments interleaved)
     and w1_scales [E][2I/16][KQ(H)][64] int32; w2_frags [E][H/BN2][I/128][BN2/16][1536]
@@ -108,6 +113,47 @@ def _layer_shapes(E: int, H: int, I: int, a_fmt: str):
         (E, H // 16, q.kq(I), 64),
     )
     return shapes, bn1, bn2
+
+
+def _check_formats(a_fmt: str, w_fmt: str) -> None:
+    if a_fmt not in q.FORMATS or w_fmt not in _W_FMTS:
+        raise ValueError(
+            f"a_fmt {a_fmt!r} must be one of {tuple(q.FORMATS)}, w_fmt {w_fmt!r} "
+            "'e2m3' or 'e3m2'"
+        )
+
+
+def _prepared_layer(E, H, I, a_fmt, w_fmt, dev, packed) -> Mxfp6MoeWeights:
+    """The layer of packed(stage, e) -> (bytes [1, N, K*3/4], scales [1, N, K/32]):
+    the packed MX weights of expert e of stage 0 (W1, gate rows first) or 1 (W2)."""
+    shapes, bn1, bn2 = _layer_shapes(E, H, I, a_fmt)
+    b1 = torch.empty(shapes[0], dtype=torch.uint8, device=dev)
+    s1 = torch.empty(shapes[1], dtype=torch.int32, device=dev)
+    b2 = torch.empty(shapes[2], dtype=torch.uint8, device=dev)
+    s2 = torch.empty(shapes[3], dtype=torch.int32, device=dev)
+    setattr(b1, MXFP6_FMT_ATTR, (a_fmt, w_fmt))
+    setattr(b2, MXFP6_FMT_ATTR, (a_fmt, w_fmt))
+    # per expert: the working copies of all experts do not fit
+    for e in range(E):
+        b1[e : e + 1], s1[e : e + 1] = q.preshuffle_b_packed(
+            *packed(0, e), interleave_gate_up=True, bn=bn1
+        )
+        b2[e : e + 1], s2[e : e + 1] = q.preshuffle_b_packed(*packed(1, e), bn=bn2)
+    return Mxfp6MoeWeights(
+        experts=E,
+        model_dim=H,
+        inter_dim=I,
+        a_fmt=a_fmt,
+        w_fmt=w_fmt,
+        w1_frags=b1,
+        w1_scales=s1,
+        w2_frags=b2,
+        w2_scales=s2,
+        slab_n1=bn1,
+        slab_n2=bn2,
+        w1_bytes=b1.nbytes + s1.nbytes,
+        w2_bytes=b2.nbytes + s2.nbytes,
+    )
 
 
 def prepare_mxfp6_moe_weights(
@@ -145,42 +191,82 @@ def prepare_mxfp6_moe_weights(
         raise ValueError(
             f"w1 and w2 must be on one device, got {w1.device} and {w2.device}"
         )
-    if a_fmt not in q.FORMATS or w_fmt not in _W_FMTS:
+    _check_formats(a_fmt, w_fmt)
+
+    def packed(stage, e):
+        codes, scales = q.quant_mx((w1, w2)[stage][e : e + 1], w_fmt)
+        return q.pack6(codes), scales
+
+    return _prepared_layer(E, H, I, a_fmt, w_fmt, w1.device, packed)
+
+
+def prepare_mxfp6_moe_packed_weights(
+    w1: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    *,
+    a_fmt: str = "e2m3",
+    w_fmt: str = "e2m3",
+) -> Mxfp6MoeWeights:
+    """Preshuffle a layer's weights that are MX w_fmt already (a quantized checkpoint)
+    into MFMA fragments, for calls with a_fmt activations: the layer
+    prepare_mxfp6_moe_weights makes of float weights, without the quantization. The
+    codes and the scales are used as they are stored. Torch only.
+
+    Args:
+        w1: uint8 [E, 2I, H * 3 / 4], gate rows first: the 6-bit codes of a row, four
+            to three bytes, element j of the four at bits [6j, 6j + 6) of the 24
+            (little-endian; mxfp6_moe_quant.pack6, and how amd-quark packs fp6_e2m3 /
+            fp6_e3m2).
+        w1_scale: uint8 [E, 2I, H / 32]: the E8M0 scale (biased 127) of each 32
+            elements of a row.
+        w2: uint8 [E, H, I * 3 / 4], packed as w1.
+        w2_scale: uint8 [E, H, I / 32].
+        a_fmt: as prepare_mxfp6_moe_weights.
+        w_fmt: "e2m3" or "e3m2", the format the codes are in. The bytes do not say
+            it: codes of the other format are read as wrong weights, not refused.
+
+    Raises:
+        ValueError: tensors that are not uint8 of these shapes on one device, with H
+            and I multiples of 128; an unknown format.
+    """
+    tensors = (w1, w1_scale, w2, w2_scale)
+    shapes_ok = all(t.dim() == 3 for t in tensors)
+    if shapes_ok:
+        E, N1, H = w1.shape[0], w1.shape[1], w2.shape[1]
+        I = N1 // 2
+        shapes_ok = (
+            min(E, H, I) > 0
+            and not (N1 % 2 or H % 128 or I % 128)
+            and w1.shape[2] == H * 3 // 4
+            and w2.shape == (E, H, I * 3 // 4)
+            and w1_scale.shape == (E, N1, H // q.BLOCK)
+            and w2_scale.shape == (E, H, I // q.BLOCK)
+        )
+    if not shapes_ok:
         raise ValueError(
-            f"a_fmt {a_fmt!r} must be one of {tuple(q.FORMATS)}, w_fmt {w_fmt!r} "
-            "'e2m3' or 'e3m2'"
+            "w1 must be [E, 2I, H * 3 / 4], w1_scale [E, 2I, H / 32], w2 "
+            "[E, H, I * 3 / 4] and w2_scale [E, H, I / 32] with H and I multiples of "
+            "128, got " + ", ".join(str(tuple(t.shape)) for t in tensors)
         )
-    dev = w1.device
-    shapes, bn1, bn2 = _layer_shapes(E, H, I, a_fmt)
-    b1 = torch.empty(shapes[0], dtype=torch.uint8, device=dev)
-    s1 = torch.empty(shapes[1], dtype=torch.int32, device=dev)
-    b2 = torch.empty(shapes[2], dtype=torch.uint8, device=dev)
-    s2 = torch.empty(shapes[3], dtype=torch.int32, device=dev)
-    setattr(b1, MXFP6_FMT_ATTR, (a_fmt, w_fmt))
-    setattr(b2, MXFP6_FMT_ATTR, (a_fmt, w_fmt))
-    # per expert: the fp32 working copy of all experts does not fit
-    for e in range(E):
-        c, s = q.quant_mx(w1[e : e + 1], w_fmt)
-        b1[e : e + 1], s1[e : e + 1] = q.preshuffle_b(
-            c, s, interleave_gate_up=True, bn=bn1
+    if any(t.dtype != torch.uint8 for t in tensors):
+        raise ValueError(
+            "w1, w1_scale, w2 and w2_scale must be uint8 (packed 6-bit codes and "
+            "E8M0 scales), got " + ", ".join(str(t.dtype) for t in tensors)
         )
-        c, s = q.quant_mx(w2[e : e + 1], w_fmt)
-        b2[e : e + 1], s2[e : e + 1] = q.preshuffle_b(c, s, bn=bn2)
-    return Mxfp6MoeWeights(
-        experts=E,
-        model_dim=H,
-        inter_dim=I,
-        a_fmt=a_fmt,
-        w_fmt=w_fmt,
-        w1_frags=b1,
-        w1_scales=s1,
-        w2_frags=b2,
-        w2_scales=s2,
-        slab_n1=bn1,
-        slab_n2=bn2,
-        w1_bytes=b1.nbytes + s1.nbytes,
-        w2_bytes=b2.nbytes + s2.nbytes,
-    )
+    if any(t.device != w1.device for t in tensors):
+        raise ValueError(
+            "w1, w1_scale, w2 and w2_scale must be on one device, got "
+            + ", ".join(str(t.device) for t in tensors)
+        )
+    _check_formats(a_fmt, w_fmt)
+
+    def packed(stage, e):
+        weights, scales = ((w1, w1_scale), (w2, w2_scale))[stage]
+        return weights[e : e + 1], scales[e : e + 1]
+
+    return _prepared_layer(E, H, I, a_fmt, w_fmt, w1.device, packed)
 
 
 def _check_call(x, weights, topk_weight, topk_ids, config) -> None:
@@ -194,7 +280,8 @@ def _check_call(x, weights, topk_weight, topk_ids, config) -> None:
         )
     if not isinstance(weights, Mxfp6MoeWeights):
         raise TypeError(
-            "weights must come from prepare_mxfp6_moe_weights(), got "
+            "weights must come from prepare_mxfp6_moe_weights() or "
+            "prepare_mxfp6_moe_packed_weights(), got "
             f"{type(weights).__name__}"
         )
     if config is not None and not isinstance(config, Mxfp6MoeConfig):
@@ -249,7 +336,8 @@ def flydsl_mxfp6_moe(
 
     Args:
         hidden_states: contiguous bf16 [T, H].
-        weights: the layer, from prepare_mxfp6_moe_weights.
+        weights: the layer, from prepare_mxfp6_moe_weights or
+            prepare_mxfp6_moe_packed_weights.
         topk_weight: float [T, topk] routing weights (cast to fp32).
         topk_ids: int32 or int64 [T, topk] expert ids in [0, E) (not checked: that
             would read the tensor on the host).
@@ -395,15 +483,14 @@ def _neutral(name: str, value: Any, default: Any) -> bool:
 
 def _tagged_weights(w1, w2, w1_scale, w2_scale) -> Mxfp6MoeWeights:
     """The prepared layer of fused_moe's weight arguments. Raises ValueError unless
-    they are the four tensors of one prepare_mxfp6_moe_weights call: the kernels read
-    raw pointers."""
+    they are the four tensors of one prepared layer: the kernels read raw
+    pointers."""
     fmt = getattr(w1, MXFP6_FMT_ATTR, None)
     if fmt is None or getattr(w2, MXFP6_FMT_ATTR, None) != fmt:
         raise ValueError(
             f"w1 is tagged {MXFP6_FMT_ATTR}={fmt!r} and w2 "
             f"{getattr(w2, MXFP6_FMT_ATTR, None)!r}: MXFP6 weights carry the tag of "
-            "one prepare_mxfp6_moe_weights call (a copy of a tensor drops it: set "
-            "it on the copy)"
+            "one prepared layer (a copy of a tensor drops it: set it on the copy)"
         )
     known = isinstance(fmt, tuple) and len(fmt) == 2
     if not (known and fmt[0] in q.FORMATS and fmt[1] in _W_FMTS):
@@ -415,7 +502,7 @@ def _tagged_weights(w1, w2, w1_scale, w2_scale) -> Mxfp6MoeWeights:
     if w1_scale is None or w2_scale is None:
         raise ValueError(
             "MXFP6 weights take w1_scale and w2_scale, the w1_scales and w2_scales "
-            "of prepare_mxfp6_moe_weights"
+            "of the prepared layer"
         )
     ok = w1.dim() == 5 and w2.dim() == 5
     if ok:
@@ -435,7 +522,7 @@ def _tagged_weights(w1, w2, w1_scale, w2_scale) -> Mxfp6MoeWeights:
     if not ok:
         raise ValueError(
             "w1, w1_scale, w2 and w2_scale must be the w1_frags, w1_scales, w2_frags "
-            "and w2_scales of one prepare_mxfp6_moe_weights call, got "
+            "and w2_scales of one prepared layer (Mxfp6MoeWeights), got "
             + ", ".join(
                 f"{t.dtype} {tuple(t.shape)}" for t in (w1, w1_scale, w2, w2_scale)
             )
@@ -466,8 +553,9 @@ def _fused_moe_mxfp6(call: Mapping[str, Any]) -> torch.Tensor:
 
     Args:
         call: fused_moe's arguments by name. w1 / w2 / w1_scale / w2_scale: the
-            w1_frags / w2_frags / w1_scales / w2_scales of one
-            prepare_mxfp6_moe_weights call; quant_type: QuantType.per_1x32;
+            w1_frags / w2_frags / w1_scales / w2_scales of one prepared layer
+            (prepare_mxfp6_moe_weights or prepare_mxfp6_moe_packed_weights);
+            quant_type: QuantType.per_1x32;
             hidden_states, topk_weight, topk_ids: as flydsl_mxfp6_moe takes them;
             output: fused_moe's optional destination.
 

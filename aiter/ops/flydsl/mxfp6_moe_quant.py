@@ -17,6 +17,9 @@ group g = l // 16.
   Scale of (row r, K-block b of one 128-step) in lane 16b + r.
 
 Storage formats produced here (K = reduction dim, KS = K/128 steps, KQ = ceil(KS/4)):
+  Packed MX weights (what an MXFP6 checkpoint stores): [..., K * 3 / 4] bytes, the
+      6-bit codes of a row four to three bytes (pack6), with one E8M0 scale per 32
+      elements, [..., K / 32] uint8.
   "A" rows: [R, K * bits / 8] bytes, row-major, already in per-128 MFMA order (FP6:
       plain packing; FP8: each 128-block permuted to the split-half order), so lane
       (r, g) loads 24 (FP6) / 32 (FP8) contiguous bytes at 128-step s: offset
@@ -156,29 +159,41 @@ def preshuffle_b(
     bn: int | None = None,
 ):
     """Weights [E, N, K] (6-bit codes) and scales [E, N, K/32] -> (frags uint8, scales
-    int32).
+    int32), as preshuffle_b_packed lays them out."""
+    return preshuffle_b_packed(pack6(codes6), sexp, interleave_gate_up, bn)
+
+
+def preshuffle_b_packed(
+    packed: torch.Tensor,
+    sexp: torch.Tensor,
+    interleave_gate_up: bool = False,
+    bn: int | None = None,
+):
+    """Packed weights [E, N, K*3/4] (pack6 of the 6-bit codes) and scales
+    [E, N, K/32] -> (frags uint8, scales int32).
 
     interleave_gate_up: N = 2*I with gate rows first; reorder 16-row fragments as
     gate0, up0, gate1, up1, ... so a wave's fragment pair (2p, 2p+1) is (gate, up)."""
-    E, N, K = codes6.shape
+    E, N, KB = packed.shape
+    K = KB * 4 // 3
     KS, KQ = K // 128, kq(K)
     if interleave_gate_up:
         I = N // 2
-        g = codes6[:, :I].reshape(E, I // 16, 16, K)
-        u = codes6[:, I:].reshape(E, I // 16, 16, K)
-        codes6 = torch.stack([g, u], 2).reshape(E, N, K)
+        g = packed[:, :I].reshape(E, I // 16, 16, KB)
+        u = packed[:, I:].reshape(E, I // 16, 16, KB)
+        packed = torch.stack([g, u], 2).reshape(E, N, KB)
         gs = sexp[:, :I].reshape(E, I // 16, 16, -1)
         us = sexp[:, I:].reshape(E, I // 16, 16, -1)
         sexp = torch.stack([gs, us], 2).reshape(E, N, -1)
-    p = pack6(codes6)  # [E, N, K*3/4]
-    p = p.reshape(E, N // 16, 16, KS, 4, 24).permute(0, 1, 3, 4, 2, 5).contiguous()
+    p = packed.reshape(E, N // 16, 16, KS, 4, 24)
+    p = p.permute(0, 1, 3, 4, 2, 5).contiguous()
     frags = p.reshape(E, N // 16, KS, 64 * 24)
     if bn is not None:
         # N-block-major [E, N/bn, KS, bn/16, 1536]: a block's fragments for one K step
         # are contiguous
         frags = frags.reshape(E, N // bn, bn // 16, KS, 64 * 24)
         frags = frags.permute(0, 1, 3, 2, 4).contiguous()
-    s = torch.full((E, N, KQ * 4, 4), 127, dtype=torch.uint8, device=codes6.device)
+    s = torch.full((E, N, KQ * 4, 4), 127, dtype=torch.uint8, device=packed.device)
     s[:, :, :KS, :] = sexp.reshape(E, N, KS, 4)  # [E, n, step, b]
     s = s.reshape(E, N // 16, 16, KQ, 4, 4)  # [E, nf, r, q, j, b]
     # [E, nf, q, b, r, j]: lane = 16b + r
