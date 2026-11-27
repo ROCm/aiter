@@ -229,14 +229,10 @@ def _gfx1250_tdm_configs(m, n, k, dtype, layout="nt"):
     split_k_candidates.extend(split_k for split_k in range(2, 10) if k % split_k == 0)
     selections = {
         "block_m": [16, 32, 48, 64, 80, 96, 128, 256],
-        "block_n": [16, 32, 64, 80, 96, 128, 256],
+        "block_n": [16, 32, 64, 80, 96, 128, 160, 256],
         "block_k": [64, 128, 256, 512],
         "stages": [i for i in range(2, 10)],
         "split_k": split_k_candidates,
-        # BF16 split-K searches both workspace and packed-atomic reduction.
-        "split_k_atomic": (
-            [False, True] if dtype is torch.bfloat16 and n % 2 == 0 else [False]
-        ),
         "m_waves": [1, 2, 4],
         "n_waves": [1, 2, 4],
         "group_m": [0, 4],
@@ -258,7 +254,6 @@ def _gfx1250_tdm_configs(m, n, k, dtype, layout="nt"):
                 "n_waves": [2],
                 "interleave": [True],
                 "split_k": [1],
-                "split_k_atomic": [False],
             }
         )
     keys = selections.keys()
@@ -271,7 +266,6 @@ def _gfx1250_tdm_configs(m, n, k, dtype, layout="nt"):
             not config["interleave"]
             or (config["m_waves"], config["n_waves"]) not in ((2, 4), (4, 2), (4, 4))
         )
-        and (not config["split_k_atomic"] or config["split_k"] > 1)
     ]
     for config in configs:
         config["k_waves"] = 1
@@ -309,7 +303,6 @@ def _gfx1250_tdm_configs(m, n, k, dtype, layout="nt"):
                 b_k_contiguous,
                 config["split_k"],
                 interleave=config["interleave"],
-                split_k_atomic=config["split_k_atomic"],
             )
             valid_configs.append(config)
         except ValueError:
@@ -319,15 +312,7 @@ def _gfx1250_tdm_configs(m, n, k, dtype, layout="nt"):
         config.pop("mma_m")
         config.pop("mma_n")
         config.pop("mma_k")
-        config["policy"] = (
-            "tdmia"
-            if config["interleave"] and config["split_k_atomic"]
-            else (
-                "tdmi"
-                if config["interleave"]
-                else "tdma" if config["split_k_atomic"] else "tdm"
-            )
-        )
+        config["policy"] = "tdmi" if config["interleave"] else "tdm"
         config["use_half_tile_interleaved"] = False
     return valid_configs
 
@@ -347,7 +332,10 @@ def get_flydsl_a16w16_configs(
     if out_dtype not in (dtype, torch.float32):
         return []
     if get_gfx_runtime() == "gfx1250" and out_dtype == dtype:
-        return _gfx1250_tdm_configs(m, n, k, dtype)
+        # Re-add the original gfx1250 FT/HT backend to the tuner race next to
+        # TDM. Their split-K partials and K-tail handling differ, so each
+        # backend is validated by its own catalog.
+        return _gfx1250_tdm_configs(m, n, k, dtype) + _gfx1250_configs(m, n, k)
     if get_gfx_runtime() in ("gfx1250", "gfx1250-strict"):
         return _gfx1250_configs(m, n, k)
     if make_gemm_a16w16_param_and_validate is None:

@@ -8,14 +8,13 @@ import functools
 import torch
 
 from .kernels.dcp_topk_merge import build_dcp_topk_merge_module
-from .kernels.kernels_common import get_warp_size
-from .kernels.tensor_shim import _run_compiled
+from .kernels.tensor_shim import _run_compiled, wave_size_of
 
 
 @functools.cache
-def _get_launcher(n_cand, k_loc, topk_tokens, page_size, world_size):
+def _get_launcher(n_cand, k_loc, topk_tokens, page_size, world_size, wave_size):
     return build_dcp_topk_merge_module(
-        n_cand, k_loc, topk_tokens, page_size, world_size
+        n_cand, k_loc, topk_tokens, page_size, world_size, wave_size
     )
 
 
@@ -39,7 +38,6 @@ def _validate(
     world_size,
     topk_tokens,
     page_size,
-    device_warp,
 ):
     if len(sc_shape) != 2 or sc_dtype != torch.float32:
         raise ValueError("gathered_scores must be a 2D float32 tensor")
@@ -84,8 +82,6 @@ def _validate(
         raise ValueError("out_kv_indices too small for the worst case")
     if page_size <= 0:
         raise ValueError("page_size must be positive")
-    if device_warp != 64:
-        raise ValueError("the FlyDSL DCP merge kernel requires a wave64 GPU")
 
 
 def flydsl_dcp_topk_merge(
@@ -138,11 +134,14 @@ def flydsl_dcp_topk_merge(
         world_size,
         topk_tokens,
         page_size,
-        get_warp_size(),
     )
     rows, n_cand = gathered_scores.shape
     k_loc = n_cand // world_size
-    launcher = _get_launcher(n_cand, k_loc, topk_tokens, page_size, world_size)
+    # The kernel is built for the wave width of the GPU the scores are on.
+    wave_size = wave_size_of(gathered_scores.device.index)
+    launcher = _get_launcher(
+        n_cand, k_loc, topk_tokens, page_size, world_size, wave_size
+    )
     _run_compiled(
         launcher,
         gathered_scores,
