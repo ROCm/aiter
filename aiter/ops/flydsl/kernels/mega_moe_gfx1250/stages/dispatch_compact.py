@@ -63,7 +63,7 @@ def _compact_gemm_align_m(
     tile disagree.
     """
 
-    tile_m, tile_m2, _ = _compact_gemm_tiles(config, recv_bound)
+    tile_m, tile_m2, _, _ = _compact_gemm_tiles(config, recv_bound)
     return max(tile_m, tile_m2)
 
 
@@ -76,9 +76,11 @@ def _env_int(name: str) -> int | None:
 
 def _compact_gemm_tiles(
     config: "MegaMoEConfig", recv_bound: int | None = None
-) -> tuple[int, int, int]:
-    """``(tile_m, tile_m2, m_warp2)`` fused_moe resolves for this recv bound,
-    before it clamps both tiles to the plan alignment.
+) -> tuple[int, int, int, int]:
+    """``(tile_m, tile_m2, m_warp2, tdm_b_th)`` fused_moe resolves for this recv
+    bound, before it clamps both tiles to the plan alignment. ``tdm_b_th`` is
+    the row's weight TDM temporal hint after ``AITER_TDM_B_TH``, which the
+    stage-1 kernel's embedded GEMM1 takes too.
 
     Same precedence as ``grouped_gemm_gfx1250_a8w4``: the grouped-GEMM CSV row
     for ``_get_padded_m(recv_bound)``, or a row that splits that bucket at a
@@ -88,6 +90,7 @@ def _compact_gemm_tiles(
     verdict and its launcher key are computed from this, so it has to name the
     tiles GEMM1 later receives; the GEMM1 hook rejects a launch where it does not.
     """
+    from aiter.ops.flydsl.grouped_gemm_mxfp4 import _select_tdm_b_th
     from aiter.ops.flydsl.grouped_moe_gfx1250 import (
         _as_int,
         _find_grouped_config,
@@ -111,13 +114,14 @@ def _compact_gemm_tiles(
             quant_type=config.recipe.compute.quant_type,
             ep_fused=True,
         )
-    tile_m, m_warp = 64, 1
+    tile_m, m_warp, b_th = 64, 1, 0
     tile_m2 = m_warp2 = None
     if row is not None:
         tile_m = _as_int(row.get("tile_m"), tile_m) or tile_m
         tile_m2 = _as_int(row.get("tile_m2"), tile_m) or tile_m
         m_warp = _as_int(row.get("m_warp"), m_warp) or m_warp
         m_warp2 = _as_int(row.get("m_warp2"), m_warp) or m_warp
+        b_th = _as_int(row.get("tdm_b_th"), 0)
     ov_m, ov_m2 = _env_int("AITER_TDM_TILE_M"), _env_int("AITER_TDM_TILE_M2")
     if ov_m is not None or ov_m2 is not None:
         tile_m = tile_m if ov_m is None else ov_m
@@ -136,7 +140,7 @@ def _compact_gemm_tiles(
         m_warp2 = m_warp if ov_mw2 is None else ov_mw2
     tile_m2 = tile_m if tile_m2 is None else tile_m2
     m_warp2 = m_warp if m_warp2 is None else m_warp2
-    return int(tile_m), int(tile_m2), int(m_warp2)
+    return int(tile_m), int(tile_m2), int(m_warp2), _select_tdm_b_th(b_th)
 
 
 _OVERRIDE_LOGGED: set = set()
@@ -200,6 +204,7 @@ class _CompactStep:
     # align_m; 0 when not resolved (the arena-capacity placeholder step).
     g1_tile_m: int = 0
     quant_wmma_rep: int = 0
+    g1_tdm_b_th: int = 0  # GEMM1's weight TDM temporal hint
 
 
 class _CompactDispatch(_Dispatch):
@@ -684,7 +689,7 @@ class _CompactDispatch(_Dispatch):
 
         config, geo = self.config, self.compact
         bound = max(1, min(int(recv_bound), config.max_recv))
-        tile_m, tile_m2, m_warp2 = _compact_gemm_tiles(config, recv_bound=bound)
+        tile_m, tile_m2, m_warp2, b_th = _compact_gemm_tiles(config, recv_bound=bound)
         # The arena holds rows for the capacity tile, and the CSV tiles are not
         # monotonic in the token bucket, so a smaller bound can still name a
         # wider tile. Clamping keeps every step inside the allocated rows.
@@ -703,6 +708,7 @@ class _CompactDispatch(_Dispatch):
             rows=min(rows, geo.cap),
             g1_tile_m=min(tile_m, align_m),
             quant_wmma_rep=max(1, tile_m2 // max(1, m_warp2) // 16),
+            g1_tdm_b_th=b_th,
         )
 
     def _precompile_s1f_plans(self) -> None:
@@ -731,7 +737,9 @@ class _CompactDispatch(_Dispatch):
             st = self._step_for(b)
             steps.setdefault(int(st.align_m), st)
             if not self.fusion.step_reasons(st):
-                self.fusion.launch_keys.add((int(st.align_m), int(st.quant_wmma_rep)))
+                self.fusion.launch_keys.add(
+                    (int(st.align_m), int(st.quant_wmma_rep), int(st.g1_tdm_b_th))
+                )
         max_tok = min(int(config.max_tokens_per_rank), limit)
         widths = {}
         for tok in range(1, max_tok + 1):

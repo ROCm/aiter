@@ -81,6 +81,8 @@ _S1F_MAX_RECV_BY_SHAPE: dict = {
     (2, 6): 1 << 30,
     (4, 6): 1 << 30,
     (8, 6): 1 << 30,
+    # EP8 top-16 (K3 decode c1024): bucket 8192 runs stage-1 fused (tile 128).
+    (8, 16): 8192,
     (16, 6): 1 << 30,
     (2, 7): 1 << 30,
     (4, 7): 1 << 30,
@@ -207,7 +209,7 @@ class _Stage1Fusion:
         self.cu = 0
         self.tiles: set[int] = set()
         self.tile_cap = 0
-        # (align_m, quant_wmma_rep) of every step bound that runs the kernel.
+        # (align_m, quant_wmma_rep, tdm_b_th) of every step bound that runs the kernel.
         self.launch_keys: set = set()
         self.step = None
         self.wire = None
@@ -464,11 +466,27 @@ class _Stage1Fusion:
         return s1f_producers(tokens), s1f_block_runs(tokens)
 
     def _launcher(
-        self, *, tile_m, producers, group_m, stage1_act, quant_wmma_rep, block_runs
+        self,
+        *,
+        tile_m,
+        producers,
+        group_m,
+        stage1_act,
+        quant_wmma_rep,
+        block_runs,
+        tdm_b_th,
     ):
         from .s1f_stage1 import make_s1f_stage1
 
-        key = (tile_m, producers, group_m, stage1_act, quant_wmma_rep, block_runs)
+        key = (
+            tile_m,
+            producers,
+            group_m,
+            stage1_act,
+            quant_wmma_rep,
+            block_runs,
+            tdm_b_th,
+        )
         launch = self.launches.get(key)
         if launch is None:
             d, config = self.d, self.d.config
@@ -499,6 +517,7 @@ class _Stage1Fusion:
                 block_runs=block_runs,
                 ticket_span=self.ticket_span,
                 ctas_per_cu=ctas_per_cu,
+                tdm_b_th=tdm_b_th,
             )
             self.launches[key] = launch
         return launch
@@ -511,7 +530,9 @@ class _Stage1Fusion:
         spec = tuple((a.dtype, a.dim()) for a in args if isinstance(a, torch.Tensor))
         _run_compiled(launch, *args, specialization_key=spec)
 
-    def _precompile(self, launch_args, *, tile_m, group_m, stage1_act, quant_wmma_rep):
+    def _precompile(
+        self, launch_args, *, tile_m, group_m, stage1_act, quant_wmma_rep, tdm_b_th
+    ):
         from .compact_plan import compact_run_buffer_dwords
 
         config, d = self.d.config, self.d
@@ -541,6 +562,7 @@ class _Stage1Fusion:
                 stage1_act=stage1_act,
                 quant_wmma_rep=quant_wmma_rep,
                 block_runs=block_runs,
+                tdm_b_th=tdm_b_th,
             )
             if id(launch) not in seen:
                 seen.add(id(launch))
@@ -662,19 +684,21 @@ class _Stage1Fusion:
         # The first eager launch builds the launcher of every step bound that
         # can run the kernel, so a bucket first seen in a graph capture does
         # not JIT-compile there. The precompile launches are collective.
-        keys = {(t, int(stage1_act), q) for t, q in self.launch_keys}
-        keys.add((align_m, int(stage1_act), int(quant_wmma_rep)))
+        b_th = int(self.d._step.g1_tdm_b_th)
+        keys = {(t, int(stage1_act), q, b) for t, q, b in self.launch_keys}
+        keys.add((align_m, int(stage1_act), int(quant_wmma_rep), b_th))
         if not keys <= self.precompiled and (
             not torch.cuda.is_current_stream_capturing()
         ):
-            for t, act, q in sorted(keys - self.precompiled):
-                self.precompiled.add((t, act, q))
+            for t, act, q, b in sorted(keys - self.precompiled):
+                self.precompiled.add((t, act, q, b))
                 self._precompile(
                     launch_args,
                     tile_m=t,
                     group_m=group_m,
                     stage1_act=act,
                     quant_wmma_rep=q,
+                    tdm_b_th=b,
                 )
         launch = self._launcher(
             tile_m=align_m,
@@ -683,6 +707,7 @@ class _Stage1Fusion:
             stage1_act=int(stage1_act),
             quant_wmma_rep=int(quant_wmma_rep),
             block_runs=block_runs,
+            tdm_b_th=b_th,
         )
         self._run(
             launch,

@@ -540,6 +540,7 @@ def make_s1f_stage1(
     block_runs=MB_RB,
     ticket_span=None,
     ctas_per_cu=2,
+    tdm_b_th=0,
 ):
     """Build the S1F stage-1 kernel; returns a ``@flyc.jit`` launcher.
 
@@ -788,7 +789,7 @@ def make_s1f_stage1(
             next_stage_prefetch=0,
             num_waves_per_tensor_tdm=2,
             tdm_as_in_prologue=0,
-            tdm_b_th=0,
+            tdm_b_th=tdm_b_th,
             enable_ep_scatter=0,
             ep_arena_handle=0,
             ep_combine_input_offset=0,
