@@ -60,7 +60,7 @@ def attn_res_gate_tdm_kernel_gfx1250(
 ):
     """One program per token. ``prefix``, ``add_hidden``, ``add_hidden2``,
     ``prefix_out`` and ``o`` are contiguous ``[N, D]``. Requires B >= 1."""
-    gl.static_assert(PREFETCH >= 1 and PREFETCH <= 3)
+    gl.static_assert(PREFETCH == 2)
     layout: gl.constexpr = gl.BlockedLayout([8], [32], [NUM_WARPS], [0])
     t = gl.program_id(0).to(gl.int64)
     o_d = gl.arange(0, BD, layout=layout)
@@ -108,23 +108,12 @@ def attn_res_gate_tdm_kernel_gfx1250(
     b_o = ps
     for i_l in range(B):
         # Wait until row i_l is in LDS. Each wave waits for its own slice.
-        if PREFETCH == 1:
-            gl.amd.cdna5.tdm.async_wait(0)
-        elif PREFETCH == 2:
-            if i_l + 1 < B:
-                gl.amd.cdna5.tdm.async_wait(1)
-            else:
-                gl.amd.cdna5.tdm.async_wait(0)
+        if i_l + 1 < B:
+            gl.amd.cdna5.tdm.async_wait(1)
         else:
-            if i_l + 2 < B:
-                gl.amd.cdna5.tdm.async_wait(2)
-            elif i_l + 1 < B:
-                gl.amd.cdna5.tdm.async_wait(1)
-            else:
-                gl.amd.cdna5.tdm.async_wait(0)
-        # The compiler puts an s_barrier after this wait. After it, all slices of
-        # row i_l are in LDS and no wave reads row i_l - 1, which the refill
-        # overwrites. Do not add gl.barrier(): it is a second barrier and a fence.
+            gl.amd.cdna5.tdm.async_wait(0)
+        # AMD's membar pass joins the completed slices and the previous row's
+        # LDS reads before refill; test_attn_res_tdm_asm guards this barrier.
         gl.amd.cdna5.tdm.async_load(
             desc,
             [i_l + PREFETCH, 0],

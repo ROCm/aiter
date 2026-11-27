@@ -609,7 +609,7 @@ def test_attn_res_gate_out_quant_requires_output_rms_weight():
 
 
 def _skip_without_gate_tdm(backend):
-    if backend == "gluon" and attn_res_module._gate_tdm_kernel() is None:
+    if backend == "gluon" and attn_res_module._GATE_TDM_KERNEL is None:
         pytest.skip("the Gluon TDM kernel of attn_res_gate needs gfx1250")
 
 
@@ -943,7 +943,7 @@ def test_attn_res_sequence_requires_d_multiple_of_16():
 
 
 _requires_gate_tdm = pytest.mark.skipif(
-    attn_res_module._gate_tdm_kernel() is None,
+    attn_res_module._GATE_TDM_KERNEL is None,
     reason="the Gluon TDM kernel of attn_res_gate needs gfx1250",
 )
 
@@ -1022,98 +1022,253 @@ def test_attn_res_gate_gluon_matches_reference(B, N, D, variant, dtype):
         )
 
 
-def _record_gate_launches(monkeypatch):
-    """Replace both launchers of attn_res_gate; return the list of picks."""
+class _GateDispatchTensor(torch.Tensor):
+    """CPU tensor metadata for tests that replace the kernel launch."""
+
+    @property
+    def is_cuda(self):
+        return True
+
+
+def _gate_dispatch_inputs(N, D=256, B=2, dtype=torch.bfloat16):
+    prefix = torch.empty((N, D), dtype=dtype, device="cpu").as_subclass(
+        _GateDispatchTensor
+    )
+    block = torch.empty((N, B, D), dtype=dtype, device="cpu")
+    weight = torch.empty(D, dtype=dtype, device="cpu")
+    return prefix, block, weight
+
+
+def _record_gate_launches(monkeypatch, arch="gfx1250"):
+    """Record public-wrapper launches without compiling either kernel."""
     used = []
-    monkeypatch.setattr(
-        attn_res_module,
-        "_launch_gate_tdm",
-        lambda *args, **kwargs: used.append("gluon"),
+    tdm_kernel = object()
+    monkeypatch.setattr(attn_res_module, "_ARCH", arch)
+    monkeypatch.setattr(attn_res_module, "_GATE_TDM_KERNEL", tdm_kernel)
+    config_dir = config_utils.resolve_config_dir(
+        "fusions", "ATTN_RES_GATE_TDM", backend="gluon", arch="gfx1250", cu_num=None
     )
-    monkeypatch.setattr(
-        attn_res_module,
-        "_launch_gate_triton",
-        lambda *args, **kwargs: used.append("triton"),
-    )
+    config_table = config_utils.load_config_json(f"{config_dir}/DEFAULT.json")
+
+    def pick_config(tokens):
+        config = config_utils.select_leq_config(config_table, tokens)
+        return config["num_warps"], config["PREFETCH"]
+
+    def record(
+        key,
+        grid_n,
+        argv,
+        tune_kwargs,
+        kernel=attn_res_module.attnres_fwd_kernel,
+        arg_order=attn_res_module._KERNEL_ARG_ORDER,
+    ):
+        used.append(
+            (
+                "gluon" if kernel is tdm_kernel else "triton",
+                dict(zip(arg_order, argv)),
+                tune_kwargs,
+                kernel,
+            )
+        )
+
+    monkeypatch.setattr(attn_res_module, "_pick_gate_tdm_config", pick_config)
+    monkeypatch.setattr(attn_res_module, "_launch_attn_res", record)
     return used
 
 
-@_requires_gate_tdm
-def test_attn_res_gate_gluon_rejects_unsupported_inputs(monkeypatch):
-    """Unsupported inputs raise with backend="gluon" and use the Triton kernel by
-    default, also above _ATTN_RES_PREFILL_T, where a supported input uses Gluon."""
-    N = attn_res_module._ATTN_RES_PREFILL_T + 44
-    fp32 = generate_attn_res_gate_inputs(N, 256, 2, torch.float32, with_add=False)
-    bf16 = generate_attn_res_gate_inputs(N, 256, 2, torch.bfloat16, with_add=False)
-    for (prefix, block_residual, score_weight, _, _), close_block in (
-        (fp32, False),
-        (bf16, True),
-    ):
-        with pytest.raises(RuntimeError, match="Gluon backend"):
-            attn_res_gate(
-                prefix,
-                block_residual,
-                score_weight,
-                1e-6,
-                close_block=close_block,
-                backend="gluon",
-            )
-        used = _record_gate_launches(monkeypatch)
-        attn_res_gate(
-            prefix, block_residual, score_weight, 1e-6, close_block=close_block
-        )
-        assert used == ["triton"]
-
-
-@_requires_gate_tdm
-def test_attn_res_gate_gluon_needs_the_tdm_api(monkeypatch):
-    """A Triton without the Gluon CDNA5 TDM API never selects the Gluon kernel."""
-    from triton.experimental.gluon.language.amd import cdna5
-
-    monkeypatch.delattr(cdna5, "tdm")
-    attn_res_module._gate_tdm_kernel.cache_clear()
-    try:
-        assert attn_res_module._gate_tdm_kernel() is None
-    finally:
-        monkeypatch.undo()
-        attn_res_module._gate_tdm_kernel.cache_clear()
-
-
-@_requires_gate_tdm
-def test_attn_res_gate_gluon_is_not_used_on_gfx1250_strict(monkeypatch):
-    """gfx1250-strict keeps the Triton kernel: the Gluon kernel and its config
-    are validated on gfx1250 only."""
-    N = attn_res_module._ATTN_RES_PREFILL_T + 44
-    prefix, block_residual, score_weight, _, _ = generate_attn_res_gate_inputs(
-        N, 256, 2, torch.bfloat16, with_add=False
-    )
-    monkeypatch.setattr(attn_res_module.arch_info, "get_arch", lambda: "gfx1250-strict")
-    attn_res_module._gate_tdm_kernel.cache_clear()
-    try:
-        assert attn_res_module._gate_tdm_kernel() is None
-        used = _record_gate_launches(monkeypatch)
-        attn_res_gate(prefix, block_residual, score_weight, 1e-6)
-        assert used == ["triton"]
-    finally:
-        monkeypatch.undo()
-        attn_res_module._gate_tdm_kernel.cache_clear()
-
-
-def test_attn_res_gate_rejects_unknown_backend():
-    prefix, block_residual, score_weight, _, _ = generate_attn_res_gate_inputs(
-        8, 256, 2, torch.bfloat16, with_add=False
-    )
-    with pytest.raises(ValueError, match="Unknown backend"):
-        attn_res_gate(prefix, block_residual, score_weight, 1e-6, backend="cuda")
-
-
-@_requires_gate_tdm
+@pytest.mark.parametrize("arch", ["gfx942", "gfx950", "gfx1250", "gfx1250-strict"])
+@pytest.mark.parametrize("backend", [None, "triton", "gluon", "arch"])
 @pytest.mark.parametrize("N", [256, 257])
-def test_attn_res_gate_default_backend_threshold(monkeypatch, N):
-    """The default uses the Gluon kernel only above _ATTN_RES_PREFILL_T tokens."""
-    used = _record_gate_launches(monkeypatch)
-    prefix, block_residual, score_weight, _, _ = generate_attn_res_gate_inputs(
-        N, 256, 2, torch.bfloat16, with_add=False
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("close_block", [False, True])
+def test_attn_res_gate_backend_dispatch(
+    monkeypatch, arch, backend, N, dtype, close_block
+):
+    used = _record_gate_launches(monkeypatch, arch)
+    args = _gate_dispatch_inputs(N, dtype=dtype)
+    supported = arch == "gfx1250" and dtype == torch.bfloat16 and not close_block
+    if backend == "gluon" and not supported:
+        with pytest.raises(RuntimeError, match="Gluon backend"):
+            attn_res_gate(*args, close_block=close_block, backend=backend)
+        assert not used
+        return
+    attn_res_gate(*args, close_block=close_block, backend=backend)
+    expect_gluon = supported and (
+        backend in ("gluon", "arch") or (backend is None and N > 256)
     )
-    attn_res_gate(prefix, block_residual, score_weight, 1e-6)
-    assert used == ["gluon" if N > attn_res_module._ATTN_RES_PREFILL_T else "triton"]
+    assert [call[0] for call in used] == ["gluon" if expect_gluon else "triton"]
+
+
+@pytest.mark.parametrize(
+    "backend,N,close_block,arch",
+    [
+        ("triton", 257, False, "gfx1250"),
+        (None, 256, False, "gfx1250"),
+        (None, 257, True, "gfx1250"),
+        ("arch", 1, True, "gfx1250"),
+        ("arch", 257, False, "gfx950"),
+        ("arch", 257, False, "gfx1250-strict"),
+    ],
+)
+def test_attn_res_gate_dispatch_skips_tensor_probes(
+    monkeypatch, backend, N, close_block, arch
+):
+    monkeypatch.setattr(attn_res_module, "_ARCH", arch)
+    monkeypatch.setattr(attn_res_module, "_GATE_TDM_KERNEL", object())
+
+    def unexpected_probe(*args):
+        pytest.fail("the scalar dispatch checks must precede tensor checks")
+
+    monkeypatch.setattr(attn_res_module, "_gate_tdm_supports", unexpected_probe)
+    assert not attn_res_module._use_gate_tdm(backend, None, N, 256, close_block)
+
+
+def test_attn_res_gate_rejects_unknown_backend(monkeypatch):
+    used = _record_gate_launches(monkeypatch)
+    with pytest.raises(ValueError, match="Unknown backend"):
+        attn_res_gate(*_gate_dispatch_inputs(8), backend="cuda")
+    assert not used
+
+
+@pytest.mark.parametrize("backend", [None, "arch"])
+def test_attn_res_gate_missing_kernel_falls_back(monkeypatch, backend):
+    used = _record_gate_launches(monkeypatch)
+    monkeypatch.setattr(attn_res_module, "_GATE_TDM_KERNEL", None)
+    attn_res_gate(*_gate_dispatch_inputs(257), backend=backend)
+    assert [call[0] for call in used] == ["triton"]
+
+
+@pytest.mark.parametrize(
+    "case,supported",
+    [
+        ("bf16", True),
+        ("fp16", True),
+        ("fp32", False),
+        ("empty_block", False),
+        ("max_d", True),
+        ("large_d", False),
+        ("hidden_stride", False),
+        ("row_stride", False),
+        ("token_stride", False),
+        ("offset", False),
+        ("aligned_offset", True),
+        ("bank_view", True),
+    ],
+)
+def test_attn_res_gate_tdm_supports_cpu(case, supported):
+    dtype = {"fp16": torch.float16, "fp32": torch.float32}.get(case, torch.bfloat16)
+    D = {"max_d": 8192, "large_d": 8200}.get(case, 256)
+    B = 0 if case == "empty_block" else 2
+    br = torch.empty((2, B, D), dtype=dtype, device="cpu")
+    if case == "hidden_stride":
+        br = br[..., ::2]
+    elif case in ("row_stride", "token_stride"):
+        strides = (2 * D + 8, D + 1, 1) if case == "row_stride" else (2 * D + 1, D, 1)
+        br = torch.empty_strided((2, B, D), strides, dtype=dtype, device="cpu")
+    elif case in ("offset", "aligned_offset"):
+        offset = 1 if case == "offset" else 8
+        br = torch.empty(2 * B * D + offset, dtype=dtype, device="cpu")[offset:].view(
+            2, B, D
+        )
+    elif case == "bank_view":
+        br = torch.empty((2, 8, D), dtype=dtype, device="cpu")[:, :B]
+    assert attn_res_module._gate_tdm_supports(br, br.shape[-1]) is supported
+
+
+@pytest.mark.parametrize("backend", ["triton", "arch"])
+def test_attn_res_gate_preserves_strided_bank(monkeypatch, backend):
+    used = _record_gate_launches(monkeypatch)
+    prefix, _, weight = _gate_dispatch_inputs(257)
+    bank = torch.empty((257, 8, 256), dtype=torch.bfloat16, device="cpu")
+    block = bank[:, :3]
+    attn_res_gate(prefix, block, weight, backend=backend)
+    assert len(used) == 1
+    assert used[0][0] == ("gluon" if backend == "arch" else "triton")
+    args = used[0][1]
+    assert args["res_packed"] is block
+    assert args["res_packed"].data_ptr() == block.data_ptr()
+    assert (args["stride_res_n"], args["stride_res_l"]) == block.stride()[:2]
+
+
+def test_attn_res_gate_rejects_mismatched_hidden_dimension(monkeypatch):
+    used = _record_gate_launches(monkeypatch)
+    prefix, _, weight = _gate_dispatch_inputs(8)
+    block = torch.empty((8, 2, 128), dtype=torch.bfloat16, device="cpu")
+    with pytest.raises(ValueError, match="leading dimensions must match"):
+        attn_res_gate(prefix, block, weight, backend="arch")
+    assert not used
+
+
+@pytest.mark.parametrize("arch", ["gfx950", "gfx1250"])
+@pytest.mark.parametrize("close_block", [False, True])
+def test_attn_res_gate_arch_configuration_is_batch_invariant(
+    monkeypatch, arch, close_block
+):
+    used = _record_gate_launches(monkeypatch, arch)
+    selected_tokens = []
+    pick_config = attn_res_module._pick_gate_tdm_config
+
+    def record_config(tokens):
+        selected_tokens.append(tokens)
+        return pick_config(tokens)
+
+    monkeypatch.setattr(attn_res_module, "_pick_gate_tdm_config", record_config)
+    for N in (1, 256, 257, 512):
+        attn_res_gate(
+            *_gate_dispatch_inputs(N), backend="arch", close_block=close_block
+        )
+    assert len(used) == 4
+    for backend, args, kwargs, _ in used:
+        assert backend == used[0][0]
+        assert kwargs == used[0][2]
+        if backend == "triton":
+            assert args["BL"] == used[0][1]["BL"]
+            assert args["SEPARATE"] is False
+    if used[0][0] == "gluon":
+        assert selected_tokens == [1, 1, 1, 1]
+
+
+def test_attn_res_gate_arch_bypasses_autotune(monkeypatch):
+    used = _record_gate_launches(monkeypatch, "gfx950")
+    raw_kernel = object()
+
+    class Autotuner:
+        fn = raw_kernel
+
+    monkeypatch.setattr(attn_res_module, "ATTN_RES_TRITON_AUTOTUNE", True)
+    monkeypatch.setattr(attn_res_module, "attnres_fwd_kernel", Autotuner())
+    attn_res_gate(*_gate_dispatch_inputs(257), backend="arch")
+    assert len(used) == 1
+    assert used[0][3] is raw_kernel
+    assert used[0][1]["SEPARATE"] is False
+    warps, stages, bl = attn_res_module._pick_attn_res_packed_config(1, 4)
+    assert used[0][1]["BL"] == bl
+    assert used[0][2]["num_warps"] == warps
+    assert used[0][2]["num_stages"] == stages
+
+
+@pytest.mark.parametrize("case", ["supported", "unaligned_rows", "close_block"])
+def test_attn_res_gate_arch_bf16_batch_invariant(case):
+    """The same BF16 row must not change when the token count changes."""
+    D = 257 if case == "unaligned_rows" else 256
+    prefix, block, weight, hidden, hidden2 = generate_attn_res_gate_inputs(
+        512, D, 3, torch.bfloat16, with_add=True, with_add2=True
+    )
+    onorm = torch.randn(D, dtype=torch.bfloat16, device="cuda")
+    results = []
+    for N in (1, 256, 257, 512):
+        results.append(
+            attn_res_gate(
+                prefix[:N],
+                block[:N],
+                weight,
+                add_hidden=hidden[:N],
+                add_hidden2=hidden2[:N],
+                output_rms_weight=onorm,
+                backend="arch",
+                close_block=case == "close_block",
+            )
+        )
+    for result in results[1:]:
+        for value, expected in zip(result, results[0]):
+            torch.testing.assert_close(value[:1], expected, atol=0, rtol=0)

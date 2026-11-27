@@ -18,15 +18,14 @@ fla, but the backward pass is not ported. The backward checkpoint tensors
 as kernel parameters so a backward kernel can be reintroduced later, but they are
 passed as ``None`` with their save flags off here.
 
-Both residual layouts are served by the single ``attnres_fwd_kernel`` via an
-``IS_PACKED`` switch:
+The Triton kernel supports both residual layouts through ``IS_PACKED``:
 
 * ``layout="sequence"``: a ``Sequence`` of L independent ``[.., D]`` tensors, the
   native form of the fla ``fused_attnres`` API, gathered through a length-``L2``
   pointer table.
 * ``layout="packed"``: one contiguous ``[.., L, D]`` tensor read with row strides.
 
-:func:`attn_res_gate` exposes the same packed kernel under the inference contract
+:func:`attn_res_gate` uses Triton or gfx1250 Gluon TDM under the inference contract
 used by serving stacks (the candidate set is a packed ``[.., B, D]`` block plus a
 separate ``prefix`` row, and the caller's ``prefix += hidden [+ hidden2]`` add can
 be folded into the kernel) -- this mirrors ATOM's ``apply_attn_res``, including its
@@ -37,7 +36,6 @@ RMSNorm can also emit a per-token FP8 activation directly (``out_quant_dtype``),
 which is what lets several consumers of the same normed row share one quant.
 """
 
-import functools
 import logging
 import os
 from collections.abc import Sequence
@@ -437,37 +435,16 @@ _GATE_TDM_ARG_ORDER = (
 )
 
 
-def _has_gluon_tdm() -> bool:
-    # The kernel module imports without these; Gluon resolves them only when it
-    # traces the kernel, so check them before the kernel is selected.
-    try:
-        from triton.experimental.gluon import language as gl
-    except ImportError:
-        return False
-    cdna5 = getattr(getattr(gl, "amd", None), "cdna5", None)
-    tdm = getattr(cdna5, "tdm", None)
-    return all(
-        callable(getattr(tdm, name, None))
-        for name in ("make_tensor_descriptor", "async_load", "async_wait")
-    ) and all(
-        callable(getattr(cdna5, name, None)) for name in ("buffer_load", "buffer_store")
-    )
-
-
-@functools.cache
-def _gate_tdm_kernel():
-    """The gfx1250 Gluon TDM kernel of attn_res_gate, or None where it cannot run."""
-    # gfx1250 only: the kernel and its config are validated on gfx1250, not on
-    # gfx1250-strict (see docs/gfx1250-strict-enablement-plan.md).
-    if arch_info.get_arch() != "gfx1250" or not _has_gluon_tdm():
-        return None
+_ARCH = arch_info.get_arch()
+_GATE_TDM_KERNEL = None
+if _ARCH == "gfx1250":
     from aiter.ops.triton._gluon_kernels.gfx1250.fusions.attn_res import (
         attn_res_gate_tdm_kernel_gfx1250,
     )
 
-    if tuple(attn_res_gate_tdm_kernel_gfx1250.arg_names) != _GATE_TDM_ARG_ORDER:
+    _GATE_TDM_KERNEL = attn_res_gate_tdm_kernel_gfx1250
+    if tuple(_GATE_TDM_KERNEL.arg_names) != _GATE_TDM_ARG_ORDER:
         raise RuntimeError("attn_res_gate_tdm_kernel_gfx1250 signature changed")
-    return attn_res_gate_tdm_kernel_gfx1250
 
 
 def _gate_tdm_supports(br: torch.Tensor, D: int) -> bool:
@@ -486,25 +463,25 @@ def _gate_tdm_supports(br: torch.Tensor, D: int) -> bool:
 def _use_gate_tdm(
     backend: str | None, br: torch.Tensor, N: int, D: int, close_block: bool
 ) -> bool:
-    # None picks Gluon where supported in the prefill regime; "triton" and
-    # "gluon" force that kernel.
-    if backend not in (None, "triton", "gluon"):
-        raise ValueError(f"Unknown backend {backend!r}; use None, 'triton' or 'gluon'")
-    if backend == "triton":
+    if backend not in (None, "triton", "gluon", "arch"):
+        raise ValueError(
+            f"Unknown backend {backend!r}; use None, 'triton', 'gluon' or 'arch'"
+        )
+    if backend == "triton" or (backend is None and N <= _ATTN_RES_PREFILL_T):
         return False
-    # close_block keeps the copied rows in VGPRs and halves the occupancy.
     supported = (
-        not close_block and _gate_tdm_kernel() is not None and _gate_tdm_supports(br, D)
+        not close_block
+        and _ARCH == "gfx1250"
+        and _GATE_TDM_KERNEL is not None
+        and _gate_tdm_supports(br, D)
     )
     if backend == "gluon" and not supported:
         raise RuntimeError(
-            "The Gluon backend of attn_res_gate requires gfx1250 with the Gluon "
-            "CDNA5 TDM API, a bf16 or fp16 "
+            "The Gluon backend of attn_res_gate requires gfx1250, a bf16 or fp16 "
             "block_residual with B >= 1, D <= 8192 and 16-byte aligned rows, "
             "and close_block=False"
         )
-    # At N <= _ATTN_RES_PREFILL_T the Triton packed path is as fast or faster.
-    return supported and (backend == "gluon" or N > _ATTN_RES_PREFILL_T)
+    return supported
 
 
 def _pick_gate_tdm_config(tokens: int) -> tuple[int, int]:
@@ -794,137 +771,6 @@ def _run_packed(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm):
     return o.view(output_shape)
 
 
-def _launch_gate_triton(
-    sw,
-    ow,
-    y,
-    y_scale,
-    br,
-    pf,
-    hs,
-    hs2,
-    prefix_out,
-    bo,
-    N,
-    L,
-    D,
-    eps,
-    output_rms_eps,
-    scale,
-    has_onorm,
-    do_add,
-    do_add2,
-    close_block,
-    quant,
-    out_quant_dtype,
-) -> None:
-    """attn_res_gate on attnres_fwd_kernel (packed + prefix layout)."""
-    B = L - 1
-    L2 = max(1, _next_pow2(L))
-    num_warps, num_stages, bl = _pick_attn_res_packed_config(N, L2)
-    # Prefill regime: separate the prefix candidate out of the loop and drop to BL=1
-    # (see _ATTN_RES_PREFILL_T). The separated loop covers only the B block_residual
-    # rows, so BL=1 is a flat 1-D row load with no candidate-axis raggedness.
-    separate = N > _ATTN_RES_PREFILL_T
-    if separate:
-        bl = _pick_attn_res_separate_bl(N, _next_pow2(max(L - 1, 1)), close_block)
-        num_warps = _pick_attn_res_separate_num_warps(N, B, close_block, num_warps)
-
-    res_stride_n, res_stride_l, _ = br.stride()
-    bo_stride_n, bo_stride_l, _ = bo.stride()
-    fp8_max = _dtype_max(out_quant_dtype) if quant else 1.0
-    argv = (
-        sw,  # q
-        None,  # res: unused when IS_PACKED (sequence branch is dead); None keeps
-        # the L2 dead pointer slots out of the kernarg segment
-        sw,  # w
-        ow,
-        y,  # o
-        None,  # o_pre
-        None,  # rstd
-        None,  # logit
-        None,  # lse
-        br,  # res_packed
-        pf,  # prefix
-        hs,  # add_hidden
-        hs2,  # add_hidden2
-        prefix_out,
-        bo,  # block_out
-        y_scale,  # o_scale
-        N,
-        L,
-        res_stride_n,
-        res_stride_l,
-        bo_stride_n,
-        bo_stride_l,
-        L2,
-        D,
-        eps,
-        output_rms_eps,  # out_eps
-        scale,
-        bl,  # BL
-        _next_pow2(D),  # BD
-        has_onorm,  # HAS_ONORM
-        False,  # SAVE_OPRE
-        False,  # SAVE_STATS
-        True,  # IS_PACKED
-        True,  # HAS_PREFIX
-        do_add,  # DO_ADD
-        do_add2,  # DO_ADD2
-        do_add,  # WRITE_PREF
-        close_block,  # WRITE_BLOCK_CAT
-        False,  # HAS_W
-        quant,  # QUANT_FP8
-        fp8_max,  # FP8_MAX
-        separate,  # SEPARATE
-    )
-    if _LAUNCH_CACHE_ENABLED:
-        # Everything Triton would specialize on. The aliased slots (q/w, and the
-        # hs/hs2/prefix_out/bo reuse of pf/br when their flags are off) are
-        # covered by the flags already in the key, so they are not probed twice.
-        key = (
-            _tensor_spec(sw),
-            _tensor_spec(ow),
-            _fresh_tensor_spec(y),
-            _fresh_tensor_spec(y_scale),
-            _tensor_spec(br),
-            _tensor_spec(pf),
-            _tensor_spec(hs) if do_add else None,
-            _tensor_spec(hs2) if do_add2 else None,
-            _fresh_tensor_spec(prefix_out) if do_add else None,
-            _fresh_tensor_spec(bo) if close_block else None,
-            _int_spec(N),
-            L,
-            res_stride_n,
-            res_stride_l,
-            bo_stride_n,
-            bo_stride_l,
-            L2,
-            D,
-            # Triton specializes scalars too -- a float that happens to be 1.0
-            # compiles to a different kernel than one that is not -- so the
-            # scalars go in by value rather than by any derived property. They
-            # are model constants, so this does not grow the cache.
-            eps,
-            output_rms_eps,
-            scale,
-            bl,
-            has_onorm,
-            do_add,
-            do_add2,
-            close_block,
-            quant,
-            fp8_max,
-            separate,
-            num_warps,
-            num_stages,
-        )
-    else:
-        key = None
-    # BL rides in argv at its signature position, so it must not be repeated here.
-    _launch_attn_res(key, N, argv, _launch_tune_kwargs(num_warps, num_stages))
-
-
 def _launch_gate_tdm(
     sw,
     ow,
@@ -946,10 +792,10 @@ def _launch_gate_tdm(
     do_add2,
     quant,
     out_quant_dtype,
+    batch_invariant,
 ) -> None:
     """attn_res_gate on the gfx1250 Gluon TDM kernel."""
-    tdm_kernel = _gate_tdm_kernel()
-    num_warps, prefetch = _pick_gate_tdm_config(N)
+    num_warps, prefetch = _pick_gate_tdm_config(1 if batch_invariant else N)
     res_stride_n, res_stride_l, _ = br.stride()
     fp8_max = _dtype_max(out_quant_dtype) if quant else 1.0
     argv = (
@@ -1011,7 +857,7 @@ def _launch_gate_tdm(
     else:
         key = None
     _launch_attn_res(
-        key, N, argv, {"num_warps": num_warps}, tdm_kernel, _GATE_TDM_ARG_ORDER
+        key, N, argv, {"num_warps": num_warps}, _GATE_TDM_KERNEL, _GATE_TDM_ARG_ORDER
     )
 
 
@@ -1071,8 +917,11 @@ def attn_res_gate(
       candidates, which need the unquantized values.
 
     - backend: ``None`` (default) uses the gfx1250 Gluon TDM kernel where it
-      is supported and ``N > 256``, else the Triton kernel. ``"triton"`` and ``"gluon"`` force
-      one kernel. The Gluon kernel needs gfx1250, a bf16 or fp16
+      is supported and ``N > 256``, else the Triton kernel. ``"arch"`` uses
+      Gluon for all supported token counts and Triton otherwise. This mode
+      fixes each kernel's configuration across token counts for batch invariance.
+      ``"triton"`` forces Triton; ``"gluon"`` raises on unsupported inputs.
+      The Gluon kernel needs gfx1250, a bf16 or fp16
       ``block_residual`` with ``B >= 1``, ``D <= 8192`` and 16-byte aligned
       rows, and ``close_block=False``. It gives the same result as the Triton
       kernel up to FP32 rounding.
@@ -1111,7 +960,13 @@ def attn_res_gate(
     B = block_residual.shape[-2]
     L = B + 1  # candidates: the B packed rows plus the prefix
 
-    br = _fast_reshape3d(block_residual, B, D)
+    br = (
+        block_residual
+        if block_residual.ndim == 3
+        and block_residual.shape[2] == D
+        and block_residual.stride(-1) == 1
+        else _fast_reshape3d(block_residual, B, D)
+    )
     pf = _fast_reshape2d(prefix, D)
     sw = _fast_flatten1d(score_weight)
     N = pf.shape[0]
@@ -1148,7 +1003,12 @@ def attn_res_gate(
         block_out = None
         bo = br  # unused (WRITE_BLOCK_CAT off); reuse an existing tensor arg
 
-    if _use_gate_tdm(backend, br, N, D, close_block):
+    if (
+        backend is not None
+        or (
+            _GATE_TDM_KERNEL is not None and N > _ATTN_RES_PREFILL_T and not close_block
+        )
+    ) and _use_gate_tdm(backend, br, N, D, close_block):
         _launch_gate_tdm(
             sw,
             ow,
@@ -1170,32 +1030,123 @@ def attn_res_gate(
             do_add2,
             quant,
             out_quant_dtype,
+            backend == "arch",
         )
     else:
-        _launch_gate_triton(
-            sw,
+        L2 = max(1, _next_pow2(L))
+        # Keep the reduction layout fixed across batches in architecture mode.
+        config_tokens = 1 if backend == "arch" else N
+        num_warps, num_stages, bl = _pick_attn_res_packed_config(config_tokens, L2)
+        # Prefill regime: separate the prefix candidate out of the loop and drop to BL=1
+        # (see _ATTN_RES_PREFILL_T). The separated loop covers only the B block_residual
+        # rows, so BL=1 is a flat 1-D row load with no candidate-axis raggedness.
+        separate = backend != "arch" and N > _ATTN_RES_PREFILL_T
+        if separate:
+            bl = _pick_attn_res_separate_bl(N, _next_pow2(max(L - 1, 1)), close_block)
+            num_warps = _pick_attn_res_separate_num_warps(N, B, close_block, num_warps)
+
+        res_stride_n, res_stride_l, _ = br.stride()
+        bo_stride_n, bo_stride_l, _ = bo.stride()
+        fp8_max = _dtype_max(out_quant_dtype) if quant else 1.0
+        argv = (
+            sw,  # q
+            None,  # res: unused when IS_PACKED (sequence branch is dead); None keeps
+            # the L2 dead pointer slots out of the kernarg segment
+            sw,  # w
             ow,
-            y,
-            y_scale,
-            br,
-            pf,
-            hs,
-            hs2,
+            y,  # o
+            None,  # o_pre
+            None,  # rstd
+            None,  # logit
+            None,  # lse
+            br,  # res_packed
+            pf,  # prefix
+            hs,  # add_hidden
+            hs2,  # add_hidden2
             prefix_out,
-            bo,
+            bo,  # block_out
+            y_scale,  # o_scale
             N,
             L,
+            res_stride_n,
+            res_stride_l,
+            bo_stride_n,
+            bo_stride_l,
+            L2,
             D,
             eps,
-            output_rms_eps,
+            output_rms_eps,  # out_eps
             scale,
-            has_onorm,
-            do_add,
-            do_add2,
-            close_block,
-            quant,
-            out_quant_dtype,
+            bl,  # BL
+            _next_pow2(D),  # BD
+            has_onorm,  # HAS_ONORM
+            False,  # SAVE_OPRE
+            False,  # SAVE_STATS
+            True,  # IS_PACKED
+            True,  # HAS_PREFIX
+            do_add,  # DO_ADD
+            do_add2,  # DO_ADD2
+            do_add,  # WRITE_PREF
+            close_block,  # WRITE_BLOCK_CAT
+            False,  # HAS_W
+            quant,  # QUANT_FP8
+            fp8_max,  # FP8_MAX
+            separate,  # SEPARATE
         )
+        if _LAUNCH_CACHE_ENABLED:
+            # Everything Triton would specialize on. The aliased slots (q/w, and the
+            # hs/hs2/prefix_out/bo reuse of pf/br when their flags are off) are
+            # covered by the flags already in the key, so they are not probed twice.
+            key = (
+                _tensor_spec(sw),
+                _tensor_spec(ow),
+                _fresh_tensor_spec(y),
+                _fresh_tensor_spec(y_scale),
+                _tensor_spec(br),
+                _tensor_spec(pf),
+                _tensor_spec(hs) if do_add else None,
+                _tensor_spec(hs2) if do_add2 else None,
+                _fresh_tensor_spec(prefix_out) if do_add else None,
+                _fresh_tensor_spec(bo) if close_block else None,
+                _int_spec(N),
+                L,
+                res_stride_n,
+                res_stride_l,
+                bo_stride_n,
+                bo_stride_l,
+                L2,
+                D,
+                # Triton specializes scalars too -- a float that happens to be 1.0
+                # compiles to a different kernel than one that is not -- so the
+                # scalars go in by value rather than by any derived property. They
+                # are model constants, so this does not grow the cache.
+                eps,
+                output_rms_eps,
+                scale,
+                bl,
+                has_onorm,
+                do_add,
+                do_add2,
+                close_block,
+                quant,
+                fp8_max,
+                separate,
+                num_warps,
+                num_stages,
+            )
+        else:
+            key = None
+        # BL rides in argv at its signature position, so it must not be repeated here.
+        if backend == "arch" and ATTN_RES_TRITON_AUTOTUNE:
+            _launch_attn_res(
+                key,
+                N,
+                argv,
+                {"num_warps": num_warps, "num_stages": num_stages},
+                attnres_fwd_kernel.fn,
+            )
+        else:
+            _launch_attn_res(key, N, argv, _launch_tune_kwargs(num_warps, num_stages))
 
     # prefix is [.., D] and the kernel writes [N, D], so the view is a no-op
     # whenever the caller already handed us a 2-D batch -- the decode case.
