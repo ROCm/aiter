@@ -79,26 +79,15 @@ def _flydsl_intranode_supported(fly_kwargs: dict) -> bool:
     """Whether the FlyDSL intra-node op serves a handle built from
     *fly_kwargs* (see :func:`_flydsl_op_kwargs`).
 
-    The kernels are wave64 (gfx942 / gfx950), and the op keeps its buffers on
-    ``cuda:{rank}``, so the rank must be the current device; everything else
-    is the op's own static config check, so the two cannot disagree.
+    The kernels are wave64 (gfx942 / gfx950); everything else is the op's own
+    static config check, so the two cannot disagree. Every term is the same
+    on every rank: building a handle is collective, so the ranks must not
+    pick different implementations.
     """
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
     arch = get_gfx_runtime()
     if arch not in ("gfx942", "gfx950") or not _has_module("flydsl"):
-        return False
-    try:
-        device = torch.cuda.current_device()
-    except (RuntimeError, AssertionError):  # no usable GPU
-        return False
-    if device != fly_kwargs["rank"]:
-        logger.debug(
-            "FlyDSL intra-node EP does not serve this handle: EP rank %d is not "
-            "the current device %d",
-            fly_kwargs["rank"],
-            device,
-        )
         return False
     from aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_op import (
         FlyDSLDispatchCombineConfig,
@@ -192,8 +181,8 @@ class MoriAll2AllManager(All2AllManagerBase):
 
     On one node, a high-throughput handle (``low_latency=False``) whose shape
     the FlyDSL intra-node op accepts (gfx942 / gfx950, and the op's static
-    config check, with the EP rank as the current device) is served by that op
-    over HIP IPC buffers; mori is not used for it. The manager keeps these ops
+    config check) is served by that op, on the current device, over HIP IPC
+    buffers; mori is not used for it. The manager keeps these ops
     alive until :meth:`destroy`. Every other handle -- inter-node, low
     latency, other shapes or arches, or ``backend="mori"`` -- is a mori
     ``EpDispatchCombineOp``. mori's shmem heap is initialised the first time

@@ -5,8 +5,7 @@
 
 Supported intra-node high-throughput handles go to the FlyDSL kernels without
 touching mori; every other case (inter-node, low latency, a config the FlyDSL
-op rejects, an unsupported arch, an EP rank that is not the current device,
-``backend="mori"``) builds a mori handle after initialising mori's shmem heap.
+op rejects, an unsupported arch, ``backend="mori"``) builds a mori handle after initialising mori's shmem heap.
 The FlyDSL decision is the op's own static config check, the op accepts
 mori's ``dispatch(x, w, None, ids)`` on a handle configured with scales, and
 the manager keeps its FlyDSL ops until ``destroy()``. Also the launch
@@ -156,13 +155,14 @@ def test_internode_uses_mori(manager):
     assert calls["shmem"] == 1
 
 
-def test_rank_not_current_device_uses_mori(manager, monkeypatch):
-    """The op keeps its buffers on cuda:{rank}; another current device (e.g.
-    ranks placed with an offset) keeps mori."""
+def test_gate_does_not_depend_on_the_device(manager, monkeypatch):
+    """Building a handle is collective, so every rank must pick the same
+    implementation: the gate does not look at the current device (one visible
+    GPU per process, a strided EP group), and the op runs on that device."""
     m, _ = manager
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
-    assert _impl(m) == "mori"
-    assert _impl(m, rank=1) == "flydsl"
+    for device in (0, 1, 5):
+        monkeypatch.setattr(torch.cuda, "current_device", lambda d=device: d)
+        assert _impl(m, rank=3) == "flydsl"
 
 
 def test_unsupported_arch_uses_mori(manager, monkeypatch):

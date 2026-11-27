@@ -101,12 +101,13 @@ def make_dispatch_kernel(
     warp_num_per_block: int,
     scale_dim: int = 0,
     scale_type_size: int = 0,
-    enable_std_moe: bool = False,
     data_type=None,
     max_recv: int | None = None,
 ):
-    """Build intranode dispatch ``@flyc.kernel``. ``max_recv`` caps per-rank recv
-    slots (must match combine decode); None => npes * max_tok_per_rank."""
+    """Build the expert-major intranode dispatch ``@flyc.kernel``, which also
+    writes the StdMoE packed output (the only path that uses it; the plain
+    path is ``make_dispatch_kernel_tokmajor``). ``max_recv`` caps per-rank
+    recv slots (must match combine decode); None => npes * max_tok_per_rank."""
     if max_recv is None:
         max_recv = npes * max_tok_per_rank
     _is_fp4 = data_type == torch.float4_e2m1fn_x2
@@ -348,106 +349,97 @@ def make_dispatch_kernel(
             buffer_store(fx.Int32(0), _r_tok_off, 0)
 
         # Phase 4: ConvertDispatchOutput (StdMoE).
-        if const_expr(enable_std_moe):
-            # Same pattern for the grid barrier: release this block's stores
-            # before its relaxed ticket.
-            fence_system_release()
-            fx.barrier()
-            if tid == 0:
-                _bn_i64 = fx.Uint64(block_num)
-                _one_i64 = fx.Uint64(1)
-                _ticket_raw = atomic_add_global_at(addr_disp_grid_bar, _one_i64)
-                _ticket = fx.Uint64(_ticket_raw)
-                _target = (
-                    _ticket // _bn_i64 + _one_i64
-                ) * _bn_i64  # (epoch+1)*block_num
-                wait_i64_until_equals(addr_disp_grid_bar, _target)
-                # Acquire fence pairs with the release fences before the tickets; makes
-                # total_recv / shmem_tok_id_to_src / shmem_idx visible.
-                fence_system_acquire()
-            fx.barrier()
+        # Same pattern for the grid barrier: release this block's stores
+        # before its relaxed ticket.
+        fence_system_release()
+        fx.barrier()
+        if tid == 0:
+            _bn_i64 = fx.Uint64(block_num)
+            _one_i64 = fx.Uint64(1)
+            _ticket_raw = atomic_add_global_at(addr_disp_grid_bar, _one_i64)
+            _ticket = fx.Uint64(_ticket_raw)
+            _target = (_ticket // _bn_i64 + _one_i64) * _bn_i64  # (epoch+1)*block_num
+            wait_i64_until_equals(addr_disp_grid_bar, _target)
+            # Acquire fence pairs with the release fences before the tickets; makes
+            # total_recv / shmem_tok_id_to_src / shmem_idx visible.
+            fence_system_acquire()
+        fx.barrier()
 
-            _r_out_idx_local = create_buffer_resource_from_addr(addr_shmem_idx)
-            _r_tis_local = create_buffer_resource_from_addr(addr_shmem_tok_id_to_src)
-            total_recv = buffer_load(_r_total_rv, 0, vec_width=1, dtype=T.i32)
-            smoe_work_limit = total_recv * experts_per_token
+        _r_out_idx_local = create_buffer_resource_from_addr(addr_shmem_idx)
+        _r_tis_local = create_buffer_resource_from_addr(addr_shmem_tok_id_to_src)
+        total_recv = buffer_load(_r_total_rv, 0, vec_width=1, dtype=T.i32)
+        smoe_work_limit = total_recv * experts_per_token
 
-            for smoe_idx in range(global_warp_id, smoe_work_limit, global_warp_num):
-                smoe_tok_id = smoe_idx // experts_per_token
+        for smoe_idx in range(global_warp_id, smoe_work_limit, global_warp_num):
+            smoe_tok_id = smoe_idx // experts_per_token
 
-                expert_id = buffer_load(
-                    _r_out_idx_local, smoe_idx, vec_width=1, dtype=T.i32
+            expert_id = buffer_load(
+                _r_out_idx_local, smoe_idx, vec_width=1, dtype=T.i32
+            )
+            local_expert_id = expert_id - rank * experts_per_rank
+            # MUST be unsigned ``ult``: signed ``slt`` would mis-classify
+            # negative ``local_expert_id`` (non-local experts) as local
+            # and trigger illegal global access in WarpCopy below.
+            is_local = fx.Uint32(local_expert_id) < fx.Uint32(experts_per_rank)
+
+            packed_slot_lane0 = fx.Int32(0)
+            if lane == 0 and is_local:
+                count_addr = addr_out_packed_recv_count + fx.Int64(local_expert_id) * 4
+                packed_slot_lane0 = atomic_add_global_at(count_addr, 1)
+            packed_slot = readlane(T.i32, packed_slot_lane0, 0)
+
+            safe_local_expert = is_local.select(local_expert_id, 0)
+            packed_linear_idx = safe_local_expert * max_tokens_per_expert + packed_slot
+            slot_val_i64 = is_local.select(
+                fx.Int64(packed_linear_idx), -1
+            )  # -1 = non-local
+            if lane == 0:
+                slot_map_addr = addr_out_disp_tok_map + fx.Int64(smoe_idx) * 8
+                store_i64_global_system(slot_map_addr, slot_val_i64)
+
+            if lane == 0 and is_local:
+                src_pos_enc = buffer_load(
+                    _r_tis_local, smoe_tok_id, vec_width=1, dtype=T.i32
                 )
-                local_expert_id = expert_id - rank * experts_per_rank
-                # MUST be unsigned ``ult``: signed ``slt`` would mis-classify
-                # negative ``local_expert_id`` (non-local experts) as local
-                # and trigger illegal global access in WarpCopy below.
-                is_local = fx.Uint32(local_expert_id) < fx.Uint32(experts_per_rank)
-
-                packed_slot_lane0 = fx.Int32(0)
-                if lane == 0 and is_local:
-                    count_addr = (
-                        addr_out_packed_recv_count + fx.Int64(local_expert_id) * 4
-                    )
-                    packed_slot_lane0 = atomic_add_global_at(count_addr, 1)
-                packed_slot = readlane(T.i32, packed_slot_lane0, 0)
-
-                safe_local_expert = is_local.select(local_expert_id, 0)
-                packed_linear_idx = (
-                    safe_local_expert * max_tokens_per_expert + packed_slot
+                store_i32_system(
+                    addr_out_packed_recv_src_info,
+                    packed_linear_idx,
+                    src_pos_enc,
                 )
-                slot_val_i64 = is_local.select(
-                    fx.Int64(packed_linear_idx), -1
-                )  # -1 = non-local
-                if lane == 0:
-                    slot_map_addr = addr_out_disp_tok_map + fx.Int64(smoe_idx) * 8
-                    store_i64_global_system(slot_map_addr, slot_val_i64)
 
-                if lane == 0 and is_local:
-                    src_pos_enc = buffer_load(
-                        _r_tis_local, smoe_tok_id, vec_width=1, dtype=T.i32
+            src_tok_base = addr_shmem_tok + fx.Int64(smoe_tok_id) * nbytes
+            dst_tok_base = addr_out_packed_recv_x + fx.Int64(packed_linear_idx) * nbytes
+            rsrc_src = create_buffer_resource_from_addr(src_tok_base)
+            rsrc_dst = create_buffer_resource_from_addr(dst_tok_base)
+            lane_i32_off = lane * 4
+            safe_end_i32 = (n_i32 // 512) * 512
+            if n_i32 >= 512 and safe_end_i32 > 0:
+                copy_end_main = is_local.select(safe_end_i32, lane_i32_off)
+                for chunk_i32_off in range(lane_i32_off, copy_end_main, 512):
+                    vec_a = buffer_load(
+                        rsrc_src, chunk_i32_off, vec_width=4, dtype=T.i32
                     )
-                    store_i32_system(
-                        addr_out_packed_recv_src_info,
-                        packed_linear_idx,
-                        src_pos_enc,
+                    vec_b = buffer_load(
+                        rsrc_src, chunk_i32_off + 256, vec_width=4, dtype=T.i32
                     )
-
-                src_tok_base = addr_shmem_tok + fx.Int64(smoe_tok_id) * nbytes
-                dst_tok_base = (
-                    addr_out_packed_recv_x + fx.Int64(packed_linear_idx) * nbytes
-                )
-                rsrc_src = create_buffer_resource_from_addr(src_tok_base)
-                rsrc_dst = create_buffer_resource_from_addr(dst_tok_base)
-                lane_i32_off = lane * 4
-                safe_end_i32 = (n_i32 // 512) * 512
-                if n_i32 >= 512 and safe_end_i32 > 0:
-                    copy_end_main = is_local.select(safe_end_i32, lane_i32_off)
-                    for chunk_i32_off in range(lane_i32_off, copy_end_main, 512):
-                        vec_a = buffer_load(
-                            rsrc_src, chunk_i32_off, vec_width=4, dtype=T.i32
-                        )
-                        vec_b = buffer_load(
-                            rsrc_src, chunk_i32_off + 256, vec_width=4, dtype=T.i32
-                        )
-                        buffer_store(vec_a, rsrc_dst, chunk_i32_off)
-                        buffer_store(vec_b, rsrc_dst, chunk_i32_off + 256)
-                if safe_end_i32 < n_i32:
-                    copy_end_tail = is_local.select(n_i32, lane_i32_off)
-                    for chunk_i32_off in range(
-                        lane_i32_off + safe_end_i32, copy_end_tail, 256
-                    ):
-                        vec_a = buffer_load(
-                            rsrc_src, chunk_i32_off, vec_width=4, dtype=T.i32
-                        )
-                        buffer_store(vec_a, rsrc_dst, chunk_i32_off)
-                elif n_i32 < 512:
-                    copy_end_small = is_local.select(n_i32, lane_i32_off)
-                    for chunk_i32_off in range(lane_i32_off, copy_end_small, 256):
-                        vec_a = buffer_load(
-                            rsrc_src, chunk_i32_off, vec_width=4, dtype=T.i32
-                        )
-                        buffer_store(vec_a, rsrc_dst, chunk_i32_off)
+                    buffer_store(vec_a, rsrc_dst, chunk_i32_off)
+                    buffer_store(vec_b, rsrc_dst, chunk_i32_off + 256)
+            if safe_end_i32 < n_i32:
+                copy_end_tail = is_local.select(n_i32, lane_i32_off)
+                for chunk_i32_off in range(
+                    lane_i32_off + safe_end_i32, copy_end_tail, 256
+                ):
+                    vec_a = buffer_load(
+                        rsrc_src, chunk_i32_off, vec_width=4, dtype=T.i32
+                    )
+                    buffer_store(vec_a, rsrc_dst, chunk_i32_off)
+            elif n_i32 < 512:
+                copy_end_small = is_local.select(n_i32, lane_i32_off)
+                for chunk_i32_off in range(lane_i32_off, copy_end_small, 256):
+                    vec_a = buffer_load(
+                        rsrc_src, chunk_i32_off, vec_width=4, dtype=T.i32
+                    )
+                    buffer_store(vec_a, rsrc_dst, chunk_i32_off)
 
     return ep_dispatch_intranode
 
@@ -1589,7 +1581,7 @@ def make_dispatch_jit(
         "max_recv": max_recv,
     }
     if enable_std_moe:
-        kernel = make_dispatch_kernel(**common, enable_std_moe=True)
+        kernel = make_dispatch_kernel(**common)
     else:
         kernel = make_dispatch_kernel_tokmajor(**common)
 

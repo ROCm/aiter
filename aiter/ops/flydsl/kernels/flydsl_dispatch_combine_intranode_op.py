@@ -560,7 +560,12 @@ class FlyDSLDispatchGroupMajorOp:
         self._heap = (
             heap
             if heap is not None
-            else _make_heap(rank, world_size, torch.device("cuda", rank), None)
+            else _make_heap(
+                rank,
+                world_size,
+                torch.device("cuda", torch.cuda.current_device()),
+                None,
+            )
         )
         if payload_arena is not None and self._heap.group is not None:
             raise ValueError(
@@ -590,7 +595,7 @@ class FlyDSLDispatchGroupMajorOp:
         self.scale_dim = scale_dim
         self.scale_type_size = scale_type_size
         self.scale_bytes = scale_dim * scale_type_size
-        self._dev = torch.device("cuda", rank)
+        self._dev = self._heap.device
         self.row_view = _token_view_dim_for(data_type, hidden_dim)
         (
             self.num_valid_max,
@@ -819,7 +824,9 @@ class FlyDSLDispatchCombineIntraNodeOp:
         self._check_config()
         if config.tuning_table is None:
             self.load_tuning_config(config.tuning_config_path)
-        self._dev = torch.device("cuda", config.rank)
+        # The current device, as mori uses: the EP rank need not be the
+        # device index (one visible GPU per process, a strided EP group).
+        self._dev = torch.device("cuda", torch.cuda.current_device())
         r = config.rank
         if group is not None and (
             dist.get_rank(group=group) != r
@@ -1456,10 +1463,9 @@ class FlyDSLDispatchCombineIntraNodeOp:
             raise TypeError(f"{name} must be a torch.Tensor, got {type(t)}")
         if not t.is_cuda:
             raise ValueError(f"{name} must live on CUDA, got device={t.device}")
-        if t.device.index != self.cfg.rank:
+        if t.device != self._dev:
             raise ValueError(
-                f"{name}.device={t.device} does not match cfg.rank={self.cfg.rank} "
-                f"(expected cuda:{self.cfg.rank})"
+                f"{name}.device={t.device} is not the op's device {self._dev}"
             )
 
     def _check_dispatch_inputs(self, input, weights, scales, indices, packed_recv_x):

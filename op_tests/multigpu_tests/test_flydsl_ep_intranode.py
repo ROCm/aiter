@@ -138,14 +138,18 @@ def _reference(xf, ids, epr, wire_fp8=False):
     return acc.to(torch.bfloat16)
 
 
-def _worker(rank, world, port, cases, tokens, routings, replays, result_q):
+def _worker(
+    rank, world, port, cases, tokens, routings, replays, result_q, device_shift=0
+):
     from aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_op import (
         FlyDSLDispatchCombineConfig,
         FlyDSLDispatchCombineIntraNodeOp,
     )
 
-    torch.cuda.set_device(rank)
-    dev = torch.device("cuda", rank)
+    # EP rank r runs on GPU (r + device_shift) % world: the op works on the
+    # current device, which need not be the rank.
+    dev = torch.device("cuda", (rank + device_shift) % world)
+    torch.cuda.set_device(dev)
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group(
@@ -158,7 +162,9 @@ def _worker(rank, world, port, cases, tokens, routings, replays, result_q):
     try:
         for variant, (hidden, E, K, max_tok) in cases:
             epr = E // world
-            sd = hidden // 32
+            # e8m0 scales per 32 elements, padded to whole 4-byte words (the
+            # op takes scale rows of whole words; 2880 -> 90 -> 92 B)
+            sd = (hidden // 32 + 3) // 4 * 4
             d_dtype = fp4 if variant == "fp4" else fp8
             wire_fp8 = variant == "fp8_direct_cast"
             xb = hidden // 2 if variant == "fp4" else hidden  # row bytes
@@ -330,6 +336,7 @@ def run(
     routings=ROUTINGS,
     replays=3,
     variants=VARIANTS,
+    device_shift=0,
 ):
     from aiter.dist.utils import get_open_port
     from aiter.jit.utils.chip_info import get_gfx_runtime
@@ -343,12 +350,18 @@ def run(
     if world < 2 or world > min(8, n_dev):
         print(f"skip: world {world} needs 2..8 GPUs, have {n_dev}")
         return True
-    # (hidden, experts, top-k, max tokens per rank)
-    shapes = shapes or [(5120, 48 * world, 6, 4096), (2048, 16 * world, 3, 1024)]
+    # (hidden, experts, top-k, max tokens per rank). Hidden 2880 (gpt-oss,
+    # 128 experts, top-4) is the shape whose rows end in a partial wave of
+    # 16-byte chunks on dispatch and combine.
+    shapes = shapes or [
+        (5120, 48 * world, 6, 4096),
+        (2048, 16 * world, 3, 1024),
+        (2880, 128, 4, 1024),
+    ]
     tokens = tokens or [1, 7, 32, 192, 1000]
-    # fp8 runs every shape; the other variants run the last one
+    # fp8 runs every shape; the other variants run the last two
     cases = [
-        (v, sh) for v in variants for sh in (shapes if v == "fp8" else shapes[-1:])
+        (v, sh) for v in variants for sh in (shapes if v == "fp8" else shapes[-2:])
     ]
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
@@ -356,7 +369,7 @@ def run(
     procs = [
         ctx.Process(
             target=_worker,
-            args=(r, world, port, cases, tokens, routings, replays, q),
+            args=(r, world, port, cases, tokens, routings, replays, q, device_shift),
         )
         for r in range(world)
     ]
@@ -370,7 +383,8 @@ def run(
         print("FAIL", f)
     print(
         f"flydsl intranode EP: world={world} shapes={shapes} tokens={tokens} "
-        f"routings={list(routings)} variants={list(variants)}: "
+        f"routings={list(routings)} variants={list(variants)} "
+        f"device_shift={device_shift}: "
         f"{'FAILED' if failures else 'passed'}"
     )
     return not failures
@@ -387,12 +401,19 @@ if __name__ == "__main__":
     ap.add_argument("--routings", type=str, default=",".join(ROUTINGS))
     ap.add_argument("--replays", type=int, default=3)
     ap.add_argument("--variants", type=str, default=",".join(VARIANTS))
+    ap.add_argument(
+        "--device-shift",
+        type=int,
+        default=0,
+        help="run EP rank r on GPU (r + shift) %% world",
+    )
     a = ap.parse_args()
     ok = run(
         world=a.world,
         tokens=[int(t) for t in a.tokens.split(",")] if a.tokens else None,
         routings=a.routings.split(","),
         replays=a.replays,
+        device_shift=a.device_shift,
         variants=a.variants.split(","),
     )
     sys.exit(0 if ok else 1)

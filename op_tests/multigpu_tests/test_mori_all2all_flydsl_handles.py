@@ -32,9 +32,10 @@ Each rank builds the EP group with ``aiter.init_dist_env`` and asks the
   dispatch + combine at 1 to 4096 tokens (every row's bucket, 1025..2048
   included) loads nothing new, and the results match the reference. With the
   CU count capped at 80 (MI308X) and 38 (a CPX partition), new handles use
-  only geometries within it and give the same results. The gate declines a
-  handle whose EP rank is not the current device, and one whose scale rows
-  are not whole 4-byte words (gpt-oss MXFP4 rows: 90 B of e8m0 scales).
+  only geometries within it and give the same results. The gate does not
+  depend on the current device (building a handle is collective), and it
+  declines scale rows that are not whole 4-byte words (gpt-oss MXFP4 rows:
+  90 B of e8m0 scales).
 
     python op_tests/multigpu_tests/test_mori_all2all_flydsl_handles.py [--world 8]
 """
@@ -489,8 +490,9 @@ def _case_geometry(manager, rank, world, dev, failures):
         failures.append(f"rank{rank} geometry: gate declines the supported handle")
     torch.cuda.set_device((rank + 1) % world)
     try:
-        if all2all._flydsl_intranode_supported(fly_kwargs):
-            failures.append(f"rank{rank} geometry: gate accepts rank != device")
+        # rank-independent: the op runs on the current device
+        if not all2all._flydsl_intranode_supported(fly_kwargs):
+            failures.append(f"rank{rank} geometry: gate declines rank != device")
     finally:
         torch.cuda.set_device(rank)
     gpt_oss = {
