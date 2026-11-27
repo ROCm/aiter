@@ -374,7 +374,7 @@ def test_gemm_a16w16_gfx1250_gptoss_96cu_lookup(N, K, monkeypatch):
 
 
 @pytest.mark.parametrize("N, K", _GPTOSS_SHAPES)
-@pytest.mark.parametrize("M", [1, 64, 1000, 2049, 3073, 8192])
+@pytest.mark.parametrize("M", [1, 64, 168, 256, 1000, 2049, 3073, 8192])
 def test_gemm_a16w16_gfx1250_gptoss_tuned(M, N, K):
     if not is_gluon_supported():
         pytest.skip("Gluon not supported on this architecture")
