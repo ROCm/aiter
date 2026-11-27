@@ -111,6 +111,7 @@ from aiter.utility.mp_tuner import (
     clear_inherited_rocprofiler_env,
     mp_tuner,
 )
+from csrc.ck_gemm_moe_2stages_codegen import grouped_fmoe_search as grouped_search
 from csrc.ck_gemm_moe_2stages_codegen.mxfp4_staged_search import (
     DEFAULT_SCREEN_TOPK,
     AccumulationMode,
@@ -999,6 +1000,42 @@ class FmoeTuner(TunerCommon):
             help="On gfx1250, tune the FlyDSL grouped-GEMM MoE path instead of the normal fmoe tuner.",
         )
         self.parser.add_argument(
+            "--grouped-search",
+            choices=("descent", "tile_m"),
+            default="descent",
+            help="With --grouped-gemm: 'descent' (default) searches the knobs of "
+            "both GEMMs from the row in use, timing candidates in interleaved "
+            "rounds in a crash-isolated worker per --mp GPU; 'tile_m' times "
+            "tile_m 16..128 at tile_n/tile_k 256 only.",
+        )
+        self.parser.add_argument(
+            "--grouped-budget",
+            type=float,
+            default=1800.0,
+            help="With --grouped-search descent: seconds of search per shape "
+            "before the final confirmation (default 1800).",
+        )
+        self.parser.add_argument(
+            "--grouped-rounds",
+            type=int,
+            default=5,
+            help="With --grouped-search descent: interleaved timing rounds per "
+            "batch of candidates (default 5).",
+        )
+        self.parser.add_argument(
+            "--grouped-routing",
+            default="balanced",
+            help="With --grouped-search descent: routing of the timed tokens, "
+            "balanced (default), uniform or zipf:<s> (skewed, e.g. zipf:0.6).",
+        )
+        self.parser.add_argument(
+            "--grouped-min-gain",
+            type=float,
+            default=1.0,
+            help="With --grouped-search descent: percent a move must save, as the "
+            "median of per-round time ratios, to be taken (default 1.0).",
+        )
+        self.parser.add_argument(
             "--mxfp4-flydsl",
             action="store_true",
             required=False,
@@ -1090,6 +1127,19 @@ class FmoeTuner(TunerCommon):
             self.parser.error("--fast-scan requires --mxfp4-flydsl")
         if not hasattr(args, "fast_scan"):
             args.fast_scan = False
+        if args.grouped_gemm and args.grouped_search == "descent":
+            try:
+                grouped_search.check_routing(args.grouped_routing)
+            except ValueError as exc:
+                self.parser.error(f"--grouped-routing: {exc}")
+            if args.grouped_rounds < 1 or args.grouped_budget < 0:
+                self.parser.error(
+                    "--grouped-rounds must be >= 1, --grouped-budget >= 0"
+                )
+            if not 0 <= args.grouped_min_gain < 100:
+                self.parser.error("--grouped-min-gain is a percent in [0, 100)")
+            if args.select == "power":
+                self.parser.error("--select power needs --grouped-search tile_m")
         mxfp4_port = (
             args.mxfp4_flydsl
             and not args.grouped_gemm
@@ -7153,18 +7203,21 @@ class GroupedFmoeTuner(FmoeTuner):
         max_m = max(tile_m, ((max_m_raw + tile_m - 1) // tile_m) * tile_m)
         data_format = self._data_format(q_dtype_a)
         n_warp = 4
-        return {
-            **{k: row[k] for k in self.keys if k in row},
-            "gate_mode": gate_mode,
-            "max_m": max_m,
+        knobs = {
             "tile_m": tile_m,
             "tile_n": self.WARP_TILE_N * n_warp,
             "tile_k": self.TILE_K,
             "m_warp": 1,
             "n_warp": n_warp,
             "num_buffers": 2,
+        }
+        return {
+            **{k: row[k] for k in self.keys if k in row},
+            "gate_mode": gate_mode,
+            "max_m": max_m,
+            # Every knob explicit: what the candidate runs with.
+            **grouped_search.resolve_config(knobs),
             "grouped_persistent_m": 1,
-            "persistent_workers": "",
             "kernelName1": f"grouped_gemm1_{data_format}_{layout}",
             "kernelName2": f"grouped_gemm2_{data_format}",
             "us": 0,
@@ -7278,6 +7331,12 @@ class GroupedFmoeTuner(FmoeTuner):
             cache = getattr(grouped_mod, "_GROUPED_CONFIG_CACHE", None)
             if cache is not None:
                 cache.clear()
+            # The lookups are lru_cached on the shape alone: without this every
+            # candidate after the first would rerun the first one's row.
+            for name in ("_find_grouped_config", "_widest_grouped_tile"):
+                fn = getattr(grouped_mod, name, None)
+                if hasattr(fn, "cache_clear"):
+                    fn.cache_clear()
 
         config_path = self._write_candidate_config(candidate)
         old_config = os.environ.get("AITER_CONFIG_GROUPED_FMOE")
@@ -7289,16 +7348,9 @@ class GroupedFmoeTuner(FmoeTuner):
             os.environ["AITER_FORCE_GFX1250"] = "1"
             _clear_grouped_config_cache()
             case = self._prepare_grouped_case(row, candidate)
-            activation = (
-                ActivationType.Swiglu
-                if str(row["act_type"]).endswith("Swiglu")
-                else ActivationType.Silu
-            )
-            gate_mode = (
-                GateMode.INTERLEAVE
-                if str(row.get("gate_mode", "")).endswith("INTERLEAVE")
-                else GateMode.SEPARATED
-            )
+            # The row's own activation (SiTUv2 is not SiLU) and activation dtype.
+            activation = str2ActivationType(str(row["act_type"]).split(".")[-1])
+            q_dtype_a = getattr(torch, str(row["q_dtype_a"]).split(".")[-1])
 
             def _call():
                 return fused_moe(
@@ -7312,7 +7364,10 @@ class GroupedFmoeTuner(FmoeTuner):
                     w1_scale=case[5],
                     w2_scale=case[6],
                     dtype=torch.bfloat16,
-                    gate_mode=gate_mode.value,
+                    # The grouped kernels only serve GUGU (INTERLEAVE) weights;
+                    # gfx1250 rejects SEPARATED, and the lookup ignores gate_mode.
+                    gate_mode=GateMode.INTERLEAVE.value,
+                    quant_dtype_a=q_dtype_a,
                 )
 
             _call()
@@ -7349,6 +7404,9 @@ class GroupedFmoeTuner(FmoeTuner):
         # Refuse an output file that the write-back cannot keep blank-free
         # before timing anything.
         self._write_layout(self.get_out_file(args.tune_file))
+        # Callers that build args without the option keep the tile_m sweep.
+        if getattr(args, "grouped_search", "tile_m") == "descent":
+            return self._tune_descent(untunedf, args)
         rows = []
         for _, row in untunedf.iterrows():
             best = None
@@ -7381,6 +7439,124 @@ class GroupedFmoeTuner(FmoeTuner):
                 )
             rows.append(best)
         return rows
+
+    def _failed_row(self, row, reason):
+        failed = self._candidate_row(row, self.TILE_M_CANDIDATES[0])
+        failed["us"] = self.INVALID_TIME
+        failed["kernelName1"] = ("FAILED: " + str(reason))[:240]
+        return failed
+
+    def _tune_descent(self, untunedf, args):
+        """Search each shape from the row in use; see grouped_fmoe_search."""
+        opts = grouped_search.SearchOptions(
+            budget_s=float(args.grouped_budget),
+            rounds=int(args.grouped_rounds),
+            min_gain=float(args.grouped_min_gain) / 100.0,
+        )
+        out_file = self.get_out_file(args.tune_file)
+        tables = [out_file] + [p for group in self._runtime_tables() for p in group]
+        rows, jobs = [], []
+        for _, series in untunedf.iterrows():
+            row = series.to_dict()
+            reason = grouped_search.unsupported_reason(row)
+            if reason:
+                print(f"[grouped] skip token={row['token']}: {reason}", flush=True)
+                rows.append(self._failed_row(row, reason))
+                continue
+            shape = grouped_search.shape_of(row, cu_num=int(row["cu_num"]))
+            label = (
+                f"token={shape.token} {shape.model_dim}x{shape.inter_dim} "
+                f"E{shape.expert} top{shape.topk} {str(row['act_type']).split('.')[-1]} "
+                f"{'a4w4' if shape.a_fp4 else 'a8w4'}"
+            )
+            seeds = grouped_search.make_seeds(row, shape, tables, str(row["gfx"]))
+            jobs.append(
+                grouped_search.Job(
+                    row=row,
+                    shape=shape,
+                    seeds=seeds,
+                    routing=args.grouped_routing,
+                    label=label,
+                )
+            )
+            rows.append(jobs[-1])
+        if jobs:
+            gpus = max(
+                1, min(int(getattr(args, "mp", 1) or 1), torch.cuda.device_count())
+            )
+            grouped_search.run_jobs(
+                jobs,
+                list(range(min(gpus, len(jobs)))),
+                opts,
+                timeout=float(args.timeout),
+                err_ratio=float(args.errRatio),
+                warmup=max(1, min(int(args.warmup), 5)),
+            )
+        records, out = [], []
+        for item in rows:
+            if not isinstance(item, grouped_search.Job):
+                out.append(item)
+                continue
+            res = item.result
+            key = {k: item.row.get(k) for k in self.keys}
+            records += [{**key, **rec} for rec in res.get("records", [])]
+            if not res.get("ok"):
+                out.append(
+                    self._failed_row(item.row, res.get("error", "search failed"))
+                )
+                continue
+            best = self._candidate_row(item.row, res["config"]["tile_m"])
+            best.update(res["config"])
+            best["us"] = res["us"]
+            shape = item.shape
+            flop = 6.0 * shape.token * shape.topk * shape.model_dim * shape.inter_dim
+            best["tflops"] = round(flop / res["us"] / 1e6, 2)
+            start = res.get("start_us")
+            gain = (
+                f" ({(res['us'] / start - 1) * 100:+.1f}% vs {start} us)"
+                if start
+                else ""
+            )
+            print(
+                f"[grouped] {item.label}: {res['label']} {res['us']} us{gain}, "
+                f"stages {res['stage_us']}, {res['measured']} configs in "
+                f"{res['seconds']} s; moves {' > '.join(res['history'])}",
+                flush=True,
+            )
+            out.append(best)
+        if records and args.profile_file:
+            exists = os.path.exists(args.profile_file)
+            pd.DataFrame(records).to_csv(
+                args.profile_file, mode="a", header=not exists, index=False
+            )
+        return out
+
+    @staticmethod
+    def _runtime_tables():
+        """Table groups a later process merges for its grouped config: the
+        shipped table + model_configs/ (no env), and the env list if set."""
+        from aiter.jit.core import model_config_files
+
+        groups = [
+            [f"{AITER_ROOT_DIR}/aiter/configs/tuned_grouped_fmoe.csv"]
+            + sorted(model_config_files("tuned_grouped_fmoe"))
+        ]
+        env = (os.environ.get("AITER_CONFIG_GROUPED_FMOE") or "").strip()
+        if env:
+            groups.append([p for p in env.split(os.pathsep) if p])
+        return groups
+
+    def _merge_peers(self, file):
+        """Tables merged together with ``file`` at runtime, as (path, rows)."""
+        target = os.path.realpath(file)
+        peers = {}
+        for group in self._runtime_tables():
+            paths = [os.path.realpath(p) for p in group]
+            if target in paths:
+                for p in paths:
+                    if p != target and os.path.exists(p):
+                        peers[p] = grouped_search.read_rows(p)
+        return list(peers.items())
 
     def post_process(self, results, args, topk=-1, fast_mode=False):
         del args, topk, fast_mode
@@ -7491,6 +7667,26 @@ class GroupedFmoeTuner(FmoeTuner):
         invalid = results[
             (results["us"] == self.INVALID_TIME) | (results["us"] == self.INF_TIME)
         ]
+        # A shape another merged table also holds would end up twice in the
+        # runtime merge: its duplicate check rewrites both source files, or the
+        # lookup picks whichever row reports the lower us. Write it into that
+        # table (-o) instead.
+        peers = self._merge_peers(file)
+        if peers and not valid.empty:
+            clash = []
+            for i, result in valid.iterrows():
+                key = grouped_search.lookup_key(result)
+                for path, rows in peers:
+                    if any(grouped_search.row_matches(r, key) for r in rows):
+                        print(
+                            f"[grouped] not writing token={result['token']} to {file}: "
+                            f"{path} already holds that shape; rerun with -o {path}",
+                            flush=True,
+                        )
+                        clash.append(i)
+                        break
+            invalid = pd.concat([invalid, valid.loc[clash]], ignore_index=True)
+            valid = valid.drop(index=clash)
         self.success = pd.concat([self.success, valid], ignore_index=True)
         self.failed = pd.concat([self.failed, invalid], ignore_index=True)
         keys = [k for k in self.keys if k in columns]
@@ -9770,16 +9966,11 @@ if __name__ == "__main__":
         "tflops",
         "bw",
     ]
+    # Every knob grouped_moe_gfx1250 reads, so a new table carries them all.
     grouped_result_list = [
         "max_m",
-        "tile_m",
-        "tile_n",
-        "tile_k",
-        "m_warp",
-        "n_warp",
-        "num_buffers",
+        *grouped_search.KNOB_COLUMNS,
         "grouped_persistent_m",
-        "persistent_workers",
         "kernelName1",
         "kernelName2",
         "us",
