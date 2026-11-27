@@ -50,9 +50,9 @@ def _v_row_layout(ROWS, SK, NUM_WARPS):
 
 
 @gluon.jit
-def _state_row(
+def _state_off(
     slot,
-    stride_slot_rows,
+    stride_slot,
     i_hv,
     i_v,
     K: gl.constexpr,
@@ -61,8 +61,47 @@ def _state_row(
     STATE_V_FIRST: gl.constexpr,
 ):
     if STATE_V_FIRST:
-        return slot.to(gl.int32) * stride_slot_rows + i_hv * V + i_v * BV
-    return slot.to(gl.int32) * stride_slot_rows + i_hv * K
+        return slot.to(gl.int64) * stride_slot + (i_hv * V + i_v * BV) * K
+    return slot.to(gl.int64) * stride_slot + i_hv * K * V
+
+
+@gluon.jit
+def _slot_desc(
+    ptr,
+    slot_off,
+    HV: gl.constexpr,
+    K: gl.constexpr,
+    V: gl.constexpr,
+    BV: gl.constexpr,
+    STATE_V_FIRST: gl.constexpr,
+    SMEM: gl.constexpr,
+):
+    if STATE_V_FIRST:
+        d = _TDM.make_tensor_descriptor(
+            base=ptr + slot_off,
+            shape=(HV * V, K),
+            strides=(K, 1),
+            block_shape=(BV, K),
+            layout=SMEM,
+        )
+    else:
+        d = _TDM.make_tensor_descriptor(
+            base=ptr + slot_off,
+            shape=(HV * K, V),
+            strides=(V, 1),
+            block_shape=(K, BV),
+            layout=SMEM,
+        )
+    return d
+
+
+@gluon.jit
+def _slot(base, row, cols, i, NUM_SLOTS_P2: gl.constexpr):
+    if NUM_SLOTS_P2 == 1:
+        x = gl.load(base + i).to(gl.int32)
+    else:
+        x = gl.sum(gl.where(cols == i, row, 0), axis=0)
+    return x
 
 
 @gluon.jit
@@ -377,10 +416,8 @@ def fused_recurrent_kda_packed_decode_kernel(
     stride_beta_token: gl.constexpr,
     stride_o_token: gl.constexpr,
     stride_og_token: gl.constexpr,
-    stride_state_slot_rows,
-    stride_state_out_slot_rows,
-    state_rows,
-    state_out_rows,
+    stride_state_slot,
+    stride_state_out_slot,
     stride_cs_slot,
     stride_cs_dim,
     stride_cs_pos,
@@ -416,6 +453,9 @@ def fused_recurrent_kda_packed_decode_kernel(
     USE_CONV: gl.constexpr = False,
     USE_RMS_GATE: gl.constexpr = False,
     TDM_STORE_BUFS: gl.constexpr = 2,
+    NUM_SLOTS: gl.constexpr = 1,
+    NUM_SLOTS_P2: gl.constexpr = 1,
+    ROW_ALIGNED_SLOTS: gl.constexpr = False,  # slot stride % K == 0: pool-wide TDM desc
 ):
     gl.static_assert(V % BV == 0, "BV must divide V")
     gl.static_assert(32 % SK == 0, "SK must divide the wave")
@@ -463,7 +503,6 @@ def fused_recurrent_kda_packed_decode_kernel(
     )
     K_LAYOUT: gl.constexpr = gl.SliceLayout(0 if STATE_V_FIRST else 1, STATE_LAYOUT)
     V_LAYOUT: gl.constexpr = gl.SliceLayout(1 if STATE_V_FIRST else 0, STATE_LAYOUT)
-    ROWLEN: gl.constexpr = K if STATE_V_FIRST else V
 
     NV: gl.constexpr = V // BV
     pid = gl.program_id(0)
@@ -482,25 +521,33 @@ def fused_recurrent_kda_packed_decode_kernel(
     if n_tok == 0:
         return
 
+    if IS_CONTINUOUS_BATCHING:
+        idx_p = state_indices_ptr + i_n * stride_indices_seq
+        if NUM_SLOTS_P2 == 1:
+            row, cols = 0, 0
+        else:
+            cols = gl.arange(
+                0,
+                NUM_SLOTS_P2,
+                layout=gl.BlockedLayout([NUM_SLOTS_P2], [32], [NUM_WARPS], [0]),
+            )
+            row = gl.load(idx_p + cols, mask=cols < NUM_SLOTS, other=0).to(gl.int32)
+        if IS_SPEC_DECODING:
+            seed = gl.maximum(gl.load(num_accepted_ptr + i_n).to(gl.int32) - 1, 0)
+        else:
+            seed = 0
     off_k = gl.arange(0, K, layout=K_LAYOUT)
     off_v = gl.arange(0, BV, layout=V_LAYOUT)
 
-    if PAD_SLOT_GUARD:
-        if IS_SPEC_DECODING:
-            pad_seed = gl.maximum(gl.load(num_accepted_ptr + i_n).to(gl.int32) - 1, 0)
-        else:
-            pad_seed = 0
-        pad_slot = gl.load(state_indices_ptr + i_n * stride_indices_seq + pad_seed).to(
-            gl.int32
-        )
-        if pad_slot <= 0:
-            zero = gl.full([BV], 0.0, o_ptr.dtype.element_ty, V_LAYOUT)
-            o_z = o_ptr + bos.to(gl.int64) * stride_o_token + i_hv * V + i_v * BV
-            for t in range(n_tok):
-                gl.amd.gfx1250.buffer_store(zero, o_z + t * stride_o_token, off_v)
-            return
+    if PAD_SLOT_GUARD and _slot(idx_p, row, cols, seed, NUM_SLOTS_P2) <= 0:
+        zero = gl.full([BV], 0.0, o_ptr.dtype.element_ty, V_LAYOUT)
+        o_z = o_ptr + bos.to(gl.int64) * stride_o_token + i_hv * V + i_v * BV
+        for t in range(n_tok):
+            gl.amd.gfx1250.buffer_store(zero, o_z + t * stride_o_token, off_v)
+        return
 
     col = 0 if STATE_V_FIRST else i_v * BV
+    row_rel = i_hv * V + i_v * BV if STATE_V_FIRST else i_hv * K  # within a slot
     if STATE_V_FIRST:
         off_s = off_v[:, None] * K + off_k[None, :]
     else:
@@ -593,38 +640,15 @@ def fused_recurrent_kda_packed_decode_kernel(
         SMEM: gl.constexpr = _smem_layout(STATE_V_FIRST, K, BV)
         if STATE_V_FIRST:
             smem = gl.allocate_shared_memory(gl.float32, [TDM_STORE_BUFS, BV, K], SMEM)
-            desc_out = _TDM.make_tensor_descriptor(
-                base=state_out_ptr,
-                shape=(state_out_rows, K),
-                strides=(K, 1),
-                block_shape=(BV, K),
-                layout=SMEM,
-            )
         else:
             smem = gl.allocate_shared_memory(gl.float32, [TDM_STORE_BUFS, K, BV], SMEM)
-            desc_out = _TDM.make_tensor_descriptor(
-                base=state_out_ptr,
-                shape=(state_out_rows, V),
-                strides=(V, 1),
-                block_shape=(K, BV),
-                layout=SMEM,
-            )
         buf: gl.int32 = 0
 
     if USE_INITIAL_STATE:
         if IS_CONTINUOUS_BATCHING:
-            if IS_SPEC_DECODING:
-                seed = gl.maximum(gl.load(num_accepted_ptr + i_n).to(gl.int32) - 1, 0)
-            else:
-                seed = 0
-            if CACHE_STATE_UPDATES:
-                slot = gl.load(state_indices_ptr + i_n * stride_indices_seq).to(
-                    gl.int32
-                )
-            else:
-                slot = gl.load(state_indices_ptr + i_n * stride_indices_seq + seed).to(
-                    gl.int32
-                )
+            slot = _slot(
+                idx_p, row, cols, 0 if CACHE_STATE_UPDATES else seed, NUM_SLOTS_P2
+            )
         else:
             slot = i_n
         if USE_CONV:
@@ -641,9 +665,7 @@ def fused_recurrent_kda_packed_decode_kernel(
                 [1, 0],
             )
             if IS_SPEC_DECODING:
-                cslot = gl.load(state_indices_ptr + i_n * stride_indices_seq).to(
-                    gl.int32
-                )
+                cslot = _slot(idx_p, row, cols, 0, NUM_SLOTS_P2)
                 hb = conv_state_ptr + cslot.to(gl.int64) * stride_cs_slot
                 hb_in = hb + seed * stride_cs_pos
             else:
@@ -667,36 +689,40 @@ def fused_recurrent_kda_packed_decode_kernel(
                 FLATK,
                 FLATV,
             )
-        row_in = _state_row(
-            slot, stride_state_slot_rows, i_hv, i_v, K, V, BV, STATE_V_FIRST
-        )
+        off_in = _state_off(slot, stride_state_slot, i_hv, i_v, K, V, BV, STATE_V_FIRST)
         if USE_TDM_LOAD:
             SMEM_IN: gl.constexpr = _smem_layout(STATE_V_FIRST, K, BV)
-            if STATE_V_FIRST:
-                if USE_TDM_STORE and STORE_FINAL_STATE:
-                    smem_in = smem.index(0)
-                else:
-                    smem_in = gl.allocate_shared_memory(gl.float32, [BV, K], SMEM_IN)
+            if USE_TDM_STORE and STORE_FINAL_STATE:
+                smem_in = smem.index(0)
+            elif STATE_V_FIRST:
+                smem_in = gl.allocate_shared_memory(gl.float32, [BV, K], SMEM_IN)
+            else:
+                smem_in = gl.allocate_shared_memory(gl.float32, [K, BV], SMEM_IN)
+            if (
+                ROW_ALIGNED_SLOTS
+            ):  # one descriptor over the pool, the slot as a row offset
                 desc_in = _TDM.make_tensor_descriptor(
                     base=state_ptr,
-                    shape=(state_rows, K),
+                    shape=(1 << 30, K),
                     strides=(K, 1),
                     block_shape=(BV, K),
                     layout=SMEM_IN,
                 )
+                r_in = (slot.to(gl.int64) * stride_state_slot // K).to(gl.int32)
+                r_in += row_rel
             else:
-                if USE_TDM_STORE and STORE_FINAL_STATE:
-                    smem_in = smem.index(0)
-                else:
-                    smem_in = gl.allocate_shared_memory(gl.float32, [K, BV], SMEM_IN)
-                desc_in = _TDM.make_tensor_descriptor(
-                    base=state_ptr,
-                    shape=(state_rows, V),
-                    strides=(V, 1),
-                    block_shape=(K, BV),
-                    layout=SMEM_IN,
+                desc_in = _slot_desc(
+                    state_ptr,
+                    slot.to(gl.int64) * stride_state_slot,
+                    HV,
+                    K,
+                    V,
+                    BV,
+                    STATE_V_FIRST,
+                    SMEM_IN,
                 )
-            _TDM.async_load(desc_in, [row_in, col], smem_in)
+                r_in = row_rel
+            _TDM.async_load(desc_in, [r_in, col], smem_in)
             if USE_CONV:
                 nxt = _conv_qkv_finish(
                     nxt, conv_loads, hb, stride_cs_pos, W - 2, True, K_LAYOUT, V_LAYOUT
@@ -704,21 +730,18 @@ def fused_recurrent_kda_packed_decode_kernel(
             _TDM.async_wait(0)
             S = smem_in.load(STATE_LAYOUT)
         else:
-            S = gl.amd.gfx1250.buffer_load(
-                state_ptr + row_in.to(gl.int64) * ROWLEN + col, off_s
-            ).to(gl.float32)
+            S = gl.amd.gfx1250.buffer_load(state_ptr + off_in + col, off_s)
+            S = S.to(gl.float32)
             if USE_CONV:
                 nxt = _conv_qkv_finish(
                     nxt, conv_loads, hb, stride_cs_pos, W - 2, True, K_LAYOUT, V_LAYOUT
                 )
         if CACHE_STATE_UPDATES and IS_SPEC_DECODING:
             for j in range(1, seed + 1):
-                rslot = gl.load(state_indices_ptr + i_n * stride_indices_seq + j).to(
-                    gl.int32
-                )
+                rslot = _slot(idx_p, row, cols, j, NUM_SLOTS_P2)
                 r_p = (
                     state_ptr
-                    + rslot.to(gl.int64) * (stride_state_slot_rows * ROWLEN)
+                    + rslot.to(gl.int64) * stride_state_slot
                     + i_hv * V * K
                     + i_v * (2 * K + BV)
                 )
@@ -745,9 +768,7 @@ def fused_recurrent_kda_packed_decode_kernel(
         if USE_INITIAL_STATE and not IS_SPEC_DECODING:
             slot_nxt = slot
         else:
-            slot_nxt = gl.load(state_indices_ptr + i_n * stride_indices_seq).to(
-                gl.int32
-            )
+            slot_nxt = _slot(idx_p, row, cols, 0, NUM_SLOTS_P2)
 
     for PHASE in gl.static_range(PHASES):
         if PHASE == 0:
@@ -892,24 +913,13 @@ def fused_recurrent_kda_packed_decode_kernel(
                 if INPLACE_FINAL_STATE:
                     if PREFETCH_DEPTH == 1 and PHASE == 0:
                         out_slot = slot_nxt
-                        slot_nxt = gl.load(
-                            state_indices_ptr + i_n * stride_indices_seq + t + 1
-                        ).to(gl.int32)
+                        slot_nxt = _slot(idx_p, row, cols, t + 1, NUM_SLOTS_P2)
                     else:
-                        out_slot = gl.load(
-                            state_indices_ptr + i_n * stride_indices_seq + t
-                        ).to(gl.int32)
+                        out_slot = _slot(idx_p, row, cols, t, NUM_SLOTS_P2)
                 else:
                     out_slot = bos + t
-                row_out = _state_row(
-                    out_slot,
-                    stride_state_out_slot_rows,
-                    i_hv,
-                    i_v,
-                    K,
-                    V,
-                    BV,
-                    STATE_V_FIRST,
+                off_out = _state_off(
+                    out_slot, stride_state_out_slot, i_hv, i_v, K, V, BV, STATE_V_FIRST
                 )
                 if PAD_SLOT_GUARD and INPLACE_FINAL_STATE:
                     store_ok = out_slot > 0
@@ -920,14 +930,13 @@ def fused_recurrent_kda_packed_decode_kernel(
                         if t == 0:
                             gl.amd.gfx1250.buffer_store(
                                 S.to(state_out_ptr.dtype.element_ty),
-                                state_out_ptr + row_out.to(gl.int64) * ROWLEN + col,
+                                state_out_ptr + off_out + col,
                                 off_s,
                             )
                         else:
                             r_p = (
                                 state_out_ptr
-                                + out_slot.to(gl.int64)
-                                * (stride_state_out_slot_rows * ROWLEN)
+                                + out_slot.to(gl.int64) * stride_state_out_slot
                                 + i_hv * V * K
                                 + i_v * (2 * K + BV)
                             )
@@ -939,9 +948,19 @@ def fused_recurrent_kda_packed_decode_kernel(
                         _TDM.async_wait(TDM_STORE_BUFS - 1)
                         smem.index(buf).store(S)
                         gl.barrier()
+                        desc_out = _slot_desc(
+                            state_out_ptr,
+                            out_slot.to(gl.int64) * stride_state_out_slot,
+                            HV,
+                            K,
+                            V,
+                            BV,
+                            STATE_V_FIRST,
+                            SMEM,
+                        )
                         _TDM.async_store(
                             desc_out,
-                            [row_out, col],
+                            [row_rel, col],
                             smem.index(buf),
                             cache_modifier=".wt",
                         )
@@ -950,7 +969,7 @@ def fused_recurrent_kda_packed_decode_kernel(
                     if store_ok:
                         gl.amd.gfx1250.buffer_store(
                             S.to(state_out_ptr.dtype.element_ty),
-                            state_out_ptr + row_out.to(gl.int64) * ROWLEN + col,
+                            state_out_ptr + off_out + col,
                             off_s,
                         )
 
@@ -972,18 +991,28 @@ def fused_recurrent_kda_packed_decode_kernel(
         _TDM.async_wait(0)
 
     if STORE_FINAL_STATE and not IS_CONTINUOUS_BATCHING:
-        row_out = _state_row(
-            i_n, stride_state_out_slot_rows, i_hv, i_v, K, V, BV, STATE_V_FIRST
+        off_out = _state_off(
+            i_n, stride_state_out_slot, i_hv, i_v, K, V, BV, STATE_V_FIRST
         )
         if USE_TDM_STORE:
             smem.index(0).store(S)
             gl.barrier()
-            _TDM.async_store(desc_out, [row_out, col], smem.index(0))
+            desc_out = _slot_desc(
+                state_out_ptr,
+                i_n.to(gl.int64) * stride_state_out_slot,
+                HV,
+                K,
+                V,
+                BV,
+                STATE_V_FIRST,
+                SMEM,
+            )
+            _TDM.async_store(desc_out, [row_rel, col], smem.index(0))
             _TDM.async_wait(0)
         else:
             gl.amd.gfx1250.buffer_store(
                 S.to(state_out_ptr.dtype.element_ty),
-                state_out_ptr + row_out.to(gl.int64) * ROWLEN + col,
+                state_out_ptr + off_out + col,
                 off_s,
             )
 
@@ -1002,18 +1031,27 @@ def get_kda_config(
     num_seq_heads = num_seqs * HV
     aligned = K % 32 == 0 and V % 32 == 0
     if fused:
-        bucket = "fused"
+        if avg_T == 1 and num_seq_heads >= 256 and "fused_t1" in tuned:
+            bucket = "fused_t1"
+        elif num_seq_heads < 768 and "fused_seq_heads_lt_768" in tuned:
+            bucket = "fused_seq_heads_lt_768"  # latency-bound: overlap the stores
+        else:
+            bucket = "fused"
     elif avg_T > 1:
         if aligned and num_seq_heads >= 3072 and V % 128 == 0:
             bucket = "t_gt1_seq_heads_geq_3072"
         elif aligned and num_seq_heads >= 384:
             bucket = "t_gt1_seq_heads_geq_384"
+        elif aligned and "t_gt1_seq_heads_lt_384" in tuned:
+            bucket = "t_gt1_seq_heads_lt_384"
         elif K % 16 == 0:
             bucket = "t_gt1_default"
         else:
             bucket = "default"
     elif aligned and 256 <= num_seq_heads <= 512:
         bucket = "t1_seq_heads_256_to_512"
+    elif aligned and num_seq_heads > 512 and "t1_seq_heads_gt_512" in tuned:
+        bucket = "t1_seq_heads_gt_512"
     else:
         bucket = "default"
     config = dict(tuned[bucket])
