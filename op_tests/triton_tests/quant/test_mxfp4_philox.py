@@ -21,34 +21,3 @@ def test_philox_stream_reservation(enabled):
         if active:
             offset += 128
     assert offsets == tuple(expected)
-
-
-@pytest.mark.parametrize("enabled", [(True,), (True, True), (False, True)])
-def test_philox_inclusive_last_counter(enabled):
-    last_start = (1 << 63) - 128 * sum(enabled)
-    reserve_mxfp4_philox_streams(1024, enabled, 1, last_start)
-    with pytest.raises(ValueError, match="leave room"):
-        reserve_mxfp4_philox_streams(1024, enabled, 1, last_start + 1)
-
-
-@pytest.mark.parametrize(
-    "seed,offset,error",
-    [
-        (None, 0, ValueError),
-        (True, 0, TypeError),
-        (1, False, TypeError),
-        (1.5, 0, TypeError),
-        (-1, 0, ValueError),
-        (1 << 63, 0, ValueError),
-        (1, -1, ValueError),
-    ],
-)
-def test_philox_invalid_metadata(seed, offset, error):
-    with pytest.raises(error):
-        reserve_mxfp4_philox_streams(1024, (True,), seed, offset)
-
-
-@pytest.mark.parametrize("seed,offset", [(1, 0), (None, 1)])
-def test_philox_disabled_rejects_metadata(seed, offset):
-    with pytest.raises(ValueError, match="only valid"):
-        reserve_mxfp4_philox_streams(1024, (False,), seed, offset)

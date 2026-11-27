@@ -85,11 +85,9 @@ from .transport import (
     _color_io,
     _i32_to_bytes,
     _load_flag,
-    _load_peers,
     _release_inbox,
     _store_flag_peer,
     _store_v4i32_peer,
-    _to_sgpr_i64,
     make_pack_storage,
 )
 
@@ -392,7 +390,6 @@ def make_quick_allreduce_mesh_kernel(
         num_tiles: fx.Int32,
         inp_ptr: fx.Int64,
         out_ptr: fx.Int64,
-        peer_ptrs: fx.Int64,
         colors_ptr: fx.Int64,
         n_blocks: fx.Int32,
         res_in_ptr: fx.Int64,
@@ -402,6 +399,14 @@ def make_quick_allreduce_mesh_kernel(
         w_bias: fx.Float32,
         q_ptr: fx.Int64,
         q_scale_ptr: fx.Int64,
+        peer0: fx.Int64,
+        peer1: fx.Int64,
+        peer2: fx.Int64,
+        peer3: fx.Int64,
+        peer4: fx.Int64,
+        peer5: fx.Int64,
+        peer6: fx.Int64,
+        peer7: fx.Int64,
         divisor: fx.Float32 = fx.Float32(DEFAULT_DIVISOR),  # noqa: B008
     ):
         _clamp_fp16_overflow()
@@ -433,14 +438,17 @@ def make_quick_allreduce_mesh_kernel(
         lds = allocator.allocate(PackStorage).peek()
         pack = lds.pack.view(pack_layout)
         smem_ptr = lds.pack.ptr
-        peers = _load_peers(peer_ptrs, world_size + (2 if relay is not None else 0))
-        peer_vec = fx.Vector.from_elements(peers[:world_size], dtype=fx.Int64)
-        inbox = _buffer_ptr(_to_sgpr_i64(peer_vec[rank]), T.i32, 4)
+        peer_args = [peer0, peer1, peer2, peer3, peer4, peer5, peer6, peer7]
+        peers = peer_args[:world_size]
+        self_inbox = peers[self_rank]
+        inbox = _buffer_ptr(self_inbox, T.i32, 4)
         if const_expr(relay is not None):
             # Uniform per block, and the same on both ranks for the same tiles.
             is_relay = (bid % fx.Int32(relay[1])) < fx.Int32(relay[0])
-            bounce_out = _buffer_ptr(_to_sgpr_i64(peers[world_size]), T.i32, 4)
-            bounce_in = _buffer_ptr(_to_sgpr_i64(peers[world_size + 1]), T.i32, 4)
+            # The host passes this rank's outgoing and incoming bounce in the
+            # peer slots after the TP ranks (_StEngine.peer_args).
+            bounce_out = _buffer_ptr(peer_args[world_size], T.i32, 4)
+            bounce_in = _buffer_ptr(peer_args[world_size + 1], T.i32, 4)
 
         def _push_base(j):
             """Inbox base of destination *j*, a lane-varying ``push_peers`` index."""
@@ -710,7 +718,7 @@ def make_quick_allreduce_mesh_kernel(
                 elem = _sub_tile_i32(phase, spin_src, fx.Int32(0)) + fx.Int32(
                     release_i32_off
                 )
-                _wait_flag(peer_vec[rank] + _i32_to_bytes(elem), color)
+                _wait_flag(self_inbox + _i32_to_bytes(elem), color)
             gpu.barrier()
             # Unconditional and after the join. Only `tid < n_push` spun,
             # so scoping the acquire to the spin would leave the other waves
@@ -924,7 +932,14 @@ def make_quick_allreduce_mesh_kernel(
         num_tiles: fx.Int32,
         inp_ptr: fx.Int64,
         out_ptr: fx.Int64,
-        peer_ptrs: fx.Int64,
+        peer0: fx.Int64,
+        peer1: fx.Int64,
+        peer2: fx.Int64,
+        peer3: fx.Int64,
+        peer4: fx.Int64,
+        peer5: fx.Int64,
+        peer6: fx.Int64,
+        peer7: fx.Int64,
         colors_ptr: fx.Int64,
         grid_x: fx.Int32,
         divisor: fx.Float32 = fx.Float32(DEFAULT_DIVISOR),  # noqa: B008
@@ -936,7 +951,6 @@ def make_quick_allreduce_mesh_kernel(
             num_tiles,
             inp_ptr,
             out_ptr,
-            peer_ptrs,
             colors_ptr,
             grid_x,
             fx.Int64(0),
@@ -946,6 +960,14 @@ def make_quick_allreduce_mesh_kernel(
             fx.Float32(0.0),
             fx.Int64(0),
             fx.Int64(0),
+            peer0,
+            peer1,
+            peer2,
+            peer3,
+            peer4,
+            peer5,
+            peer6,
+            peer7,
             divisor,
             value_attrs={"rocdl.flat_work_group_size": flat_wg},
         ).launch(
@@ -961,7 +983,14 @@ def make_quick_allreduce_mesh_kernel(
         num_tiles: fx.Int32,
         inp_ptr: fx.Int64,
         out_ptr: fx.Int64,
-        peer_ptrs: fx.Int64,
+        peer0: fx.Int64,
+        peer1: fx.Int64,
+        peer2: fx.Int64,
+        peer3: fx.Int64,
+        peer4: fx.Int64,
+        peer5: fx.Int64,
+        peer6: fx.Int64,
+        peer7: fx.Int64,
         colors_ptr: fx.Int64,
         grid_x: fx.Int32,
         res_in_ptr: fx.Int64,
@@ -979,7 +1008,6 @@ def make_quick_allreduce_mesh_kernel(
             num_tiles,
             inp_ptr,
             out_ptr,
-            peer_ptrs,
             colors_ptr,
             grid_x,
             res_in_ptr,
@@ -989,6 +1017,14 @@ def make_quick_allreduce_mesh_kernel(
             w_bias,
             q_ptr,
             q_scale_ptr,
+            peer0,
+            peer1,
+            peer2,
+            peer3,
+            peer4,
+            peer5,
+            peer6,
+            peer7,
             fx.Float32(DEFAULT_DIVISOR),
             value_attrs={"rocdl.flat_work_group_size": flat_wg},
         ).launch(
@@ -1043,5 +1079,6 @@ def make_quick_allreduce_mesh_kernel(
         "rank": self_rank,
         "relay": relay,
         "bounce_bytes": flags_bytes + data_bytes,
+        "device_colors": True,
         **epilogue.spec(),
     }

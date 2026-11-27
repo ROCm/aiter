@@ -1342,3 +1342,207 @@ def test_old_ipc_module_name_still_imports():
     from aiter.ops.flydsl.quick_allreduce_int4_ipc import UncachedIpcHeap as Old
 
     assert Old is UncachedIpcHeap
+
+
+# The pull schedule: exact bf16 Gemma all-reduce + RMSNorm on registered
+# graph inputs. Its window and ladder are table data like every other family's.
+
+PULL_H = 6144
+PULL_ROW = 2 * PULL_H
+PULL_CELL = ("xgmi", 4, "gfx950")
+
+
+def _pull_rows_rung(rows, ladder=None):
+    """The rung that runs *rows* rows of hidden 6144 (what ``rung()`` of the
+    engine does)."""
+    ladder = ladder or P.fused_pull_ladder(
+        world_size=4, link="xgmi", arch="gfx950", hidden=PULL_H
+    )
+    return P.select_rung(ladder, rows * PULL_ROW)
+
+
+def _pull_doc(rungs):
+    doc = _ladder_doc()
+    doc["platforms"][0]["pull"] = {"hidden": {"6144": {"rungs": rungs}}}
+    return doc
+
+
+def test_pull_window_is_rows_1_to_1024_at_the_decode_platform():
+    row = _fused_row(*PULL_CELL)
+    w = row.pull_window()
+    assert w.contains(PULL_ROW) and w.contains(1024 * PULL_ROW)
+    assert not w.contains(1025 * PULL_ROW)
+
+
+@pytest.mark.parametrize("cell", CELLS)
+def test_only_the_decode_platform_serves_pull(cell):
+    row = _fused_row(*cell)
+    assert (row.pull_window() is not None) == (cell == PULL_CELL)
+    kw = {"world_size": cell[1], "link": cell[0], "arch": cell[2]}
+    assert bool(P.fused_pull_hiddens(**kw)) == (cell == PULL_CELL)
+
+
+@pytest.mark.parametrize("cell", CELLS)
+def test_pull_is_no_algorithm_of_the_other_families(cell):
+    """The mesh, ring and one-shot selection ignores the pull window."""
+    row = _fused_row(*cell)
+    no_pull = dataclasses.replace(row, pull=None)
+    for quantized in (False, True):
+        assert row.algorithms(quantized=quantized) == no_pull.algorithms(
+            quantized=quantized
+        )
+        for n in (1 << k for k in range(4, 30)):
+            assert row.select(n, quantized=quantized) == no_pull.select(
+                n, quantized=quantized
+            )
+
+
+def test_pull_ladder_tiers():
+    """The kernel of every row count of the shipped ladder (fitted by
+    bench_fused_ar_rms_gemma.py): one-shot with acks to 11 rows, one-row pull
+    to 256 (per-wave hand-offs 37-96), streamed with the weight hoisted above
+    (2 rows per workgroup to 512, 4 above)."""
+    want = []
+    for rows in range(1, 1025):
+        if rows <= 11:
+            want.append(("oneshot",))
+        elif rows <= 256:
+            want.append(("pull", 37 <= rows <= 96))
+        else:
+            want.append(("stream", 2 if rows <= 512 else 4, True))
+    assert [_pull_rows_rung(r).cfg for r in range(1, 1025)] == want
+
+
+@pytest.mark.parametrize(
+    "rows", [8, 16, 32, 64, 96, 128, 192, 256, 384, 512, 640, 768, 1024]
+)
+def test_m31_decode_rows_route_to_pull(rows):
+    """MiniMax-M3.1 TP4 decode (hidden 6144, DSpark rows 8..512): inside the
+    pull window, on a rung of the ladder."""
+    row = _fused_row(*PULL_CELL)
+    assert row.pull_window().contains(rows * PULL_ROW)
+    assert _pull_rows_rung(rows).kernel in P.PULL_KERNELS
+
+
+@pytest.mark.parametrize("rows", [2048, 4096])
+def test_m31_long_prefill_rows_are_not_pull(rows):
+    assert not _fused_row(*PULL_CELL).pull_window().contains(rows * PULL_ROW)
+
+
+def test_pull_window_env_overrides():
+    link, ws, arch = PULL_CELL
+    p = f"{P.FUSED_ENV_PREFIX}_PULL"
+    with mock.patch.dict(os.environ, {f"{p}_MAX_BYTES": "0"}):
+        assert _resolve_fused(link, ws, arch).pull_window() is None
+    with mock.patch.dict(os.environ, {f"{p}_MAX_BYTES": str(129 * PULL_ROW)}):
+        w = _resolve_fused(link, ws, arch).pull_window()
+    assert w.contains(128 * PULL_ROW) and not w.contains(129 * PULL_ROW)
+    with mock.patch.dict(os.environ, {f"{p}_MIN_BYTES": str(16 * PULL_ROW)}):
+        w = _resolve_fused(link, ws, arch).pull_window()
+    assert not w.contains(15 * PULL_ROW) and w.contains(16 * PULL_ROW)
+    with mock.patch.dict(os.environ, {f"{p}_MAX_BYTES": "none"}):
+        assert _resolve_fused(link, ws, arch).pull_window().max is None
+
+
+def test_pull_window_env_is_ignored_without_a_ladder():
+    """A platform with no pull ladder cannot be enabled by a window variable,
+    as for the other families."""
+    p = f"{P.FUSED_ENV_PREFIX}_PULL"
+    with mock.patch.dict(os.environ, {f"{p}_MIN_BYTES": "0", f"{p}_MAX_BYTES": "1MB"}):
+        assert _resolve_fused("pcie", 4, "gfx950").pull_window() is None
+    # the plain table has no pull window and the plain prefix does not make one
+    with mock.patch.dict(os.environ, {"AITER_FLY_AR_PULL_MAX_BYTES": "1048576"}):
+        assert (
+            P.resolve_family_policy(world_size=4, arch="gfx950", link="xgmi").pull
+            is None
+        )
+
+
+def test_pull_digest_follows_window_and_rungs():
+    from aiter.dist.device_communicators.flydsl_backends import _pull_digest
+
+    link, ws, arch = PULL_CELL
+    kw = {"world_size": ws, "link": link, "arch": arch}
+    ladders = {PULL_H: P.fused_pull_ladder(**kw, hidden=PULL_H)}
+    window = _resolve_fused(link, ws, arch).pull_window()
+    base = _pull_digest(link=link, arch=arch, window=window, ladders=ladders)
+    assert base == _pull_digest(link=link, arch=arch, window=window, ladders=ladders)
+    other = P.Window(window.min, window.max - PULL_ROW)
+    assert base != _pull_digest(link=link, arch=arch, window=other, ladders=ladders)
+    moved = list(ladders[PULL_H])
+    moved[1] = dataclasses.replace(moved[1], min_bytes=moved[1].min_bytes + PULL_ROW)
+    assert base != _pull_digest(
+        link=link, arch=arch, window=window, ladders={PULL_H: tuple(moved)}
+    )
+    # the platform ladders the other fused engines vote on carry the pull ones too
+    assert P.fused_platform_ladders(**kw)[-1][0] == "pull"
+
+
+def test_pull_ladder_file_round_trip(tmp_path):
+    rungs = [
+        {"min_bytes": 0, "kernel": "oneshot"},
+        {"min_bytes": 12 * PULL_ROW, "kernel": "pull", "wave": True},
+        {"min_bytes": 288 * PULL_ROW, "kernel": "stream", "rows_per_wg": 4},
+    ]
+    got = P.load_fused_ladders(_write_ladders(tmp_path, _pull_doc(rungs)))
+    ladder = got.pull[("gfx950", "pcie", 4, PULL_H)]
+    assert [r.cfg for r in ladder] == [
+        ("oneshot",),
+        ("pull", True),
+        ("stream", 4, True),
+    ]
+    assert [r.min_bytes for r in ladder] == [r["min_bytes"] for r in rungs]
+    # a file without the key has no pull ladder
+    plain = P.load_fused_ladders(_write_ladders(tmp_path, _ladder_doc()))
+    assert plain.pull == {}
+
+
+@pytest.mark.parametrize(
+    "rungs, match",
+    [
+        ([{"min_bytes": 0, "kernel": "mesh"}], "kernel"),
+        ([{"min_bytes": 64, "kernel": "pull"}], "start at 0"),
+        ([{"min_bytes": 0, "kernel": "stream"}], "rows_per_wg"),
+        ([{"min_bytes": 0, "kernel": "stream", "rows_per_wg": 3}], "rows_per_wg"),
+        ([{"min_bytes": 0, "kernel": "oneshot", "wave": True}], "wave"),
+        ([{"min_bytes": 0, "kernel": "pull", "rows_per_wg": 2}], "stream rung"),
+        ([{"min_bytes": 0, "kernel": "pull", "grid_cap": 8}], "unknown"),
+        ([], "non-empty"),
+    ],
+)
+def test_pull_ladder_file_rejects(tmp_path, rungs, match):
+    with pytest.raises(ValueError, match=match):
+        P.load_fused_ladders(_write_ladders(tmp_path, _pull_doc(rungs)))
+
+
+def test_shipped_pull_ladder_is_sorted_and_row_aligned():
+    ladder = P.fused_pull_ladder(
+        world_size=4, link="xgmi", arch="gfx950", hidden=PULL_H
+    )
+    assert ladder[0].min_bytes == 0
+    assert all(r.min_bytes % PULL_ROW == 0 for r in ladder)
+    assert all(r.kernel in P.PULL_KERNELS for r in ladder)
+
+
+def test_pull_engine_refuses_a_ladder_that_hangs():
+    """A one-row pull rung that the window lets reach 768 rows would hang its
+    graph replay: the engine's check refuses it, a stream rung there passes."""
+    pytest.importorskip("flydsl")
+    from aiter.ops.flydsl.pull_allreduce_rmsnorm import PullAllReduceRMSNorm
+
+    R = P.FusedPullRung
+    bad = (R(0, "oneshot"), R(12 * PULL_ROW, "pull"))
+    ok = (
+        R(0, "oneshot"),
+        R(12 * PULL_ROW, "pull"),
+        R(257 * PULL_ROW, "stream", rows_per_wg=2),
+    )
+    window = P.Window(0, 1025 * PULL_ROW)
+    eng = object.__new__(PullAllReduceRMSNorm)
+    eng.window, eng.max_rows = window, 1024
+    eng._check_ladder(ok)
+    with pytest.raises(ValueError, match="only known to run"):
+        eng._check_ladder(bad)
+    # a window that ends before the bad rows makes the same ladder legal
+    eng.window, eng.max_rows = P.Window(0, 641 * PULL_ROW), 640
+    eng._check_ladder(bad)

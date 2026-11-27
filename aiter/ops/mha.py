@@ -955,7 +955,7 @@ _GFX1250_VARLEN_ASM_BF16 = 1  # fmha_fwd_with_sink_varlen_asm
 _GFX1250_VARLEN_ASM_FP8 = 2  # fmha_fwd_fp8_varlen_asm
 # (hdim_q, hdim_v) the gfx1250 bf16 ASM backward (fmha_v3_bwd / fmha_v3_varlen_bwd)
 # serves.
-_GFX1250_BWD_HDIMS = ((64, 64), (128, 128), (192, 128))
+_GFX1250_BWD_HDIMS = ((64, 64), (128, 128), (192, 128), (256, 256))
 
 
 def _probe_gfx1250_asm_device() -> bool:
@@ -2986,6 +2986,7 @@ def _flash_attn_backward(
         ret &= dbias is None
         ret &= dropout_p == 0.0
         ret &= (hdim_q, hdim_v) in _GFX1250_BWD_HDIMS
+        ret &= not deterministic or hdim_q != 256  # hd256 has no deterministic build
         ret &= nhead_q % nhead_k == 0
         ret &= wl == -1 and (causal or wr == -1)
         ret &= sink is None and d_sink is None
@@ -3913,9 +3914,7 @@ def _flash_attn_varlen_backward(
         # sliding window kernels are hd128 only
         ret &= not swa or hdim_q <= 128
         if hdim_q == 256:
-            ret &= not causal
-            ret &= window_size_left == -1 and window_size_right == -1
-            ret &= nhead_q == nhead_k
+            ret &= window_size_left == -1 and (causal or window_size_right == -1)
             ret &= q.dtype == dtypes.bf16
 
         return ret
@@ -3928,6 +3927,7 @@ def _flash_attn_varlen_backward(
         ret &= alibi_slopes is None
         ret &= dropout_p == 0.0
         ret &= (hdim_q, hdim_v) in _GFX1250_BWD_HDIMS
+        ret &= not deterministic or hdim_q != 256  # hd256 has no deterministic build
         ret &= nhead_q % nhead_k == 0
         ret &= window_size_left == -1 and (causal or window_size_right == -1)
         ret &= sink is None and d_sink is None
@@ -3936,9 +3936,10 @@ def _flash_attn_varlen_backward(
 
     def can_impl_fmha_bwd_flydsl():
         # d_qk=192 / d_v=128 causal varlen self-attention, taken only when no ASM v3
-        # kernel covers it (gfx942 has the hd192_128 pssk kernels).
-        # `deterministic` is absent on purpose: the kernel uses no atomics and
-        # writes each of dq/dk/dv exactly once, so it is deterministic either way.
+        # kernel covers it: gfx942 runs the hd192_128 pssk kernels unless deterministic.
+        # `deterministic` is forwarded rather than gated: 192 / 128 never takes the
+        # atomic-dQ fused kernel (its 12 MFMA d tiles exceed the 8 waves), so the flag
+        # only matters for the narrower head dims a direct caller may request.
         ret = get_gfx() == "gfx942"
         ret &= alibi_slopes is None
         ret &= dropout_p == 0.0
@@ -4034,6 +4035,7 @@ def _flash_attn_varlen_backward(
             max_seqlen_q,
             max_seqlen_k,
             softmax_scale,
+            deterministic,
         )
     else:
         (

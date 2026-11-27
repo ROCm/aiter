@@ -1524,6 +1524,15 @@ def _pinned_cases():
             (mla_gluon, "_mla_gluon_launch"),
             (out, None),
         ),
+        "mla_gluon with kv_split_info": (
+            "mla_paged_decode",
+            lambda: mla_gluon.mla_gluon(
+                **_gluon_args(),
+                kv_split_info=(_z(8, 8, dtype=torch.int32), _z(3, dtype=torch.int32)),
+            ),
+            (mla_gluon, "_mla_gluon_launch"),
+            (out, None),
+        ),
     }
 
 
@@ -1538,6 +1547,7 @@ def _pinned_cases():
         "mhc_fused_post_pre, backend=",
         "mla_gluon prefill mode",
         "mla_gluon with a sink",
+        "mla_gluon with kv_split_info",
     ],
 )
 def test_a_pinned_call_runs_aiter_s_own_and_asks_no_provider(monkeypatch, case):
