@@ -76,7 +76,6 @@ def parse_kernel_name(name: str) -> dict[str, int] | None:
     return {key: int(value) for key, value in match.groupdict().items()}
 
 
-@functools.lru_cache(maxsize=256)
 def compile_a6w6_gemm(
     *,
     K: int,
@@ -84,7 +83,16 @@ def compile_a6w6_gemm(
     mblk_n: int = 2,
     bar: int | None = 8,
 ):
-    """Compile and memoize one launcher for the padded contraction dimension ``K``."""
+    """Compile and memoize the current device's launcher for the padded contraction
+    dimension ``K``."""
+    return _compile_a6w6_gemm(
+        torch.cuda.current_device(), int(K), int(xcd_swizzle), int(mblk_n), bar
+    )
+
+
+@functools.lru_cache(maxsize=256)
+def _compile_a6w6_gemm(device, K, xcd_swizzle, mblk_n, bar):
+    # device only keys the cache: a launcher runs on the device that first ran it.
     _lazy_import()
     if K < MIN_K or K % BLOCK_K:
         raise ValueError(
@@ -117,8 +125,16 @@ def run_gemm_a6w6_4wave(
         raise NotImplementedError(
             "[FlyDSL A6W6 4wave] kernel is supported only on gfx950"
         )
-    if out.dtype != torch.bfloat16 or out.ndim != 2 or not out.is_contiguous():
-        raise ValueError("[FlyDSL A6W6 4wave] out must be a contiguous 2-D BF16 tensor")
+    if (
+        not out.is_cuda
+        or out.dtype != torch.bfloat16
+        or out.ndim != 2
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            "[FlyDSL A6W6 4wave] out must be a contiguous 2-D BF16 GPU tensor"
+        )
+    device = out.get_device()
     pad_m, pad_n = out.shape
     if pad_m % BLOCK_M or pad_n % BLOCK_N:
         raise ValueError(
@@ -138,11 +154,19 @@ def run_gemm_a6w6_4wave(
                 f"[FlyDSL A6W6 4wave] {name} must be {expected} packed uint8 bytes, got "
                 f"{tensor.numel()} {tensor.dtype}"
             )
-    if max(A.numel(), B.numel(), out.numel() * 2) >= 2**31:
+        if tensor.get_device() != device or not tensor.is_contiguous():
+            raise ValueError(
+                f"[FlyDSL A6W6 4wave] {name} must be a contiguous tensor on {out.device}"
+            )
+    # Byte offsets are signed 32-bit: a buffer may hold up to 2**31 bytes.
+    if max(A.numel(), B.numel(), out.numel() * 2) > 2**31:
         raise ValueError("[FlyDSL A6W6 4wave] operands exceed 32-bit byte offsets")
-    executable = compile_a6w6_gemm(
-        K=int(K), xcd_swizzle=int(xcd_swizzle), mblk_n=int(mblk_n), bar=bar
-    )
+    if device != torch.cuda.current_device():
+        with torch.cuda.device(device):
+            return run_gemm_a6w6_4wave(
+                A, B, A_scale, B_scale, out, K, xcd_swizzle, mblk_n, bar
+            )
+    executable = _compile_a6w6_gemm(device, int(K), int(xcd_swizzle), int(mblk_n), bar)
     _run_compiled(
         executable,
         A.view(-1),
@@ -152,7 +176,7 @@ def run_gemm_a6w6_4wave(
         B_scale.view(-1),
         pad_m,
         pad_n,
-        _fx.Stream(torch.cuda.current_stream(device=out.device)),
+        _fx.Stream(torch.cuda.current_stream(device)),
     )
     return out
 

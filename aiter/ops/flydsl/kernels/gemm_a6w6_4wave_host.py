@@ -18,13 +18,11 @@ with a bias the N biases, then the prep's column vectors (``PrepSpec.pack_column
 no scales).
 
 Modes: one projection (``roles == 1``), plain or with the bias, prep or maxima epilogue,
-persistent over ``num_cu`` workgroups or one block per workgroup; or ``roles`` column
-blocks of one fused weight (Q/K/V), persistent, with ``hooks`` under the ``gemm_hooks``
-contract. A workgroup runs its blocks one after another: a block's prologue starts after
-the previous block's epilogue.
+persistent over ``num_cu`` workgroups (one per block if there are fewer) or one block
+per workgroup; or ``roles`` column blocks of one fused weight (Q/K/V), persistent, with
+``hooks`` under the ``gemm_hooks`` contract. A workgroup runs its blocks one after
+another: a block's prologue starts after the previous block's epilogue.
 """
-
-import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -65,6 +63,7 @@ from aiter.ops.flydsl.kernels.gemm_hooks import (
 from aiter.ops.flydsl.kernels.kernels_common import (
     ceildiv,
     format_kernel_name,
+    per_device_cache,
     set_slp_vectorize_once_used,
 )
 from aiter.ops.flydsl.kernels.qk_prep import PrepSpec
@@ -90,7 +89,7 @@ def host_weight_order(n):
     return (p // 128) * 128 + 8 * (p % 16) + (p % 128) // 16
 
 
-@functools.cache
+@per_device_cache
 def compile_a6w6_host_4w(
     *,
     K: int,
@@ -198,7 +197,7 @@ def compile_a6w6_host_4w(
         h5: fx.Int64,
     ):
         m_blocks = ceildiv(c_m, BLOCK_M)
-        n_blocks = c_n // BLOCK_N
+        n_blocks = ceildiv(c_n, BLOCK_N)
         hook_args = (h0, h1, h2, h3, h4, h5)
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
@@ -484,7 +483,9 @@ def compile_a6w6_host_4w(
         c_n: fx.Int32,
         stream: fx.Stream,
     ):
-        grid_x = num_cu if persistent else ceildiv(c_m, BLOCK_M) * (c_n // BLOCK_N)
+        grid_x = ceildiv(c_m, BLOCK_M) * ceildiv(c_n, BLOCK_N)
+        if const_expr(persistent):
+            grid_x = (grid_x > num_cu).select(fx.Int32(num_cu), grid_x)
         zero = fx.Int64(0)
         kernel_gemm(
             A,
@@ -553,5 +554,6 @@ def compile_a6w6_host_4w(
     # LLVM otherwise aligns a loop only when that takes at most 4 bytes of padding, which
     # leaves the K loop's alignment to the code before it; this kernel's time moves by up
     # to 2 % with it.
-    launcher.compile_hints.setdefault("llvm_options", {})["max-bytes-for-alignment"] = 32
+    llvm_options = launcher.compile_hints.setdefault("llvm_options", {})
+    llvm_options["max-bytes-for-alignment"] = 32
     return set_slp_vectorize_once_used(launcher, False)

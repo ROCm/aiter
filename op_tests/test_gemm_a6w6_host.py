@@ -134,7 +134,15 @@ def _close(expected, actual, rtol, label, outliers=0.0):
 
 @pytest.mark.parametrize(
     "shape",
-    [(256, 256, 128), (300, 512, 1000), (1024, 768, 1280), (9472, 15360, 5120)],
+    [
+        (256, 256, 128),
+        (300, 512, 1000),
+        (1024, 768, 1280),
+        (9472, 15360, 5120),
+        # N % 256 == 128: the last block's second half is past N.
+        (256, 128, 256),
+        (300, 384, 1000),
+    ],
 )
 @pytest.mark.parametrize("persistent", [False, True])
 @torch.no_grad()
@@ -163,6 +171,9 @@ PREP_CASES = [
     (1184, 5120, 5120, "rms_across_heads", "interleaved", True, True, True),
     (1184, 5120, 5120, "rms_per_head", "rotate_half", True, True, True),
     (576, 3072, 3072, "rms_per_head", "interleaved", True, False, True),
+    # One and three heads: N % 256 == 128.
+    (257, 128, 512, "rms_per_head", "interleaved", True, True, True),
+    (257, 384, 512, "rms_across_heads", "rotate_half", False, True, False),
 ]
 
 
@@ -181,10 +192,19 @@ def test_prep_matches_pytorch(m, n, k, norm, rope, hadamard, bias, persistent):
         _close(row_partials, partials[0], 1e-3, f"{spec}: row partials", outliers=1e-3)
 
 
-@pytest.mark.parametrize("bias,amax", [(True, False), (False, True), (True, True)])
+@pytest.mark.parametrize(
+    "n,bias,amax",
+    [
+        (512, True, False),
+        (512, False, True),
+        (512, True, True),
+        (128, True, True),
+        (384, False, True),
+    ],
+)
 @torch.no_grad()
-def test_bias_and_maxima_match_pytorch(bias, amax):
-    m, n, k = 300, 512, 1000
+def test_bias_and_maxima_match_pytorch(n, bias, amax):
+    m, k = 300, 1000
     case = _case(m, n, k, bias, seed=11)
     stored, _, maxima = _reference(case, bias=bias)
     out, partials = _launch(case, bias=bias, amax=amax)
@@ -297,6 +317,25 @@ def test_persistent_matches_one_block_per_workgroup():
     persistent = _launch(case, spec, num_cu=get_cu_num())
     for a, b in zip(one, persistent):
         assert torch.equal(a.view(torch.int16), b.view(torch.int16))
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two GPUs")
+@torch.no_grad()
+def test_each_device_runs_its_own_launcher():
+    """cuda:0 runs the host and the standalone GEMM first; cuda:1 then matches them bit
+    for bit, the standalone GEMM with cuda:0 still current."""
+    m, n, k = 300, 384, 1000
+    case = _case(m, n, k, False, seed=7)
+    a, a_scale = aiter.quant_mxfp6_gemm(case["x"])
+    b, b_scale = aiter.quant_mxfp6_gemm(case["w"])
+    operands = (a, b, a_scale, b_scale)
+    expected = (_launch(case)[0], aiter.gemm_a6w6(*operands, m, n, k))
+    with torch.cuda.device(1):
+        other = {"x": case["x"].to("cuda:1"), "w": case["w"].to("cuda:1"), "bias": None}
+        host = _launch(other)[0]
+    standalone = aiter.gemm_a6w6(*(t.to("cuda:1") for t in operands), m, n, k)
+    for want, got in zip(expected, (host, standalone)):
+        assert torch.equal(want.cpu().view(torch.int16), got.cpu().view(torch.int16))
 
 
 if __name__ == "__main__":

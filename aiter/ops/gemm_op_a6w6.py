@@ -761,9 +761,11 @@ def _flydsl_default_kernel() -> str | None:
     """The FlyDSL kernel's default variant, or None without FlyDSL."""
     try:
         from .flydsl.gemm_a6w6_4wave import make_kernel_name
+
+        # The name imports the kernel module, which imports FlyDSL's MLIR bindings.
+        return make_kernel_name()
     except ImportError:
         return None
-    return make_kernel_name()
 
 
 def _default_gemm_a6w6_kernel(M: int, N: int, K: int) -> str:
