@@ -80,7 +80,7 @@ class TestLogTunedConfigMiss(_MissLogCase):
         self.set_log_all(1)
         lines = self.misses(self.log, range(1, 11))
         self.assertEqual(len(lines), 10)
-        self.assertTrue(all("Logged once" not in line for line in lines))
+        self.assertTrue(all("Not repeated" not in line for line in lines))
         self.assertTrue(common.log_tuned_config_miss("fam", (GFX, 1, 1), "x"))
         self.assertTrue(common.log_tuned_config_miss("fam", (GFX, 1, 1), "x"))
 

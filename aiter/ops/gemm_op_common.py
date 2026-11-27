@@ -55,9 +55,8 @@ def log_tuned_config_miss(family: str, key: tuple, message: str) -> bool:
     if not _first_report_of((family, *key)):
         return False
     logger.info(
-        f"{message} (Logged once per N/K and default; other M that pick the same "
-        "default are not logged. "
-        "Set AITER_LOG_TUNED_CONFIG=1 to log every miss.)"
+        f"{message} (Not repeated for other M while this N/K/default key stays "
+        "cached. Set AITER_LOG_TUNED_CONFIG=1 to log every miss.)"
     )
     return True
 
