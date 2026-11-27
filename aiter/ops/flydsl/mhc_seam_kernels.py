@@ -9,6 +9,7 @@ With NORM="separate", aiter.rms_norm normalizes the collapse in a third launch.
 """
 
 import functools
+import threading
 import weakref
 from collections.abc import Callable
 
@@ -328,6 +329,7 @@ def _validate_inputs(
 ) -> tuple[int, int, str]:
     """Validate inputs and return the token count, hidden size, and GPU arch."""
     _require(residual.dim() == 3, "residual must be (T, 4, H)")
+    _require(residual.is_cuda, "residual must be on a GPU")
     _require(residual.dtype == torch.bfloat16, "residual must be bf16", TypeError)
     _require(residual.is_contiguous(), "residual must be contiguous")
     T, n, H = residual.shape
@@ -469,6 +471,7 @@ def flydsl_mhc_seam_pack_fn(fn: torch.Tensor) -> torch.Tensor:
 
 
 _FN_CACHE: dict = {}
+_FN_CACHE_LOCK = threading.Lock()
 
 
 def _pack_fn(
@@ -482,41 +485,44 @@ def _pack_fn(
     outlive any graph that captured its pack.
 
     Packing is eager only, runs outside inference mode and autograd, and is waited for
-    so no other stream reads it half written. A call that finds an entry records its
-    stream on the pack, so the buffer outlives fn until that stream is done; the stream
-    must outlive fn too (an external stream destroyed first faults when fn is freed).
+    so no other stream reads it half written. Lookup, packing and publication hold one
+    lock, so threads that miss on one fn together share one buffer. A call that finds an
+    entry records its stream on the pack, so the buffer outlives fn until that stream is
+    done; the stream must outlive fn too (an external stream destroyed first faults when
+    fn is freed).
 
     A caller that builds a fresh tensor per call misses every time; it wants fn_packed.
     """
     key = id(fn)
-    hit = _FN_CACHE.get(key)
     stamp = (fn.data_ptr(), fn._version)
-    if hit is not None:
-        hit[1].record_stream(stream)
-        if hit[0] == stamp:
-            return hit[1]
-    _require(
-        not capturing,
-        "fn is not packed during CUDA-graph capture: pass fn_packed, "
-        "or run one eager call with the same fn before capturing and again after "
-        "updating it in place",
-        RuntimeError,
-    )
-    with torch.inference_mode(False), torch.no_grad():
-        packed = flydsl_mhc_seam_pack_fn(fn)
-        if hit is None:
-            weakref.finalize(fn, _FN_CACHE.pop, key, None)
-        else:
-            # A fresh buffer would leave captured graphs on the old one.
-            _require(
-                hit[1].shape == packed.shape,
-                "fn changed shape in place; "
-                "the pack captured graphs hold cannot follow it",
-                RuntimeError,
-            )
-            packed = hit[1].copy_(packed)
-    stream.synchronize()
-    _FN_CACHE[key] = (stamp, packed)
+    with _FN_CACHE_LOCK:
+        hit = _FN_CACHE.get(key)
+        if hit is not None:
+            hit[1].record_stream(stream)
+            if hit[0] == stamp:
+                return hit[1]
+        _require(
+            not capturing,
+            "fn is not packed during CUDA-graph capture: pass fn_packed, "
+            "or run one eager call with the same fn before capturing and again after "
+            "updating it in place",
+            RuntimeError,
+        )
+        with torch.inference_mode(False), torch.no_grad():
+            packed = flydsl_mhc_seam_pack_fn(fn)
+            if hit is None:
+                weakref.finalize(fn, _FN_CACHE.pop, key, None)
+            else:
+                # A fresh buffer would leave captured graphs on the old one.
+                _require(
+                    hit[1].shape == packed.shape,
+                    "fn changed shape in place; "
+                    "the pack captured graphs hold cannot follow it",
+                    RuntimeError,
+                )
+                packed = hit[1].copy_(packed)
+        stream.synchronize()
+        _FN_CACHE[key] = (stamp, packed)
     return packed
 
 
@@ -670,6 +676,7 @@ def _make_separate_norm_runner(
 @functools.lru_cache(maxsize=512)
 def _compile_launcher(
     *,
+    device: int,
     T: int,
     H: int,
     arch: str,
@@ -684,7 +691,7 @@ def _compile_launcher(
     sinkhorn_repeat: int,
     norm_eps: float,
 ) -> Callable:
-    """Cache a tensor-level runner by shape, device properties, mode, and config.
+    """Cache a tensor-level runner by GPU, shape, device properties, mode, and config.
 
     The runner retains only the compiled kernels and scalar launch metadata.
     Tensors, scratch, and streams belong to each invocation.
@@ -699,6 +706,7 @@ def _compile_launcher(
     )
     separate = cfg["NORM"] == "separate"
     fused = mhc_seam.compile_mhc_seam_fused(
+        device=device,
         streams=_N,
         hidden=H,
         has_post=has_post,
@@ -717,6 +725,7 @@ def _compile_launcher(
         prefetch=bool(cfg["PREFETCH"]),
     )
     finish_kwargs = {
+        "device": device,
         "hidden": H,
         "splits": cfg["SPLITS"],
         "rms_eps": rms_eps,
@@ -792,12 +801,12 @@ def flydsl_mhc_seam(
     config overrides MHC_SEAM_DEFAULTS key by key and rejects unknown keys. Split-K
     scratch is allocated per call.
 
-    CUDA graphs: compile before capture, with one eager call per shape. fn_packed is
-    fn packed ahead of the call by flydsl_mhc_seam_pack_fn. With it, the kernel reads
-    that buffer instead of fn, and a captured graph follows whatever the caller repacks
-    into it. Without it, fn is packed on the first eager call and repacked by a later
-    one once fn changed in place; a write through fn.data is missed, and packing during
-    capture raises RuntimeError.
+    CUDA graphs: compile before capture, with one eager call per shape on each GPU.
+    fn_packed is fn packed ahead of the call by flydsl_mhc_seam_pack_fn. With it, the
+    kernel reads that buffer instead of fn, and a captured graph follows whatever the
+    caller repacks into it. Without it, fn is packed on the first eager call and
+    repacked by a later one once fn changed in place; a write through fn.data is missed,
+    and packing during capture raises RuntimeError.
 
     Pass it for model integration, repacked into the same buffer when fn is reloaded.
     It is required for an inference-mode fn, and for any caller without one long-lived
@@ -838,37 +847,40 @@ def flydsl_mhc_seam(
     if T == 0:
         return residual_out, post_out, comb_out, layer_input, next_pre
 
-    launcher = _compile_launcher(
-        T=T,
-        H=H,
-        arch=arch,
-        cu_num=_cu_num(),
-        config_key=_config_key(config),
-        has_post=has_post,
-        identity_pre=identity_pre,
-        rms_eps=float(rms_eps),
-        hc_pre_eps=float(hc_pre_eps),
-        hc_sinkhorn_eps=float(hc_sinkhorn_eps),
-        hc_post_mult_value=float(hc_post_mult_value),
-        sinkhorn_repeat=int(sinkhorn_repeat),
-        norm_eps=float(norm_eps),
-    )
-    layer_input = launcher(
-        residual=residual,
-        fn=fn,
-        hc_scale=hc_scale,
-        hc_base=hc_base,
-        pre_mix=pre_mix,
-        sublayer_out=sublayer_out,
-        post_layer_mix=post_layer_mix,
-        comb_res_mix=comb_res_mix,
-        norm_weight=norm_weight,
-        residual_out=residual_out,
-        post_out=post_out,
-        comb_out=comb_out,
-        layer_input=layer_input,
-        next_pre=next_pre,
-        stream=torch.cuda.current_stream(device),
-        fn_packed=fn_packed,
-    )
+    # Compiles and launches on the inputs' GPU, whichever is current.
+    with torch.cuda.device(device):
+        launcher = _compile_launcher(
+            device=device.index,
+            T=T,
+            H=H,
+            arch=arch,
+            cu_num=_cu_num(),
+            config_key=_config_key(config),
+            has_post=has_post,
+            identity_pre=identity_pre,
+            rms_eps=float(rms_eps),
+            hc_pre_eps=float(hc_pre_eps),
+            hc_sinkhorn_eps=float(hc_sinkhorn_eps),
+            hc_post_mult_value=float(hc_post_mult_value),
+            sinkhorn_repeat=int(sinkhorn_repeat),
+            norm_eps=float(norm_eps),
+        )
+        layer_input = launcher(
+            residual=residual,
+            fn=fn,
+            hc_scale=hc_scale,
+            hc_base=hc_base,
+            pre_mix=pre_mix,
+            sublayer_out=sublayer_out,
+            post_layer_mix=post_layer_mix,
+            comb_res_mix=comb_res_mix,
+            norm_weight=norm_weight,
+            residual_out=residual_out,
+            post_out=post_out,
+            comb_out=comb_out,
+            layer_input=layer_input,
+            next_pre=next_pre,
+            stream=torch.cuda.current_stream(device),
+            fn_packed=fn_packed,
+        )
     return residual_out, post_out, comb_out, layer_input, next_pre

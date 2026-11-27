@@ -54,6 +54,8 @@ Constraints:
     the finish launch's is `finish_blocks(tokens)`. Every scratch element the finish pass reads
     is then written by the fused pass on the same call, which lets all three buffers go unzeroed.
   - The fused pass's tile geometry: see `check_config`.
+  - Each `compile_*` takes the GPU index as `device` and only caches on it: a launcher's
+    compiled kernel is loaded on the GPU of its first launch and cannot launch on another.
 """
 
 import hashlib
@@ -467,6 +469,7 @@ def sums_elements(tokens: int, splits: int) -> int:
 @cache
 def compile_mhc_seam_fused(
     *,
+    device: int,
     streams: int,
     hidden: int,
     has_post: bool,
@@ -496,6 +499,7 @@ def compile_mhc_seam_fused(
     `prefetch` issues each chunk's `residual` and `sublayer_out` loads one step early: the
     first chunk's ahead of the gate staging, each later one's ahead of the previous projection.
     """
+    del device  # only keys the @cache: one compiled kernel per GPU
     _require_streams(streams)
     _require_fast_narrow(fast_fp_math, fast_narrow)
     rows = gate_rows(streams)
@@ -1063,6 +1067,7 @@ def compile_mhc_seam_fused(
 @cache
 def compile_mhc_seam_finish(
     *,
+    device: int,
     streams: int,
     hidden: int,
     block_m: int,
@@ -1087,6 +1092,7 @@ def compile_mhc_seam_finish(
     (`finish_col_steps`); with `gate_only` a leading step carries the gate chain alone
     (`gate_step`).
     """
+    del device  # only keys the @cache: one compiled kernel per GPU
     _require_streams(streams)
     rows = gate_rows(streams)
     wide = streams * hidden
@@ -1344,6 +1350,7 @@ def compile_mhc_seam_finish(
 @cache
 def compile_mhc_seam_finish_nonorm(
     *,
+    device: int,
     hidden: int,
     block_m: int,
     splits: int,
@@ -1373,6 +1380,7 @@ def compile_mhc_seam_finish_nonorm(
     multiply per lane instead of 16 serial sums and 16 multiplies in one thread. The grid is
     `finish_blocks(tokens)`, as for the fused finish.
     """
+    del device  # only keys the @cache: one compiled kernel per GPU
     _require(splits >= 1, f"splits must be at least 1, got {splits}")
     _require(block_m >= 1, f"block_m must be at least 1, got {block_m}")
     rows = gate_rows(STREAMS)
