@@ -435,7 +435,7 @@ def _gemm_a4w4_preshuffle(A, B, A_scale, B_scale, out, kernel_name):
     return out[:m].view(*A.shape[:-1], n)
 
 
-@torch_compile_guard(gen_fake=gemm_a4w4_fake)
+@torch_compile_guard(mutates_args=[], gen_fake=gemm_a4w4_fake)
 def gemm_a4w4(
     A: Tensor,  # A:[M, K/2] f4x2
     B: Tensor,  # B:[N, K/2] f4x2
@@ -834,7 +834,7 @@ def gemm_a4w4o8_fake(
     return out.view(*lead, out.shape[-1]), scale
 
 
-@torch_compile_guard(gen_fake=gemm_a4w4o8_fake)
+@torch_compile_guard(mutates_args=[], gen_fake=gemm_a4w4o8_fake)
 def gemm_a4w4o8(
     A: Tensor,  # A:[M, K/2] f4x2
     B: Tensor,  # B:[N, K/2] f4x2
