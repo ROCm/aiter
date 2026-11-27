@@ -87,5 +87,49 @@ class TestOpusCoArchAlias(unittest.TestCase):
         self.assertEqual(self._plan("gfx1250", non_co_kid).resolved_kid, non_co_kid)
 
 
+class TestGroupedMoeArchSource(unittest.TestCase):
+    """The grouped MoE dispatch must read the live GPU, not the build targets.
+
+    ``grouped_moe_gfx1250`` calls its ``get_gfx`` to enable grouped GEMM, to key
+    the tuned-config lookup and to decide the gfx1250-strict a4w4-as-a8w4
+    fallback, all at call time. ``get_gfx()`` follows ``GPU_ARCHS`` and returns
+    its last entry on a multi-target build, so binding it here would fire the
+    strict fallback on a GPU that is not gfx1250, and skip it on an MI450 A0
+    whose build lists another arch last.
+    """
+
+    def test_dispatch_reads_the_runtime_arch(self):
+        from aiter.jit.utils import chip_info
+        from aiter.ops.flydsl import grouped_moe_gfx1250
+
+        self.assertIs(grouped_moe_gfx1250.get_gfx, chip_info.get_gfx_runtime)
+        self.assertIsNot(grouped_moe_gfx1250.get_gfx, chip_info.get_gfx)
+
+    def test_grouped_gemm_is_not_enabled_by_gpu_archs_alone(self):
+        from aiter.ops.flydsl import grouped_moe_gfx1250
+
+        env = {"GPU_ARCHS": "gfx950;gfx1250-strict", "AITER_USE_GROUPED_GEMM": "0"}
+        with mock.patch.dict(os.environ, env, clear=False):
+            with mock.patch.object(
+                grouped_moe_gfx1250, "get_gfx", return_value="gfx942"
+            ):
+                self.assertFalse(grouped_moe_gfx1250._use_grouped_gemm_enabled())
+                self.assertFalse(
+                    grouped_moe_gfx1250._is_gfx1250_strict(
+                        grouped_moe_gfx1250.get_gfx()
+                    )
+                )
+            # The arch the build targets would have supplied does select it.
+            with mock.patch.object(
+                grouped_moe_gfx1250, "get_gfx", return_value="gfx1250-strict"
+            ):
+                self.assertTrue(grouped_moe_gfx1250._use_grouped_gemm_enabled())
+                self.assertTrue(
+                    grouped_moe_gfx1250._is_gfx1250_strict(
+                        grouped_moe_gfx1250.get_gfx()
+                    )
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
