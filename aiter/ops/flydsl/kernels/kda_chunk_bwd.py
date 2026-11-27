@@ -2479,17 +2479,24 @@ def compile_intra_mfma(
         n16 = lane % 16
         kq4 = (lane // 16) * 4
 
-        def off_lower(s_a):
-            """s_s[m] = sum over earlier sub-chunks of s_a[m, j] k[j] exp2(g[m] - g[j])."""
+        def off_lower():
+            """s_s[m] = sum over earlier sub-chunks of s_a[m, j] k[j] exp2(g[m] - g[j])
+            for s_a = dAqk, then dAkk. Both products share the decayed k operand,
+            which is built once per (j, c)."""
+            accs = []
             for ktl in range_constexpr(K // 32):
                 c = (kt0 + ktl) * 16 + n16
                 gn = lds_ld(s_g, m0 * LDG + c)  # pivot: first row of the sub-chunk
-                acc = fx.Float32x4(0.0)
+                acc_q = fx.Float32x4(0.0)
+                acc_k = fx.Float32x4(0.0)
                 for J in range_constexpr(BT // 16 - 1):
                     # Only sub-chunks before this wave's; the branch is wave-uniform.
                     if sub > J:
-                        a = _lds_row(
-                            s_a, (m0 + n16) * LDA + J * 16 + kq4, 4, fx.Float32
+                        aq = _lds_row(
+                            s_aq, (m0 + n16) * LDA + J * 16 + kq4, 4, fx.Float32
+                        )
+                        ak = _lds_row(
+                            s_ak, (m0 + n16) * LDA + J * 16 + kq4, 4, fx.Float32
                         )
                         bv = []
                         for p in range_constexpr(4):
@@ -2498,16 +2505,24 @@ def compile_intra_mfma(
                                 lds_ld(s_k, j * LDQ + c, fx.BFloat16)
                                 * _decay(gn - lds_ld(s_g, j * LDG + c))
                             )
-                        acc = _mfma16_f32(fx.Float32x4(a), fx.Float32x4(bv), acc)
-                for p in range_constexpr(4):
-                    m = m0 + kq4 + p
-                    lds_st(
-                        s_s, m * LDK + c, acc[p] * _decay(lds_ld(s_g, m * LDG + c) - gn)
-                    )
-            gpu.barrier()
-            out = _lds_row(s_s, r * LDK + seg * CPT, CPT, fx.Float32)
-            gpu.barrier()
-            return out
+                        bv = fx.Float32x4(bv)
+                        acc_q = _mfma16_f32(fx.Float32x4(aq), bv, acc_q)
+                        acc_k = _mfma16_f32(fx.Float32x4(ak), bv, acc_k)
+                scl = [
+                    _decay(lds_ld(s_g, (m0 + kq4 + p) * LDG + c) - gn)
+                    for p in range_constexpr(4)
+                ]
+                accs.append((c, scl, acc_q, acc_k))
+            outs = []
+            for which in range_constexpr(2):
+                for c, scl, acc_q, acc_k in accs:
+                    acc = acc_q if which == 0 else acc_k
+                    for p in range_constexpr(4):
+                        lds_st(s_s, (m0 + kq4 + p) * LDK + c, acc[p] * scl[p])
+                gpu.barrier()
+                outs = outs + _lds_row(s_s, r * LDK + seg * CPT, CPT, fx.Float32)
+                gpu.barrier()
+            return outs
 
         def off_upper():
             """s_s[m] = sum over later sub-chunks of (dAqk[j, m] q[j] + dAkk[j, m] beta[j] k[j]) exp2(g[j] - g[m])."""
@@ -2540,7 +2555,7 @@ def compile_intra_mfma(
             return out
 
         jb = (r // 16) * 16
-        init = off_lower(s_aq) + off_lower(s_ak)
+        init = off_lower()
         # Pairs inside the row's own sub-chunk.
         for jj, st in range(0, 16, 1, init=init):
             jq = jb + fx.Int32(jj)
