@@ -11,7 +11,7 @@ from aiter import get_hip_quant, logger
 from aiter.dist.parallel_state import is_global_first_rank
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.enum import QuantType
-from aiter.utility.dtypes import fp8
+from aiter.utility.dtypes import fp8, fp8_e8m0
 
 from ._all_reduce_config import get_ar_1stage_max_bytes
 from .base_device_communicator import All2AllManagerBase, DeviceCommunicatorBase
@@ -21,6 +21,11 @@ from .base_device_communicator import All2AllManagerBase, DeviceCommunicatorBase
 _GLUON_AR_MAX_BYTES = 8 << 20
 # The plain Gluon all-reduce is faster than the custom all-reduce and RCCL up to 4 MiB.
 _GLUON_PLAIN_AR_MAX_BYTES = 4 << 20
+# Where fused_allreduce_rmsnorm takes the Gluon power-of-2 kernel (self.gluon_ar), the
+# Lamport MXFP8 kernel is faster than it and the quant at hidden 2048 to 8192 up to
+# the cap, at hidden 1024 only up to 4 MiB (not from 6 MiB): larger MXFP8 calls of
+# power-of-2 hidden up to 1024 keep those two.
+_GLUON_POW2_LAMPORT_MXFP8_MAX_BYTES = 4 << 20
 
 should_nccl_symm_mem_allreduce = False
 _SUPPORTED_ALL2ALL_MANAGER_BACKENDS = ("flydsl", "mori", "mori_v2")
@@ -30,19 +35,27 @@ _SUPPORTED_ALL2ALL_MANAGER_BACKENDS = ("flydsl", "mori", "mori_v2")
 _GLUON_AR_NORM_MAX_TOKENS = 128
 
 
-def _use_gluon_ar_norm(comm, input_, res_inp_, weight_, lamport: bool) -> bool:
+def _use_gluon_ar_norm(
+    comm, input_, res_inp_, weight_, lamport: bool, mxfp8: bool = False
+) -> bool:
     """True if all_reduce_rmsnorm_per_token_quant takes the call: up to the 4 MiB of
     the plain Gluon all-reduce, and up to _GLUON_AR_NORM_MAX_TOKENS rows if the
-    Lamport one-shot can take it (lamport). As for Lamport, operand addresses are
-    not looked at: all ranks must take the same path."""
+    Lamport one-shot can take it (lamport). With mxfp8 only while no wave of the
+    Gluon program idles (norm_waves_busy) where Lamport can take it: the Lamport
+    MXFP8 kernel is faster otherwise (TP4 graph replay, hidden 1024 to 8192). As
+    for Lamport, operand addresses are not looked at: all ranks must take the same
+    path."""
     if comm.gluon_ar_plain is None or input_.dim() != 2:
         return False
-    from aiter.ops.triton.comms.all_reduce import norm_fits
+    from aiter.ops.triton.comms.all_reduce import norm_fits, norm_waves_busy
 
     tokens, hidden = input_.shape
+    max_tokens = _GLUON_AR_NORM_MAX_TOKENS
+    if mxfp8 and not norm_waves_busy(hidden):
+        max_tokens = 0
     return (
         norm_fits(tokens, hidden, comm.gluon_ar_plain[1])
-        and (tokens <= _GLUON_AR_NORM_MAX_TOKENS or not lamport)
+        and (tokens <= max_tokens or not lamport)
         and input_.dtype == res_inp_.dtype == weight_.dtype == torch.bfloat16
         and res_inp_.shape == input_.shape
         and weight_.shape == (hidden,)
@@ -622,9 +635,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
         hadamard_rotate: bool = False,
     ):
         # quant_type arrives already canonicalized to a string ("per_token"/
-        # "per_group"/"mxfp4") from the public API.
+        # "mxfp8"/"per_group"/"mxfp4") from the public API.
         if hadamard_rotate and quant_type != "mxfp4":
             raise ValueError("hadamard_rotate is MXFP4-only")
+        if quant_type == "mxfp8":
+            return self.fused_allreduce_rmsnorm_mxfp8_quant(
+                input_, res_inp_, weight_, eps, prefill_support, gemma_norm
+            )
         if quant_type == "per_group":
             return self.fused_allreduce_rmsnorm_quant_per_group(
                 input_,
@@ -753,6 +770,63 @@ class CudaCommunicator(DeviceCommunicatorBase):
             assert bf16_out is not None
             return out, res_out, scale_out, bf16_out
         return out, res_out, scale_out
+
+    def fused_allreduce_rmsnorm_mxfp8_quant(
+        self,
+        input_: torch.Tensor,
+        res_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+        prefill_support: bool = False,
+        gemma_norm: bool = False,
+    ):
+        """(out, residual_out, scale): E4M3 out with row-major group-32 E8M0
+        scales, the bytes of the AR + RMSNorm it runs followed by
+        per_1x32_mx_quant_hip. One launch of the Gluon kernel or the Lamport
+        one-shot where one takes the call (_use_gluon_ar_norm, then
+        should_lamport_ar_rms), else fused_allreduce_rmsnorm and then the quant."""
+        if input_.dim() != 2 or input_.shape[-1] % 32:
+            raise ValueError("mxfp8 takes a 2-D input with hidden divisible by 32")
+        if input_.shape[0] == 0:
+            scale = input_.new_empty((0, input_.shape[1] // 32), dtype=fp8_e8m0)
+            return input_.to(fp8), torch.empty_like(res_inp_), scale
+        ca_comm = self.ca_comm
+        lamport = ca_comm is not None and ca_comm.should_lamport_ar_rms(
+            input_, res_inp_, weight_, input_.shape[-1]
+        )
+        if _use_gluon_ar_norm(self, input_, res_inp_, weight_, lamport, mxfp8=True):
+            from aiter.ops.triton.comms.all_reduce import (
+                all_reduce_rmsnorm_mxfp8_quant,
+            )
+
+            return all_reduce_rmsnorm_mxfp8_quant(
+                input_,
+                res_inp_,
+                weight_,
+                eps,
+                gemma_norm,
+                self.cpu_group,
+                *self.gluon_ar_plain,
+            )
+        hidden = input_.shape[-1]
+        if lamport and (
+            self.gluon_ar is None
+            or input_.dtype != torch.bfloat16
+            or hidden & (hidden - 1)
+            or hidden > 1024
+            or input_.numel() * input_.element_size()
+            <= _GLUON_POW2_LAMPORT_MXFP8_MAX_BYTES
+        ):
+            return ca_comm.lamport_fused_ar_rms_mxfp8(
+                input_, res_inp_, weight_, eps, gemma_norm
+            )
+        from aiter.ops.quant import per_1x32_mx_quant_hip
+
+        out, res_out = self.fused_allreduce_rmsnorm(
+            input_, res_inp_, weight_, eps, prefill_support, gemma_norm=gemma_norm
+        )
+        out, scale = per_1x32_mx_quant_hip(out, quant_dtype=fp8, scale_type=fp8_e8m0)
+        return out, res_out, scale
 
     def fused_allreduce_rmsnorm_quant_per_group(
         self,

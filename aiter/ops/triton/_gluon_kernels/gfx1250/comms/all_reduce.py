@@ -4,7 +4,7 @@ receiver waits until its lines carry the tag of the call, then adds the 4 chunks
 and odd calls use 2 banks of the inbox: a GPU can be one call ahead of a peer.
 
 _all_reduce_rmsnorm_kernel is the same all-reduce of rows that then adds the residual
-and applies RMSNorm (and per-token FP8 quant). A row is cdiv(HIDDEN, 384) chunks; the last one is partial and
+and applies RMSNorm (and per-token FP8 or group-32 MXFP8 quant). A row is cdiv(HIDDEN, 384) chunks; the last one is partial and
 its lines past the row carry 0. A program runs W waves (a power of 2, at least
 HIDDEN / 768): a sender sends one chunk a wave, and a receiver takes one row, 2 chunks
 a wave. For HIDDEN 6144 (W 8), these 768 values are those of one wave of the HIP
@@ -247,6 +247,50 @@ def _asm(op: gl.constexpr, v):
 
 
 @gluon.jit
+def _mxfp8_quant_store(
+    y,
+    out,
+    scale,
+    at,
+    local,
+    mask,
+    row,
+    HIDDEN: gl.constexpr,
+):
+    """Store one contiguous 128-value plane as native group-32 MXFP8."""
+    y = _wave_units(y.to(gl.bfloat16).to(gl.float32))
+    at = _wave_units(at)
+    mask = gl.broadcast(mask, local)[0]
+    local = _wave_units(local)
+    mask = _wave_units(mask)
+
+    W: gl.constexpr = gl.num_warps()
+    groups = gl.reshape(y, [4 * W, 32])
+    amax = gl.maximum(gl.max(gl.abs(groups), axis=1), 1e-10)
+    scaled = amax * (1.0 / 448.0)
+    bits = scaled.to(gl.uint32, bitcast=True)
+    code = (bits >> 23) + ((bits & 0x7FFFFF) != 0).to(gl.uint32)
+    reciprocal = (gl.maximum(254 - code.to(gl.int32), 0) << 23).to(
+        gl.float32, bitcast=True
+    )
+    reciprocal = gl.reshape(
+        gl.broadcast(reciprocal[:, None], groups)[0],
+        [W, 128],
+    )
+    q = gl.clamp(y * reciprocal, -448.0, 448.0).to(gl.float8e4nv)
+    gl.amd.cdna5.buffer_store(q, out, at, mask=mask)
+
+    code = gl.reshape(gl.broadcast(code[:, None], groups)[0], [W, 128]).to(gl.uint8)
+    group_at = row * (HIDDEN // 32) + local // 32
+    gl.amd.cdna5.buffer_store(
+        code,
+        scale,
+        group_at,
+        mask=mask & (local % 32 == 0),
+    )
+
+
+@gluon.jit
 def _wave_units(p):
     """Plane p [rows, 2] of the waves as [wave, unit] (see _wave_lines)."""
     W: gl.constexpr = gl.num_warps()
@@ -374,7 +418,8 @@ def _receive_norm(
     values past the row are masked). Then stores residual_out = the sum + residual and
     out = RMSNorm(residual_out) as bf16, or with QUANT as per-token FP8 and its fp32
     scale. The arithmetic is that of add_rmsnorm_quant_kernel<256, 24>, and with
-    QUANT then that of the per-token quant of its bf16 out."""
+    QUANT then that of the per-token quant of its bf16 out. QUANT 2 stores E4M3 and
+    row-major group-32 E8M0 scales instead, as per_1x32_mx_quant_hip of the bf16 out."""
     WORDS: gl.constexpr = gl.BlockedLayout([1, 2], [32, 1], [gl.num_warps(), 1], [1, 0])
     LINE: gl.constexpr = gl.BlockedLayout([1, 4], [32, 1], [gl.num_warps(), 1], [1, 0])
     ROW: gl.constexpr = _row_chunks(HIDDEN, LINES)
@@ -442,6 +487,9 @@ def _receive_norm(
     if not QUANT:
         for j in gl.static_range(6):
             gl.amd.cdna5.buffer_store(y[j].to(gl.bfloat16), out, at[j], mask=masks[j])
+    elif QUANT == 2:
+        for j in gl.static_range(6):
+            _mxfp8_quant_store(y[j], out, scale, at[j], cols[j], masks[j], row, HIDDEN)
     else:
         # Quantize the bf16 norm output, as the split norm -> per-token quant path.
         q = ()
@@ -557,7 +605,7 @@ def _all_reduce_rmsnorm_kernel(
     EPS: gl.constexpr,
 ):
     """_all_reduce_kernel of tokens rows of HIDDEN values, then residual_out = the sum +
-    residual and out = RMSNorm(residual_out), bf16 or per-token FP8. The W-wave
+    residual and out = RMSNorm(residual_out), bf16, per-token FP8 or MXFP8. The W-wave
     programs 0 to S - 1 send W chunks each (S = cdiv(tokens cdiv(HIDDEN, 6 LINES), W));
     the next programs receive one row each."""
     ROW: gl.constexpr = _row_chunks(HIDDEN, LINES)

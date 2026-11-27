@@ -93,6 +93,8 @@ void fused_allreduce_rmsnorm_lamport(fptr_t _fa,
                                      bool gemma_norm);
 // The same with the per-token FP8 quant of fused_allreduce_rmsnorm_quant: out
 // FP8, one FP32 scale a row, and the bf16/fp16 output at bf16_out_ptr unless 0.
+// With an E8M0 scale_out (rows x hidden / 32) it is MXFP8 instead, the bytes of
+// per_1x32_mx_quant_hip(fp8, e8m0) of the bf16/fp16 output (bf16_out_ptr 0).
 void fused_allreduce_rmsnorm_quant_lamport(fptr_t _fa,
                                            const aiter_tensor_t& inp,
                                            const aiter_tensor_t& res_inp,

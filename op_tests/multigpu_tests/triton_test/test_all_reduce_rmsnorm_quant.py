@@ -11,7 +11,7 @@ import torch
 import torch.distributed as dist
 
 import aiter
-from aiter import logger
+from aiter import dtypes, logger
 from aiter.dist.communication_op import (
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_fused_allreduce_rmsnorm,
@@ -19,6 +19,7 @@ from aiter.dist.communication_op import (
 )
 from aiter.dist.parallel_state import get_tp_group
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
+from aiter.ops.quant import per_1x32_mx_quant_hip
 from aiter.ops.triton.comms import all_reduce as plain
 from aiter.ops.triton.comms.all_reduce import (
     all_reduce,
@@ -364,6 +365,46 @@ def _dispatch_worker(rank, init_method):
                     )
             name = f"rank {rank} per-token dispatch tokens {tokens} quant {quant}"
             if not op.called or _pt_wrong(outs, xs, res, w, quant, rank, ar):
+                failures.append(f"{name}: another path or wrong")
+
+        # MXFP8: the bytes of the route's AR + RMSNorm, then per_1x32_mx_quant_hip.
+        # One Gluon launch where Lamport cannot run (2880 ends in a partial chunk) and,
+        # with every Gluon wave busy, up to 128 rows (6144); one Lamport launch
+        # elsewhere (7168: idle Gluon waves; 6144 x 192 a cluster a row, x 512 a block).
+        ca = tp.device_communicator.ca_comm
+        for tokens, hidden, gluon in (
+            (1, 2880, True),
+            (64, 7168, False),
+            (128, PT_HIDDEN, True),
+            (192, PT_HIDDEN, False),
+            (512, PT_HIDDEN, False),
+        ):
+            xs, res, w = _pt_inputs(tokens, hidden, 600 + tokens, device)
+            with patch.object(
+                plain,
+                "all_reduce_rmsnorm_mxfp8_quant",
+                wraps=plain.all_reduce_rmsnorm_mxfp8_quant,
+            ) as op, patch.object(
+                ca, "lamport_fused_ar_rms_mxfp8", wraps=ca.lamport_fused_ar_rms_mxfp8
+            ) as lamport:
+                outs = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+                    xs[rank], res, w, EPS, quant_type="mxfp8", gemma_norm=True
+                )
+            if gluon:
+                y, res_out = all_reduce_rmsnorm_per_token_quant(
+                    xs[rank], res, w, EPS, True, False, *ar
+                )
+            else:
+                y, res_out = ca.lamport_fused_ar_rms(xs[rank], res, w, EPS, True)
+            q, scale = per_1x32_mx_quant_hip(
+                y, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+            )
+            same = all(
+                torch.equal(o.view(torch.uint8), r.view(torch.uint8))
+                for o, r in zip(outs, (q, res_out, scale))
+            )
+            if op.called != gluon or lamport.called == gluon or not same:
+                name = f"rank {rank} mxfp8 tokens {tokens} hidden {hidden}"
                 failures.append(f"{name}: another path or wrong")
     finally:
         aiter.destroy_dist_env()

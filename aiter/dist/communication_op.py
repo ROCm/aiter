@@ -39,6 +39,7 @@ _FUSED_AR_RMS_QUANT_ALIASES = {
     "per-token": "per_token",
     "per_token": "per_token",
     "per_token_fp8": "per_token",
+    "mxfp8": "mxfp8",
     "fp8_per_group": "per_group",
     "per-group": "per_group",
     "per_group": "per_group",
@@ -70,7 +71,8 @@ def _normalize_fused_ar_rms_quant_type(quant_type):
             pass
     raise ValueError(
         "unsupported fused AR+RMSNorm quant_type="
-        f"{quant_type!r}; expected per_token, per_group/per_1x128, or mxfp4/per_1x32"
+        f"{quant_type!r}; expected per_token, mxfp8, per_group/per_1x128, "
+        "or mxfp4/per_1x32"
     )
 
 
@@ -102,7 +104,7 @@ def _is_per_group_quant(quant_type):
 
 
 def _canonical_fused_ar_rms_quant_type(quant_type):
-    """Trace-safe canonical string ("per_token"/"per_group"/"mxfp4").
+    """Trace-safe canonical string ("per_token"/"mxfp8"/"per_group"/"mxfp4").
 
     Reduces the pybind enum via int ``.value`` (never ``enum == enum``, which
     graph-breaks Dynamo) so downstream string guards match under torch.compile.
@@ -118,7 +120,8 @@ def _canonical_fused_ar_rms_quant_type(quant_type):
         return "mxfp4"
     raise ValueError(
         "unsupported fused AR+RMSNorm quant_type="
-        f"{quant_type!r}; expected per_token, per_group/per_1x128, or mxfp4/per_1x32"
+        f"{quant_type!r}; expected per_token, mxfp8, per_group/per_1x128, "
+        "or mxfp4/per_1x32"
     )
 
 
@@ -206,6 +209,7 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
 
     ``quant_type`` selects the quantization epilogue:
     ``"per_token"`` for existing FP8 per-token quantization,
+    ``"mxfp8"`` for E4M3 values with row-major group-32 E8M0 scales,
     ``"per_group"`` / ``"per_1x128"`` for FP8 per-group quantization, and
     ``"mxfp4"`` / ``"per_1x32"`` for MXFP4 quantization.
 
@@ -279,6 +283,25 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_mxfp4_quant(
         emit_bf16=emit_bf16,
         gemma_norm=gemma_norm,
         hadamard_rotate=hadamard_rotate,
+    )
+
+
+def tensor_model_parallel_fused_allreduce_rmsnorm_mxfp8_quant(
+    input_: torch.Tensor,
+    residual_inp_: torch.Tensor,
+    weight_: torch.Tensor,
+    eps: float,
+    prefill_support: bool = False,
+    gemma_norm: bool = False,
+):
+    return tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+        input_,
+        residual_inp_,
+        weight_,
+        eps,
+        prefill_support,
+        quant_type="mxfp8",
+        gemma_norm=gemma_norm,
     )
 
 

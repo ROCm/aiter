@@ -438,6 +438,7 @@ def fused_allreduce_rmsnorm_lamport_gfx1250(
 
 # The same with the per-token FP8 quant of fused_allreduce_rmsnorm_quant_gfx1250:
 # out FP8, one fp32 scale a row, and the bf16/fp16 output at bf16_out_ptr unless 0.
+# An E8M0 scale_out (rows x hidden / 32) asks for MXFP8 instead (bf16_out_ptr 0).
 @compile_ops(
     GFX1250_MD_NAME, fc_name="fused_allreduce_rmsnorm_quant_lamport", develop=True
 )

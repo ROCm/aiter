@@ -10,6 +10,7 @@ from aiter.ops.triton._gluon_kernels.gfx1250.comms.all_reduce import (
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.utility.dtypes import fp8_e8m0
 
 _LOGGER = AiterTritonLogger()
 
@@ -27,6 +28,12 @@ def norm_waves(hidden: int) -> int:
     """
     waves = triton.next_power_of_2(triton.cdiv(hidden, 12 * _LINES))
     return waves if hidden > 0 and hidden % 8 == 0 and waves <= 32 else 0
+
+
+def norm_waves_busy(hidden: int) -> bool:
+    """Whether every wave of norm_waves(hidden) has a chunk of the row: no wave idles
+    because the count was rounded up to a power of two."""
+    return norm_waves(hidden) == triton.cdiv(hidden, 12 * _LINES)
 
 
 def norm_fits(tokens: int, hidden: int, calls: torch.Tensor) -> bool:
@@ -217,3 +224,54 @@ def all_reduce_rmsnorm_per_token_quant(
     if quant:
         return out, residual_out, scale
     return out, residual_out
+
+
+def all_reduce_rmsnorm_mxfp8_quant(
+    x, residual, weight, eps, gemma, group, inboxes, calls
+):
+    """
+    all_reduce_rmsnorm_per_token_quant with out as E4M3 and a row-major group-32
+    E8M0 scale of shape (tokens, hidden // 32): the bytes of its bf16 out through
+    ``per_1x32_mx_quant_hip(quant_dtype=fp8, scale_type=fp8_e8m0)``. hidden is a
+    multiple of 32. Returns (out, residual_out, scale).
+    """
+    tokens, hidden = x.shape
+    assert hidden % 32 == 0 and norm_fits(tokens, hidden, calls)
+    assert x.dtype == residual.dtype == weight.dtype == torch.bfloat16
+    assert residual.shape == x.shape and weight.shape == (hidden,)
+    assert x.is_contiguous() and residual.is_contiguous() and weight.is_contiguous()
+    x, residual, weight = (
+        t if t.data_ptr() % 16 == 0 else t.clone() for t in (x, residual, weight)
+    )
+    waves = norm_waves(hidden)
+    chunks = (calls.numel() - 1) // 2
+    num_chunks = tokens * triton.cdiv(hidden, 6 * _LINES)  # whole chunks a row
+
+    _LOGGER.info("ALL_REDUCE_RMSNORM_MXFP8_QUANT [gluon]: x=%s", x.shape)
+
+    residual_out = torch.empty_like(x)
+    out = torch.empty(x.shape, dtype=torch.float8_e4m3fn, device=x.device)
+    scale = torch.empty((tokens, hidden // 32), dtype=torch.uint8, device=x.device)
+    _all_reduce_rmsnorm_kernel[(triton.cdiv(num_chunks, waves) + tokens,)](
+        x,
+        residual_out,
+        inboxes,
+        calls,
+        calls[-1:],
+        tokens,
+        residual,
+        weight,
+        out,
+        scale,
+        RANK=dist.get_rank(group),
+        LINES=_LINES,
+        SLOT=4 * _LINES * chunks,
+        MAXIT=_MAXIT,
+        QUANT=2,
+        HIDDEN=hidden,
+        GEMMA=bool(gemma),
+        EPS=float(eps),
+        num_warps=waves,
+        enable_fp_fusion=False,
+    )
+    return out, residual_out, scale.view(fp8_e8m0)
