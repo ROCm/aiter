@@ -130,6 +130,8 @@ pip install -r requirements.txt
 
 AITER includes Triton-based operators that require Triton from AMD PyPI, with the correct version selected based on your ROCm installation. For an editable installation, run the install script before `pip install -e .` as shown above.
 
+The script installs triton 3.9.0 from `pypi.amd.com`, so it needs Python 3.11 or newer and network access to that index. On Python 3.10 it prints a reminder and keeps the Triton you already have; if the index cannot be reached or has no build for your Python and ROCm, it exits without changing your Triton.
+
 To keep an existing compatible Triton installation, skip the script and set:
 
 ```bash

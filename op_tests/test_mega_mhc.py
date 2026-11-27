@@ -41,14 +41,31 @@ BACKENDS = ("hip", "flydsl", "triton")
 # asm shares mega_mhc and its arguments with hip.
 NATIVE_BACKENDS = ("hip", "asm")
 OUT_DTYPES = ("bf16", "mxfp8")
-# M covers decode through prefill; use --hidden to test other model widths.
+# M covers decode through prefill; the ragged prefill sizes cover the split tail.
 # 1152 and 1280 (72 and 80 token tiles) take the gfx1250 three-way split.
-TOKEN_COUNTS = (1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 1152, 1280, 2048)
-TOKEN_COUNTS += (4096, 4160, 8192, 16384)
+DECODE_TOKEN_COUNTS = (
+    1,
+    4,
+    8,
+    16,
+    32,
+    64,
+    128,
+    192,
+    256,
+    512,
+    768,
+    1024,
+    1152,
+    1280,
+    2048,
+)
+PREFILL_TOKEN_COUNTS = (4096, 4097, 4160, 4224, 6000, 8192, 8200, 8320, 9000, 16384)
+TOKEN_COUNTS = DECODE_TOKEN_COUNTS + PREFILL_TOKEN_COUNTS
+HIDDEN_SIZES = (5120, 7168)
 # With asm: both sides of every dispatch boundary (tiles 16/32/64, the HIP
 # split-3 range and the tile-64 limit without post-mix).
 ASM_TOKEN_COUNTS = (256, 257, 512, 513, 1024, 1025, 1280, 1281, 3072, 3073)
-HIDDEN_SIZES = (5120,)
 # --asm-suite: asm-only, asm/HIP mixed by mode, HIP-only (1025) and the tile-64
 # tail with a partial round.
 ASM_SUITE_TOKENS = (16, 512, 1025, 3073, 4160)

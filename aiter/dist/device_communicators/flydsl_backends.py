@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """The FlyDSL backends of the communicators: the quantized plain all-reduce
-(``FlyDSLQuickAllReduce``) and the fused all-reduce + RMSNorm
-(``FlyDSLAllReduceRMSNorm``).
+(``FlyDSLQuickAllReduce``), the fused all-reduce + RMSNorm
+(``FlyDSLAllReduceRMSNorm``) and the exact Gemma all-reduce + RMSNorm on
+graph-registered inputs (``FlyDSLPullAllReduceRMSNorm``).
 
 The message size windows come from the policies, ``resolve_family_policy`` and
 ``resolve_fused_policy``, and ``AITER_FLY_AR_<ALG>_{MIN,MAX}_BYTES`` and
@@ -23,7 +24,7 @@ logger = logging.getLogger(__name__)
 # checked at import time.
 try:
     from aiter.ops.flydsl import allreduce_policy as fly_policy
-    from aiter.ops.flydsl.allreduce_host_shared import eligible_payload_bytes
+    from aiter.ops.flydsl.comm_collectives_host_shared import eligible_payload_bytes
     from aiter.ops.flydsl.one_shot_allreduce import OneShotAllReduceRMSNorm
     from aiter.ops.flydsl.quick_allreduce import (
         FlyQuickAllReduce,
@@ -734,6 +735,186 @@ class FlyDSLAllReduceRMSNorm:
             except (AttributeError, RuntimeError):
                 pass
         self._engines = {}
+        self.disabled = True
+
+    def __del__(self):
+        try:
+            self.close()
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+
+
+PULL_ENV = "AITER_FLY_AR_PULL"
+
+
+def _pull_digest(*, link: str, arch: str, window, ladders) -> int:
+    """A number that is equal on two ranks exactly when they would build the
+    same pull engine: same payload window, same rungs at every width."""
+    return _digest((_flydsl_version(), "pull", link, arch, window, ladders))
+
+
+def pull_enabled() -> bool:
+    """Whether the bf16 pull all-reduce + Gemma RMSNorm is built.
+
+    A kill switch, not a route: ``AITER_FLY_AR_PULL=0`` builds nothing, ``=1``
+    builds it without the FlyDSL all-reduce opt-in; unset, it follows
+    ``AITER_FLY_AR=1``. Which payloads it serves and with which kernel is the
+    ``pull`` window and ladder of the fused policy, not this switch. Every
+    rank must read the same value (the construction votes on it)."""
+    import os
+
+    value = os.environ.get(PULL_ENV, "").strip()
+    if value in ("0", "1"):
+        return value == "1"
+    return bool(fly_policy is not None and fly_policy.enabled())
+
+
+class FlyDSLPullAllReduceRMSNorm:
+    """Exact bf16 all-reduce + residual add + Gemma RMSNorm on the ``pull``
+    schedule of ``FlyQuickAllReduceRMSNorm``, for the platforms and widths the
+    fused policy gives a ``pull`` window and ladder (gfx950 xGMI TP4, hidden
+    6144).
+
+    It serves only ``gemma_norm`` calls recorded inside a graph capture that is
+    wrapped in :meth:`capture`: the schedule reads the ranks' inputs in place,
+    so the capture has to register them. Every other call is declined and the
+    caller's next backend serves it.
+
+    Every rank votes before anything is built, builds and compiles in the same
+    order, and agrees afterwards; a rank that cannot build disables the path on
+    every rank.
+    """
+
+    def __init__(
+        self, group: ProcessGroup, device: torch.device, *, serve: bool = True
+    ):
+        self.disabled = True
+        self._engine = None
+        self._hiddens = ()
+        self._tag = "FlyDSL pull AR+Gemma RMSNorm"
+        link = None
+        digest = _POLICY_DECLINED
+        world_size = dist.get_world_size(group=group)
+        if not _FLY_IMPORT_OK:
+            logger.debug("%s disabled: flydsl is not importable.", self._tag)
+        elif not pull_enabled():
+            pass
+        elif not serve:
+            logger.debug("%s disabled: not served in this configuration.", self._tag)
+        elif world_size not in fly_policy.SUPPORTED_WORLDS:
+            logger.debug("%s disabled: no schedule for TP%d.", self._tag, world_size)
+        else:
+            from aiter.jit.utils.chip_info import get_gfx_runtime
+
+            arch = get_gfx_runtime()
+            if arch not in fly_policy.SUPPORTED_ARCHS:
+                logger.debug("%s disabled: unsupported arch %s.", self._tag, arch)
+            else:
+                # The window and the rungs come from the fused policy of this
+                # process's environment; the digest covers both, so ranks that
+                # resolved different ones decline together instead of
+                # deadlocking in the engine's IPC exchange.
+                try:
+                    link = fly_policy.detect_link()
+                    window = fly_policy.resolve_fused_policy(
+                        world_size=world_size, arch=arch, link=link
+                    ).pull_window()
+                    kw = {"world_size": world_size, "link": link, "arch": arch}
+                    ladders = {
+                        h: fly_policy.fused_pull_ladder(**kw, hidden=h)
+                        for h in fly_policy.fused_pull_hiddens(**kw)
+                    }
+                    if window is None or not ladders:
+                        logger.debug("%s disabled by the policy.", self._tag)
+                    else:
+                        self._hiddens = tuple(sorted(ladders))
+                        digest = _pull_digest(
+                            link=link, arch=arch, window=window, ladders=ladders
+                        )
+                except fly_policy.NoPolicyError as e:
+                    logger.debug("%s disabled: %s", self._tag, e)
+                except ValueError as e:
+                    logger.warning("%s disabled: %s", self._tag, e)
+        if not vote_on_digest(digest, group, tag=self._tag):
+            return
+        self.group = group
+        self.device = device
+        ok = True
+        try:
+            engine = FlyQuickAllReduceRMSNorm(
+                group=group,
+                device=device,
+                rank=dist.get_rank(group=group),
+                world_size=world_size,
+                algorithm="pull",
+                link=link,
+            )
+        except Exception:
+            logger.warning(
+                "%s disabled: construction failed.", self._tag, exc_info=True
+            )
+            engine = None
+            ok = False
+        if ok:
+            try:
+                # The kernels are built per width: a ladder for a width the
+                # kernels cannot run is not preloaded and not served.
+                self._hiddens = tuple(
+                    h for h in self._hiddens if engine.supports_hidden(h)
+                )
+                for hidden in self._hiddens:
+                    engine.preload(hidden)
+            except Exception:
+                logger.warning(
+                    "%s disabled: compiling its kernels failed.",
+                    self._tag,
+                    exc_info=True,
+                )
+                ok = False
+        if not all_ranks_agree(ok, group):
+            if engine is not None:
+                engine.close()
+            return
+        self._engine = engine
+        self.disabled = False
+        logger.info(
+            "%s enabled: TP%d on %s, hidden %s, payload %s.",
+            self._tag,
+            world_size,
+            link,
+            ", ".join(map(str, self._hiddens)),
+            (
+                engine.min_bytes
+                if engine.max_bytes is None
+                else (engine.min_bytes, engine.max_bytes)
+            ),
+        )
+
+    def capture(self):
+        """Wrap every graph capture on every rank: registers the captured
+        calls' inputs when it exits."""
+        import contextlib
+
+        if self.disabled:
+            return contextlib.nullcontext()
+        return self._engine.capture()
+
+    def should_fly_pull_rms(self, inp, residual, weight) -> bool:
+        """Whether this call is served now. Never raises."""
+        if self.disabled:
+            return False
+        return self._engine.accepts(inp, residual, weight, gemma_norm=True)
+
+    def fly_pull_rms(self, inp, residual, weight, eps):
+        """``(out, residual_out)``. Only call when the predicate said yes."""
+        return self._engine.allreduce_rmsnorm(
+            inp, residual, weight, eps, gemma_norm=True
+        )
+
+    def close(self):
+        if self._engine is not None:
+            self._engine.close()
+            self._engine = None
         self.disabled = True
 
     def __del__(self):

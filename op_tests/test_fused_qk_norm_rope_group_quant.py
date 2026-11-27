@@ -135,7 +135,7 @@ def _norm_rope_nope_fp8(x, weight, cos, sin, pos, eps, *, is_neox, group_size):
 
     # nope: per-group amax -> e8m0 scale (MX RoundUp, HW-native FP8 E4M3) -> fp8.
     # gfx942 uses E4M3_FNUZ (max=240), while gfx950+ uses OCP E4M3 (max=448),
-    # matching kHwFp8E4m3Dtype in the HIP kernel.
+    # matching aiter::kHwFp8MxDtype in the HIP kernel.
     amax = (
         nope.reshape(T, n_heads, n_groups, group_size).abs().amax(-1).clamp_min(1e-12)
     )

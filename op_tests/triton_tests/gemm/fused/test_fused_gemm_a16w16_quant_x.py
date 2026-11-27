@@ -11,6 +11,7 @@ from aiter.ops.triton.gemm.fused.fused_gemm_a16w16_quant_x import (
 from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
     generate_gemm_a16w16_inputs,
 )
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 _QUANT_BLOCK_SIZE = 32
 # 0xFF800000 in two's complement int32. Mask keeps sign + 8-bit exponent + top mantissa bit.
@@ -45,16 +46,6 @@ def torch_mxfp8_quant_from_fp32(x_fp32: torch.Tensor):
     return y_fp8, s
 
 
-def get_x_vals():
-    x_vals = [(1024, 1024, 1024)]
-    x_vals += [(2048, 2048, 2048)]
-    # DSv4 router gate: num_tokens x 384 x 7168
-    x_vals += [(2**i, 384, 7168) for i in range(5, 9)]
-    # DSR1 router GEMM
-    x_vals += [(2**i, 256, 7168) for i in range(5, 9)]
-    return x_vals
-
-
 def _assert_quant_close(triton_x_quant, triton_x_scales, x):
     ref_x_quant, ref_x_scales = torch_mxfp8_quant_from_fp32(x.to(torch.float32))
     # e8m0 scales: bit-exact (integer-only after fp32 cast).
@@ -71,7 +62,7 @@ def _assert_quant_close(triton_x_quant, triton_x_scales, x):
 
 @pytest.mark.parametrize(
     "M, N, K, dtype, layout",
-    [(M, N, K, torch.bfloat16, "TN") for M, N, K in get_x_vals()]
+    [(M, N, K, torch.bfloat16, "TN") for M, N, K in get_shapes(k_mult=32)]
     + [
         (M, 2048, 2048, dtype, layout)
         for M, layout in (
@@ -106,16 +97,8 @@ def test_fused_gemm_a16w16_quant_x(
     _assert_quant_close(triton_x_quant, triton_x_scales, x)
 
 
-def get_fewer_x_vals():
-    x_vals = [(16, 1024, 1024)]
-    x_vals += [(128, 8192, 512)]
-    x_vals += [(256, 512, 8192)]
-    x_vals += [(1024, 1024, 1024)]
-    return x_vals
-
-
 @pytest.mark.parametrize("activation", ["gelu", "gelu_tanh", "silu"])
-@pytest.mark.parametrize("M, N, K", get_fewer_x_vals())
+@pytest.mark.parametrize("M, N, K", get_shapes(k_mult=32, max_size=256 * 512 * 8192))
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 def test_fused_gemm_a16w16_quant_x_activation(
@@ -144,7 +127,7 @@ def test_fused_gemm_a16w16_quant_x_activation(
     _assert_quant_close(triton_x_quant, triton_x_scales, x)
 
 
-@pytest.mark.parametrize("M, N, K", get_fewer_x_vals())
+@pytest.mark.parametrize("M, N, K", get_shapes(k_mult=32, max_size=256 * 512 * 8192))
 @pytest.mark.parametrize("skip_reduce", [True, False])
 def test_fused_gemm_a16w16_quant_x_skip_reduce(M: int, N: int, K: int, skip_reduce):
     torch.cuda.empty_cache()
