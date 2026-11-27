@@ -4127,10 +4127,13 @@ __launch_bounds__(256, 8) __global__
     const uint64_t sid   = Hid * img_width + Wid;
 
     const uint64_t size_half_d = size_d >> 1;
+    // Frequencies per half: with ReuseFreqsFrontPart the cos/sin rows are d/4 wide and each
+    // half of d/2 elements rotates with them; otherwise they are d/2 wide.
+    const int32_t size_f = ReuseFreqsFrontPart ? (size_half_d >> 1) : size_half_d;
 
     const int offset_h_i = bid * stride_i_b + sid * stride_i_s;
     const int offset_h_o = bid * stride_o_b + sid * stride_o_s;
-    const int offset_h_f = Hid * size_half_d;
+    const int offset_h_f = Hid * size_f;
     Op::template apply_1c<RotateStyle,
                           ReuseFreqsFrontPart,
                           NopeFirst,
@@ -4146,7 +4149,7 @@ __launch_bounds__(256, 8) __global__
                                     0, // offset already baked into pointer
                                     size_h,
                                     size_half_d,
-                                    size_half_d,
+                                    size_f,
                                     stride_i_h,
                                     stride_i_d,
                                     stride_o_h,
@@ -4156,7 +4159,7 @@ __launch_bounds__(256, 8) __global__
 
     const int offset_w_i = offset_h_i + size_half_d * stride_i_d;
     const int offset_w_o = offset_h_o + size_half_d * stride_o_d;
-    const int offset_w_f = Wid * size_half_d;
+    const int offset_w_f = Wid * size_f;
     Op::template apply_1c<RotateStyle,
                           ReuseFreqsFrontPart,
                           NopeFirst,
@@ -4172,7 +4175,7 @@ __launch_bounds__(256, 8) __global__
                                     0, // offset already baked into pointer
                                     size_h,
                                     size_half_d,
-                                    size_half_d,
+                                    size_f,
                                     stride_i_h,
                                     stride_i_d,
                                     stride_o_h,
@@ -4218,9 +4221,12 @@ __launch_bounds__(256, 8) __global__
     const uint64_t sid   = Hid * img_width + Wid;
 
     const uint64_t size_half_d = size_d >> 1;
+    // Frequencies per half: with ReuseFreqsFrontPart the cos/sin rows are d/4 wide and each
+    // half of d/2 elements rotates with them; otherwise they are d/2 wide.
+    const int32_t size_f = ReuseFreqsFrontPart ? (size_half_d >> 1) : size_half_d;
 
     const int offset_h   = bid * stride_b + sid * stride_s;
-    const int offset_h_f = Hid * size_half_d;
+    const int offset_h_f = Hid * size_f;
     Op::template apply_1c<RotateStyle,
                           ReuseFreqsFrontPart,
                           NopeFirst,
@@ -4236,7 +4242,7 @@ __launch_bounds__(256, 8) __global__
                                     0, // offset already baked into pointer
                                     size_h,
                                     size_half_d,
-                                    size_half_d,
+                                    size_f,
                                     stride_h,
                                     stride_d,
                                     stride_h,
@@ -4245,7 +4251,7 @@ __launch_bounds__(256, 8) __global__
                                     threads_per_sb);
 
     const int offset_w   = offset_h + size_half_d * stride_d;
-    const int offset_w_f = Wid * size_half_d;
+    const int offset_w_f = Wid * size_f;
     Op::template apply_1c<RotateStyle,
                           ReuseFreqsFrontPart,
                           NopeFirst,
@@ -4261,7 +4267,7 @@ __launch_bounds__(256, 8) __global__
                                     0, // offset already baked into pointer
                                     size_h,
                                     size_half_d,
-                                    size_half_d,
+                                    size_f,
                                     stride_h,
                                     stride_d,
                                     stride_h,
@@ -6251,7 +6257,11 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
     const bool all_stride_d_eq_1 = (stride_i_d == 1) && (stride_o_d == 1);
     auto [grid, block, vec_pairs, threads_per_sb] =
         get_grid_config<RotateStyle, ReuseFreqsFrontPart, true, scalar_t>(
-            img_height, img_width, size_b, size_d >> 1, all_stride_d_eq_1);
+            img_height,
+            img_width,
+            size_b,
+            ReuseFreqsFrontPart ? (size_d >> 2) : (size_d >> 1),
+            all_stride_d_eq_1);
     const int32_t total_sb = img_height * img_width * size_b;
 
     LAUNCH_KERNEL_VEC_PAIRS(

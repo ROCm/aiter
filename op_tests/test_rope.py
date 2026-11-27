@@ -1229,12 +1229,15 @@ cu_seqlens: {cu_seqlens}
     )
 
 
-def test_rope_2d(input, height, width, freqs_h, freqs_w, grad):
+def test_rope_2d(
+    input, height, width, freqs_h, freqs_w, grad, reuse_freqs_front_part=False
+):
     input_msg = f"""
 dtype: {input.dtype}, \
 freq_dtype: {freqs_h.dtype}, \
 dim_input: {input.shape!s:<20}, \
-dim_freqs: {freqs_h.shape!s:<20}
+dim_freqs: {freqs_h.shape!s:<20}, \
+reuse_freqs_front_part: {reuse_freqs_front_part}
 """
 
     cos_h = freqs_h.cos()
@@ -1242,16 +1245,46 @@ dim_freqs: {freqs_h.shape!s:<20}
     cos_w = freqs_w.cos()
     sin_w = freqs_w.sin()
 
+    # With reuse_freqs_front_part the d // 4 wide tables serve both halves of each
+    # d // 2 part (NEOX).
+    def full(t):
+        return torch.cat((t, t), dim=-1) if reuse_freqs_front_part else t
+
     ref = ref_rope_2d_fwd(
-        input, height, width, cos_h, sin_h, cos_w, sin_w, RotateStyle.NEOX
+        input,
+        height,
+        width,
+        full(cos_h),
+        full(sin_h),
+        full(cos_w),
+        full(sin_w),
+        RotateStyle.NEOX,
     )
     ref.backward(grad)
 
     hip_fwd, hip_fwd_avg = hip_rope_2d_fwd(
-        input, cos_h, sin_h, cos_w, sin_w, height, width, RotateStyle.NEOX, False, False
+        input,
+        cos_h,
+        sin_h,
+        cos_w,
+        sin_w,
+        height,
+        width,
+        RotateStyle.NEOX,
+        reuse_freqs_front_part,
+        False,
     )
     hip_bwd, hip_bwd_avg = hip_rope_2d_bwd(
-        grad, cos_h, sin_h, cos_w, sin_w, height, width, RotateStyle.NEOX, False, False
+        grad,
+        cos_h,
+        sin_h,
+        cos_w,
+        sin_w,
+        height,
+        width,
+        RotateStyle.NEOX,
+        reuse_freqs_front_part,
+        False,
     )
 
     checkAllclose(
@@ -1747,11 +1780,14 @@ if __name__ == "__main__":
                 device="cuda",
                 requires_grad=True,
             )
-            freqs_h = torch.randn(
-                (1, height + margin, 1, d // 2), dtype=fdtype, device="cuda"
-            )
-            freqs_w = torch.randn(
-                (1, width + margin, 1, d // 2), dtype=fdtype, device="cuda"
-            )
             grad = torch.randn((b, height * width, h, d), dtype=dtype, device="cuda")
-            test_rope_2d(input, height, width, freqs_h, freqs_w, grad)
+            for reuse in (False, True):
+                f = d // 4 if reuse else d // 2
+                freqs_h = torch.randn(
+                    (1, height + margin, 1, f), dtype=fdtype, device="cuda"
+                )
+                freqs_w = torch.randn(
+                    (1, width + margin, 1, f), dtype=fdtype, device="cuda"
+                )
+                input.grad = None
+                test_rope_2d(input, height, width, freqs_h, freqs_w, grad, reuse)
