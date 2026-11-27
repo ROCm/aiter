@@ -400,6 +400,24 @@ def test_a4w4_prefill_moe_rejects_bad_inputs():
         a4w4_prefill_moe(**good)
 
 
+def test_flydsl_exports():
+    """Callers import the chain from `aiter.ops.flydsl`: each export is prefill.py's."""
+    import aiter.ops.flydsl as fly
+    from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_mxfp4 import prefill
+
+    for name, attr in {
+        "minimax_m3_moe_prefill_flydsl": "a4w4_prefill_moe",
+        "minimax_m3_moe_prefill_flydsl_supported": "supports_shapes",
+        "minimax_m3_moe_prefill_mxfp4_quant": "mxfp4_quant",
+        "minimax_m3_moe_prefill_block_m": "block_m_for",
+        "MINIMAX_M3_MOE_PREFILL_MIN_TOKENS": "MIN_PREFILL_TOKENS",
+        "MINIMAX_M3_MOE_PREFILL_MAX_TOKENS": "MAX_PREFILL_TOKENS",
+        "MINIMAX_M3_MOE_PREFILL_BM256_FROM_TOKENS": "BM256_FROM_TOKENS",
+    }.items():
+        assert name in fly.__all__, name
+        assert getattr(fly, name) is getattr(prefill, attr), name
+
+
 def main():
     if get_gfx_runtime() not in SUPPORTED_GFX:
         aiter.logger.warning(
@@ -416,6 +434,7 @@ def main():
     aiter.logger.info(
         "minimax_m3 prefill moe summary (markdown):\n%s", df.to_markdown(index=False)
     )
+    test_flydsl_exports()
     test_mxfp4_quant()
     test_a4w4_prefill_moe_rejects_bad_inputs()
     test_a4w4_prefill_moe_non_current_device()
