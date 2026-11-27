@@ -69,6 +69,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
                 "$TEST_DIR/tuning_tests/test_mp_tuner_fault.py" \
                 "$TEST_DIR/tuning_tests/test_dispatch_verification.py" \
                 "$TEST_DIR/tuning_tests/test_compare_logic.py" \
+                "$TEST_DIR/tuning_tests/test_a4w4_shape_legality.py" \
                 "$TEST_DIR/tuning_tests/test_mp_tuner_logic.py" \
                 "$TEST_DIR/tuning_tests/test_tuner_infra.py" \
                 "tests/test_flydsl_aot_cache.py" \

@@ -100,6 +100,24 @@ dtype and kernel. The default gfx950 op test also runs these CSV-selected shapes
 --batch 50
 ```
 
+#### Candidate shape legality
+
+The tuner skips a candidate that cannot run the shape, and `gemm_a4w4` applies the same
+rules (`a4w4_ck_shape_legal`, `a4w4_asm_shape_legal` in `aiter/ops/gemm_op_a4w4.py`) when a
+tuned row or the default selection names a kernel. A tuned row that is illegal for its shape
+is ignored with a one-time warning and the default ASM selection runs.
+
+- CK: `N % 16 == 0`, `K % (256 << splitK) == 0`, and `N >= NPerBLOCK`. The instances use
+  `GemmSpecialization::Default` with a preshuffled B, and CK checks no N padding for that
+  layout, so a tile wider than N reads past B and faults (for example N=96).
+- ASM: `N % 16 == 0` and `K % 64 == 0`. A kernel with `full_n_tile` set to 1 in
+  `hsa/gfx950/f4gemm/f4gemm_bf16_per1x32Fp4.csv` also needs `N % tile_N == 0`; the C++
+  default selection reads the same flag.
+
+A tuned CK row whose instance is not compiled into the prebuilt `module_gemm_a4w4_blockscale`
+(it only holds the instances of the tuned file used at build time) falls back the same way
+instead of raising; rebuild with `AITER_REBUILD=1` to use that row.
+
 #### `-k, --splitK`
 - **Type**: Flag (boolean)
 - **Default**: `False`
@@ -128,7 +146,7 @@ dtype and kernel. The default gfx950 op test also runs these CSV-selected shapes
 - **Type**: Optional argument
 - **Default**: disabled
 - **Description**: Run production-operator benchmark only and exit (no tuning).
-  - `--run_config /path/to/tuned.csv`: read shapes from that tuned CSV and run tuned kernels from that file.
+  - `--run_config /path/to/tuned.csv`: read shapes from that tuned CSV and run tuned kernels from that file. The default untuned CSV is not needed (and may be missing) unless `--compare` or `--all` is also given.
   - `--run_config` (no path): read shapes from `-i/--untune_file` and run default kernels.
 
 **Examples**:

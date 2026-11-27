@@ -293,6 +293,10 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
         shape_grouped = args.shape_grouped
         errRatio = args.errRatio
         from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
+        from aiter.ops.gemm_op_a4w4 import (
+            a4w4_ck_shape_legal,
+            a4w4_kernel_shape_legal,
+        )
 
         if get_gfx() not in ["gfx950"]:
             print(f"tuning is not supported in this chip {get_gfx()}")
@@ -345,6 +349,10 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                     else 0
                 )
                 for splitK in range(maxsplitK + 1):
+                    # Same rule gemm_a4w4 applies at run time: a tile wider than N
+                    # reads past B and faults the worker.
+                    if not a4w4_ck_shape_legal(N, K, kernel.NPerBLOCK, splitK):
+                        continue
                     info = ((gfx, cu_num, M, N, K), kernel_idx, splitK, "")
                     task.append(
                         (
@@ -396,6 +404,11 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                     maxsplitK = 0
                 for splitK in range(maxsplitK + 1):
                     kernel_name = kernelName[0]
+                    if not a4w4_kernel_shape_legal(
+                        kernel_name, N, K, splitK, asm_kernel_list_csv
+                    ):
+                        asm_kernels_id = asm_kernels_id + 1  # keep ids stable
+                        continue
                     info = ((gfx, cu_num, M, N, K), asm_kernels_id, splitK, kernel_name)
                     task.append(
                         (

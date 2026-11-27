@@ -1990,7 +1990,17 @@ class TunerCommon:
             return self._run_selected(args, fast_mode)
 
     def _run_selected(self, args, fast_mode=False):
-        self.pre_process(args)
+        # --run_config <tuned_csv> reads its shapes from that file; only --compare and
+        # --all need the untuned file, so a missing default one must not abort it.
+        if (
+            isinstance(args.run_config, str)
+            and not getattr(args, "compare", False)
+            and not getattr(args, "all", False)
+            and not os.path.exists(getattr(args, "untune_file", None) or "")
+        ):
+            self.untunedf = pd.DataFrame()
+        else:
+            self.pre_process(args)
 
         # Resolve --run_config: can be False, True (no file), or a file path string.
         # Strict semantics:
