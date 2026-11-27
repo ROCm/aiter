@@ -612,11 +612,13 @@ def test_moe_sorting_flydsl_under_contention(
     topk_ids, topk_weights, _, _ = _build_moe_sorting_inputs(
         token, model_dim, E, topk, dtype, False, 0
     )
-    ref_ids, _, ref_eids, ref_num = run_torch_moe_sorting(
+    ref_ids, ref_ws, ref_eids, ref_num = run_torch_moe_sorting(
         topk_ids, topk_weights, E, BLOCK_SIZE_M
     )
     n_ids = ref_num[0].item()
     n_blocks = n_ids // BLOCK_SIZE_M
+    w_mask = ref_ids[:n_ids] != (topk << 24 | token)
+    ref_ws = ref_ws[:n_ids][w_mask]
 
     def alloc():
         return [
@@ -633,25 +635,28 @@ def test_moe_sorting_flydsl_under_contention(
     a = torch.randn((8192, 8192), dtype=dtypes.bf16, device="cuda")
     v = torch.randn((64 << 20,), dtype=dtypes.fp32, device="cuda")
     wrong = 0
-    for _ in range(iters // batch):
-        for out in outs:
+    for start in range(0, iters, batch):
+        cur = outs[: min(batch, iters - start)]
+        for out in cur:
             for t in out:
                 t.fill_(-7) if t.dtype == dtypes.i32 else t.fill_(float("nan"))
         torch.cuda.synchronize()
-        for out in outs:
+        for out in cur:
             with torch.cuda.stream(side):
                 torch.mm(a, a)
                 v.sin_().mul_(1.0001)
             flydsl_moe_sorting_fwd(topk_ids, topk_weights, *out, E, BLOCK_SIZE_M)
         torch.cuda.synchronize()
-        for ids, _, eids, num, _ in outs:
+        for ids, ws, eids, num, buf in cur:
             wrong += not (
                 torch.equal(ids[:n_ids], ref_ids[:n_ids])
+                and torch.equal(ws[:n_ids][w_mask], ref_ws)
                 and torch.equal(eids[:n_blocks], ref_eids[:n_blocks])
                 and torch.equal(num, ref_num)
+                and not buf.any()
             )
     assert wrong == 0, (
-        f"FlyDSL moe_sorting under contention: {wrong}/{iters // batch * batch} wrong "
+        f"FlyDSL moe_sorting under contention: {wrong}/{iters} wrong "
         f"(token={token}, E={E}, topk={topk})"
     )
 
