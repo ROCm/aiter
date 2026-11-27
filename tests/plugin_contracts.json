@@ -151,11 +151,13 @@
   "version": 1
  },
  "mla_decode_fwd": {
-  "fingerprint": "8c1528aa5cb5de72",
-  "signature": "q:positional, kv_buffer:positional, o:positional, qo_indptr:positional, kv_indptr:positional, kv_indices:positional, kv_last_page_lens:positional, max_seqlen_q:positional, page_size:positional=1, nhead_kv:positional=1, sm_scale:positional=None, logit_cap:positional=0.0, num_kv_splits:positional=None, num_kv_splits_indptr:positional=None, work_meta_data:positional=None, work_indptr:positional=None, work_info_set:positional=None, reduce_indptr:positional=None, reduce_final_map:positional=None, reduce_partial_map:positional=None, q_scale:positional=None, kv_scale:positional=None, intra_batch_mode:positional=False, return_logits:positional=False, return_lse:positional=False, g_kv_indptr:positional=None, cp_world_size:positional=1, cp_rank:positional=0, causal:positional=True, kv_layout:positional='token_major', seq_lens:positional=None, page_table:positional=None, kv_csr_layout:positional='page', fast_mode:positional=True, q_aux:keyword-only=None, kv_aux:keyword-only=None, nvfp4_params:keyword-only=None, nvfp4_lse:keyword-only=None",
+  "fingerprint": "c9da1f64c630feaa",
+  "signature": "q:positional, kv_buffer:positional, o:positional, qo_indptr:positional, kv_indptr:positional, kv_indices:positional, kv_last_page_lens:positional, max_seqlen_q:positional, page_size:positional=1, nhead_kv:positional=1, sm_scale:positional=None, logit_cap:positional=0.0, num_kv_splits:positional=None, num_kv_splits_indptr:positional=None, work_meta_data:positional=None, work_indptr:positional=None, work_info_set:positional=None, reduce_indptr:positional=None, reduce_final_map:positional=None, reduce_partial_map:positional=None, q_scale:positional=None, kv_scale:positional=None, intra_batch_mode:positional=False, return_logits:positional=False, return_lse:positional=False, g_kv_indptr:positional=None, cp_world_size:positional=1, cp_rank:positional=0, causal:positional=True, kv_layout:positional='token_major', seq_lens:positional=None, page_table:positional=None, kv_csr_layout:positional='page', fast_mode:positional=True, q_aux:keyword-only=None, kv_aux:keyword-only=None, nvfp4_params:keyword-only=None, nvfp4_lse:keyword-only=None, has_partials:keyword-only=True",
   "source": "aiter/mla.py",
-  "supersedes": [],
-  "version": 1
+  "supersedes": [
+   1
+  ],
+  "version": 2
  },
  "mla_decode_fwd_v4_nm": {
   "fingerprint": "da501459c91a356a",
@@ -236,11 +238,11 @@
   "version": 2
  },
  "pa_persistent_fwd": {
-  "fingerprint": "5256b167078255dd",
-  "signature": "Q:positional:torch.Tensor, K:positional:torch.Tensor, V:positional:torch.Tensor, output:positional:torch.Tensor, max_qlen:positional:int, qo_indptr:positional:torch.Tensor, kv_indptr:positional:torch.Tensor, kv_indices:positional:torch.Tensor, context_lens:positional:torch.Tensor, work_indptr:positional:torch.Tensor, work_info:positional:torch.Tensor, reduce_indptr:positional:torch.Tensor, reduce_final_map:positional:torch.Tensor, reduce_partial_map:positional:torch.Tensor, K_QScale:positional:torch.Tensor | None=None, V_QScale:positional:torch.Tensor | None=None, softmax_scale:positional:float | None=None, mask:positional:int=0, quant_type:positional:QuantType=QuantType.per_Token, high_precision:positional:int=1, reduce_waves:positional:int=0, return_lse:positional:bool=True, -> tuple[torch.Tensor, torch.Tensor | None]",
+    "fingerprint": "c823299d645c7539",
+    "signature": "Q:positional:torch.Tensor, K:positional:torch.Tensor, V:positional:torch.Tensor, output:positional:torch.Tensor, max_qlen:positional:int, qo_indptr:positional:torch.Tensor, kv_indptr:positional:torch.Tensor, kv_indices:positional:torch.Tensor, context_lens:positional:torch.Tensor, work_indptr:positional:torch.Tensor, work_info:positional:torch.Tensor, reduce_indptr:positional:torch.Tensor, reduce_final_map:positional:torch.Tensor, reduce_partial_map:positional:torch.Tensor, K_QScale:positional:torch.Tensor | None=None, V_QScale:positional:torch.Tensor | None=None, softmax_scale:positional:float | None=None, mask:positional:int=0, quant_type:positional:QuantType=QuantType.per_Token, high_precision:positional:int=1, reduce_waves:positional:int=0, return_lse:positional:bool=True, compact_partials:positional:bool=False, -> tuple[torch.Tensor, torch.Tensor | None]",
   "source": "aiter/ops/attention.py",
   "supersedes": [],
-  "version": 1
+    "version": 2
  },
  "per_group_quant": {
   "fingerprint": "6c00cb7bcfc0e0b5",
@@ -278,11 +280,11 @@
   "version": 1
  },
  "top_k_per_row_decode": {
-  "fingerprint": "254392f1c1ad0fcb",
-  "signature": "logits:positional:torch.Tensor, next_n:positional:int, seqLens:positional:torch.Tensor, indices:positional:torch.Tensor, numRows:positional:int, stride0:positional:int, stride1:positional:int, k:positional:int=2048, stable:positional:bool=False, values:positional:torch.Tensor | None=None, row_starts:keyword-only:torch.Tensor | None=None, plane_width:keyword-only:int | None=None, -> None",
+  "fingerprint": "1a9252653b1e4979",
+  "signature": "logits:positional:torch.Tensor, next_n:positional:int, seqLens:positional:torch.Tensor, indices:positional:torch.Tensor, numRows:positional:int, stride0:positional:int, stride1:positional:int, k:positional:int=2048, stable:positional:bool=False, values:positional:torch.Tensor | None=None, max_row_len:positional:int | None=None, row_starts:keyword-only:torch.Tensor | None=None, plane_width:keyword-only:int | None=None, -> None",
   "source": "aiter/ops/topk.py",
   "supersedes": [],
-  "version": 1
+  "version": 2
  },
  "topk_gating": {
   "fingerprint": "b6325c278faa3184",
