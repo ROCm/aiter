@@ -266,6 +266,107 @@ def test_op(
     assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)
 
 
+@pytest.mark.parametrize("m, n, k, n_expts_tot, n_expts_act", [(192, 1536, 5120, 384, 6), (24, 5120, 2304, 48, 6)])
+def test_gfx942_gluon_fp16_operand_matches_bf16(m, n, k, n_expts_tot, n_expts_act, monkeypatch):
+    """gfx942 FP16_OPERAND path (e8m0 scale folded into the fp16 byte lookup) against the bf16 path on the same
+    inputs: every fp4 code, scales across the whole exact window [114, 140], zero-padding columns (zero weights with
+    e8m0 0, as vLLM pads), and activations spanning the fp16 range."""
+    if arch_info.get_arch() != "gfx942":
+        pytest.skip("gfx942 Gluon a16w4 kernel only")
+    import aiter.ops.triton.moe.moe_op_gemm_a16w4 as moe_mod
+
+    device = "cuda"
+    torch.manual_seed(0)
+    m, rdata, gindx, sindx = init_routing_data(m, n_expts_tot, n_expts_act, True, False, device=device)
+    x = (torch.randn((m, k), device=device) * 2.0 ** torch.randint(-12, 8, (m, k), device=device)).to(torch.bfloat16)
+    w_packed = torch.randint(0, 256, (n_expts_tot, n, k // 2), dtype=torch.uint8, device=device)
+    w_scale = torch.randint(114, 141, (n_expts_tot, n, k // 32), dtype=torch.uint8, device=device)
+    w_packed[:, -32:] = 0
+    w_scale[:, -32:] = 0
+    w_tri, s_tri = w_packed.transpose(1, 2), w_scale.transpose(1, 2)
+    ys = {}
+    for mode in ("0", "1"):
+        monkeypatch.setattr(moe_mod, "_GFX942_FP16", mode)
+        ys[mode] = moe_gemm_a16w4(
+            x, w_tri, None, s_tri, None, None, None, rdata, gindx, None, None, None,
+            torch.bfloat16, False, backend="gluon",
+        )
+    # same exact products and f32 accumulation (the bf16 path is checked against the reference by test_op); the
+    # only operand difference is activations below 2^-17, which fp16 rounds: last-bit output differences at most
+    atol = 2.0**-20 * ys["0"].abs().max().item()
+    torch.testing.assert_close(ys["1"], ys["0"], rtol=2.0**-7, atol=atol)
+    assert (ys["1"] == ys["0"]).float().mean().item() > 0.99
+    assert (ys["1"][:, -32:] == 0).all()
+    # |x| > 65504 saturates in the fp16 convert instead of producing inf
+    x[: m // 2, ::7] = 1.0e5
+    y_big = moe_gemm_a16w4(
+        x, w_tri, None, s_tri, None, None, None, rdata, gindx, None, None, None, torch.bfloat16, False, backend="gluon"
+    )
+    assert torch.isfinite(y_big).all()
+
+
+def test_gfx942_gluon_fp16_operand_scale_check(monkeypatch):
+    """auto mode: the scale-range verdict is per scale storage and is redone for a new buffer at the same address."""
+    if arch_info.get_arch() != "gfx942":
+        pytest.skip("gfx942 Gluon a16w4 kernel only")
+    import aiter.ops.triton.moe.moe_op_gemm_a16w4 as moe_mod
+
+    monkeypatch.setattr(moe_mod, "_GFX942_FP16", "auto")
+    monkeypatch.setattr(moe_mod, "_gfx942_fp16_scales_ok", {})
+    for lo, hi, ok in ((114, 140, True), (113, 140, False), (114, 141, False), (120, 125, True)):
+        s = torch.randint(lo, hi + 1, (8, 64, 160), dtype=torch.uint8, device="cuda")
+        s[0, 0, 0], s[0, 0, 1], s[0, 1, 0] = lo, hi, 0
+        assert moe_mod._gfx942_fp16_operand(s.transpose(1, 2)) is ok, (lo, hi)
+        assert moe_mod._gfx942_fp16_operand(s.transpose(1, 2)) is ok, (lo, hi)  # cached
+        del s
+
+
+def test_gfx942_gluon_fp16_operand_graph_capture(monkeypatch):
+    """vLLM order: a large-M eager call (the profile run, block_m > 32) primes the scale check, then a decode-size
+    call is captured with no eager warmup at that size. The captured call must take the fp16 path from the cache
+    (no host sync under capture) and replay must match eager."""
+    if arch_info.get_arch() != "gfx942":
+        pytest.skip("gfx942 Gluon a16w4 kernel only")
+    import aiter.ops.triton.moe.moe_op_gemm_a16w4 as moe_mod
+
+    monkeypatch.setattr(moe_mod, "_GFX942_FP16", "auto")
+    real, seen = moe_mod._gfx942_fp16_operand, []
+
+    def spy(scales):
+        r = real(scales)
+        seen.append((torch.cuda.is_current_stream_capturing(), r))
+        return r
+
+    monkeypatch.setattr(moe_mod, "_gfx942_fp16_operand", spy)
+    device = "cuda"
+    torch.manual_seed(0)
+    n, k, n_expts_tot, n_expts_act = 1536, 5120, 384, 6
+    w_packed = torch.randint(0, 256, (n_expts_tot, n, k // 2), dtype=torch.uint8, device=device)
+    w_scale = torch.randint(118, 129, (n_expts_tot, n, k // 32), dtype=torch.uint8, device=device)
+    w_tri, s_tri = w_packed.transpose(1, 2), w_scale.transpose(1, 2)
+
+    def make_call(m):
+        m, rdata, gindx, _ = init_routing_data(m, n_expts_tot, n_expts_act, True, False, device=device)
+        x = (torch.randn((m, k), device=device) * 0.1).to(torch.bfloat16)
+        return lambda: moe_gemm_a16w4(
+            x, w_tri, None, s_tri, None, None, None, rdata, gindx, None, None, None, torch.bfloat16, False, backend="gluon"
+        )
+
+    decode = make_call(192)
+    y_eager = decode()  # compile outside capture
+    monkeypatch.setattr(moe_mod, "_gfx942_fp16_scales_ok", {})
+    make_call(8192)()  # profile-run size
+    seen.clear()
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        y_graph = decode()
+    g.replay()
+    torch.cuda.synchronize()
+    assert seen == [(True, True)], seen
+    assert torch.equal(y_graph, y_eager)
+
+
 def _ep_setup(
     m, n, k, n_expts_tot, n_expts_act, ep_size, ep_rank, do_gather, do_scatter
 ):
@@ -323,6 +424,7 @@ def _ep_setup(
     "do_gather, do_scatter", [(True, False), (False, True), (True, True)]
 )
 @pytest.mark.parametrize("apply_swiglu", [False, True])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_op_expert_parallel(
     m,
     n,
@@ -334,11 +436,15 @@ def test_op_expert_parallel(
     do_gather,
     do_scatter,
     apply_swiglu,
+    backend,
 ):
     """Rank-local weights + global routing reproduce the local experts' output;
     non-local gates contribute exactly 0 to the top-k combine."""
-    if not arch_info.is_fp4_avail():
+    if not (arch_info.is_fp4_avail() or arch_info.get_arch() == _TUNED_ARCH):
         pytest.skip("MXFP4 not supported on this architecture")
+    # expert_map on the gluon path is gfx942-only (other arches assert in the wrapper)
+    if backend == "gluon" and arch_info.get_arch() != "gfx942":
+        pytest.skip("gluon expert_map is only supported on gfx942")
 
     x, w_tri, w_scale_tri, bias, rdata, gindx, sindx, lo, hi, expert_map, gate_valid = (
         _ep_setup(
@@ -372,7 +478,7 @@ def test_op_expert_parallel(
         None,
         torch.bfloat16,
         apply_swiglu,
-        backend="triton",
+        backend=backend,
         expert_map=expert_map,
         gate_valid=gate_valid,
     )
