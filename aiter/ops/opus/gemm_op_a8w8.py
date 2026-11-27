@@ -8,6 +8,7 @@
 # make it add a dummy CUDA Tensor to every raw launch, which is observable host
 # overhead on short BMM kernels.
 
+import math
 import re
 
 import torch
@@ -807,45 +808,111 @@ def _launch_a8w8_mxfp8_gemm(
     return Y
 
 
+# Measured us per 1000 K of a (B_M, B_N) tile on the "np" kids (MI355X, 256 CUs),
+# per layout: (a launch of up to half the CUs' tiles, one round of cu_num tiles
+# of a launch of several rounds). A tile's time is not its area's share (the K
+# loop has a fixed part, larger for an operand stored [K, M] / [K, N]) and tiles
+# sharing a CU slow each other down, hence the two columns.
+_MXFP8_TILE_US = {
+    "NT": {
+        (256, 256): (9.0, 15.6),
+        (256, 192): (7.8, 14.0),
+        (192, 256): (7.7, 12.8),
+        (256, 128): (5.2, 9.4),
+        (128, 256): (5.3, 9.5),
+        (128, 128): (4.0, 6.2),
+    },
+    "NN": {
+        (256, 256): (9.6, 16.6),
+        (256, 192): (8.9, 16.1),
+        (192, 256): (8.1, 13.6),
+        (256, 128): (7.3, 11.6),
+        (128, 256): (5.6, 10.0),
+        (128, 128): (5.2, 7.4),
+    },
+    "TT": {
+        (256, 256): (9.4, 15.9),
+        (256, 192): (8.4, 13.8),
+        (192, 256): (9.1, 14.1),
+        (256, 128): (6.0, 10.3),
+        (128, 256): (7.5, 11.0),
+        (128, 128): (4.7, 7.2),
+    },
+    "TN": {
+        (256, 256): (9.9, 15.9),
+        (256, 192): (9.5, 15.5),
+        (192, 256): (9.5, 14.0),
+        (256, 128): (7.9, 11.5),
+        (128, 256): (7.8, 11.0),
+        (128, 128): (7.2, 8.8),
+    },
+}
+_MXFP8_SPLITK_US = 14.0  # a split-K launch: the workspace and splitk_reduce_kernel
+_MXFP8_SPLITK_MIN_US = 45.0  # below this a launch is not worth splitting
+
+
+def _a8w8_mxfp8_kid_us(
+    direction: str, instance, M: int, N: int, K: int, cu_num: int
+) -> float | None:
+    """Estimated us of one launch of ``instance`` (split-K kids at their auto
+    split, see :func:`_a8w8_mxfp8_plan`), None for a kid the estimate does not
+    cover. Only the order of the kids of one shape is meant to be right.
+
+    Up to cu_num tiles each has a CU: the tile's time, up to 25 % more as the
+    launch goes from half the CUs to all of them. Past that the tiles run in
+    rounds of cu_num, a started round costing half a full one. Split-K divides
+    K among ``split`` blocks per tile and adds a fixed cost."""
+    tile_us = _MXFP8_TILE_US[direction].get((instance.B_M, instance.B_N))
+    if tile_us is None or instance.co_variant not in ("nob", "np", "sk"):
+        return None
+    k = -(-K // _MXFP8_K_ALIGN) * _MXFP8_K_ALIGN / 1000
+    tiles = -(-M // instance.B_M) * -(-N // instance.B_N)
+    if instance.co_variant == "sk":
+        split, _ = _a8w8_mxfp8_plan(instance, M, N, K, 0, cu_num)
+        if split <= 1:
+            return None
+        k /= split
+        tiles *= split
+    rounds = tiles / cu_num
+    if rounds <= 1:
+        us = k * tile_us[0] * (1 + 0.5 * max(0.0, rounds - 0.5))
+    else:
+        us = k * tile_us[1] * (rounds + 0.5 * (math.ceil(rounds) - rounds))
+    if instance.co_variant == "sk":
+        return us + _MXFP8_SPLITK_US
+    # No boundary code: about 3 % faster than the "np" kid of the same tile.
+    return us * 0.97 if instance.co_variant == "nob" else us
+
+
 def _select_a8w8_mxfp8_kid(
     direction: str, M: int, N: int, K: int, arch: str, cu_num: int
 ) -> int | None:
-    """Pick an a8w8_mxfp8 (plain) kid for the shape.
-
-    One tile per block: the largest of 256x256 / 256x128 / 128x128 whose tile
-    count exceeds half the CUs (else 128x128); the boundary-free 256x256
-    ("nob") when M and N are multiples of 256. When that leaves CUs idle and
-    K >= 4096, the split-K kid whose auto split (see :func:`_a8w8_mxfp8_plan`)
-    fills the most CUs, larger tiles first.
-    """
-    kids = get_registry(_A8W8_MXFP8_1X32_FAMILY, arch, cu_num)
-    sizes = ((256, 256), (256, 128), (128, 128))
-    want = next(
-        (s for s in sizes if -(-M // s[0]) * -(-N // s[1]) > cu_num // 2), sizes[-1]
-    )
-    best = None
-    for kid, instance in kids.items():
-        if instance.co_variant not in ("nob", "np"):
+    """Pick an a8w8_mxfp8 (plain) kid for the shape: the "nob" / "np" kid with
+    the lowest estimate (:func:`_a8w8_mxfp8_kid_us`), or a split-K kid when that
+    launch is long enough to split and the split-K estimate is lower. Ties go
+    to the larger tile. The persistent kids time as the "np" ones and are only
+    run by ``kernelId``."""
+    best = best_sk = None
+    for kid, instance in get_registry(_A8W8_MXFP8_1X32_FAMILY, arch, cu_num).items():
+        us = _a8w8_mxfp8_kid_us(direction, instance, M, N, K, cu_num)
+        if us is None:
             continue
-        if not a8w8_mxfp8_kid_runs(instance, M, N, K, 0, direction):
+        split_k = 0
+        if instance.co_variant == "sk":
+            split_k, _ = _a8w8_mxfp8_plan(instance, M, N, K, 0, cu_num)
+        if not a8w8_mxfp8_kid_runs(instance, M, N, K, split_k, direction):
             continue
-        rank = ((instance.B_M, instance.B_N) != want, instance.co_variant != "nob", kid)
-        if best is None or rank < best[0]:
-            best = (rank, kid)
-    if best is None or -(-M // want[0]) * -(-N // want[1]) >= cu_num or K < 4096:
-        return None if best is None else best[1]
-    best_sk = None
-    for kid, instance in kids.items():
-        if instance.co_variant != "sk":
-            continue
-        split, _ = _a8w8_mxfp8_plan(instance, M, N, K, 0, cu_num)
-        if split <= 1 or not a8w8_mxfp8_kid_runs(instance, M, N, K, split, direction):
-            continue
-        tiles = -(-M // instance.B_M) * -(-N // instance.B_N)
-        rank = (-tiles * split, -instance.B_M * instance.B_N, kid)
-        if best_sk is None or rank < best_sk[0]:
-            best_sk = (rank, kid)
-    return best[1] if best_sk is None else best_sk[1]
+        rank = (us, -instance.B_M * instance.B_N, -instance.B_M, kid)
+        if instance.co_variant == "sk":
+            if best_sk is None or rank < best_sk:
+                best_sk = rank
+        elif best is None or rank < best:
+            best = rank
+    if best is None:
+        return None
+    if best_sk is not None and best[0] > _MXFP8_SPLITK_MIN_US and best_sk[0] < best[0]:
+        return best_sk[-1]
+    return best[-1]
 
 
 def _a8w8_mxfp8_pad_k(operand: Tensor, transposed: bool, K: int) -> Tensor:
