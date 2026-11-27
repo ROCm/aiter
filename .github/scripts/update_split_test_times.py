@@ -142,6 +142,7 @@ def list_test_files(repo_root: Path, test_type: str) -> list[str]:
             if p.is_file()
         }
         for rel_path in (
+            "op_tests/tuning_tests/test_a16w16_asm_arch_guard.py",
             "op_tests/tuning_tests/test_csv_validation.py",
             "op_tests/tuning_tests/test_config_shape_collision.py",
             "op_tests/tuning_tests/test_mixed_mxfp_tuning.py",

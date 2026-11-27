@@ -22,8 +22,9 @@ import torch.nn.functional as F
 
 import aiter
 from aiter import dtypes, logger
-from aiter.jit.core import AITER_CONFIG_GEMM_BF16, get_asm_dir
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
+from aiter.jit.core import AITER_ASM_DIR, AITER_CONFIG_GEMM_BF16
+from aiter.jit.utils.asm_kernels import has_asm_kernels
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.flydsl.gemm_a16w16_policy import (
     get_flydsl_a16w16_configs,
 )
@@ -657,13 +658,20 @@ class GemmA16W16Tuner(GemmCommonTuner):
         self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
     ):
         M, N, K = info_keys[2], info_keys[3], info_keys[4]
-        if (scaleAB or K % 64 != 0 or indtype != dtypes.bf16) and get_gfx() == "gfx942":
+        # The row's arch (the live device, see tune()), never the build arch
+        # that get_gfx() reads from GPU_ARCHS.
+        gfx = info_keys[0]
+        if not has_asm_kernels("bf16gemm", gfx, AITER_ASM_DIR):
+            return []
+        if (scaleAB or K % 64 != 0 or indtype != dtypes.bf16) and gfx == "gfx942":
             return []
         if (
             scaleAB or K % 64 != 0 or N % 64 != 0 or indtype != dtypes.bf16
-        ) and get_gfx() == "gfx950":
+        ) and gfx == "gfx950":
             return []
-        asm_kernel_list_csv = f"{get_asm_dir()}/bf16gemm/bf16gemm_fp32bf16.csv"
+        asm_kernel_list_csv = os.path.join(
+            AITER_ASM_DIR, gfx, "bf16gemm", "bf16gemm_fp32bf16.csv"
+        )
         asm_kernels = get_asm_kernels(asm_kernel_list_csv, is_shuffle)
         rtol, atol = _default_tol(outdtype)
         tasks = []
