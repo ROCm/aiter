@@ -201,13 +201,26 @@ def _quantize_v_mxfp4_fp6_p_hip(
     """Pack MXFP4 V in the contraction order required by an FP6 P operand."""
 
 
-def _validate_bshd_hd128(input: Tensor, operation: str) -> tuple[int, int, int, int]:
-    if input.dim() != 4 or not input.is_contiguous():
-        raise ValueError(f"{operation} requires a contiguous BSHD input")
-    if input.shape[-1] != 128:
+def _validate_hd128_last_dimension(input: Tensor, operation: str) -> None:
+    if input.dim() >= 1 and input.shape[-1] != 128:
         raise ValueError(
             f"{operation} is packed for head dimension 128, got {input.shape[-1]}"
         )
+    if input.dim() < 1 or input.stride(-1) != 1:
+        raise ValueError(
+            f"{operation} requires hd128 input with a contiguous last dimension"
+        )
+
+
+def _validate_bshd_hd128(
+    input: Tensor, operation: str, hip_rows: bool = True
+) -> tuple[int, int, int, int]:
+    # The HIP producers read contiguous rows; the Triton ones take any pointer and strides.
+    if input.dim() != 4:
+        raise ValueError(f"{operation} requires hd128 BSHD input")
+    _validate_hd128_last_dimension(input, operation)
+    if hip_rows and not input.is_contiguous():
+        raise ValueError(f"{operation} requires a contiguous BSHD input")
     return input.shape
 
 
@@ -222,19 +235,44 @@ def _quantize_per_tensor(
     clip: float,
     partial: Optional[Tensor] = None,  # noqa: UP045
 ) -> tuple[Tensor, Tensor]:
-    """Quantize to a single scale. `partial` supplies precomputed per-block amaxes."""
-    if not input.is_contiguous():
-        raise ValueError("MHA v4 per-tensor quantization requires contiguous input")
+    """Quantize to a single scale. `partial` supplies precomputed per-block amaxes.
+
+    The output is contiguous. The input may also be a BSHD view whose last dimension alone is
+    contiguous, such as a sequence crop of a packed QKV tensor; its head dimension must then be a
+    power of two no larger than the block, so that a block is a whole number of rows.
+    """
+    strided = not input.is_contiguous()
+    if strided:
+        head_dim = input.shape[-1] if input.dim() == 4 else 0
+        if (
+            input.stride(-1) != 1
+            or head_dim <= 0
+            or head_dim & (head_dim - 1)
+            or head_dim > MHA_V4_PER_TENSOR_BLOCK_SIZE
+        ):
+            raise ValueError(
+                "MHA v4 per-tensor quantization requires contiguous input or BSHD input with a "
+                "contiguous last dimension of power-of-two size"
+            )
     numel = input.numel()
     blocks = triton.cdiv(numel, MHA_V4_PER_TENSOR_BLOCK_SIZE)
     scale = input.new_empty((1,), dtype=torch.float32)
     output = input.new_empty(input.shape, dtype=output_dtype)
+    if strided:
+        _, sequence, heads, _ = input.shape
+        layout = (heads, sequence, *input.stride()[:3])
+    else:
+        head_dim = 1
+        layout = (1, 1, 0, 0, 0)
     if partial is None:
         partial = input.new_empty((blocks,), dtype=torch.float32)
         mha_v4_per_tensor_amax_kernel[(blocks,)](
             input,
             partial,
             numel,
+            *layout,
+            STRIDED=strided,
+            HEAD_DIM=head_dim,
             BLOCK_SIZE=MHA_V4_PER_TENSOR_BLOCK_SIZE,
             num_warps=8,
         )
@@ -262,7 +300,10 @@ def _quantize_per_tensor(
         output,
         scale,
         numel,
+        *layout,
         IS_INT8=output_dtype == torch.int8,
+        STRIDED=strided,
+        HEAD_DIM=head_dim,
         BLOCK_SIZE=MHA_V4_PER_TENSOR_BLOCK_SIZE,
         num_warps=8,
     )
@@ -271,7 +312,7 @@ def _quantize_per_tensor(
 
 @torch.library.custom_op("aiter::mha_v4_quantize_int8_v2", mutates_args=())
 def quantize_int8(input: Tensor, clip: float = 1.0) -> tuple[Tensor, Tensor]:
-    """Per-tensor quantize a contiguous tensor to INT8 and return its scale."""
+    """Per-tensor quantize to INT8 and return its scale; see _quantize_per_tensor for layouts."""
     return _quantize_per_tensor(input, torch.int8, 127.0, clip)
 
 
@@ -285,7 +326,7 @@ def _quantize_int8_fake(input: Tensor, clip: float = 1.0) -> tuple[Tensor, Tenso
 
 @torch.library.custom_op("aiter::mha_v4_quantize_fp8", mutates_args=())
 def quantize_fp8(input: Tensor) -> tuple[Tensor, Tensor]:
-    """Per-tensor quantize a contiguous tensor to native FP8 and return its scale."""
+    """Per-tensor quantize to native FP8 and return its scale; see _quantize_per_tensor for layouts."""
     return _quantize_per_tensor(input, dtypes.fp8, torch.finfo(dtypes.fp8).max, 1.0)
 
 
@@ -641,7 +682,9 @@ def _quantize_mxfp6_k_raw_fake(
 @torch.library.custom_op("aiter::mha_v4_quantize_v_fp8", mutates_args=())
 def quantize_v_fp8(input: Tensor) -> tuple[Tensor, Tensor]:
     """Quantize hd128 BSHD V to FP8 with one FP32 scale per channel."""
-    batch, sequence, heads, head_dim = _validate_bshd_hd128(input, "FP8 V quantization")
+    batch, sequence, heads, head_dim = _validate_bshd_hd128(
+        input, "FP8 V quantization", hip_rows=False
+    )
     fp8_max = torch.finfo(dtypes.fp8).max
     scale_block_k = 256
     scale_blocks = triton.cdiv(sequence, scale_block_k)
@@ -676,7 +719,7 @@ def quantize_v_fp8(input: Tensor) -> tuple[Tensor, Tensor]:
     )
     block_k = 64
     blocks = triton.cdiv(sequence, block_k)
-    quantized = torch.empty_like(input, dtype=dtypes.fp8)
+    quantized = input.new_empty(input.shape, dtype=dtypes.fp8)
     sage_quant_v_kernel[(batch * heads * blocks,)](
         input,
         quantized,
@@ -750,7 +793,7 @@ def _quantize_v_mxfp4_fp6_p_raw_fake(input: Tensor) -> tuple[Tensor, Tensor]:
 @torch.library.custom_op("aiter::mha_v4_quantize_v_mxfp6", mutates_args=())
 def quantize_v_mxfp6(input: Tensor) -> tuple[Tensor, Tensor]:
     """Pack hd128 BSHD V into MXFP6 data and E8M0 scale views."""
-    _validate_bshd_hd128(input, "MXFP6 V quantization")
+    _validate_bshd_hd128(input, "MXFP6 V quantization", hip_rows=False)
     return pack_fp6_v_data_scale_views(input)
 
 

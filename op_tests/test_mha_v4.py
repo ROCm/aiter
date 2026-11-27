@@ -593,6 +593,98 @@ def test_mha_v4_rotated_fp8_quantization_rejects_noncontiguous_input():
         quantize_fp8_rotated(value)
 
 
+def _strided_bshd_views(batch, sequence, heads):
+    """A sequence crop of a packed QKV tensor, NaN outside the crop, and a BHSD transpose."""
+    start = 37
+    qkv = torch.randn(
+        (batch, sequence + 2 * start, 3, heads, 128),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    qkv[:, :start] = float("nan")
+    qkv[:, start + sequence :] = float("nan")
+    bhsd = torch.randn(
+        (batch, heads, sequence, 128), device="cuda", dtype=torch.bfloat16
+    )
+    return {
+        "qkv_crop": qkv[:, start : start + sequence, 1],
+        "bhsd": bhsd.transpose(1, 2),
+    }
+
+
+def _bitwise_equal(actual, expected):
+    if isinstance(actual, tuple):
+        return all(_bitwise_equal(a, e) for a, e in zip(actual, expected))
+    return torch.equal(
+        actual.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8)
+    )
+
+
+_STRIDED_QUANTIZERS = {
+    "int8": quantize_int8,
+    "fp8": quantize_fp8,
+    "v_fp8": quantize_v_fp8,
+    "v_mxfp6": quantize_v_mxfp6,
+}
+_TRITON_V_QUANTIZERS = {"v_fp8": quantize_v_fp8, "v_mxfp6": quantize_v_mxfp6}
+_GFX942_STRIDED_QUANTIZERS = {"int8", "fp8", "v_fp8"}
+# Off gfx950 the MX quantizers abort rather than raise, so they are skipped there rather than run.
+_STRIDED_QUANTIZER_CASES = [
+    param(
+        quantizer,
+        skip=get_gfx() != "gfx950" and quantizer not in _GFX942_STRIDED_QUANTIZERS,
+    )
+    for quantizer in _STRIDED_QUANTIZERS
+]
+
+
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 MHA v4 quantizers")
+@parametrize("quantizer", _STRIDED_QUANTIZER_CASES)
+@parametrize("batch,sequence,heads", [(2, 1001, 5), (1, 129, 2)])
+def test_mha_v4_quantizers_read_strided_views_like_contiguous_input(
+    quantizer, batch, sequence, heads
+):
+    """A view whose rows alone are dense quantizes exactly as its contiguous copy does.
+
+    The crop is NaN outside its rows, so a read past them would surface in the codes or scales.
+    """
+    torch.manual_seed(41)
+    quantize = _STRIDED_QUANTIZERS[quantizer]
+    for value in _strided_bshd_views(batch, sequence, heads).values():
+        assert not value.is_contiguous()
+        assert _bitwise_equal(quantize(value), quantize(value.contiguous()))
+
+
+def _misaligned_bshd_view(layout, batch=1, sequence=128, heads=2):
+    """An hd128 BSHD view off the 16-byte grid, by its start pointer or its outer strides."""
+    row = 136 if layout == "misaligned_pointer" else 129
+    storage = torch.randn(
+        (batch, sequence, heads, row), device="cuda", dtype=torch.bfloat16
+    )
+    return storage[..., 1:129] if layout == "misaligned_pointer" else storage[..., :128]
+
+
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 MHA v4 quantizers")
+@parametrize(
+    "quantizer",
+    [
+        param(
+            quantizer,
+            skip=get_gfx() != "gfx950" and quantizer not in _GFX942_STRIDED_QUANTIZERS,
+        )
+        for quantizer in _TRITON_V_QUANTIZERS
+    ],
+)
+@parametrize("layout", ["misaligned_pointer", "misaligned_outer_stride"])
+def test_mha_v4_triton_v_quantizers_accept_misaligned_bshd_views(quantizer, layout):
+    """The Triton V producers take any pointer and strides."""
+    torch.manual_seed(43)
+    value = _misaligned_bshd_view(layout, batch=2, sequence=257, heads=3)
+    quantize = _TRITON_V_QUANTIZERS[quantizer]
+
+    assert _bitwise_equal(quantize(value), quantize(value.contiguous()))
+
+
 # The MX quantizers AITER_CHECK on gfx950, and that check aborts rather than raising.
 @skipif(get_gfx() != "gfx950", reason="gfx950 MX quantization")
 @parametrize(
