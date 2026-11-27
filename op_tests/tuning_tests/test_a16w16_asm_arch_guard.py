@@ -15,6 +15,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from typing import ClassVar
 from unittest import mock
 
 import torch
@@ -142,7 +143,10 @@ class TestAsmKernelMetadata(unittest.TestCase):
     def test_any_arch_dir_with_a_kernel_table_counts(self):
         # The answer is cached per root, so each case gets its own root.
         has_asm_kernels = tuned.has_asm_kernels
-        with tempfile.TemporaryDirectory() as empty, tempfile.TemporaryDirectory() as full:
+        with (
+            tempfile.TemporaryDirectory() as empty,
+            tempfile.TemporaryDirectory() as full,
+        ):
             Path(empty, "gfx9999", "bf16gemm").mkdir(parents=True)
             Path(full, "gfx9999", "bf16gemm").mkdir(parents=True)
             Path(full, "gfx9999", "bf16gemm", "bf16gemm_fp32bf16.csv").write_text(
@@ -156,9 +160,11 @@ class TestAsmKernelMetadata(unittest.TestCase):
 class TestDefaultSelection(_Base):
     def test_bpreshuffle_without_asm_kernels_raises_before_launch(self):
         for gfx in NO_ASM_ARCHES:
-            with self.subTest(gfx=gfx):
-                with self.assertRaisesRegex(RuntimeError, "preshuffled B.*" + gfx):
-                    self._config(gfx, bpreshuffle=True)
+            with (
+                self.subTest(gfx=gfx),
+                self.assertRaisesRegex(RuntimeError, "preshuffled B.*" + gfx),
+            ):
+                self._config(gfx, bpreshuffle=True)
 
     def test_bpreshuffle_selection_is_unchanged_on_gfx942_and_gfx950(self):
         cfg = self._config("gfx942", bpreshuffle=True)
@@ -183,7 +189,12 @@ class TestDefaultSelection(_Base):
 
 
 class TestTunedRows(_Base):
-    ROW = {"libtype": "asm", "solidx": 3, "splitK": 1, "kernelName": "k"}
+    ROW: ClassVar[dict] = {
+        "libtype": "asm",
+        "solidx": 3,
+        "splitK": 1,
+        "kernelName": "k",
+    }
 
     def test_asm_row_on_an_arch_without_kernels_is_skipped(self):
         for gfx in NO_ASM_ARCHES:
@@ -211,9 +222,10 @@ class TestAsmLaunch(unittest.TestCase):
         inp = torch.zeros(M, K, dtype=torch.bfloat16)
         weights = torch.zeros(N, K, dtype=torch.bfloat16)
         launch = mock.Mock(name="gemm_a16w16_asm")
-        with mock.patch.object(
-            tuned, "get_gfx_runtime", lambda: gfx
-        ), mock.patch.object(tuned, "gemm_a16w16_asm", launch):
+        with (
+            mock.patch.object(tuned, "get_gfx_runtime", lambda: gfx),
+            mock.patch.object(tuned, "gemm_a16w16_asm", launch),
+        ):
             tuned.asm_gemm(
                 inp, weights, 0, otype=torch.bfloat16, config={"libtype": "asm"}
             )
@@ -222,17 +234,19 @@ class TestAsmLaunch(unittest.TestCase):
     def test_launch_is_refused_on_an_arch_without_kernels(self):
         for gfx in NO_ASM_ARCHES:
             with self.subTest(gfx=gfx):
-                with mock.patch.object(tuned, "gemm_a16w16_asm") as launch:
-                    with mock.patch.object(tuned, "get_gfx_runtime", lambda g=gfx: g):
-                        with self.assertRaisesRegex(RuntimeError, "no bf16gemm"):
-                            tuned.asm_gemm(
-                                torch.zeros(M, K, dtype=torch.bfloat16),
-                                torch.zeros(N, K, dtype=torch.bfloat16),
-                                0,
-                                otype=torch.bfloat16,
-                                config={"libtype": "asm"},
-                            )
-                    launch.assert_not_called()
+                with (
+                    mock.patch.object(tuned, "gemm_a16w16_asm") as launch,
+                    mock.patch.object(tuned, "get_gfx_runtime", lambda g=gfx: g),
+                    self.assertRaisesRegex(RuntimeError, "no bf16gemm"),
+                ):
+                    tuned.asm_gemm(
+                        torch.zeros(M, K, dtype=torch.bfloat16),
+                        torch.zeros(N, K, dtype=torch.bfloat16),
+                        0,
+                        otype=torch.bfloat16,
+                        config={"libtype": "asm"},
+                    )
+                launch.assert_not_called()
 
     def test_launch_proceeds_on_gfx942_and_gfx950(self):
         for gfx in ("gfx942", "gfx950"):

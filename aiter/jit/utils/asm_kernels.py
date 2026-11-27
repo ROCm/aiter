@@ -19,7 +19,7 @@ def _default_asm_root() -> str:
     )
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _has_asm_kernels(family: str, gfx: str, asm_root: str) -> bool:
     family_dir = os.path.join(asm_root, gfx, family)
     try:
