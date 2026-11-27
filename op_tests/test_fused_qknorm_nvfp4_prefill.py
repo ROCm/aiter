@@ -493,3 +493,12 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # CI runs test_bigneg_slots_skipped() under pytest; exercise it from the script entry too so the
+    # standalone path also covers the large-magnitude-negative-slot check (#8472). Only at top level
+    # (the --child/--bigneg-child workers main() handled above must not re-spawn the comparison) and
+    # only on gfx950, matching main()'s own gate so the non-gfx950 run skips cleanly.
+    if not ({"--child", "--bigneg-child"} & set(sys.argv)):
+        from aiter.jit.utils.chip_info import get_gfx_runtime
+
+        if get_gfx_runtime() == "gfx950":
+            test_bigneg_slots_skipped()
