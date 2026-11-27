@@ -4,6 +4,7 @@
 """gfx1250 MLA gather + FlyDSL ptpc projection."""
 
 import functools
+import os
 
 import torch
 from torch import Tensor
@@ -25,6 +26,33 @@ def _projection_runtime():
     from .kernels.tensor_shim import _run_compiled, ptr_arg
 
     return launch_gather_kv_b_proj_8wave_gfx1250, ptr_arg, fx, _run_compiled
+
+
+@functools.lru_cache(maxsize=1)
+def _head_loop_runtime():
+    from .kernels.gather_kv_b_proj_hl_gfx1250 import (
+        heads_per_group,
+        launch_gather_kv_b_proj_hl_gfx1250,
+    )
+
+    return launch_gather_kv_b_proj_hl_gfx1250, heads_per_group
+
+
+@functools.lru_cache(maxsize=16)
+def _num_cus(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _use_head_loop(output_fp8: bool, n_heads: int) -> bool:
+    """FP8 outputs take the A-resident head-loop kernel (one 256-token tile per
+    workgroup, all its heads); AITER_GATHER_KVB_HEAD_LOOP=0 restores the tile
+    kernel. It needs an even head count: heads run in pairs so K is written in
+    whole 128 B lines."""
+    return (
+        output_fp8
+        and n_heads % 2 == 0
+        and os.environ.get("AITER_GATHER_KVB_HEAD_LOOP", "1") != "0"
+    )
 
 
 def _cluster_n(m: int, n_heads: int) -> int:
@@ -68,6 +96,19 @@ def _run_projection(
         ptr_arg(v_out_scale if output_fp8 else cache),
         fx.Stream(torch.cuda.current_stream(device=cache.device)),
     )
+    if _use_head_loop(output_fp8, n_heads):
+        launch_head_loop, heads_per_group = _head_loop_runtime()
+        hpg = heads_per_group(m, n_heads, _num_cus(cache.device.index))
+        head_loop_spec = (n_heads, int(scale_is_ptr))
+        run_compiled(
+            launch_head_loop,
+            *args[:-1],
+            hpg,
+            args[-1],
+            *head_loop_spec,
+            specialization_key=head_loop_spec,
+        )
+        return
     projection_spec = (n_heads, int(scale_is_ptr), cluster_n, int(output_fp8))
     run_compiled(
         launch_projection,
