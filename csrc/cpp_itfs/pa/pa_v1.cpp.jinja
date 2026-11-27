@@ -66,10 +66,13 @@ void {{func_name}}(void* out_ptr,
     {% else %}
     const float logits_soft_cap_rcp = 0.f;
     {% endif %}
+    // Each statistics buffer holds [num_seqs, mtp, num_heads, max_num_partitions].
+    const int64_t stats_elements =
+        static_cast<int64_t>(num_seqs) * {{mtp}} * num_heads * max_num_partitions;
     float* exp_sums_ptr   = reinterpret_cast<float*>(workspace_buffer_ptr);
-    float* max_logits_ptr = exp_sums_ptr + (num_seqs * num_heads * max_num_partitions);
+    float* max_logits_ptr = exp_sums_ptr + stats_elements;
     {{dtype}}* tmp_out_ptr =
-        reinterpret_cast<{{dtype}}*>(max_logits_ptr + (num_seqs * num_heads * max_num_partitions));
+        reinterpret_cast<{{dtype}}*>(max_logits_ptr + stats_elements);
 
     ck_tile::ComposedAttention<{{"true" if logits_soft_cap_enabled else "false"}} * ck_tile::LOGITS_SOFT_CAP> variant;
     constexpr int NTHR = 256;
