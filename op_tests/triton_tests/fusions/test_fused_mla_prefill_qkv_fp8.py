@@ -11,7 +11,7 @@ from aiter.ops.triton.fusions.fused_mla_prefill_qkv_fp8 import (
 from aiter.ops.triton.utils._triton import arch_info
 
 pytestmark = pytest.mark.skipif(
-    arch_info.get_arch() not in ("gfx950", "gfx1250"),
+    arch_info.get_arch() not in ("gfx950", "gfx1250", "gfx1250-strict"),
     reason="fused_mla_prefill_qkv_fp8 configs ship for gfx950 and gfx1250 only",
 )
 

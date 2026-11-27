@@ -12,8 +12,10 @@ from ..combine import (
 )
 from ..combine import (
     COMBINE_LDS_BUDGET,
+    _make_combine_direct_reduce,
     _make_combine_fused_reduce,
     _make_combine_fused_sync,
+    combine_direct_reduce_blocks,
     combine_reduce_lds_bytes,
 )
 from ..config import _WAVE_SIZE
@@ -33,9 +35,7 @@ from .base import (
 # `_combine_tile` walks these down until the tile fits a given topk.
 _COMBINE_TOKENS_PER_BLOCK = 16
 _COMBINE_CHUNKS_PER_ITER = 1
-# The MXFP8 wire wants a larger C: its scale plane puts only C*8 bytes in a TDM
-# row, so a small C makes that load pull a whole cache line per row for a
-# handful of bytes.
+# The MX wires want a larger C: at the bf16 tile their reduce runs 4-14% slower.
 _COMBINE_QUANT_TOKENS_PER_BLOCK = 8
 _COMBINE_QUANT_CHUNKS_PER_ITER = 4
 
@@ -49,8 +49,7 @@ def _combine_tile(*, topk, hidden_dim, quant_bits):
 
     T then takes the tile as high as the LDS budget allows, since trips per block
     is what keeps the prefetch pipeline fed. LDS grows as T*topk, so a large topk
-    trades height away: topk=8 on the mxfp8 wire needs 164KB at the preferred
-    T=8 and lands on T=7.
+    trades height away: topk=8 on the mxfp8 wire lands on T=4.
     """
     n_chunks = hidden_dim // _COMBINE_CHUNK_ELEMS
     max_chunks, max_toks = (
@@ -96,6 +95,8 @@ class _FusedScatterCombine:
     accepted_layouts = frozenset(BatchLayout)
     uses_mori = False
     needs_aggregated_reservation = False
+    # finish() can fold a bf16 [tokens, hidden] tensor into the reduce.
+    adds_shared = True
 
     def __init__(self, config: MegaMoEConfig, caps=None):
         self.config = config
@@ -142,19 +143,33 @@ class _FusedScatterCombine:
         # grid is unconstrained. Both wires stage through LDS, so the block is
         # sized to the lane tile (T*C*256/16 lanes) -- which differs per wire,
         # hence one build per width rather than one shared spec.
+        # Keyed (bits, add_shared): the second variant also adds the shared
+        # expert's output in the same pass (see ``finish``).
         self._reduces = {}
+        # The bf16 wire has no scale plane to stage, so it skips LDS and reduces
+        # straight from global memory (see ``_make_combine_direct_reduce``).
         for bits, (toks, chunks) in self._tiles.items():
             lanes = toks * chunks * _COMBINE_CHUNK_ELEMS // 16
-            self._reduces[bits] = _make_combine_fused_reduce(
-                experts_per_token=config.topk,
-                hidden_dim=config.hidden_dim,
-                block_num=512,
-                warp_num_per_block=lanes // _WAVE_SIZE,
-                slot_stride_nbytes=config.combine_slot_stride_for(bits),
-                quant_bits=bits,
-                tokens_per_block=toks,
-                chunks_per_iter=chunks,
-            )
+            for add_shared in (False, True):
+                if bits == 0:
+                    self._reduces[bits, add_shared] = _make_combine_direct_reduce(
+                        experts_per_token=config.topk,
+                        hidden_dim=config.hidden_dim,
+                        slot_stride_nbytes=config.combine_slot_stride_for(bits),
+                        add_shared=add_shared,
+                    )
+                    continue
+                self._reduces[bits, add_shared] = _make_combine_fused_reduce(
+                    experts_per_token=config.topk,
+                    hidden_dim=config.hidden_dim,
+                    block_num=512,
+                    warp_num_per_block=lanes // _WAVE_SIZE,
+                    slot_stride_nbytes=config.combine_slot_stride_for(bits),
+                    quant_bits=bits,
+                    tokens_per_block=toks,
+                    chunks_per_iter=chunks,
+                    add_shared=add_shared,
+                )
         self._sync = _make_combine_fused_sync(
             rank=config.rank,
             npes=config.world_size,
@@ -179,11 +194,29 @@ class _FusedScatterCombine:
         )
 
     def finish(
-        self, routing: Routing, quant_bits: int, expert_out=None
+        self, routing: Routing, quant_bits: int, expert_out=None, shared_add=None
     ) -> torch.Tensor:
         """The gemm2 epilogue has already scattered the results into the peers'
-        slots, packed as the ``quant_bits`` wire; reduce them."""
+        slots, packed as the ``quant_bits`` wire; reduce them.
+
+        ``shared_add``: a bf16 ``[>= token_count, hidden]`` tensor added to each
+        token's sum in the reduce itself, bit-identical to adding it afterwards.
+        """
         res = self.res
+        if shared_add is not None:
+            count = routing.token_count
+            if (
+                shared_add.dtype != torch.bfloat16
+                or not shared_add.is_contiguous()
+                or shared_add.dim() != 2
+                or shared_add.shape[1] != self.config.hidden_dim
+                or shared_add.shape[0] < count
+            ):
+                raise ValueError(
+                    f"shared_add must be a contiguous bf16 [>={count}, "
+                    f"{self.config.hidden_dim}] tensor, got "
+                    f"{tuple(shared_add.shape)} {shared_add.dtype}"
+                )
         stream = fx.Stream(torch.cuda.current_stream())
         # 1-block cross-device barrier, then the barrier-free reduce on the
         # same stream; the kernel boundary gives the reduce its visibility.
@@ -194,11 +227,18 @@ class _FusedScatterCombine:
             self.config.rank,
             stream,
         )
+        grid = (
+            (combine_direct_reduce_blocks(self.config.hidden_dim, routing.token_count),)
+            if quant_bits == 0
+            else ()
+        )
         _run_compiled(
-            self._reduces[quant_bits],
+            self._reduces[quant_bits, shared_add is not None],
             res.arena.local_ptr("comb_inp"),
             res.combine_output.data_ptr(),
             routing.token_count,
+            0 if shared_add is None else shared_add.data_ptr(),
+            *grid,
             stream,
         )
         return res.output(routing.token_count)

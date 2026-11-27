@@ -18,7 +18,8 @@ inline void opus_moe_stage2_a8w4_decode_launch_gfx950(
     hipStream_t stream)
 {
     int route_blocks =
-        (kargs.sorted_blocks * kargs.sort_block_m + Traits::B_M - 1) / Traits::B_M;
+        (kargs.sorted_blocks * kargs.sort_block_m + Traits::ROUTE_M_STRIDE - 1) /
+        Traits::ROUTE_M_STRIDE;
     opus_moe_stage2_a8w4_kargs launch_kargs = kargs;
     if constexpr(Traits::DECODE_PACE_ROUTE_BLOCKS_TO_POW2)
     {

@@ -332,6 +332,202 @@ def test_flydsl_v2_stage2_a8w4_full_tile(block_m, inter_dim, tile_k):
     )
 
 
+def _a4w4_scatter_stage2_inputs(token, model_dim, inter_dim, E, topk, seed):
+    """MXFP4 stage-2 inputs in the sorted BM=128 layout of the v2 scatter GEMM2."""
+    from aiter.ops.shuffle import shuffle_scale
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    scores = torch.randn((token, E), dtype=torch.float32, device="cuda")
+    topk_ids = scores.topk(topk, dim=1).indices.to(torch.int32)
+    topk_weights = torch.softmax(
+        torch.randn((token, topk), dtype=torch.float32, device="cuda"), dim=1
+    )
+    sti, sw, sei, nvi, _, _, rev = moe_sorting(
+        topk_ids,
+        topk_weights,
+        E,
+        model_dim,
+        torch.bfloat16,
+        block_size=128,
+        accumulate=False,
+        output_aux="opus",
+    )
+    a2 = torch.randn((token * topk, inter_dim), dtype=torch.bfloat16, device="cuda")
+    a2_q, a2_s = per_1x32_f4_quant(a2, quant_dtype=dtypes.fp4x2)
+    a2_q = a2_q.view(torch.uint8).view(token * topk, inter_dim // 2)
+    max_sorted = sti.shape[0]
+    pos = torch.arange(max_sorted, device="cuda")
+    tok = (sti & 0xFFFFFF).long()
+    row = (tok * topk + (sti >> 24).long()).clamp(max=token * topk - 1)
+    valid = (pos < nvi[0]) & (tok < token)
+    inter_q = torch.zeros(
+        (max_sorted, inter_dim // 2), dtype=torch.uint8, device="cuda"
+    )
+    inter_q[valid] = a2_q[row[valid]]
+    inter_s = mxfp4_moe_sort_fwd(
+        a2_s.view(token * topk, inter_dim // 32),
+        sorted_ids=sti,
+        num_valid_ids=nvi,
+        token_num=token,
+        cols=inter_dim,
+    )
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=torch.bfloat16, device="cuda")
+    w2_q, w2_scale = per_1x32_f4_quant(w2, quant_dtype=dtypes.fp4x2)
+    w2_q = w2_q.view(E, model_dim, inter_dim // 2)
+    w2_sh = shuffle_weight(w2_q, (16, 16), is_guinterleave=False, gate_up=False)
+    w2_ssh = shuffle_scale(w2_scale, E, is_guinterleave=False, gate_up=False)
+    # fp32 reference on the dequantized operands
+    a_f = (
+        fp4_utils.mxfp4_to_f32(a2_q).view(token * topk, inter_dim // 32, 32)
+        * fp4_utils.e8m0_to_f32(a2_s.view(torch.uint8)).view(
+            token * topk, inter_dim // 32, 1
+        )
+    ).view(token, topk, inter_dim)
+    w_f = (
+        fp4_utils.mxfp4_to_f32(w2_q.view(torch.uint8)).view(
+            E, model_dim, inter_dim // 32, 32
+        )
+        * fp4_utils.e8m0_to_f32(w2_scale.view(torch.uint8)).view(
+            E, model_dim, inter_dim // 32, 1
+        )
+    ).view(E, model_dim, inter_dim)
+    ref = torch.zeros((token, model_dim), dtype=torch.float32, device="cuda")
+    for e in range(E):
+        t, k = (topk_ids == e).nonzero(as_tuple=True)
+        if t.numel():
+            ref.index_add_(0, t, (a_f[t, k] @ w_f[e].T) * topk_weights[t, k][:, None])
+    return {
+        "sti": sti,
+        "sw": sw,
+        "sei": sei,
+        "nvi": nvi,
+        "rev": rev,
+        "inter_q": inter_q,
+        "inter_s": inter_s,
+        "w2_sh": w2_sh,
+        "w2_ssh": w2_ssh,
+        "topk_weights": topk_weights,
+        "ref": ref,
+    }
+
+
+@pytest.mark.parametrize("token", [1, 37, 300])
+@pytest.mark.parametrize(("model_dim", "inter_dim"), [(512, 256), (6144, 768)])
+@pytest.mark.parametrize(
+    ("tile_n", "tile_k"), [(256, 256), (128, 256), (256, 128), (128, 128)]
+)
+@_SKIP_GFX950_FLYDSL
+def test_flydsl_v2_stage2_scatter_ldspa(token, model_dim, inter_dim, tile_n, tile_k):
+    """The _ldspa scatter epilogue writes the same bf16 intermediate as the stock one.
+
+    The stage-2 output of the production wrapper is also the same, and it agrees
+    with an fp32 reference."""
+    from aiter.fused_moe import _mxfp4_a4w4_stage2_fw
+    from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
+
+    E, topk = 16, 4
+    d = _a4w4_scatter_stage2_inputs(token, model_dim, inter_dim, E, topk, seed=7)
+    max_sorted = d["sti"].shape[0]
+    flats = {}
+    for ldspa in (False, True):
+        flat = torch.full(
+            (max_sorted, model_dim), float("nan"), dtype=torch.bfloat16, device="cuda"
+        )
+        mxfp4_moe_gemm2(
+            inter_sorted_quant=d["inter_q"],
+            inter_sorted_shuffled_scale=d["inter_s"].view(torch.uint8),
+            w2_u8=d["w2_sh"].view(torch.uint8),
+            w2_scale_u8=d["w2_ssh"].view(torch.uint8),
+            sorted_expert_ids=d["sei"],
+            cumsum_tensor=d["nvi"],
+            sorted_token_ids=d["sti"],
+            sorted_weights=d["sw"],
+            out=flat,
+            M_logical=token,
+            max_sorted=max_sorted,
+            NE=E,
+            D_HIDDEN=model_dim,
+            D_INTER=inter_dim,
+            topk=topk,
+            BM=128,
+            BN=tile_n,
+            BK=tile_k,
+            a_dtype="fp4",
+            b_dtype="fp4",
+            epilog="scatter",
+            SBM=128,
+            g2_scatter_lds_pairs=ldspa,
+        )
+        flats[ldspa] = flat
+    torch.cuda.synchronize()
+    nv = int(d["nvi"][0])
+    # Compare bits. Sort-padding rows can hold NaN because the scale sort does not
+    # write their A scales.
+    assert torch.equal(
+        flats[False][:nv].view(torch.int16), flats[True][:nv].view(torch.int16)
+    ), "ldspa intermediate differs"
+    if model_dim != 6144:
+        return  # mxfp4_moe_scatter_reduce has instances for model shapes only
+
+    outs = {}
+    w1_carrier = torch.empty((E, 2 * inter_dim, 1), dtype=torch.uint8, device="cuda")
+    base = f"flydsl_moe2_layout_afp4_wfp4_bf16_t128x{tile_n}x{tile_k}_scatter_sbm128"
+    for name in (base, base + "_ldspa"):
+        out = torch.empty((token, model_dim), dtype=torch.bfloat16, device="cuda")
+        _mxfp4_a4w4_stage2_fw(
+            d["inter_q"],
+            w1_carrier,
+            d["w2_sh"],
+            d["sti"],
+            d["sei"],
+            d["nvi"],
+            out,
+            topk,
+            w2_scale=d["w2_ssh"],
+            a2_scale=d["inter_s"],
+            block_m=128,
+            sorted_weights=d["sw"],
+            topk_weights=d["topk_weights"],
+            kernelName2=name,
+            reverse_sorted=d["rev"],
+        )
+        outs[name] = out
+    torch.cuda.synchronize()
+    assert torch.equal(outs[base], outs[base + "_ldspa"])
+    _check_close(d["ref"], outs[base + "_ldspa"].float(), f"scatter_ldspa_t{token}")
+
+
+def test_ldspa_kernel_names_match_the_generator():
+    """_ldspa names parse only where get_flydsl_stage2_v2_kernels makes them."""
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_stage2_v2_kernels
+    from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
+
+    made = []
+    for a_dtype, b_dtype in (("fp4", "fp4"), ("fp8", "fp4"), ("fp8", "fp8")):
+        for out_dtype in ("bf16", "fp4"):
+            for block_m in (16, 32, 64, 128):
+                made += get_flydsl_stage2_v2_kernels(
+                    a_dtype, b_dtype, out_dtype, block_m, 6144, 768
+                )
+    ldspa = [name for name in made if name.endswith("_ldspa")]
+    assert ldspa
+    for name in ldspa:
+        parsed = parse_flydsl_v2_gemm2_kernel(name)
+        assert parsed["scatter_lds_pairs"] and parsed["a_dtype"] == "fp4", name
+        assert (
+            parse_flydsl_v2_gemm2_kernel(name[: -len("_ldspa")])["scatter_lds_pairs"]
+            is False
+        )
+    for name in (
+        "flydsl_moe2_layout_afp8_wfp4_bf16_t128x256x256_scatter_sbm128_ldspa",
+        "flydsl_moe2_layout_afp4_wfp4_fp4_t128x256x256_scatter_sbm128_ldspa",
+        "flydsl_moe2_layout_afp4_wfp4_bf16_t128x256x256_atomic_sbm128_ldspa",
+    ):
+        with pytest.raises(ValueError, match="_ldspa needs"):
+            parse_flydsl_v2_gemm2_kernel(name)
+
+
 @_SKIP_GFX950_FLYDSL
 def test_flydsl_stage2_fp8_ep_reduction():
     from aiter.ops.flydsl.kernels.mxfp4_gemm_common import fp8out_row_bytes

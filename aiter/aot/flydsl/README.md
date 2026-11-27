@@ -11,8 +11,10 @@ compiles them up front so the runtime JIT path hits the cache.
 | `gemm.py` | Every FlyDSL kernel the tuned GEMM tables reach, by replaying each table's public GEMM entry (see below) |
 | `conv.py` | conv3d implicit-GEMM kernels and the NCDHW->NDHWC pre-transpose, by replaying `flydsl_conv_implicit` |
 | `chunk_gdn_h.py` | chunk-gdn-h opt (K5) kernels, by replaying `chunk_gated_delta_rule_fwd_h_flydsl_opt` |
+| `gdn_fused_prefill.py` | gfx950 single-kernel GDN prefill, by replaying `gdn_fused_prefill_fwd` per head shape in `DEFAULT_SHAPES` |
 | `mega_moe.py` | MegaMoE A8W4 and A4W4 bundles of every deployment profile, by preloading `MegaMoEV2` itself (see below) |
 | `fmha_fp8.py` | gfx950 FP8 flash-attention forward, by replaying `flydsl_flash_attn_fp8_func` per head shape in `DEFAULT_SHAPES` |
+| `pa_decode_plan.py` | PA decode planner, every batch bucket, block size and window mode up to each arch's LDS limit, by replaying `plan_pa_decode` (see below) |
 | `mxfp4_moe.py` | Not part of the AOT build; the MXFP4 tuner's `--fast-scan` precompiles its candidates with it |
 | `common.py` | Job collection, the deadlock-free fork pool, `run_aot` (what `setup.py` runs), and cache-hit checking logic |
 | `replay.py` | The shared driver of the replaying modules other than MoE/MegaMoE: per-arch processes, worker batches, size scans and bisection, `--check` |
@@ -94,17 +96,34 @@ variant of the profile's bundle plan.
   process group or mori install is needed.
 - The device reports itself as an MI355X, because the combine launch geometry
   is tuned per GPU model.
-- `quantize()` is replayed too: `preload_aot_bundles()` leaves it out, but
-  fixed-slot `forward` and the per-stage benchmarks call it.
+- The input quant kernel is replayed too (through `quantize()`):
+  `preload_aot_bundles()` leaves it out, but fixed-slot `forward`, `quantize()`
+  and the per-stage benchmarks launch it.
+- The instance builds every route of its plan. Where the layout supports the
+  fused routes (`FUSED_LAYOUTS`: DeepSeek-V4-Pro EP8 and DeepSeek-V4.1-Flash
+  EP8 / EP4 / EP2, a8w4), `preload_aot_bundles()` also loads the small-input
+  kernel of every token bucket of each reachable small-input capacity (256 and
+  512), and, for an MTPR in `large_m_mtprs_for()` of the layout (1024..16384
+  for V4-Pro EP8, 8192 and 16384 for every V4.1-Flash layout), the
+  large-input persistent kernel. The default build covers the V4.1-Flash EP4,
+  EP2 and EP8 profiles at the MTPRs of ATOM's instances (`V41_FLASH_MTPRS`:
+  128, 8192, 16384; the large-input kernel at 8192 and 16384); one MTPR of the
+  EP4 profile alone:
+  `python -m aiter.aot.flydsl.mega_moe --world-size 4 --model-dim 5120
+  --inter-dim 2304 --experts-per-rank 96 --mtpr 8192 --quant a8w4`.
+- `--check` compiles nothing: with `FLYDSL_RUNTIME_RUN_ONLY=1`, any kernel the
+  replay reaches but the cache lacks fails the job, which tests that the runtime's
+  cache keys hit the artifacts the build produced.
 - Like the MoE replay, it runs in a process of its own, started with
   `GPU_ARCHS=gfx950` and `AITER_AOT_REPLAY=1`; both
   `python -m aiter.aot.flydsl.mega_moe` and `setup.py` start it that way. It
   is skipped when `GPU_ARCHS` names targets without gfx950.
 
-### How `gemm.py`, `conv.py`, `chunk_gdn_h.py` and `fmha_fp8.py` work
+### How `gemm.py`, `conv.py`, `chunk_gdn_h.py`, `gdn_fused_prefill.py` and `fmha_fp8.py` work
 
 They follow `moe.py`: none restates launch logic. Each turns a tuned row (or,
-for `fmha_fp8.py`, a configured head shape) into what a caller passes the op's
+for `gdn_fused_prefill.py` and `fmha_fp8.py`, a configured head shape) into
+what a caller passes the op's
 public entry, as FakeTensors, and `replay.py` calls that entry inside
 `dry_run`. The runtime looks the row up, picks and parameterizes its kernels
 and launches them; every FlyDSL launch is compiled into the cache instead.
@@ -115,15 +134,26 @@ and launches them; every FlyDSL launch is compiled into the cache instead.
   fp16 output, which their rows leave open),
   `gemm_a8w8_blockscale_abpreshuffle`, `gemm_a8w8_mxfp8_bpreshuffle`,
   `gemm_a8w8_blockscale_bpreshuffle` with e8m0 scales,
-  `batched_gemm_a8w8_mxscale_bpreshuffle`, `gemm_a16w16` and `gemm_a4w4`.
+  `batched_gemm_a8w8_mxscale_bpreshuffle` (and its `_fused_quant` entry,
+  another kernel of the same row, at every row: it runs FlyDSL at an OPUS
+  row too), `gemm_a16w16` and `gemm_a4w4`.
   A row tuned at M also serves the M down to the previous tuned M
-  of its shape. On gfx1250 (`SCAN_ARCHS`) every one of those M is identified
-  first: replayed with each FlyDSL launch stopped at its cache key, so nothing
-  compiles. Then one M per set of kernels the row's own replay did not build
-  is replayed for real, reported as `[SCAN]`. Bisecting between the two ends
-  would miss kernels there, since the gfx1250 GEMMs fit cluster_m to the
-  number of M tiles and specialize a ragged last tile: M=5120 and M=6144 can
-  request one kernel and M=5632 another. Rows of other archs are replayed at
+  of its shape. On gfx1250 (`SCAN_ARCHS`) those M are identified first:
+  replayed with each FlyDSL launch stopped at its cache key, so nothing
+  compiles. Not every M is identified, only those `scan_sizes` names, where
+  the runtime's choice can change: on each piece of the range where the
+  padded-M lookup finds the same row, the first `lcm(1..cluster_m)` M-tile
+  counts of the kernel of each row it finds and the last (each ragged, at the
+  other parity, and full); where it finds none (a sparse table), every size
+  class the untuned-shape heuristics tell apart; and every power of two
+  (about 15K M instead of 2.27M for the default tables, and the same kernels
+  as identifying every M). Then one M per set of kernels the
+  row's own replay did not build is replayed for real, reported as `[SCAN]`. Bisecting between the two ends
+  would miss kernels there, since the gfx1250 GEMMs' kernels follow M's tile
+  counts (the heuristics' picks; a compute kernel is one binary for every
+  cluster_m, except that a launch fitting to one workgroup runs the plain
+  kernel), so two sizes that request one kernel can bound a size that requests
+  another. Rows of other archs are replayed at
   both ends and bisected between them where they request different kernels
   (`[BISECT]`). Either way this reaches the FlyDSL heuristic kernels the
   runtime falls back to below a shape's smallest tuned M; the scan also
@@ -134,6 +164,9 @@ and launches them; every FlyDSL launch is compiled into the cache instead.
 - `chunk_gdn_h.py` replays each row at its batch shape, with `g` head- and
   token-major and a dense and indexed initial state, and each of those layouts
   over batch sizes the table never measured, where the BV rule decides.
+- `gdn_fused_prefill.py` replays each head shape with and without
+  `track_state` and `has_initial_state` (compile-time flags), over batch
+  sizes from 1 sequence up, bisected where the wrapper's BV rule switches.
 - `fmha_fp8.py` replays a grid of batch sizes and sequence lengths per head
   shape, bisecting between grid points where the wrapper switches kernels.
   Between grid points of the batch and query length the wrapper can still
@@ -141,6 +174,10 @@ and launches them; every FlyDSL launch is compiled into the cache instead.
   query length 5675 and key/value length 66157 splits 11 ways), so each
   launcher it can pick at all is replayed too, with its tile and split count
   pinned through the wrapper's own overrides.
+- `pa_decode_plan.py` replays `plan_pa_decode` at the largest batch of
+  each bucket, at each task capacity where the block size can change and
+  with and without a window. Capacity stops at the batch times the CU
+  count, so each arch replays with the most CUs any of its devices has.
 - Ops with a Python body behind `torch_compile_guard` run that body under
   `dry_run(python_ops=True)`, so a replay can enter at a public op; C++ ops
   still dispatch to their fakes.
@@ -200,6 +237,10 @@ python -m aiter.aot.flydsl.conv
 # chunk-gdn-h
 python -m aiter.aot.flydsl.chunk_gdn_h
 
+# single-kernel GDN prefill (DEFAULT_SHAPES, or ad hoc H:Hg)
+python -m aiter.aot.flydsl.gdn_fused_prefill
+python -m aiter.aot.flydsl.gdn_fused_prefill --shape 48:16
+
 # MegaMoE profile bundles (all token buckets and all eight ranks)
 python -m aiter.aot.flydsl.mega_moe
 
@@ -222,6 +263,20 @@ python -m aiter.aot.flydsl.fmha_fp8
 python -m aiter.aot.flydsl.fmha_fp8 --shape 12:12:192:128
 ```
 
+The PA decode planner compiles one kernel per batch bucket (1, 2, 4, ...,
+clipped to the arch's LDS), block size (64 to 1024 threads, from the plan's
+task capacity) and dense/windowed mode; batch, capacity, partition cap and
+window are passed at launch, and `max_batch_size` only bounds the batch.
+`run_aot` replays the whole set up to each arch's LDS limit (16256 on gfx942,
+40832 on gfx950, 81792 on gfx1250), so it serves every `max_batch_size`.
+
+```bash
+# every planner kernel up to each arch's LDS limit, as the wheel build does
+python -m aiter.aot.flydsl.pa_decode_plan
+# one arch
+GPU_ARCHS=gfx950 python -m aiter.aot.flydsl.pa_decode_plan
+```
+
 The gfx1250 MoE build imports aiter, so it needs aiter's C++ core module. An
 installed wheel ships it. Built for gfx1250, the module needs a HIP that
 declares the cluster launch API, which ROCm 7.2.4's does not; there, build it
@@ -233,9 +288,11 @@ GPU_ARCHS=gfx1250 python -m aiter.aot.flydsl.moe
 ```
 
 MegaMoE defaults to every profile the service ships: DeepSeek-V4-Pro r0/r32/r64
-(`experts_per_rank=48/52/56`) and Kimi-K3 (`experts_per_rank=112`). The expert
-count is part of the compiled ABI, so one profile cannot safely reuse another
-profile's bundle.
+(`experts_per_rank=48/52/56`), Kimi-K3 (`experts_per_rank=112`) and
+DeepSeek-V4.1-Flash EP4 / EP2 / EP8 (`world_size=4/2/8`,
+`experts_per_rank=96/192/48`, a8w4, MTPR 128/8192/16384 unless `--mtpr` is
+given). The expert count is part of the
+compiled ABI, so one profile cannot safely reuse another profile's bundle.
 
 ### Common arguments
 
@@ -373,11 +430,14 @@ python op_tests/test_moe_2stage.py
   is refreshed to the right version.
 - **`ReplayHookBroken`, or an `AttributeError` on `JitFunction`, after a FlyDSL
   upgrade**: the replay learns each launch's cache key by hooking two private
-  methods of FlyDSL's `JitFunction`, `_compile_or_execute` and
-  `_build_full_cache_key` (`replay.requested_kernels`). A release that renames
+  names of FlyDSL's `jit_function` module, `JitFunction._compile_or_execute`
+  and `_artifact_cache_key` (`replay.requested_kernels`). A release that renames
   either fails every replay with an `AttributeError`; one whose launches stop
-  deriving their key in `_build_full_cache_key` fails them with
-  `ReplayHookBroken`. Update `requested_kernels` for that release.
+  deriving their key in `_artifact_cache_key` fails them with
+  `ReplayHookBroken`. A scan (`SCAN_ARCHS`) also hooks `JitFunction._trace` and
+  its `convert_to_jit_arguments` / `get_ir_types`, to trace each distinct
+  launch once (`replay._trace_identity`). Update `requested_kernels` for that
+  release.
 - **Worker OOM / killed (exitcode -9)**: abnormal exits are auto-retried
   (`AITER_FLYDSL_AOT_MAX_RETRIES`) and the default worker count is already
   bounded by the shared CPU and memory policy. If it still happens,

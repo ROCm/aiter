@@ -6,10 +6,12 @@
   per-M heuristic picks;
 * the mxscale bpreshuffle lookup's N/K pre-check answers like the padded-M walk
   and reports an untuned weight shape once;
-* the nested custom op called through its undecorated body (gemm_a8w8_blockscale
-  -> gemm_a8w8_blockscale_bpreshuffle) returns what the registered torch.ops
-  dispatch returns (torch_compile_guard's _eager_body), and a rebound module
-  attribute still wins.
+* the nested call (gemm_a8w8_blockscale -> gemm_a8w8_blockscale_bpreshuffle)
+  reaches the native body rather than the public spelling, which now routes
+  when no output buffer is named, and a rebound module attribute still wins.
+  The public spelling stays registered under its own name, so
+  `torch.ops.aiter.gemm_a8w8_blockscale_bpreshuffle` and `_eager_body` are
+  still there for callers that use them.
 
 The first two and the routing contract run on CPU; the numerical checks run
 on any GPU whose arch has the kernel and skip elsewhere.
@@ -133,6 +135,68 @@ def test_mxscale_config_precheck_matches_padded_walk(mxscale_table):
         assert gemm_op_a8w8.get_mxscale_bpreshuffle_config(m, n, k, block) == want
 
 
+@pytest.mark.parametrize("tile_m", [128, 256])
+@pytest.mark.parametrize("offset", [-1, 0, 1])
+def test_mxscale_compute_row_requires_full_m_tile(mxscale_table, tile_m, offset):
+    row = {
+        "libtype": "flydsl",
+        "kernelName": (
+            "flydsl_mxfp8_128_bpreshuffle_compute_wmma_"
+            f"t{tile_m}x128x128_mw2_nw2_nb4_sk1_cm1_cn4"
+        ),
+    }
+    mxscale_table.clear()
+    for tuned_m in (tile_m, 2 * tile_m):
+        mxscale_table[("gfx1250", 256, tuned_m, 7168, 8192, "128x128")] = row
+    m = tile_m + offset
+    # All three cases really hit a row: below the tile must be rejected,
+    # exactly one tile and a legal partial second tile must retain the hit.
+    found, _ = find_padded_m_row(
+        mxscale_table,
+        lambda pm: ("gfx1250", 256, pm, 7168, 8192, "128x128"),
+        m,
+        7168,
+        8192,
+    )
+    assert found is row
+    expected = None if offset < 0 else row
+    assert (
+        gemm_op_a8w8.get_mxscale_bpreshuffle_config(m, 7168, 8192, "128x128")
+        is expected
+    )
+
+
+@pytest.mark.parametrize("libtype", [None, "opus", "triton"])
+def test_mxscale_compute_guard_only_applies_to_flydsl_rows(mxscale_table, libtype):
+    # A lookup-only row need not describe a backend. Even a compute-looking
+    # name must not apply a FlyDSL safety rule to another backend's row.
+    row = {
+        "kernelName": (
+            "flydsl_mxfp8_128_bpreshuffle_compute_wmma_"
+            "t128x128x128_mw2_nw2_nb4_sk1_cm1_cn4"
+        )
+    }
+    if libtype is not None:
+        row["libtype"] = libtype
+    mxscale_table.clear()
+    mxscale_table[("gfx1250", 256, 128, 7168, 8192, "128x128")] = row
+    assert gemm_op_a8w8.get_mxscale_bpreshuffle_config(65, 7168, 8192, "128x128") is row
+
+
+@pytest.mark.parametrize(
+    "kernel_name",
+    [
+        "flydsl_mxfp8_128_bpreshuffle_wmma_t128x128x128_mw2_nw2_nb4_sk1_cm1_cn4",
+        "other_flydsl_kernel",
+    ],
+)
+def test_mxscale_noncompute_rows_keep_padded_lookup(mxscale_table, kernel_name):
+    row = {"libtype": "flydsl", "kernelName": kernel_name}
+    mxscale_table.clear()
+    mxscale_table[("gfx1250", 256, 128, 7168, 8192, "128x128")] = row
+    assert gemm_op_a8w8.get_mxscale_bpreshuffle_config(65, 7168, 8192, "128x128") is row
+
+
 def test_mxscale_untuned_reported_once_per_weight_shape(mxscale_table, monkeypatch):
     warnings = []
     monkeypatch.setattr(
@@ -156,9 +220,16 @@ def test_blockscale_bpreshuffle_nested_body_and_rebind(monkeypatch):
         calls.append((x_scale.dtype, w_scale.dtype))
         return torch.zeros(XQ.shape[0], WQ.shape[0], dtype=dtype)
 
+    # The public spelling stays registered under its own name -- the guard sits
+    # on it, not on the native body, so `torch.ops.aiter.<this name>` and
+    # `_eager_body` both survive the routing split.
     op = gemm_op_a8w8.gemm_a8w8_blockscale_bpreshuffle
     assert op._eager_body.__name__ == "gemm_a8w8_blockscale_bpreshuffle"
-    monkeypatch.setattr(op, "_eager_body", body)
+
+    # The nested group32 call targets the native body rather than the public
+    # spelling: with no buffer named the public one routes, and a provider
+    # serving it here would be a second dispatch of the op we are inside.
+    monkeypatch.setattr(gemm_op_a8w8, "_gemm_a8w8_blockscale_bpreshuffle_native", body)
     x = torch.zeros(4, 64, dtype=dtypes.fp8)
     w = torch.zeros(32, 64, dtype=dtypes.fp8)
     xs = torch.zeros(4, 2, dtype=torch.uint8)
@@ -173,7 +244,9 @@ def test_blockscale_bpreshuffle_nested_body_and_rebind(monkeypatch):
         rebound.append(True)
         return torch.ones(XQ.shape[0], WQ.shape[0], dtype=dtype)
 
-    monkeypatch.setattr(gemm_op_a8w8, "gemm_a8w8_blockscale_bpreshuffle", patched)
+    monkeypatch.setattr(
+        gemm_op_a8w8, "_gemm_a8w8_blockscale_bpreshuffle_native", patched
+    )
     y = gemm_op_a8w8.gemm_a8w8_blockscale(x, w, xs, ws, isBpreshuffled=True)
     assert rebound == [True] and len(calls) == 1
     assert bool((y == 1).all())

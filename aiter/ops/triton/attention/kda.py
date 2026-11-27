@@ -8,6 +8,7 @@ import triton
 
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.plugin import route as _route
 
 _LOGGER = AiterTritonLogger()
 _LOG_INFO = _LOGGER._logger.isEnabledFor(logging.INFO)
@@ -28,6 +29,10 @@ elif _ARCH == "gfx950":
     )
 
 
+# Routed on the public entry: it takes no backend pin, and the gfx950 and
+# gfx1250 Gluon kernels are chosen beneath it. `config` is AITER's tuning dict,
+# a hint a provider may ignore.
+@_route(op="fused_recurrent_kda")
 def fused_recurrent_kda(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -110,6 +115,15 @@ def fused_recurrent_kda(
         state_out or a fresh [N, HV, ., .] tensor), or None when
         neither ``output_final_state`` nor ``inplace_final_state`` is set.
         A fresh state uses initial_state's dtype, or fp32 without initial_state.
+
+    Contract for a provider: ``o`` is written into ``out`` when one is passed
+    (and that tensor is returned), else returned freshly allocated. With
+    ``inplace_final_state`` the state slabs of ``initial_state`` are updated in
+    place -- at ``ssm_state_indices`` when paged -- and with
+    ``cache_state_updates`` only a sequence's first token stores its slab; the
+    rest are the per-token replay records described above. ``conv_state`` is
+    updated in place when the short convolution is fused (``conv_weight``),
+    and ``out_gate`` with ``norm_weight`` fuses the gated RMSNorm into ``o``.
     """
 
     if fused_recurrent_kda_packed_decode_kernel is None:
@@ -193,8 +207,19 @@ def fused_recurrent_kda(
         avg_T = max(1, T // max(1, N))
     else:
         avg_T = T
+    # state_out sets the dtype only when it receives the final state
+    if initial_state is not None:
+        state_ref = initial_state
+    elif output_final_state and not inplace_final_state:
+        state_ref = state_out
+    else:
+        state_ref = None
+    bf16_resident = (
+        state_ref is not None and state_ref.dtype == torch.bfloat16 and T > 1
+    )
+    bucket_T = max(avg_T, 2) if bf16_resident else avg_T
     config = get_kda_config(
-        avg_T, N, HV, K, V, overrides=config, fused=use_conv or use_rms_gate
+        bucket_T, N, HV, K, V, overrides=config, fused=use_conv or use_rms_gate
     )
     BV = config["BV"]
     SK = config["SK"]
@@ -206,8 +231,11 @@ def fused_recurrent_kda(
     tdm_store_bufs = config.get("tdm_store_bufs", 2)
     sched_strategy = config.get("sched_strategy")
     resident_state = config.get(
-        "resident_state", avg_T > 1 or num_accepted_tokens is not None
+        "resident_state", bucket_T > 1 or num_accepted_tokens is not None
     )
+    assert (
+        resident_state or not bf16_resident
+    ), "bf16 state with T > 1 needs resident_state"
     assert V % BV == 0, f"BV={BV} must divide V={V}"
     assert 32 % SK == 0 and K % SK == 0, f"SK={SK} must divide 32 and K={K}"
     assert (BV * SK) % (
@@ -246,7 +274,9 @@ def fused_recurrent_kda(
     )
     state_dtype = initial_state.dtype if initial_state is not None else torch.float32
     if initial_state is not None:
-        assert initial_state.dtype in state_dtypes
+        assert (
+            initial_state.dtype in state_dtypes
+        ), f"state dtype must be one of {state_dtypes} on {_ARCH}"
         assert (
             initial_state.shape[1:] == state_shape
         ), f"state must be [slots, HV, {state_shape[1]}, {state_shape[2]}]"
@@ -268,7 +298,9 @@ def fused_recurrent_kda(
         final_state = None
 
     if final_state is not None:
-        assert final_state.dtype in state_dtypes
+        assert (
+            final_state.dtype in state_dtypes
+        ), f"state dtype must be one of {state_dtypes} on {_ARCH}"
         if initial_state is not None:
             assert final_state.dtype == initial_state.dtype, "state dtypes must match"
         assert (
@@ -302,9 +334,6 @@ def fused_recurrent_kda(
     if state_dst is None and _ARCH == "gfx950":
         n_dst = B * T if is_paged else N
         state_dst = q.new_empty(n_dst, *state_shape, dtype=state_dtype)
-    # BF16 storage must not round the recurrent state between tokens.
-    if state_dst is not None and state_dst.dtype == torch.bfloat16 and T > 1:
-        resident_state = True
     slot_rows_in, rows_in = _rows(initial_state)
     slot_rows_out, rows_out = (
         (slot_rows_in, rows_in) if state_dst is initial_state else _rows(state_dst)
@@ -403,6 +432,10 @@ def fused_recurrent_kda(
     return out, final_state
 
 
+# Routed on its public entry, ahead of fused_recurrent_kda: a provider with a
+# kernel for the packed one-token decode serves it here. When none does, the
+# native body calls fused_recurrent_kda, which a provider is asked about again.
+@_route(op="fused_recurrent_kda_packed_decode")
 def fused_recurrent_kda_packed_decode(
     mixed_qkv: torch.Tensor,
     g: torch.Tensor,
@@ -420,6 +453,35 @@ def fused_recurrent_kda_packed_decode(
     out: torch.Tensor,
     config: dict | None = None,
 ) -> torch.Tensor:
+    """One decode token per sequence of Kimi Delta Attention, with q, k and v
+    packed in one row.
+
+    The computation is :func:`fused_recurrent_kda` with
+    ``use_qk_l2norm_in_kernel``, ``use_gate_in_kernel``,
+    ``use_beta_sigmoid_in_kernel`` and ``pad_slot_guard`` all set, the short
+    convolution fused (``conv_state``, ``conv_weight``) and the gated RMSNorm
+    fused (``out_gate``, ``norm_weight``, ``norm_eps``).
+
+    Args:
+        mixed_qkv: ``[n, 3 * H * K]``, one row per sequence: q, then k, then
+            v, each ``H * K`` wide (``HV == H``, ``V == K``).
+        g: ``[n, H, K]`` raw gate; the gate chain with ``A_log``, ``dt_bias``
+            and ``lower_bound`` runs in the kernel.
+        beta: ``[n, H]`` raw write strength; sigmoid runs in the kernel.
+        A_log, dt_bias, lower_bound: the gate chain's parameters.
+        initial_state: state slabs, indexed by ``ssm_state_indices``.
+        ssm_state_indices: ``[n]`` state slot per sequence; a slot ``<= 0``
+            marks a padded sequence.
+        conv_state, conv_weight: the fused short convolution's state and
+            ``[3, W, H * K]`` weight.
+        out_gate: ``[n, H, V]`` gate of the gated RMSNorm; ``norm_weight`` is
+            ``[V]``.
+        out: ``[n, H, V]`` destination.
+        config: AITER's tuning dict; a provider may ignore it.
+
+    Writes ``out`` in place and returns it; updates ``initial_state``'s slabs
+    and ``conv_state`` in place.
+    """
     n, H, K = g.shape
     s = mixed_qkv.stride(0)
 

@@ -22,12 +22,18 @@
 //   D128 `_rxy`     kernels compile ENABLE_SINK=0 → `sink` slot must still be
 //                   a valid non-null pointer (kernarg layout requires it), but
 //                   the kernel never reads its contents.  Pass a zero buffer.
+//   D256            kernels compile ENABLE_SINK=0 and never read the slot.
+//
+// D256 strides: token stride < 2^24 B (the kernel forms 32-bit offsets of up to
+// 256 rows), head and batch strides in (0, INT32_MAX] B; a dim of size 1 is
+// never stepped, so its stride is not checked.
 #include "aiter_tensor.h"
 #include "aiter_ctypes_error.h"
 #include "aiter_hip_common.h"   // HipDeviceGuard, AiterAsmKernel, ...
 #include "asm_fmha_fwd_bf16_configs.hpp"
 #include <hip/hip_runtime.h>
 #include <cmath>
+#include <cstdint>
 #include <memory>
 
 // Kernel argument block — packed ABI (132 B = 0x84), matches the .args YAML
@@ -43,7 +49,8 @@
 //   q_ts       = stride between Q-tiles (sub_Q * q_seqs)
 //   lse_hs     = stride per Q head for LSE (q_seq_len * 4)
 //   opt        = packed switches: bit0 reverse_kv, bit1 double_q,
-//                bit2 remap_xy.  We swap gdx/gdy at launch, so bit2=1.
+//                bit2 remap_xy (gdx/gdy are swapped at launch when set).
+//                D64 / D128: 0x7.  D256: chosen per call (select_opt_hd256).
 //   sink_addr  = per-Q-head f32 sink logits (pre-scale).  Read only by
 //                D64 `_rxy_sink_*` kernels (ENABLE_SINK=1).  For D128
 //                the slot must still be valid (kernarg layout) but is
@@ -84,6 +91,35 @@ static_assert(sizeof(KernelArgs) == 0x84,
               "fmha_fwd_with_sink_asm: KernelArgs must be 132B packed (matches v8 .args)");
 
 // ---- helpers ---------------------------------------------------------------
+
+// D256 launch options (s_opt), from host-side sizes only (cu_seqlens is not read).
+// bit0 reverse_kv: with double_q, the second Q tile walks K/V backwards.  bit1 double_q: a
+// workgroup runs Q tiles g and tiles-1-g.  bit2 remap_xy: x indexes heads, so the workgroups
+// launched together read the K/V of every kv head.
+//   remap_xy while that K/V is small: kv heads x mean kv length <= 2^17 rows.
+//   causal: double_q + reverse_kv; non-causal: double_q only with remap_xy.
+// The same rule is in asm_fmha_fwd_with_sink_varlen.cu.
+static int select_opt_hd256(long batch, long total_k, int kv_head_num, bool is_causal)
+{
+    const bool remap = (long)kv_head_num * (total_k / (batch > 0 ? batch : 1)) <= (1L << 17);
+    if (is_causal)
+        return 0x3 | (remap ? 0x4 : 0);
+    return remap ? 0x6 : 0;
+}
+
+static void check_strided_bshd_d256(const aiter_tensor_t* t, const char* name)
+{
+    const int64_t esz = (int64_t)t->element_size();
+    const int64_t limit[3] = {INT32_MAX, (int64_t(1) << 24) - 1, INT32_MAX};  // b, s, h
+    for (int d = 0; d < 3; ++d)
+    {
+        const int64_t s = t->stride(d) * esz;
+        AITER_CHECK(t->size(d) <= 1 || (s > 0 && s <= limit[d]),
+                    "fmha_fwd_with_sink_asm: ", name, " strides out of range (dim ", d,
+                    " stride ", s, " B; D256 needs batch / head strides in (0, INT32_MAX] "
+                    "and the token stride in (0, 2^24))");
+    }
+}
 
 // Kernel selection: (dtype, hdim_q, hdim_v, mask).  mask = is_causal: the csv
 // registers both mask=0 (non-causal, _rxy_pfnr source) and mask=1 (causal,
@@ -212,8 +248,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     AITER_CHECK((int)v->size(1) == kv_seq_len,   "fmha_fwd_with_sink_asm: v seq_len mismatch with k");
     AITER_CHECK((int)v->size(2) == kv_head_num,  "fmha_fwd_with_sink_asm: v head_num mismatch with k");
     AITER_CHECK(q_head_num % kv_head_num == 0,   "fmha_fwd_with_sink_asm: q_head_num must be a multiple of kv_head_num");
-    AITER_CHECK(qk_head_dim == 64 || qk_head_dim == 128,
-                "fmha_fwd_with_sink_asm: only head_dim 64 or 128 supported, got ", qk_head_dim);
+    AITER_CHECK(qk_head_dim == 64 || qk_head_dim == 128 || qk_head_dim == 256,
+                "fmha_fwd_with_sink_asm: only head_dim 64, 128 or 256 supported, got ", qk_head_dim);
     AITER_CHECK(v_head_dim == qk_head_dim,
                 "fmha_fwd_with_sink_asm: v_head_dim must equal qk_head_dim");
 
@@ -238,6 +274,16 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
 
     const int gqa       = q_head_num / kv_head_num;
     const int mask_flag = is_causal ? 1 : 0;
+    const bool hd256    = (qk_head_dim == 256);
+    AITER_CHECK(!(hd256 && sink),
+                "fmha_fwd_with_sink_asm: the D256 kernels take no sink (built with ENABLE_SINK=0)");
+    if (hd256)
+    {
+        check_strided_bshd_d256(q, "q");
+        check_strided_bshd_d256(k, "k");
+        check_strided_bshd_d256(v, "v");
+        check_strided_bshd_d256(out, "out");
+    }
 
     // ---- stride extraction (in bytes), bshd dim layout --------------------
     // bshd: dim0=b, dim1=s, dim2=h, dim3=d
@@ -288,11 +334,14 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     // s_opt SGPR: packs three host-side switches.  Bit layout:
     //   bit0: reverse_kv   (compile-time gated by CAS_MASK build; ignored by mask=0 kernels)
     //   bit1: double_q     (compile-time gated by DOUBLE_Q   build; ignored by non-_dq kernels)
-    //   bit2: remap_xy     (must be 1 — we swap gdx/gdy at launch below)
-    // 7 = 0b111 enables all three.  Safe for the four shipped _rxy_brd /
-    // _rxy_cas_brd [_sink] .co binaries because bits 0/1 are compile-time
-    // gated off in those builds; bit2 matches the gdx/gdy swap on launch.
-    args.opt        = 7;
+    //   bit2: remap_xy     (gdx/gdy are swapped at launch below when set)
+    // D64 / D128: 7 = 0b111 enables all three.  Safe for the four shipped
+    // _rxy_brd / _rxy_cas_brd [_sink] .co binaries because bits 0/1 are
+    // compile-time gated off in those builds.
+    // D256: chosen per call (select_opt_hd256); the launch below follows it.
+    args.opt        = hd256 ? select_opt_hd256(batch, (long)batch * kv_seq_len, kv_head_num,
+                                               is_causal != 0)
+                            : 0x7;
     args.lse        = return_lse ? 1 : 0;
     args.kv_seq_len = kv_seq_len;
     args.q_head_num = q_head_num;
@@ -327,6 +376,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         name, [&]() { return AiterAsmKernel(name, co_name); });
 
     // ---- launch ------------------------------------------------------------
+    // No queries: nothing to compute, and a grid dimension of 0 cannot be launched.
+    if (batch == 0 || q_seq_len == 0)
+        return;
     // gdx = ceil(q_seq_len / sub_Q) is the total number of Q-tiles to compute.
     // When s_opt bit1 (double_q) is set, each WG processes 2 Q-tiles internally,
     // so launch_gdx must be halved:
@@ -343,12 +395,13 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const int  gdy         = q_head_num;
     const int  gdz         = batch;
 
-    // All _rxy kernels use remap_xy=1: swap gdx↔gdy at launch so that
-    // bid.x indexes heads and bid.y indexes Q-tiles.
+    // remap_xy (s_opt bit2, always set for D64 / D128): swap gdx<->gdy at launch so
+    // that bid.x indexes heads and bid.y indexes Q-tiles.
+    const bool remap = (args.opt & 0x4) != 0;
     impl_ptr->launch_kernel({&args,
                              &arg_size,
-                             gdy,   // launch_gdx = head count  (swapped)
-                             gdx,   // launch_gdy = Q-tile count (swapped)
+                             remap ? gdy : gdx,
+                             remap ? gdx : gdy,
                              gdz,
                              bdx,
                              1,
