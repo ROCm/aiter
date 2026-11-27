@@ -617,6 +617,75 @@ def test_grouped_topk_zero_renorm(path):
 
 
 @benchmark()
+def test_grouped_topk_group_shapes(
+    token, expert, group, topk_group, topk, mode, finite_groups=None
+):
+    torch.manual_seed(7 + expert * 13 + group * 5 + topk)
+    gating = torch.randn((token, expert), dtype=dtypes.fp32)
+    bias = torch.zeros(expert, dtype=dtypes.fp32)
+    if mode == "biased":
+        bias = torch.randn(expert, dtype=dtypes.fp32) * 0.05
+    if finite_groups is not None:
+        # Only the first groups are selectable, so the group picks run out of
+        # finite scores before topk_group.
+        bias[finite_groups * (expert // group) :] = -torch.inf
+    w = torch.empty((token, topk), dtype=dtypes.fp32)
+    ids = torch.empty((token, topk), dtype=dtypes.i32)
+    if mode == "biased":
+        w_ref, id_ref, scores = aiter.biased_grouped_topk_torch(
+            gating, bias, topk, True, group, topk_group, True
+        )
+        _, us = run_perftest(
+            aiter.biased_grouped_topk_hip,
+            gating,
+            bias,
+            w,
+            ids,
+            group,
+            topk_group,
+            True,
+            1.0,
+            num_iters=2,
+            num_warmup=1,
+        )
+    else:
+        w_ref, id_ref = aiter.grouped_topk_torch(
+            gating, topk, True, group, topk_group, mode
+        )
+        scores = gating.softmax(-1) if mode == "softmax" else gating.sigmoid()
+        _, us = run_perftest(
+            aiter.grouped_topk,
+            gating,
+            w,
+            ids,
+            group,
+            topk_group,
+            True,
+            mode == "softmax",
+            1.0,
+            num_iters=2,
+            num_warmup=1,
+        )
+    err = check_topk_softmax_allclose(
+        w_ref,
+        id_ref,
+        w,
+        ids,
+        scores,
+        bias,
+        target_dim_len=expert,
+        tol_err_ratio=0,
+        msg=f"{mode} E={expert} G={group}: ",
+    )
+    if err or not torch.isfinite(w).all().item():
+        raise AssertionError(
+            f"{mode} E={expert} G={group} topk_group={topk_group} topk={topk}: "
+            f"err={err}, non-finite weights={int((~torch.isfinite(w)).sum().item())}"
+        )
+    return {"err": err, "us": us}
+
+
+@benchmark()
 def test_grouped_topk(
     token,
     expert,
@@ -1063,6 +1132,33 @@ aiter.logger.info(
 df = pd.DataFrame([test_grouped_topk_zero_renorm(path) for path in ("lds", "opt_sort")])
 aiter.logger.info(
     "moeTopkSoftmax_zero_renorm summary (markdown):\n%s",
+    df.to_markdown(index=False),
+)
+
+# Group scores and the group mask must cover every expert of a group: groups
+# whose size is not a multiple of 4 (vLLM's reduced DeepSeek-V3 router has 2
+# experts a group), and groups spread over 16 or 32 lanes.
+group_shape_cases = [
+    # expert, group, topk_group, topk
+    (16, 8, 4, 2),
+    (8, 4, 2, 2),
+    (48, 8, 4, 4),
+    (72, 8, 4, 4),
+    (64, 4, 2, 4),
+    (128, 4, 2, 8),
+    (64, 2, 1, 4),
+    (32, 8, 4, 8),
+    (256, 8, 4, 8),
+]
+df = [
+    test_grouped_topk_group_shapes(128, *case, mode)
+    for case in group_shape_cases
+    for mode in ("biased", "sigmoid", "softmax")
+]
+df.append(test_grouped_topk_group_shapes(128, 64, 8, 4, 4, "biased", finite_groups=3))
+df = pd.DataFrame(df)
+aiter.logger.info(
+    "moeTopkSoftmax_group_shapes summary (markdown):\n%s",
     df.to_markdown(index=False),
 )
 
