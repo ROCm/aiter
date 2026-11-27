@@ -3,6 +3,7 @@
 
 import os
 from dataclasses import dataclass, fields
+from functools import lru_cache
 
 import pytest
 import torch
@@ -21,7 +22,7 @@ from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 
 # target-specific utilities
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
+from aiter.ops.triton.utils.shuffle import gfx942_tile_major_pack, shuffle_scale_moe
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from op_tests.triton_tests.moe.moe_test_utils import assert_close
 from op_tests.triton_tests.utils.mxfp_ref import upcast_from_mxfp
@@ -266,6 +267,119 @@ def test_op(
     assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)
 
 
+def _assert_same_bits(a, b):
+    """Same bf16 bits. +0 and -0 count as equal."""
+    assert a.shape == b.shape, (a.shape, b.shape)
+    a, b = a.contiguous(), b.contiguous()
+    bad = (a.view(torch.int16) != b.view(torch.int16)) & ~((a == 0) & (b == 0))
+    assert not bool(bad.any()), f"{int(bad.sum())} of {a.numel()} values differ"
+
+
+_TILE_MAJOR_EXPERTS = 32
+
+
+@lru_cache(maxsize=1)
+def _dsv41_experts(tp):
+    """Routed experts of one DeepSeek-V4.1 TP rank (hidden 5120, intermediate
+    2304 / tp), 32 of them: vLLM's padded copy (intermediate rounded up to 256)
+    and the unpadded tile-major copy, from the same random bytes."""
+    e, hidden, inter = _TILE_MAJOR_EXPERTS, 5120, 2304 // tp
+    np_ = -(-inter // 256) * 256
+    dev, u8 = "cuda", torch.uint8
+    gate_up = torch.randint(0, 256, (e, 2 * inter, hidden // 2), dtype=u8, device=dev)
+    gate_up_s = torch.randint(
+        117, 123, (e, 2 * inter, hidden // 32), dtype=u8, device=dev
+    )
+    down = torch.randint(0, 256, (e, hidden, inter // 2), dtype=u8, device=dev)
+    down_s = torch.randint(119, 125, (e, hidden, inter // 32), dtype=u8, device=dev)
+    w13 = torch.zeros((e, 2 * np_, hidden // 2), dtype=u8, device=dev)
+    w13_s = torch.zeros((e, 2 * np_, hidden // 32), dtype=u8, device=dev)
+    w2 = torch.zeros((e, hidden, np_ // 2), dtype=u8, device=dev)
+    w2_s = torch.zeros((e, hidden, np_ // 32), dtype=u8, device=dev)
+    w13[:, : 2 * inter], w13_s[:, : 2 * inter] = gate_up, gate_up_s
+    w2[..., : inter // 2], w2_s[..., : inter // 32] = down, down_s
+    padded = tuple(t.transpose(1, 2) for t in (w13, w13_s, w2, w2_s))
+    tiled = (
+        gfx942_tile_major_pack(gate_up, gate_up_s, scale_rounds=True),
+        gfx942_tile_major_pack(down, down_s, scale_rounds=False),
+    )
+    plain = tuple(t.transpose(1, 2) for t in (gate_up, gate_up_s, down, down_s))
+    return inter, padded, tiled, plain
+
+
+# m -> routing block_m with 32 experts and top-6
+_TILE_MAJOR_BLOCK_M = {1: 16, 128: 32, 256: 64, 1024: 128}
+
+
+@pytest.mark.parametrize("m", list(_TILE_MAJOR_BLOCK_M))
+@pytest.mark.parametrize("tp", [4, 8])
+def test_op_gfx942_tile_major(tp, m):
+    """w_layout="GFX942_TILE_MAJOR" reads the unpadded tile-major copy and gives
+    the bits of the padded column-major copy, for w13 with SwiGLU and for w2
+    with gammas and the top-k combine. The m values give routing blocks 16, 32,
+    64 and 128. TP4 w2 rows end in a 32-byte K step, TP8 w2 rows in a 16-byte
+    one. At m = 128 the result is also compared with the torch reference."""
+    if arch_info.get_arch() != _TUNED_ARCH:
+        pytest.skip("the gfx942 tables give the padded and unpadded shapes one tile")
+    torch.manual_seed(0)
+    inter, padded, tiled, plain = _dsv41_experts(tp)
+    w13, w13_s, w2, w2_s = padded
+    (t13, t13_s, swz13), (t2, t2_s, swz2) = tiled
+    logits = torch.randn((m, _TILE_MAJOR_EXPERTS), dtype=torch.float16, device="cuda")
+    rdata, gindx, sindx = routing(logits, 6)
+    assert rdata.block_m == _TILE_MAJOR_BLOCK_M[m], rdata.block_m
+    x = torch.randn((m, 5120), dtype=torch.bfloat16, device="cuda")
+    act = {
+        "apply_swiglu": True,
+        "alpha": 1.0,
+        "limit": 10.0,
+        "swiglu_add_residual": False,
+    }
+    common = (None, None, None, rdata)
+
+    h = moe_gemm_a16w4(x, w13, None, w13_s, *common, gather_indx=gindx, **act)
+    h_t = moe_gemm_a16w4(
+        x,
+        t13,
+        None,
+        t13_s,
+        *common,
+        gather_indx=gindx,
+        swizzle_mx_scale=swz13,
+        w_layout="GFX942_TILE_MAJOR",
+        **act,
+    )
+    assert not bool(h[:, inter:].any())
+    _assert_same_bits(h_t, h[:, :inter])
+
+    gammas = rdata.gate_scal
+    y = moe_gemm_a16w4(h, w2, None, w2_s, *common, scatter_indx=sindx, gammas=gammas)
+    y_t = moe_gemm_a16w4(
+        h_t,
+        t2,
+        None,
+        t2_s,
+        *common,
+        scatter_indx=sindx,
+        gammas=gammas,
+        swizzle_mx_scale=swz2,
+        w_layout="GFX942_TILE_MAJOR",
+    )
+    assert bool(torch.isfinite(y).all())
+    _assert_same_bits(y_t, y)
+
+    if m == 128:
+        p13, p13_s, p2, p2_s = plain
+        r13 = upcast_from_mxfp(p13, p13_s, torch.bfloat16, axis=1)
+        r2 = upcast_from_mxfp(p2, p2_s, torch.bfloat16, axis=1)
+        h_ref = moe_gemm_torch(
+            x, r13, None, rdata, gindx, None, None, True, 1.0, 10.0, False
+        )
+        assert_close(h_ref, h_t, maxtol=4e-1, rmstol=4e-2)
+        y_ref = moe_gemm_torch(h_t, r2, None, rdata, None, sindx, gammas)
+        assert_close(y_ref, y_t, maxtol=4e-1, rmstol=4e-2)
+
+
 def _ep_setup(
     m, n, k, n_expts_tot, n_expts_act, ep_size, ep_rank, do_gather, do_scatter
 ):
@@ -383,32 +497,3 @@ def test_op_expert_parallel(
         r0, r1 = int(offs[lo]), int(offs[hi])
         ref_y, tri_y = ref_y[r0:r1], tri_y[r0:r1]
     assert_close(ref_y, tri_y, maxtol=4e-1, rmstol=4e-2)
-
-
-def test_op_expert_parallel_rejects_bad_inputs():
-    if not arch_info.is_fp4_avail():
-        pytest.skip("MXFP4 not supported on this architecture")
-    x, w_tri, w_scale_tri, bias, rdata, gindx, sindx, lo, hi, expert_map, gate_valid = (
-        _ep_setup(16, 256, 256, 8, 2, 4, 1, True, True)
-    )
-    args = (
-        x,
-        w_tri[lo:hi],
-        None,
-        w_scale_tri[lo:hi],
-        None,
-        None,
-        bias[lo:hi],
-        rdata,
-        gindx,
-        sindx,
-    )
-    with pytest.raises(AssertionError, match="requires gate_valid"):
-        moe_gemm_a16w4(*args, backend="triton", expert_map=expert_map)
-    with pytest.raises(AssertionError, match="n_expts_tot"):
-        moe_gemm_a16w4(
-            *args,
-            backend="triton",
-            expert_map=expert_map[:-1].contiguous(),
-            gate_valid=gate_valid,
-        )

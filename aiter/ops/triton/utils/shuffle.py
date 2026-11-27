@@ -335,3 +335,50 @@ def shuffle_scale_batched(
         *data_shape[:-2], N // PRESHUFFLE_FACTOR, SCALE_K * PRESHUFFLE_FACTOR
     )
     return data
+
+
+def gfx942_tile_major_pack(
+    w: torch.Tensor, w_scales: torch.Tensor, scale_rounds: bool = True
+):
+    """Re-lay MXFP4 expert weights for moe_gemm_a16w4(..., w_layout="GFX942_TILE_MAJOR").
+    This is the order of the gfx942 mono decode copy in vLLM
+    (`weights942.fp4_tile_major` and `codes_tile_rounds`). Do it once at weight load.
+
+    w:            (E, N, K/2) uint8, contiguous, 2 e2m1 values a byte along K.
+                  N % 16 == 0. (K/2) % 64 is 0, 16 or 32.
+    w_scales:     (E, N, K/32) uint8 e8m0 codes, contiguous.
+    scale_rounds: put the codes in rounds of 8 K blocks. Needs (K/32) % 8 == 0.
+                  If False, the codes stay row-major.
+    Returns (w, w_scales, swizzle_mx_scale): the (E, K/2, N) and (E, K/32, N)
+    transposed views of the new tensors, and the swizzle_mx_scale value for them.
+
+    Weight bytes: for each tile of 16 rows and each 64-byte K step, lane group j
+    of row r starts at byte 256 j + 16 r of the step, and step byte 16 i + 4 j + d
+    is at 4 i + d in the lane group. A last step of 16 or 32 bytes has the same
+    order with 4 or 8 bytes in each lane group. Scale rounds: for each tile of 16
+    rows, the 8 codes of a round are stored row after row.
+    """
+    assert w.dtype == torch.uint8 and w_scales.dtype == torch.uint8
+    assert w.ndim == 3 and w.is_contiguous() and w_scales.is_contiguous()
+    e, n, kb = w.shape
+    full = kb // 64 * 64
+    rest = kb - full
+    assert n % 16 == 0 and rest in (0, 16, 32), w.shape
+    assert tuple(w_scales.shape) == (e, n, kb // 16), (w.shape, w_scales.shape)
+    # [tile, r, step, i, j, d] -> [tile, step, j, r, i, d]
+    head = w[..., :full].reshape(-1, 16, full // 64, 4, 4, 4)
+    parts = [head.permute(0, 2, 4, 1, 3, 5).reshape(-1, 16 * full)]
+    if rest:
+        # [tile, r, i, j, d] -> [tile, j, r, i, d]
+        tail = w[..., full:].reshape(-1, 16, rest // 16, 4, 4)
+        parts.append(tail.permute(0, 3, 1, 2, 4).reshape(-1, 16 * rest))
+    w_tiled = torch.cat(parts, dim=-1).view(e, n, kb)
+    swizzle_mx_scale = None
+    if scale_rounds:
+        kc = w_scales.shape[-1]
+        assert kc % 8 == 0, w_scales.shape
+        # [tile, r, round, block] -> [tile, round, r, block]
+        rounds = w_scales.reshape(-1, 16, kc // 8, 8).permute(0, 2, 1, 3)
+        w_scales = rounds.contiguous().view(e, n, kc)
+        swizzle_mx_scale = "GFX942_TILE_ROUNDS"
+    return w_tiled.transpose(1, 2), w_scales.transpose(1, 2), swizzle_mx_scale
