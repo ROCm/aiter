@@ -448,7 +448,7 @@ def gemm_a16w16_opus(
                     f"splitK={config.get('splitK')!r}; "
                     "using OPUS heuristic fallback"
                 )
-            elif not tuned_kid_is_compiled("a16w16", arch, cu_num, plan.resolved_kid):
+            elif not tuned_kid_is_compiled("a16w16", plan.resolved_kid, XQ.device):
                 # Valid kid, but absent from the loaded module (warned once).
                 plan = None
         if plan is None:

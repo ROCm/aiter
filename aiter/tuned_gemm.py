@@ -246,9 +246,7 @@ def get_GEMM_A16W16_tuned_config(
 
                     # A valid kid can still be absent from the (subset-built)
                     # module; the launcher would raise, so skip the row.
-                    if not tuned_kid_is_compiled(
-                        "a16w16", runtime_gfx, cu_num, resolved.resolved_kid
-                    ):
+                    if not tuned_kid_is_compiled("a16w16", resolved.resolved_kid):
                         config = None
                         continue
                 if resolved is None:

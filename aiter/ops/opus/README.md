@@ -439,6 +439,14 @@ built before the manifest cannot be checked, so those callers keep their old
 behavior for it. The `a16w16` family and the gfx950 `a8w8_blockscale_bpreshuffle`
 family are the subset-built ones; the other families are always compiled in full.
 
+The check keys the manifest by the *physical* device, as the C++ dispatcher
+does (`gcnArchName` and `multiProcessorCount`, through `_device_arch_and_cu`),
+not by the row's `cu_num`. A `CU_NUM` override changes the tuned-row lookup but
+not the table the launcher searches, so a kid compiled only for the overridden
+CU count is skipped. A `gfx1250-strict`-only build has no `__gfx1250__` device
+pass, so its manifest lists only the CO kids (prebuilt `.co` images) of
+`gfx1250`; the non-CO gfx1250 kids are left out.
+
 A tuner skips rebuilding only when the sidecar and its receipt match the
 required kids and installed binary. Missing or stale metadata triggers a
 rebuild. An explicit `AITER_REBUILD` request runs once in the parent even on

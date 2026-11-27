@@ -1514,7 +1514,7 @@ def _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y):
             and a8w8_mxscale_bpreshuffle_supports_shape(instance, m, n, k)
             # Last: a kid absent from the subset-built module drops to the
             # fallback below, and the check warns only for a row that would run.
-            and tuned_kid_is_compiled("a8w8_blockscale_bpreshuffle", gfx, cu_num, kid)
+            and tuned_kid_is_compiled("a8w8_blockscale_bpreshuffle", kid, XQ.device)
         ):
             from .opus import opus_gemm
 
@@ -2047,7 +2047,7 @@ def _gemm_a8w8_blockscale_bpreshuffle_native(
 
             # A kid missing from the subset-built module falls through to the
             # default backend below instead of raising in the launcher.
-            if tuned_kid_is_compiled("a8w8_blockscale_bpreshuffle", gfx, cu, kid):
+            if tuned_kid_is_compiled("a8w8_blockscale_bpreshuffle", kid, XQ.device):
                 return opus_gemm(
                     XQ,
                     WQ,
