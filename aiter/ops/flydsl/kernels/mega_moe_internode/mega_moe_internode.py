@@ -35,33 +35,32 @@ from typing_extensions import Self
 
 from ..mega_moe.quant import BLOCK as _QUANT_BLOCK
 from ..mega_moe.quant import per_1x32_mx_quant
+from .cco_buffers import CcoBufferPlan, CcoBufferSet
 from .layout import (
     MAX_FUSED_MODEL_DIM,
     MAX_FUSED_TOKENS_PER_RANK,
+    STAGE1_RAIL_REGIONS,
+    STAGE2_RAIL_REGIONS,
     Stage1ArenaLayout,
     Stage2ArenaLayout,
     TwoKernelArenaLayout,
+    _align_up,
     validate_fused_weight_addressing,
 )
 from .mega_moe_internode_config import (
     NUM_QP,
-    STAGE2_SDMA_FRAC_Q64,
     STAGE2_SDMA_PUT_BYTES,
-    STAGE2_SDMA_RAMP_CHUNKS,
-    STAGE2_SDMA_REMOTE_ONLY,
     STAGE2_SDMA_SEND_ROWS_PER_ROUTE,
     STAGE2_TOKEN_READY,
     lookup_tune,
+    select_gemm2_bk,
     select_gemm2_bm,
     select_gemm2_bn,
     select_gemm2_grid,
     select_sdma_chunk_tiles,
     select_stage1_tile,
-    select_stage1_waves,
     select_stage2_sdma,
     select_stage2_waves,
-    use_dynamic_gemm2_claim,
-    use_single_kernel,
 )
 from .quant import get_rail_record_quant
 from .single_kernel import compile_single_kernel
@@ -70,10 +69,9 @@ from .stage2 import (
     BM,
     K1_CLAIM_WORDS,
     K1_CTAS_PER_CU,
-    SCRATCH_WORDS,
     SDMA_PLAN_WORDS_MAX,
-    compile_stage2_fused,
     peer_table_launcher,
+    stage2_scratch_layout,
 )
 
 __all__ = ["MegaMoEInternode", "build_window_layout"]
@@ -87,25 +85,8 @@ GPUS_PER_NODE = 8
 TILE_M = 32
 
 _COMM_QUANT = {"none": "none", "fp8": "fp8_blockwise_1x32"}
-# Largest single NIC registration known to work (TPR 4096 DSv4 registers 0.61 GiB).
-_MAX_RDMA_MR_BYTES = 1 << 30
 _FP4_DTYPES = (torch.uint8, getattr(torch, "float4_e2m1fn_x2", torch.uint8))
 
-# Window regions read or written by the rail (GDA RDMA).  Only this prefix of
-# the window is registered with the NIC (see _build_cco_runtime).
-_RDMA_STAGE1_REGIONS = (
-    "dispatch_staging",
-    "remote_dispatch_rx",
-    "remote_chunk_ready",
-    "remote_chunk_credit",
-)
-_RDMA_STAGE2_REGIONS = (
-    "node_accumulator",
-    "remote_partial_rx",
-    "return_group_ready",
-    "return_consumed",
-    "rail_idx",
-)
 # Parity-planed regions as stage2 kernel1 / kernel2 expect them, in order.
 _K1_EPOCH_PLANES = (
     "h1_output_q",
@@ -145,10 +126,6 @@ def _window_view(ptr: int, shape, typestr: str, strides=None) -> torch.Tensor:
     return torch.as_tensor(_CudaArrayView(ptr, shape, typestr, strides), device="cuda")
 
 
-def _align_up(value: int, alignment: int) -> int:
-    return (int(value) + int(alignment) - 1) // int(alignment) * int(alignment)
-
-
 def build_window_layout(
     *,
     model_dim: int,
@@ -156,12 +133,12 @@ def build_window_layout(
     experts: int,
     topk: int,
     max_tok_per_rank: int,
-    max_routes_per_token_per_rank: int,
+    max_recv_routes_per_rank: int | None = None,
     tile_group: int,
     comm_quant: str = "fp8",
-    data_send_ctas: int = 0,
-    fanout_ctas_per_dest: int = 16,
     quant: str = "a4w4",
+    world_size: int = WORLD_SIZE,
+    gpus_per_node: int = GPUS_PER_NODE,
 ) -> TwoKernelArenaLayout:
     """Stage1 and Stage2 layouts sharing one registered window.
 
@@ -173,58 +150,46 @@ def build_window_layout(
     rail_record_bytes = (
         model_dim + model_dim // 32 if comm_quant == "fp8" else 2 * model_dim
     )
+    if gpus_per_node <= 0 or world_size % gpus_per_node:
+        raise ValueError("world_size must divide into equal GPU nodes")
+    source_nodes = world_size // gpus_per_node
     stage2 = Stage2ArenaLayout.create(
         hidden=model_dim,
         topk=topk,
         max_tokens=max_tok_per_rank,
-        world_size=WORLD_SIZE,
-        gpus_per_node=GPUS_PER_NODE,
+        world_size=world_size,
+        gpus_per_node=gpus_per_node,
+        source_nodes=source_nodes,
         rail_record_bytes=rail_record_bytes,
     )
     stage1 = Stage1ArenaLayout.create(
         hidden=model_dim,
         inter=inter_dim,
         experts=experts,
-        world_size=WORLD_SIZE,
-        gpus_per_node=GPUS_PER_NODE,
+        world_size=world_size,
+        gpus_per_node=gpus_per_node,
         topk=topk,
         max_tokens=max_tok_per_rank,
-        max_routes_per_token_per_rank=max_routes_per_token_per_rank,
+        max_recv_routes_per_rank=max_recv_routes_per_rank,
         activation_dtype="fp8" if quant == "a8w4" else "fp4",
         block_m=TILE_M,
         tile_group=tile_group,
         embed_stage2_bytes=int(stage2.total_bytes),
-        # Each destination partitions T records into at most ceil(T/NB)+S
-        # batches per phase. This conservative bound covers both fan1/fan2.
-        send_queue_capacity=(
-            2
-            * GPUS_PER_NODE
-            * (
-                (
-                    max_tok_per_rank
-                    + max(8, min(512 // topk, TILE_M * tile_group) // 8 * 8)
-                    - 1
-                )
-                // max(8, min(512 // topk, TILE_M * tile_group) // 8 * 8)
-                + fanout_ctas_per_dest
-            )
-            if data_send_ctas
-            else 0
-        ),
     )
     return TwoKernelArenaLayout.compose(stage1, stage2)
 
 
 @dataclass(frozen=True)
 class _CcoRuntime:
+    # None when the caller supplied the Communicator: then this operator owns
+    # only its window/memory/dev_comm and must not destroy the communicator.
     context: Any
     communicator: Any
     memory: Any
     window: Any
     dev_comm: Any
-    # False when the caller supplied the Communicator: then this operator owns
-    # only its window/memory/dev_comm and must not destroy the communicator.
-    owns_communicator: bool
+    buffers: Any = None
+    local_context: Any = None
 
 
 def _close_cco_resources(
@@ -290,8 +255,7 @@ class MegaMoEInternode:
 
     Extra keyword arguments beyond MegaMoEV2's:
 
-    * ``act``: ``"silu"`` (``swiglu_limit`` > 0 clamps it) or ``"situv2"``;
-      ``activation`` is a compatible alias;
+    * ``act``: ``"silu"`` (default; ``swiglu_limit`` > 0 clamps it) or ``"situv2"``;
     * ``situ_beta`` / ``situ_linear_beta``: positive SiTUv2 gate/up saturation
       coefficients, both defaulting to 1;
     * ``comm_quant``: ``"fp8"`` (default) quantizes both local and remote
@@ -305,33 +269,64 @@ class MegaMoEInternode:
       and need not be powers of two;
     * ``communicator``: a ``mori.cco`` Communicator owned by the caller
       (default: create one per instance);
-    * ``max_routes_per_token_per_rank``: upper bound on the experts one
-      token routes to within one EP rank (default ``topk``); it sizes the
-      expert-tile arena.  Callers must respect it, it is not checked.
+    * ``max_recv_routes_per_rank``: receive capacity in routes per rank. It
+      takes priority when given; the default is the worst case
+      ``world_size * max_tok_per_rank * topk`` (every route of every token
+      lands on one rank), which is always safe. A smaller value saves window
+      memory; a forward that exceeds it fails with an asynchronous assertion.
+      Above ``max_tok_per_rank`` 1024 the rail regions are packed into MRs of
+      at most 1 GiB; a capacity whose single region exceeds that is rejected.
+    * ``gpus_per_node``: must be 8.
+
+    ``topk_ids`` entries must lie in ``[-1, experts)``; ``-1`` marks an
+    unused slot.  Other values are not checked and their routes are dropped.
+
+    Weights are contiguous byte-sized tensors (FP4x2 or uint8 payload, E8M0
+    or uint8 scales) in the preshuffled layouts; only their device, element
+    size, contiguity and total bytes are checked.
+
+    ``forward`` returns a view of an operator-owned buffer that the next
+    forward overwrites; copy it to keep it.  Forwards of one instance must be
+    issued on one stream (they share the records and the window), on the
+    device the operator was constructed on.
 
     ``mega_scheme`` and ``fanout_masks`` are accepted for MegaMoEV2
     compatibility; the internode dispatch has a single scheme and no fanout
     masks.
     """
 
+    # forward(mask_invalid_slots=...) is accepted like MegaMoEV2's; -1 top-k
+    # slots are always skipped here.
+    supports_combine_mask = True
+
     # fmt: off
     def __init__(self, *, rank: int, world_size: int, model_dim: int, inter_dim: int, experts: int,
         topk: int, quant: str, w1: torch.Tensor, w1_scale: torch.Tensor, w2: torch.Tensor,
         w2_scale: torch.Tensor, max_tok_per_rank: int, mega_scheme: str = "fixedslot",
-        swiglu_limit: float = 0.0, fanout_masks: tuple[int, ...] = (), activation: str | None = None,
-        comm_quant: str = "fp8", communicator=None, max_routes_per_token_per_rank: int | None = None,
-        act: str | None = None, situ_beta: float = 1.0, situ_linear_beta: float = 1.0):
+        swiglu_limit: float = 0.0, fanout_masks: tuple[int, ...] = (),
+        comm_quant: str = "fp8", communicator=None, max_recv_routes_per_rank: int | None = None,
+        act: str = "silu", situ_beta: float = 1.0, situ_linear_beta: float = 1.0,
+        gpus_per_node: int = GPUS_PER_NODE):
     # fmt: on
-        del mega_scheme
-        if act is not None and activation is not None and act != activation:
-            raise ValueError("act and activation must agree when both are provided")
-        activation = str(act if act is not None else "silu" if activation is None else activation)
-        route_cap = topk if max_routes_per_token_per_rank is None else max_routes_per_token_per_rank
+        if mega_scheme != "fixedslot":
+            raise ValueError("mega_scheme must be 'fixedslot'")
+        activation = str(act)
+        from aiter.jit.utils.chip_info import get_gfx_runtime
+
+        arch = str(get_gfx_runtime() or "")
+        if not arch.startswith("gfx95"):
+            raise RuntimeError(f"MegaMoEInternode requires CDNA4 (gfx95x), got {arch or 'unknown'}")
+        # Above TPR 1024 the rail regions go into bounded (<= 1 GiB) MRs and
+        # node-local payload into its own window; one window is faster below.
+        buffer_layout = "separate" if int(max_tok_per_rank) > 1024 else "legacy"
+        self.buffer_layout = buffer_layout
         self._validate_args(
-            rank=rank, world_size=world_size, model_dim=model_dim, inter_dim=inter_dim,
+            rank=rank, world_size=world_size, gpus_per_node=gpus_per_node,
+            model_dim=model_dim, inter_dim=inter_dim,
             experts=experts, topk=topk, quant=quant, max_tok_per_rank=max_tok_per_rank,
             swiglu_limit=swiglu_limit, fanout_masks=fanout_masks, activation=activation,
-            comm_quant=comm_quant, route_cap=route_cap,
+            comm_quant=comm_quant,
+            max_recv_routes_per_rank=max_recv_routes_per_rank,
             situ_beta=situ_beta, situ_linear_beta=situ_linear_beta,
         )
         if not dist.is_available() or not dist.is_initialized():
@@ -341,6 +336,7 @@ class MegaMoEInternode:
 
         self.rank = int(rank)
         self.world_size = int(world_size)
+        self.gpus_per_node = int(gpus_per_node)
         self.model_dim = int(model_dim)
         self.inter_dim = int(inter_dim)
         self.experts = int(experts)
@@ -355,7 +351,9 @@ class MegaMoEInternode:
         self.quant = str(quant).lower()
         self._activation_dtype = "fp8" if self.quant == "a8w4" else "fp4"
         self.comm_quant = str(comm_quant)
-        self.max_routes_per_token_per_rank = int(route_cap)
+        self.max_recv_routes_per_rank = (
+            None if max_recv_routes_per_rank is None else int(max_recv_routes_per_rank)
+        )
         self.device = torch.device("cuda", torch.cuda.current_device())
         self._graph_weights: dict[int, torch.Tensor] = {}
         device_cus = torch.cuda.get_device_properties(self.device).multi_processor_count
@@ -365,9 +363,6 @@ class MegaMoEInternode:
         if device_cus < WORKER_BLOCKS:
             raise RuntimeError(f"persistent kernels need {WORKER_BLOCKS} CUs, got {device_cus}")
 
-        for name, tensor in (("w1", w1), ("w1_scale", w1_scale), ("w2", w2), ("w2_scale", w2_scale)):
-            if tensor.device != self.device:
-                raise ValueError(f"{name} is on {tensor.device}, expected {self.device}")
         self._check_weight_bytes(w1, w1_scale, w2, w2_scale)
         self._w1 = _as_bytes(w1)
         self._w1_scale = _as_bytes(w1_scale)
@@ -379,24 +374,24 @@ class MegaMoEInternode:
         rows = self.mtpr * self.topk
         self._s1_tile = select_stage1_tile(
             token=rows, model_dim=self.model_dim, inter_dim=self.inter_dim,
-            expert=self.epr, topk=self.topk,
+            expert=self.epr, topk=self.topk, quant=self.quant,
+            world_size=self.world_size, gpus_per_node=self.gpus_per_node,
         )
         s2_tuned = self._lookup_tune(rows)
         self._gemm2_bn, _ = select_gemm2_bn(s2_tuned or None)
         gemm2_cu, _ = select_gemm2_grid(s2_tuned or None)
         self._gemm2_cu = gemm2_cu or WORKER_BLOCKS
         remote_first = bool(self._s1_tile["split_local"])
-        # SDMA needs the remote-first fused kernel (Stage1's local/remote
-        # split); it is dropped at runtime setup if MORI gives no SDMA queue.
+        # SDMA needs the remote-first fused kernel.
         self._stage2_sdma = bool(
             select_stage2_sdma(self.mtpr, s2_tuned or None)[0] and remote_first)
         # GEMM2 M tile (fused remote-first stage2 only; 32 elsewhere).
         self._s2_tuned = s2_tuned or None
         self._gemm2_bm, _ = select_gemm2_bm(
             self._s2_tuned, tile_group=int(self._s1_tile["tile_group"]),
-            fused=remote_first, sdma=self._stage2_sdma)
-        # Without a table row: one chunk per rail queue is the balanced
-        # point (measured TPR 512 -> 64 and TPR 1024 -> 128 exactly).
+            remote_first=remote_first, sdma=self._stage2_sdma)
+        self._gemm2_bk, _ = select_gemm2_bk(self._s2_tuned)
+        # Without a table row: one chunk per rail queue.
         # Capped at 512 (the TPR 4096 value): k2 unrolls one ready store per chunk
         # token, so mtpr > 4096 adds chunks instead of widening them.
         self._chunk_tokens = int(s2_tuned.get(
@@ -405,44 +400,58 @@ class MegaMoEInternode:
         self.layout = build_window_layout(
             model_dim=self.model_dim, inter_dim=self.inter_dim, experts=self.experts,
             topk=self.topk, max_tok_per_rank=self.mtpr,
-            max_routes_per_token_per_rank=self.max_routes_per_token_per_rank,
+            max_recv_routes_per_rank=self.max_recv_routes_per_rank,
             tile_group=self._s1_tile["tile_group"], comm_quant=self.comm_quant,
             quant=self.quant,
-            data_send_ctas=int(self._s1_tile["data_send_ctas"]),
-            fanout_ctas_per_dest=int(self._s1_tile["fanout_ctas_per_dest"]),
+            world_size=self.world_size, gpus_per_node=self.gpus_per_node,
         )
-        # One NIC MR covers the rail prefix; past ~1 GiB rail writes stop
-        # landing (ionic). Refuse here instead of hanging in k2.
-        if _align_up(self._rdma_prefix_end(), 64 << 20) > _MAX_RDMA_MR_BYTES:
-            raise ValueError(
-                f"rail-registered prefix {self._rdma_prefix_end() / 2**30:.2f} GiB exceeds "
-                f"{_MAX_RDMA_MR_BYTES / 2**30:.2f} GiB at max_tok_per_rank={self.mtpr}; "
-                "use comm_quant='fp8' or a smaller max_tok_per_rank")
+        self.buffer_plan = (
+            CcoBufferPlan.create(self.layout.stage1, self.layout.stage2)
+            if buffer_layout == "separate" else None
+        )
+        self._buffer_regions = (
+            tuple((r.stage, r.name, i) for i, r in enumerate(self.buffer_plan.regions))
+            if self.buffer_plan is not None else ()
+        )
+        self._s2_waves = select_stage2_waves(self.model_dim // self._gemm2_bn)
+        # Stage1 and Stage2 run in one kernel: Stage2 can post while Stage1
+        # still retires its rail credits. Caller-ordered flushes require
+        # independent QP contexts.
+        self._stage2_context_base = NUM_QP
+        self._gda_context_count = NUM_QP + self._stage2_context_base
         self._runtime: _CcoRuntime | None = None
         self._closed = False
         try:
-            self._runtime = self._initialize_cco_runtime(communicator)
+            self._runtime = (
+                self._initialize_separate_cco_runtime(communicator)
+                if self.buffer_plan is not None else self._initialize_cco_runtime(communicator)
+            )
+            buffers = self._runtime.buffers
+            self._transport_compile = (
+                {"lsa_peer_base": buffers.lsa_peer_base,
+                 "gda_peer_stride": buffers.gda_peer_stride,
+                 "gda_peer_lane": buffers.gda_peer_lane,
+                 "gda_physical_width": buffers.gda_physical_width}
+                if buffers is not None and buffers.gda_peer_stride != 1 else {}
+            )
             self._output = torch.empty(
                 (self.mtpr, self.model_dim), dtype=torch.bfloat16, device=self.device)
             self._init_input_records()
             # One kernel for Stage1 + fused Stage2 when both run 8-wave CTAs;
             # Stage1 then publishes per-group GMM1 completion for GEMM2.
-            s1_waves = select_stage1_waves(self._s1_tile["tile_group"])
-            self._s2_waves = select_stage2_waves(self.model_dim // self._gemm2_bn)
-            self._single_kernel = use_single_kernel(s1_waves, self._s2_waves)
             self._stage1 = compile_stage1(
                 self.layout.stage1, self.layout.stage2,
                 rank=self.rank,
                 stage2_window_offset=self.layout.stage2_offset,
                 fanout_ctas_per_dest=int(self._s1_tile["fanout_ctas_per_dest"]),
-                data_send_ctas=int(self._s1_tile["data_send_ctas"]),
                 split_local=bool(self._s1_tile["split_local"]),
                 activation=self.activation,
                 swiglu_limit=(self.swiglu_limit or None),
                 situ_beta=self.situ_beta,
                 situ_linear_beta=self.situ_linear_beta,
-                waves=s1_waves,
-                group_ready=self._single_kernel,
+                group_ready=True,
+                buffer_regions=self._buffer_regions,
+                **self._transport_compile,
             )
             self.stage1_kernel_name = self._stage1.kernel_name
             self._init_stage2()
@@ -460,13 +469,16 @@ class MegaMoEInternode:
     # construction
 
     @staticmethod
-    def _validate_args(*, rank, world_size, model_dim, inter_dim, experts, topk, quant,
+    def _validate_args(*, rank, world_size, gpus_per_node, model_dim, inter_dim, experts, topk, quant,
                        max_tok_per_rank, swiglu_limit, fanout_masks, activation, comm_quant,
-                       route_cap, situ_beta=1.0, situ_linear_beta=1.0) -> None:
+                       max_recv_routes_per_rank=None,
+                       situ_beta=1.0, situ_linear_beta=1.0) -> None:
         if str(quant).lower() not in ("a4w4", "a8w4"):
             raise ValueError("MegaMoEInternode supports quant=a4w4 or a8w4")
-        if int(world_size) != WORLD_SIZE:
-            raise ValueError(f"MegaMoEInternode requires world_size={WORLD_SIZE} (two nodes of {GPUS_PER_NODE})")
+        if int(gpus_per_node) != 8:
+            raise ValueError("gpus_per_node must be 8")
+        if int(world_size) % 8 or int(world_size) // 8 not in (2, 4, 8):
+            raise NotImplementedError("operator forward supports 2, 4 or 8 nodes of 8 GPUs")
         if not 0 <= int(rank) < int(world_size):
             raise ValueError("rank is outside world_size")
         if not 1024 <= int(model_dim) <= MAX_FUSED_MODEL_DIM or int(model_dim) % 512:
@@ -484,8 +496,15 @@ class MegaMoEInternode:
         # Stage2 decodes source IDs with shifts and masks based on this capacity.
         if int(max_tok_per_rank) & (int(max_tok_per_rank) - 1):
             raise ValueError("max_tok_per_rank must be a power of two")
-        if not 1 <= int(route_cap) <= int(topk):
-            raise ValueError("max_routes_per_token_per_rank must be in [1, topk]")
+        # Worst case: every route of every token lands on this rank.
+        theoretical_routes = int(world_size) * int(max_tok_per_rank) * int(topk)
+        if max_recv_routes_per_rank is not None and not 1 <= int(max_recv_routes_per_rank) <= theoretical_routes:
+            raise ValueError(
+                f"max_recv_routes_per_rank must be in [1, {theoretical_routes}]"
+            )
+        # Stage2 addresses one inbox plane with a 32-bit buffer resource.
+        if int(max_tok_per_rank) * int(topk) * int(model_dim) * 2 >= 1 << 31:
+            raise ValueError("max_tok_per_rank * topk * model_dim * 2 must be below 2**31")
         if str(activation) not in ("silu", "situv2"):
             raise ValueError("activation must be 'silu' or 'situv2'")
         if str(activation) == "situv2" and any(
@@ -494,6 +513,8 @@ class MegaMoEInternode:
         ):
             raise ValueError("situv2 requires finite positive situ_beta / situ_linear_beta")
         # 0.0 = no clamp; > 0 only applies to silu (DSV4: gate <= L, -L <= up <= L).
+        if not math.isfinite(float(swiglu_limit)):
+            raise ValueError("swiglu_limit must be finite")
         if float(swiglu_limit) != 0.0 and (str(activation) != "silu" or float(swiglu_limit) < 0):
             raise ValueError("swiglu_limit must be 0.0, or positive with silu")
         if tuple(fanout_masks):
@@ -506,22 +527,24 @@ class MegaMoEInternode:
         the constructor).  One instance serves every shape-identical MoE layer;
         the kernels read the weight addresses as runtime arguments, so a CUDA
         graph captured after this call keeps that layer's addresses. Captured
-        weights, including internal contiguous copies, stay alive until close.
+        weights stay alive until close.
         Callers must order weight preparation before the forward's stream."""
         if self._closed:
             raise RuntimeError("MegaMoEInternode is closed")
-        for name, tensor in (("w1", w1), ("w1_scale", w1_scale), ("w2", w2), ("w2_scale", w2_scale)):
-            if tensor.device != self.device:
-                raise ValueError(f"{name} is on {tensor.device}, expected {self.device}")
         self._check_weight_bytes(w1, w1_scale, w2, w2_scale)
-        # Prepare every view/copy before replacing the old binding. A failed
-        # conversion must not leave Stage1 and Stage2 on different weights.
         weights = tuple(_as_bytes(t) for t in (w1, w1_scale, w2, w2_scale))
         self._w1, self._w1_scale, self._w2, self._w2_scale = weights
         self._k1_ptrs["arg_bq"] = self._w2.data_ptr()
         self._k1_ptrs["arg_bscale"] = self._w2_scale.data_ptr()
 
     def _check_weight_bytes(self, w1, w1_scale, w2, w2_scale) -> None:
+        for name, tensor in (("w1", w1), ("w1_scale", w1_scale), ("w2", w2), ("w2_scale", w2_scale)):
+            if tensor.device != self.device:
+                raise ValueError(f"{name} is on {tensor.device}, expected {self.device}")
+            # The kernels read the bytes in place: a strided view or a wider
+            # dtype of the same size would be decoded as garbage.
+            if tensor.element_size() != 1 or not tensor.is_contiguous():
+                raise ValueError(f"{name} must be a contiguous 1-byte tensor, got {tensor.dtype}")
         expected = {
             "w1": self.epr * 2 * self.inter_dim * self.model_dim // 2,
             "w1_scale": self.epr * 2 * self.inter_dim * (self.model_dim // 32),
@@ -533,7 +556,7 @@ class MegaMoEInternode:
                for name, want in expected.items()
                if tensors[name].numel() * tensors[name].element_size() != want]
         if bad:
-            raise ValueError(f"invalid A4W4 weight sizes in bytes: {', '.join(bad)}")
+            raise ValueError(f"invalid {self.quant.upper()} weight sizes in bytes: {', '.join(bad)}")
 
     def _lookup_tune(self, rows: int) -> dict:
         try:
@@ -542,7 +565,8 @@ class MegaMoEInternode:
             tuned = lookup_tune(
                 gfx=get_gfx_runtime(), cu_num=get_cu_num(), token=rows,
                 model_dim=self.model_dim, inter_dim=self.inter_dim,
-                expert=self.epr, topk=self.topk,
+                expert=self.epr, topk=self.topk, quant=self.quant,
+                world_size=self.world_size, gpus_per_node=self.gpus_per_node,
             )
         except Exception:
             # A missing or unreadable table falls back to the built-in rules.
@@ -554,10 +578,10 @@ class MegaMoEInternode:
         """End offset (window coordinates) of the regions the rail touches."""
         end = 0
         for r in self.layout.stage1.regions:
-            if r.name in _RDMA_STAGE1_REGIONS:
+            if r.name in STAGE1_RAIL_REGIONS:
                 end = max(end, r.offset + r.nbytes)
         for r in self.layout.stage2.regions:
-            if r.name in _RDMA_STAGE2_REGIONS:
+            if r.name in STAGE2_RAIL_REGIONS:
                 end = max(end, self.layout.stage2_offset + r.offset + r.nbytes)
         return end
 
@@ -574,23 +598,103 @@ class MegaMoEInternode:
         context = Communicator.init(self.world_size, self.rank, uid, per_rank_vmm=per_rank_vmm)
         return self._build_cco_runtime(context.__enter__(), context=context)
 
+    def _initialize_separate_cco_runtime(self, communicator) -> _CcoRuntime:
+        """Rail regions in bounded windows on `communicator` (or an owned one);
+        node-local payload on an owned LSA-only communicator."""
+        try:
+            return self._build_separate_cco_runtime(communicator)
+        except RuntimeError as exc:
+            if not self._stage2_sdma or "SDMA queue" not in str(exc):
+                raise
+        # Same fallback as the single-window path: without a queue, keep the xGMI push.
+        logger.warning("MegaMoEInternode: MORI gave no SDMA queue (MORI_ENABLE_SDMA "
+                       "unset?); stage2 keeps the xGMI push")
+        self._stage2_sdma = False
+        self._gemm2_bm, _ = select_gemm2_bm(
+            self._s2_tuned, tile_group=int(self._s1_tile["tile_group"]),
+            remote_first=True, sdma=False)
+        return self._build_separate_cco_runtime(communicator)
+
+    def _build_separate_cco_runtime(self, communicator) -> _CcoRuntime:
+        from mori.cco import Communicator, UniqueId
+
+        if communicator is not None and (
+                int(communicator.nranks) != self.world_size or int(communicator.rank) != self.rank):
+            raise ValueError(
+                f"communicator is rank {communicator.rank} of {communicator.nranks}, "
+                f"expected {self.rank} of {self.world_size}")
+        contexts = []
+        buffers = None
+        try:
+            comms = []
+            for rail, supplied in ((False, None), (True, communicator)):
+                context = None
+                if supplied is None:
+                    payload = [bytes(Communicator.get_unique_id()) if self.rank == 0 else None]
+                    dist.broadcast_object_list(payload, src=0)
+                    context = Communicator.init(
+                        self.world_size, self.rank, UniqueId.from_bytes(payload[0]),
+                        per_rank_vmm=self.buffer_plan.per_rank_vmm(rail=rail))
+                    supplied = context.__enter__()
+                    contexts.append(context)
+                comms.append((supplied, context))
+            local_comm, local_context = comms[0]
+            rail_comm, rail_context = comms[1]
+            buffers = CcoBufferSet(
+                self.buffer_plan, local_comm, rail_comm,
+                gda_context_count=self._gda_context_count,
+                sdma_queue_count=int(self._stage2_sdma))
+            # Same team check as the single-window path (CcoBufferSet already
+            # requires contiguous rank groups).
+            lsa = buffers.local_dev_comm
+            if int(lsa.lsa_size) != self.gpus_per_node or int(lsa.lsa_rank) != self.rank % self.gpus_per_node:
+                raise ValueError(
+                    f"CCO LSA team is rank {lsa.lsa_rank} of {lsa.lsa_size}, expected "
+                    f"{self.rank % self.gpus_per_node} of {self.gpus_per_node} (consecutive ranks per node)")
+            for spec in self.buffer_plan.windows:
+                _window_view(buffers.windows[spec.name].local_ptr, (spec.allocation_bytes,), "|i1").zero_()
+            torch.cuda.synchronize(self.device)
+            rail_comm.barrier()
+            return _CcoRuntime(rail_context, rail_comm, None, None, buffers.rail_dev_comm,
+                               buffers=buffers, local_context=local_context)
+        except Exception:
+            callbacks = ([buffers.close] if buffers is not None else [])
+            callbacks.extend(lambda c=c: c.__exit__(None, None, None) for c in reversed(contexts))
+            for callback in callbacks:
+                try:
+                    callback()
+                except Exception:
+                    logger.exception("separated CCO setup cleanup failed")
+            raise
+
+    def _region_address(self, stage, name):
+        if self._runtime.buffers is not None:
+            return self._runtime.buffers.address(stage, name)
+        layout = self.layout.stage1 if stage == 1 else self.layout.stage2
+        offset = layout.region(name).offset + (self.layout.stage2_offset if stage == 2 else 0)
+        return int(self._runtime.window.local_ptr) + offset
+
     def _build_cco_runtime(self, communicator, *, context) -> _CcoRuntime:
         from mori.cco import GDA_CONNECTION_RAIL, CCODevCommRequirements
 
         memory = window = dev_comm = None
         try:
+            # A caller communicator laid out differently would address the wrong peers.
+            if int(communicator.nranks) != self.world_size or int(communicator.rank) != self.rank:
+                raise ValueError(
+                    f"communicator is rank {communicator.rank} of {communicator.nranks}, "
+                    f"expected {self.rank} of {self.world_size}")
             memory = communicator.alloc_mem(self.layout.total_bytes)
             # Only the RDMA prefix is registered with the NIC; node-local LSA
             # goes through alloc_mem's P2P mapping of the whole allocation.
-            # Registering the whole window hits ENOMEM at TPR 4096 (7.7 GB),
-            # and rail writes stop landing once one MR exceeds ~1 GiB.
+            # Registering the whole window hits ENOMEM at large capacities.
             reg_bytes = min(memory.size, _align_up(self._rdma_prefix_end(), 64 << 20))
             window = communicator.register_window(memory.ptr, reg_bytes)
             requirements = CCODevCommRequirements()
             requirements.gda_connection_type = GDA_CONNECTION_RAIL
             if self.layout.stage1.num_qp != self.layout.stage2.num_qp:
                 raise AssertionError("Stage1/Stage2 must use the same CCO QP count")
-            requirements.gda_context_count = max(self.layout.stage1.num_qp, NUM_QP)
+            requirements.gda_context_count = max(self.layout.stage1.num_qp, self._gda_context_count)
             requirements.gda_signal_count = 0
             requirements.gda_counter_count = 0
             requirements.lsa_barrier_count = 0
@@ -599,6 +703,13 @@ class MegaMoEInternode:
             if self._stage2_sdma:
                 requirements.sdma_queue_count = 1
             dev_comm = communicator.create_dev_comm(requirements)
+            # The kernels address node-local peers as rank % 8 within an
+            # 8-GPU LSA team of consecutive ranks.
+            if (int(dev_comm.lsa_size) != self.gpus_per_node
+                    or int(dev_comm.lsa_rank) != self.rank % self.gpus_per_node):
+                raise ValueError(
+                    f"CCO LSA team is rank {dev_comm.lsa_rank} of {dev_comm.lsa_size}, expected "
+                    f"{self.rank % self.gpus_per_node} of {self.gpus_per_node} (consecutive ranks per node)")
             if self._stage2_sdma and int(getattr(dev_comm, "sdma_num_queue", 0) or 0) <= 0:
                 # Puts on a comm without queues move nothing; keep the xGMI push.
                 logger.warning("MegaMoEInternode: MORI gave no SDMA queue (MORI_ENABLE_SDMA "
@@ -607,12 +718,11 @@ class MegaMoEInternode:
                 # The default M tile follows the path (xGMI stalls at SDMA's 128).
                 self._gemm2_bm, _ = select_gemm2_bm(
                     self._s2_tuned, tile_group=int(self._s1_tile["tile_group"]),
-                    fused=True, sdma=False)
+                    remote_first=True, sdma=False)
             _window_view(window.local_ptr, (self.layout.total_bytes,), "|i1").zero_()
             torch.cuda.synchronize(self.device)
             communicator.barrier()
-            return _CcoRuntime(context, communicator, memory, window, dev_comm,
-                               owns_communicator=context is not None)
+            return _CcoRuntime(context, communicator, memory, window, dev_comm)
         except Exception:
             try:
                 _close_cco_resources(
@@ -635,8 +745,7 @@ class MegaMoEInternode:
             hidden, topk, self._activation_dtype, pad_tokens=mtpr
         )
         rec, off_q, off_s, off_i, off_w = self._record_quant.layout
-        base = int(self._runtime.window.local_ptr) + int(
-            self.layout.stage1.offset("dispatch_staging", parity=0))
+        base = self._region_address(1, "dispatch_staging")
         self._rec_q = _window_view(base + off_q, (mtpr, self.layout.stage1.wire.payload_bytes), "|u1", (rec, 1))
         self._rec_scale = _window_view(base + off_s, (mtpr, hidden // 32), "|u1", (rec, 1))
         self._rec_ids = _window_view(base + off_i, (mtpr, topk), "<i4", (rec, 4))
@@ -651,12 +760,11 @@ class MegaMoEInternode:
         replayed graph sees the current generation.
         """
         layout, s1, s2 = self.layout, self.layout.stage1, self.layout.stage2
-        base = int(self._runtime.window.local_ptr)
         dev = self.device
         self._epoch_off = int(s1.offset("epoch_gate"))
 
         def s1_addr(name):
-            return base + s1.region(name).offset
+            return self._region_address(1, name)
 
         def s2_off(name):
             return layout.stage2_offset + s2.region(name).offset
@@ -674,18 +782,29 @@ class MegaMoEInternode:
         self._k1_arrival_count = torch.zeros(K1_CLAIM_WORDS, dtype=torch.int32, device=dev)
         # Each peer's plane_slot_inbox base for both parities, back to back.
         self._k1_peer_table = torch.zeros(2 * self.world_size, dtype=torch.int64, device=dev)
-        fill = peer_table_launcher(GPUS_PER_NODE, self.world_size)
+        fill = peer_table_launcher(
+            self.gpus_per_node, self.world_size,
+            lsa_peer_base=self._transport_compile.get("lsa_peer_base", 0))
         import flydsl.expr as fx
 
         stream = fx.Stream(torch.cuda.current_stream())
+        inbox_window = self._runtime.window
+        inbox_offset = s2_off("plane_slot_inbox")
+        if self._runtime.buffers is not None:
+            region = self.buffer_plan.region(2, "plane_slot_inbox")
+            inbox_window = self._runtime.buffers.windows[region.window]
+            inbox_offset = region.offset
         for parity in (0, 1):
-            fill(fx.Int64(self._runtime.window.handle),
+            fill(fx.Int64(inbox_window.handle),
                  fx.Int64(self._k1_peer_table.data_ptr() + parity * self.world_size * 8),
-                 fx.Int64(s2_off("plane_slot_inbox") + parity * s2_plane("plane_slot_inbox")),
+                 fx.Int64(inbox_offset + parity * s2_plane("plane_slot_inbox")),
                  stream)
         # The arrival word of a row sits at a fixed distance from its inbox
         # row on every peer, so kernel1 reuses the peer base it already has.
         arrival_delta = s2.region("plane_slot_arrived").offset - s2.region("plane_slot_inbox").offset
+        if self.buffer_plan is not None:
+            arrival_delta = (self.buffer_plan.region(2, "plane_slot_arrived").offset
+                             - self.buffer_plan.region(2, "plane_slot_inbox").offset)
         arrival_delta_step = s2_plane("plane_slot_arrived") - s2_plane("plane_slot_inbox")
         a_tile_map = s1.region("tile_src_of_dst")
         self._k1_ptrs = {
@@ -697,9 +816,9 @@ class MegaMoEInternode:
             "arg_sweights": s1_addr("tile_row_weight"),
             "arg_trb": self._k1_trb.data_ptr(), "arg_p2p": self._k1_peer_table.data_ptr(),
             "arg_arrival_count": self._k1_arrival_count.data_ptr(),
-            "arg_generation": base + self._epoch_off, "arg_a_tile_map": base + a_tile_map.offset,
+            "arg_generation": s1_addr("epoch_gate"), "arg_a_tile_map": s1_addr("tile_src_of_dst"),
             "row_capacity": s1.max_route_rows,
-            "local_rank": self.rank % GPUS_PER_NODE,
+            "local_rank": self.rank % self.gpus_per_node,
             "arg_expert_count": s1_addr("expert_count"),
         }
         self._k1_compile = {
@@ -707,16 +826,11 @@ class MegaMoEInternode:
             "topk": self.topk, "npes": self.world_size, "max_tok": self.mtpr,
             "a_dtype": self._activation_dtype,
             "recv_cap": self.world_size * self.mtpr,
-            "comb_inp_nbytes": 2 * self.mtpr * self.topk * self.model_dim * 2,
-            "BN": self._gemm2_bn, "cu_num": self._gemm2_cu, "gpus_per_node": GPUS_PER_NODE,
+            "comb_inp_nbytes": s2.source_nodes * self.mtpr * self.topk * self.model_dim * 2,
+            "BN": self._gemm2_bn, "cu_num": self._gemm2_cu, "gpus_per_node": self.gpus_per_node,
             "arrival_delta": arrival_delta, "arrival_delta_step": arrival_delta_step,
             "epoch_planes": tuple(s1.region(n).nbytes // 2 for n in _K1_EPOCH_PLANES),
             "a_tile_map_plane": a_tile_map.nbytes // 2,
-            # Place a tile group's m-blocks on one XCD only for G=2 (K3 TPR128,
-            # DSV4 TPR256: GEMM2 -14~22us).  At G=4 it measured neutral to
-            # +12us (K3 TPR512), so G=4 keeps the plain order.
-            "m_group": 2 if self._s1_tile["tile_group"] == 2 else 1,
-            "dynamic_claim": use_dynamic_gemm2_claim(self.mtpr),
             "resident_ctas": self._device_cus * K1_CTAS_PER_CU,
             # Fused stage2 overlaps the rail with GEMM2 by doing the
             # remote-source m-blocks first (needs Stage1's local/remote split).
@@ -724,6 +838,9 @@ class MegaMoEInternode:
             "local_experts": self.epr, "tile_group": int(self._s1_tile["tile_group"]),
             "expert_count_plane": s1.region("expert_count").nbytes // 2,
             "gemm2_bm": self._gemm2_bm,
+            "gemm2_bk": self._gemm2_bk,
+            "buffer_regions": self._buffer_regions,
+            "group_sync_tail": self._stage1.group_sync_tail,
         }
 
         if self._stage2_sdma:
@@ -733,7 +850,11 @@ class MegaMoEInternode:
             sd_tiles = (s1.max_route_rows + TILE_M - 1) // TILE_M
             sd_rows = int(STAGE2_SDMA_SEND_ROWS_PER_ROUTE * self.mtpr * self.topk)
             sd_ct = select_sdma_chunk_tiles(self.mtpr * self.topk, self._gemm2_bm // TILE_M)
-            sd_chunks = sd_tiles // sd_ct + 2 + 4 * STAGE2_SDMA_RAMP_CHUNKS
+            sd_chunks = sd_tiles // sd_ct + 2
+            # The compact landing map has one source plane per physical node.
+            sd_cdone_offset = (256 + s2.source_nodes * self.mtpr * self.topk * 4 + 255) // 256 * 256
+            if sd_cdone_offset + sd_chunks * 128 > s2_plane("plane_slot_arrived"):
+                raise ValueError("SDMA chunk counters do not fit the arrival region")
             self._sd_send = torch.empty(sd_rows * self.model_dim * 2, dtype=torch.uint8, device=dev)
             self._sd_tile_base = torch.zeros((sd_tiles + 1) * 8, dtype=torch.int32, device=dev)
             self._sd_plan = torch.zeros(SDMA_PLAN_WORDS_MAX, dtype=torch.int32, device=dev)
@@ -743,16 +864,16 @@ class MegaMoEInternode:
                 arg_sd_plan=self._sd_plan.data_ptr(), arg_sd_cdone=self._sd_cdone.data_ptr())
             self._k1_compile.update(
                 sdma=True, sdma_chunk_tiles=sd_ct, sdma_send_rows=sd_rows,
-                sdma_frac_q64=STAGE2_SDMA_FRAC_Q64, sdma_put_bytes=STAGE2_SDMA_PUT_BYTES,
+                sdma_put_bytes=STAGE2_SDMA_PUT_BYTES,
                 sdma_arrival_woff=s2_off("plane_slot_arrived"),
-                sdma_arrival_plane=s2_plane("plane_slot_arrived"), sdma_max_chunks=sd_chunks,
-                sdma_ramp_chunks=STAGE2_SDMA_RAMP_CHUNKS,
-                sdma_remote_only=STAGE2_SDMA_REMOTE_ONLY)
+                sdma_arrival_plane=s2_plane("plane_slot_arrived"), sdma_max_chunks=sd_chunks)
 
-        self._k2_scratch = torch.zeros(SCRATCH_WORDS, dtype=torch.int32, device=dev)
+        scratch = stage2_scratch_layout(s2.source_nodes, self.mtpr, self._chunk_tokens, NUM_QP)
+        self._k2_scratch = torch.zeros(scratch["words"], dtype=torch.int32, device=dev)
         self._k2_compile = {
             "hidden": self.model_dim, "max_tokens": self.mtpr, "topk": self.topk, "rank": self.rank,
-            "gpus_per_node": GPUS_PER_NODE, "num_qp": NUM_QP, "return_chunk_tokens": self._chunk_tokens,
+            "source_nodes": s2.source_nodes,
+            "gpus_per_node": self.gpus_per_node, "num_qp": NUM_QP, "return_chunk_tokens": self._chunk_tokens,
             "rail_quant": _COMM_QUANT[self.comm_quant],
             "inbox_off": s2_off("plane_slot_inbox"), "inbox_bytes": s2_plane("plane_slot_inbox"),
             "slot_mask_off": s2_off("node_dest_slot_mask"),
@@ -765,14 +886,27 @@ class MegaMoEInternode:
             "s2_window_off": layout.stage2_offset, "epoch_off": self._epoch_off,
             "parity_planes": tuple(s2_plane(n) for n in _K2_PARITY_PLANES),
             **({"sdma": True} if self._stage2_sdma else {}),
+            "buffer_regions": self._buffer_regions,
+            "gda_context_base": self._stage2_context_base,
+            **self._transport_compile,
         }
+        self._forward_status = None
+        if s1.route_capacity < s1.source_capacity * s1.max_routes_per_token_per_rank:
+            self._forward_status = _window_view(
+                s1_addr("forward_status"), (1,), "<i4"
+            )
+            self._k2_compile.update(
+                recv_overflow_off=s1.offset("recv_overflow"),
+                recv_overflow_plane=s1.region("recv_overflow").nbytes // s1.parity_depth,
+                forward_status_off=s1.offset("forward_status"),
+            )
         s2_waves = self._s2_waves
-        if s2_waves != 4:
-            self._k1_compile["waves"] = s2_waves
-            self._k2_compile["threads"] = 64 * s2_waves
+        self._k1_compile["waves"] = s2_waves
+        self._k2_compile["threads"] = 64 * s2_waves
         # Token-ready rail for the rail-bound low-topk SDMA path. High topk
-        # stays on the established local critical path (K3 measured regression).
-        token_ready = (STAGE2_TOKEN_READY and self._s2_waves == 8
+        # stays on the established local critical path.
+        token_ready = (STAGE2_TOKEN_READY
+                       and self.world_size == 2 * self.gpus_per_node
                        and self._k1_compile["remote_first"]
                        and self._stage2_sdma and self.topk <= 8 and self.mtpr >= 2048)
         if token_ready:
@@ -796,7 +930,7 @@ class MegaMoEInternode:
             self._tr_mcnt = torch.zeros(tiles + 1, dtype=torch.int32, device=dev)
             self._k1_ptrs["arg_tr_mcnt"] = self._tr_mcnt.data_ptr()
             self._tr_sdprog = torch.empty(
-                (GPUS_PER_NODE, self._k1_compile["sdma_max_chunks"]),
+                (self.gpus_per_node, self._k1_compile["sdma_max_chunks"]),
                 dtype=torch.int64, device=dev)
             self._k1_ptrs["arg_tr_sdprog"] = self._tr_sdprog.data_ptr()
             self._k1_compile["sdma_put_bytes"] = 2 << 20
@@ -812,15 +946,12 @@ class MegaMoEInternode:
             "record_quant": self._record_quant,
             "record_quant_padded": self._record_quant_padded,
         }
-        if self._single_kernel:
-            self._launchers["single"] = compile_single_kernel(
-                self._stage1, self._k1_compile, self._k2_compile, WORKER_BLOCKS
-            )
-        else:
-            self._launchers["stage1"] = self._stage1
-            self._launchers["stage2"] = compile_stage2_fused(
-                self._k1_compile, self._k2_compile, WORKER_BLOCKS
-            )
+        self._launchers["single"] = compile_single_kernel(
+            self._stage1, self._k1_compile, self._k2_compile,
+            # Every CTA runs the combine in the single kernel: the
+            # plane-parallel Phase 1 wants several CTAs per (plane, chunk).
+            int(self._stage1.grid)
+        )
 
     def _compile_launcher(self, name, args) -> None:
         """Compile and execute once, or only compile during preload.
@@ -859,16 +990,18 @@ class MegaMoEInternode:
             )
         return per_1x32_mx_quant(x_bf16, quant_mode=self._activation_dtype)
 
-    def forward(self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True):
+    def forward(self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True, mask_invalid_slots=None):
         """Return this rank's BF16 output for ``[T, H]``, with ``0 <= T <= mtpr``.
 
         Every rank still participates at the compiled communication capacity.
         ``slice_output=False`` exposes the full capacity, including zero pad rows.
+        ``mask_invalid_slots`` (MegaMoEV2 compatibility): ``None``/``True``;
+        -1 top-k slots are always skipped.
         """
         if x_bf16.dtype != torch.bfloat16 or not x_bf16.is_contiguous():
             raise ValueError("x_bf16 must be contiguous bfloat16")
         tokens = self._input_rows(x_bf16, self.model_dim)
-        self._check_routing(x_bf16, wts, topk_ids)
+        self._check_routing(x_bf16, wts, topk_ids, stream, mask_invalid_slots)
         launch_stream = self._fx_stream(stream)
         # One launch quantizes x and packs it with ids/weights into the records.
         args = (
@@ -884,7 +1017,8 @@ class MegaMoEInternode:
         out = self._run(wts, topk_ids, launch_stream, slice_output)
         return out[:tokens] if slice_output and tokens != self.mtpr else out
 
-    def forward_prequant(self, x_q, scales, wts, topk_ids, *, stream=None, slice_output=True):
+    def forward_prequant(self, x_q, scales, wts, topk_ids, *, stream=None, slice_output=True,
+                         mask_invalid_slots=None):
         """Same as :meth:`forward` for input already quantized by :meth:`quantize`."""
         payload_dtype = (torch.float8_e4m3fn,) if self.quant == "a8w4" else _FP4_DTYPES
         payload_cols = self.layout.stage1.wire.payload_bytes
@@ -896,7 +1030,7 @@ class MegaMoEInternode:
             raise ValueError(f"scales must be contiguous uint8 E8M0 [{tokens}, {self.model_dim // 32}]")
         if scales.device != self.device:
             raise ValueError(f"scales is on {scales.device}, expected {self.device}")
-        self._check_routing(x_q, wts, topk_ids)
+        self._check_routing(x_q, wts, topk_ids, stream, mask_invalid_slots)
         if stream is not None and not isinstance(stream, torch.cuda.Stream):
             raise ValueError("forward_prequant needs stream=None or a torch.cuda.Stream")
         # The copies into the records must be ordered before stage1 on the same stream.
@@ -925,9 +1059,17 @@ class MegaMoEInternode:
             raise ValueError(f"input rows must be in [0, {self.mtpr}], got {tokens}")
         return tokens
 
-    def _check_routing(self, x, wts, topk_ids) -> None:
+    def _check_routing(self, x, wts, topk_ids, stream, mask_invalid_slots) -> None:
         if self._closed:
             raise RuntimeError("MegaMoEInternode is closed")
+        if mask_invalid_slots is not None and not mask_invalid_slots:
+            raise ValueError("MegaMoEInternode always skips -1 slots; mask_invalid_slots=False is unsupported")
+        # A compiled handle does not launch on another device: the forward
+        # would silently return the previous output.
+        stream = getattr(stream, "value", stream)
+        stream_device = stream.device if isinstance(stream, torch.cuda.Stream) else None
+        if torch.cuda.current_device() != self.device.index or stream_device not in (None, self.device):
+            raise RuntimeError(f"forward must run on {self.device} (current device / stream mismatch)")
         shape = (int(x.shape[0]), self.topk)
         if wts.dtype != torch.float32 or not wts.is_contiguous() or tuple(wts.shape) != shape:
             raise ValueError(f"wts must be contiguous float32 {list(shape)}")
@@ -947,11 +1089,15 @@ class MegaMoEInternode:
             return fx.Stream(stream)
         return stream
 
-    def _record_weight_usage(self, stream) -> None:
-        """Keep raw-pointer weights valid for eager launches and captured graphs."""
+    def _torch_stream(self, stream) -> torch.cuda.Stream:
+        """The torch stream behind a launch stream (fx.Stream or raw handle)."""
         stream = getattr(stream, "value", stream)
         if not isinstance(stream, torch.cuda.Stream):
             stream = torch.cuda.ExternalStream(0 if stream is None else stream, device=self.device)
+        return stream
+
+    def _record_weight_usage(self, stream: torch.cuda.Stream) -> None:
+        """Keep raw-pointer weights valid for eager launches and captured graphs."""
         weights = (self._w1, self._w1_scale, self._w2, self._w2_scale)
         with torch.cuda.stream(stream):
             if torch.cuda.is_current_stream_capturing():
@@ -961,11 +1107,14 @@ class MegaMoEInternode:
                     weight.record_stream(stream)
 
     def _run(self, wts, topk_ids, stream, slice_output):
-        self._record_weight_usage(stream)
+        torch_stream = self._torch_stream(stream)
+        self._record_weight_usage(torch_stream)
         runtime = self._runtime
         window = runtime.window
+        arena_handle = window.handle if window is not None else 0
+        arena_ptr = window.local_ptr if window is not None else runtime.buffers.device_table_ptr
         s1_args = (
-            runtime.dev_comm.ptr, window.handle, window.local_ptr,
+            runtime.dev_comm.ptr, arena_handle, arena_ptr,
             self._rec_q.data_ptr(), self._rec_scale.data_ptr(),
             wts.data_ptr(), topk_ids.data_ptr(),
             self._w1.data_ptr(), self._w1_scale.data_ptr(), self.mtpr,
@@ -985,17 +1134,22 @@ class MegaMoEInternode:
                                   "arg_sd_plan", "arg_sd_cdone", "arg_tr_mcnt", "arg_tr_sdprog")),
             stream,
         )
-        if self._single_kernel:
-            launches = (("single", (*s1_args, *gemm2_args, *output_args, *extra_args)),)
-        else:
-            launches = (("stage1", (*s1_args, stream)),)
-            launches += (("stage2", (*gemm2_args, *s1_args[:3], *output_args, *extra_args)),)
+        launches = (("single", (*s1_args, *gemm2_args, *output_args, *extra_args)),)
         for name, args in launches:
             compiled = self._compiled.get(name)
             if compiled is None or env.compile.compile_only:
                 self._compile_launcher(name, args)
             else:
                 compiled(*args)
+        if self._forward_status is not None:
+            with torch.cuda.stream(torch_stream):
+                # The device status is written only after Stage2 has observed
+                # every peer's error bit. The existing credit handshake drains
+                # all reads before this graph-capturable asynchronous assertion.
+                torch._assert_async(
+                    self._forward_status == 0,
+                    "MegaMoE receive capacity exceeded; all peers completed the failed forward",
+                )
         return self._output[: self.mtpr] if slice_output else self._output
     def close(self) -> None:
         if self._closed:
@@ -1004,16 +1158,32 @@ class MegaMoEInternode:
         runtime, self._runtime = self._runtime, None
         try:
             if runtime is not None:
-                _close_cco_resources(
-                    memory=runtime.memory, window=runtime.window, dev_comm=runtime.dev_comm,
-                    context=runtime.context if runtime.owns_communicator else None,
-                    device=self.device)
+                if runtime.buffers is not None:
+                    callbacks = [runtime.buffers.close]
+                    callbacks.extend(lambda c=c: c.__exit__(None, None, None)
+                                     for c in (runtime.context, runtime.local_context) if c is not None)
+                    error = None
+                    for callback in callbacks:
+                        try:
+                            callback()
+                        except Exception as exc:
+                            logger.exception("separated CCO resource cleanup failed")
+                            if error is None:
+                                error = exc
+                    if error is not None:
+                        raise error
+                else:
+                    _close_cco_resources(
+                        memory=runtime.memory, window=runtime.window, dev_comm=runtime.dev_comm,
+                        context=runtime.context,
+                        device=self.device)
         finally:
             self._graph_weights.clear()
             # Drop private CUDA allocations and borrowed window views too.
             # A caller-held output view still owns its ordinary torch storage.
             for name in (
                 "_w1", "_w1_scale", "_w2", "_w2_scale", "_output",
+                "_forward_status",
                 "_rec_q", "_rec_scale", "_rec_ids", "_rec_weights",
                 "_k1_trb", "_k1_arrival_count", "_k1_peer_table", "_k2_scratch",
                 "_sd_send", "_sd_tile_base", "_sd_plan", "_sd_cdone",
@@ -1031,5 +1201,4 @@ class MegaMoEInternode:
 
 
 def _as_bytes(tensor: torch.Tensor) -> torch.Tensor:
-    tensor = tensor if tensor.is_contiguous() else tensor.contiguous()
     return tensor.view(torch.uint8)

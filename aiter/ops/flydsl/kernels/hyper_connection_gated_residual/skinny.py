@@ -83,9 +83,14 @@ def _build_down_fused(
     cols_per_wave: int,
     m_groups: int = 1,
     combine: bool = True,
+    fold_w: bool = True,
+    w_len: int = 0,
+    w_bf16: bool = True,
 ):
     # combine=False normalizes the residual as-is: block_output/injection are
     # unread and r2 is not written (the up kernel then reads the residual).
+    # fold_w=False applies the norm's (1 + w) to the weight in fp32 instead of
+    # expecting it baked into w_dn; w_len selects a shared or per-branch w.
     stream_dim = hidden // hc_count
     cols_per_block = waves_per_block * cols_per_wave
     per_iter = WAVE * DOWN_VEC
@@ -108,18 +113,21 @@ def _build_down_fused(
     part_group_elems = hc_count * n_pad * PART_M * n_chunks
     part_elems = m_groups * part_group_elems
     packed_elems = total_rows * n_pad
+    shared_w = w_len != hidden
 
     @flyc.kernel(
         name=f"gr_skinny_down_hc{hc_count}_h{hidden}_np{n_pad}_m{m_rows}"
         f"_g{m_groups}_is{inj_stride}_w{waves_per_block}_c{cols_per_wave}"
-        f"{'' if combine else '_nocomb'}",
+        f"{'' if combine else '_nocomb'}"
+        f"{'' if fold_w else f'_nw{w_len}' + ('bf16' if w_bf16 else 'f32')}",
         known_block_size=[block_threads, 1, 1],
     )
     def kernel(
         residual: fx.Tensor,  # [m_rows, hidden] bf16
         block_output: fx.Tensor,  # [m_rows, stream_dim] bf16
         injection: fx.Tensor,  # [m_rows, hc] bf16, row stride inj_stride
-        w_dn: fx.Tensor,  # [n_pad, hidden] bf16, (1+w) folded in
+        w_dn: fx.Tensor,  # [n_pad, hidden] bf16, (1+w) folded in if fold_w
+        norm_w: fx.Tensor,  # [w_len] bf16 or f32, read only if not fold_w
         r2_out: fx.Tensor,  # [m_rows, hidden] bf16
         rrms_out: fx.Tensor,  # [m_rows, hc] f32
         partial: fx.Tensor,  # [hc, n_pad, PART_M] f32
@@ -195,12 +203,30 @@ def _build_down_fused(
             ]
             for i in range_constexpr(iters if combine else 0)
         ]
+        nw_raw = []
+        if const_expr(not fold_w):
+            nw_g = GTensor(norm_w, T.bf16 if w_bf16 else T.f32, (1, w_len))
+            nw_vec = DOWN_VEC if w_bf16 else DOWN_VEC // 2
+            for i in range_constexpr(iters):
+                base = ks[i] if shared_w else s * stream_dim + ks[i]
+                nw_raw.append(
+                    [
+                        nw_g.load(base + h * nw_vec, vec_size=nw_vec)
+                        for h in range_constexpr(DOWN_VEC // nw_vec)
+                    ]
+                )
         for i in range_constexpr(iters):
             k = ks[i]
             wv = [
                 fx.Vector(w_raw[i][cc]).to(fx.Float32)
                 for cc in range_constexpr(cols_per_wave)
             ]
+            onepw = []
+            if const_expr(not fold_w):
+                for part in nw_raw[i]:
+                    pv = fx.Vector(part).to(fx.Float32) if w_bf16 else fx.Vector(part)
+                    for e in range_constexpr(DOWN_VEC // len(nw_raw[i])):
+                        onepw.append(fx.Float32(1.0) + pv[e])
             for m in range_constexpr(m_rows):
                 gm = m_base + m
                 off = gm * hidden + s * stream_dim + k
@@ -221,8 +247,10 @@ def _build_down_fused(
                 cf = cb.to(fx.Float32)
                 for e in range_constexpr(DOWN_VEC):
                     sq[m] = sq[m] + cf[e] * cf[e]
+                    # The RMS sums the raw r2; only the GEMV sees the affine.
+                    xe = cf[e] if const_expr(fold_w) else cf[e] * onepw[e]
                     for cc in range_constexpr(cols_per_wave):
-                        acc[cc][m] = acc[cc][m] + cf[e] * wv[cc][e]
+                        acc[cc][m] = acc[cc][m] + xe * wv[cc][e]
 
         for sh in range_constexpr(log2_wave):
             off = WAVE // (2 << sh)
@@ -320,6 +348,7 @@ def _build_down_fused(
         block_output: fx.Tensor,
         injection: fx.Tensor,
         w_dn: fx.Tensor,
+        norm_w: fx.Tensor,
         r2_out: fx.Tensor,
         rrms_out: fx.Tensor,
         partial: fx.Tensor,
@@ -332,6 +361,7 @@ def _build_down_fused(
             block_output,
             injection,
             w_dn,
+            norm_w,
             r2_out,
             rrms_out,
             partial,
@@ -571,6 +601,7 @@ def skinny_two_kernel(
     stream: int,
     waves_per_block: int = 4,
     cols_per_wave: int | None = None,
+    fold_w: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Returns ``(r2, block_input, packed)``; see the module docstring."""
     tokens, hidden = residual.shape
@@ -604,6 +635,9 @@ def skinny_two_kernel(
         waves_per_block,
         cols_per_wave,
         combine=combine,
+        fold_w=fold_w,
+        w_len=w.numel(),
+        w_bf16=w.dtype == torch.bfloat16,
     )
     up = _build_up_mix_grouped(
         hidden,
@@ -622,6 +656,7 @@ def skinny_two_kernel(
         block_output if combine else residual,
         injection if combine else residual,
         w_down_merged,
+        w,
         r2,
         rrms,
         partial,
@@ -648,6 +683,7 @@ def skinny_chunked_two_kernel(
     chunk_m: int = 4,
     waves_per_block: int = 4,
     cols_per_wave: int | None = None,
+    fold_w: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run low-prefill GEMV in independent ``chunk_m`` row groups.
 
@@ -693,6 +729,9 @@ def skinny_chunked_two_kernel(
         cols_per_wave,
         m_groups,
         combine=combine,
+        fold_w=fold_w,
+        w_len=w.numel(),
+        w_bf16=w.dtype == torch.bfloat16,
     )
     up = _build_up_mix_grouped(
         hidden,
@@ -712,6 +751,7 @@ def skinny_chunked_two_kernel(
         block_output if combine else residual,
         injection if combine else residual,
         w_down_merged,
+        w,
         r2,
         rrms,
         partial,

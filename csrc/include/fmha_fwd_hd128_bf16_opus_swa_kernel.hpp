@@ -773,6 +773,8 @@ __device__ __attribute__((always_inline)) void gqa_d128_swa_impl(opus_gqa_kargs 
     using namespace opus;
     using namespace gqa_d128_swa;
     using T = opus::remove_cvref_t<Traits>;
+    // The shared traits also admit D=64; this form is only built and tested at D=128.
+    static_assert(T::D_TILE_SIZE == 128, "the sliding-window kernel is D=128 only");
     using D_ATTN = typename T::D_ATTN;
     using D_ACC = typename T::D_ACC;
 

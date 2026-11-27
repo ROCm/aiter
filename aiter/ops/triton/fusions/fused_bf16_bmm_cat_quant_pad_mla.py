@@ -26,7 +26,7 @@ def _get_rope_cache_config(M: int, N: int, K: int, B: int) -> tuple[dict, bool]:
 def _launch(
     q_nope: torch.Tensor,
     w_uk_t: torch.Tensor,
-    q_pe: torch.Tensor,
+    q_pe: torch.Tensor | None,
     q_scale: torch.Tensor,
     num_padded_heads: int | None,
     out: torch.Tensor | None,
@@ -43,13 +43,21 @@ def _launch(
 ) -> torch.Tensor:
     qh, m, k = q_nope.shape
     qh_w, k_w, n = w_uk_t.shape
-    m_pe, qh_pe, d_pe = q_pe.shape
-    assert qh == qh_w == qh_pe, f"head mismatch: {qh}, {qh_w}, {qh_pe}"
+    assert qh == qh_w, f"head mismatch: {qh} vs {qh_w}"
     assert k == k_w, f"BMM K mismatch: {k} vs {k_w}"
-    assert m == m_pe, f"token mismatch: {m} vs {m_pe}"
     assert (
-        q_nope.dtype == w_uk_t.dtype == q_pe.dtype == torch.bfloat16
-    ), "q_nope, w_uk_t and q_pe must be bf16"
+        q_nope.dtype == w_uk_t.dtype == torch.bfloat16
+    ), "q_nope and w_uk_t must be bf16"
+    if q_pe is None:
+        assert out is not None, "out is required when q_pe is None"
+        assert kv_cache is None, "q_pe is required for RoPE/cache mode"
+        d_pe, pe_strides = 0, (0, 0, 0)
+    else:
+        m_pe, qh_pe, d_pe = q_pe.shape
+        assert qh == qh_pe, f"head mismatch: {qh} vs {qh_pe}"
+        assert m == m_pe, f"token mismatch: {m} vs {m_pe}"
+        assert q_pe.dtype == torch.bfloat16, "q_pe must be bf16"
+        pe_strides = q_pe.stride()
     assert q_scale.numel() == 1, "q_scale must be a single per-tensor scale"
     if num_padded_heads is None:
         num_padded_heads = qh
@@ -63,13 +71,26 @@ def _launch(
             dtype=get_fp8_e4m3_dtype(),
             device=q_nope.device,
         )
-    assert out.shape == (m, num_padded_heads, n + d_pe), f"bad out shape {out.shape}"
+    if q_pe is None:
+        assert (
+            out.ndim == 3
+            and out.shape[:2] == (m, num_padded_heads)
+            and out.shape[2] >= n
+        ), f"bad out shape {out.shape}"
+    else:
+        assert out.shape == (
+            m,
+            num_padded_heads,
+            n + d_pe,
+        ), f"bad out shape {out.shape}"
     assert out.dtype in (
         torch.float8_e4m3fn,
         torch.float8_e4m3fnuz,
     ), f"out must be fp8 e4m3, got {out.dtype}"
     if fp8_max is None:
         fp8_max = torch.finfo(out.dtype).max
+    if q_pe is None and m == 0:
+        return out
 
     rope_and_cache = kv_cache is not None
     if rope_and_cache:
@@ -93,7 +114,8 @@ def _launch(
 
     num_pid_m = triton.cdiv(m, config["BLOCK_SIZE_M"])
     num_pid_n = triton.cdiv(n, config["BLOCK_SIZE_N"])
-    grid = (qh * num_pid_m * num_pid_n + qh * num_pid_m + kv_programs,)
+    pe_programs = qh * num_pid_m if d_pe > 0 else 0
+    grid = (qh * num_pid_m * num_pid_n + pe_programs + kv_programs,)
 
     _fused_bf16_bmm_cat_quant_pad_mla_kernel[grid](
         q_nope,
@@ -116,13 +138,13 @@ def _launch(
         max_position,
         *q_nope.stride(),
         *w_uk_t.stride(),
-        *q_pe.stride(),
+        *pe_strides,
         *out.stride(),
         *rope_cache_strides,
         FP8_MAX=fp8_max,
         CACHE_MAX=cache_max,
         D_PE=d_pe,
-        BLOCK_D_PE=triton.next_power_of_2(d_pe),
+        BLOCK_D_PE=triton.next_power_of_2(max(1, d_pe)),
         BLOCK_N_KV=triton.next_power_of_2(n),
         DUP=num_padded_heads // qh,
         ROPE_AND_CACHE=rope_and_cache,
@@ -135,7 +157,7 @@ def _launch(
 def fused_bf16_bmm_cat_quant_pad_mla(
     q_nope: torch.Tensor,
     w_uk_t: torch.Tensor,
-    q_pe: torch.Tensor,
+    q_pe: torch.Tensor | None,
     q_scale: torch.Tensor,
     num_padded_heads: int | None = None,
     out: torch.Tensor | None = None,
@@ -143,7 +165,7 @@ def fused_bf16_bmm_cat_quant_pad_mla(
     config: dict | None = None,
 ) -> torch.Tensor:
     """
-    MLA decode query prep in one launch: the bf16 W_UK absorb BMM, concat with
+    MLA query prep in one launch: the bf16 W_UK absorb BMM, concat with
     the roped q_pe, static per-tensor FP8 quantization, and head padding by
     duplication. Equivalent to
 
@@ -153,16 +175,20 @@ def fused_bf16_bmm_cat_quant_pad_mla(
         q = q.repeat_interleave(num_padded_heads // QH, dim=1)
 
     Tuned configs exist only for gfx950. On other archs, pass config.
+    With q_pe=None, write only out[..., :L] and preserve every tail byte.
+    This mode requires out and returns it without a launch when M is zero.
 
     Args:
         q_nope (torch.Tensor): (QH, M, P) bf16, may be a strided view.
         w_uk_t (torch.Tensor): (QH, P, L) bf16, may be a strided view.
-        q_pe (torch.Tensor): (M, QH, R) bf16 with RoPE already applied.
+        q_pe (Optional[torch.Tensor]): (M, QH, R) bf16 with RoPE already applied.
+            None selects NoPE-only output.
         q_scale (torch.Tensor): Single-element fp32 query scale.
         num_padded_heads (Optional[int]): Head count of the output, a multiple of
             QH. Defaults to QH (no padding).
         out (Optional[torch.Tensor]): Pre-allocated (M, num_padded_heads, L + R)
-            fp8 e4m3 output.
+            fp8 e4m3 output. With q_pe=None, its width must be at least L.
+            Strided views must have positive strides and no overlapping elements.
         fp8_max (Optional[float]): Clamp bound. Defaults to the max of out.dtype.
             Pass a lower bound, for example 224 on fnuz, to match a caller that
             clamps below the dtype max.
@@ -172,13 +198,13 @@ def fused_bf16_bmm_cat_quant_pad_mla(
             FUSED-BF16-BMM-CAT-QUANT-PAD-MLA config for the shape.
 
     Returns:
-        torch.Tensor: (M, num_padded_heads, L + R) fp8.
+        torch.Tensor: The supplied out, or a new (M, num_padded_heads, L + R) fp8.
     """
     _LOGGER.info(
         "FUSED_BF16_BMM_CAT_QUANT_PAD_MLA: q_nope=%s w_uk_t=%s q_pe=%s heads=%s",
         tuple(q_nope.shape),
         tuple(w_uk_t.shape),
-        tuple(q_pe.shape),
+        tuple(q_pe.shape) if q_pe is not None else None,
         num_padded_heads,
     )
     return _launch(
