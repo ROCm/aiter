@@ -78,6 +78,7 @@ from aiter.ops.flydsl.moe_kernels import (
     get_flydsl_stage2_kernels_a16w16,
     get_flydsl_stage2_kernels_int4_bf16,
     get_flydsl_stage2_v2_kernels,
+    pick_flydsl_stage1_tile_n,
     runtime_swiglu_limit,
 )
 from aiter.ops.flydsl.mxfp4_kname import (
@@ -130,6 +131,9 @@ from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
 from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
     populate_v2_intermediate_from_ref as _v2_populate_stage2,
 )
+from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
+    tuning_routing,
+)
 
 if TYPE_CHECKING:
     from types import SimpleNamespace
@@ -170,6 +174,24 @@ def _is_tune_excluded_kernel(kernel_name) -> bool:
     """True if ``kernel_name`` matches any excluded-kernel pattern."""
     name = str(kernel_name or "")
     return any(pat in name for pat in _TUNE_EXCLUDE_KERNEL_PATTERNS)
+
+
+def _flydsl_s1_tile_n_forced(a_dtype, b_dtype, inter_dim, tile_n) -> bool:
+    """True if this shape cannot run ``tile_n`` as a stage-1 tile under its own name.
+
+    Same condition as resolve_flydsl_stage1_tile_n. a8w4 runs such a candidate
+    as its tile_n=pick_flydsl_stage1_tile_n(inter_dim) twin, which is in the
+    candidate set under its own name, so tuning it only times that kernel twice
+    and can record it under a tile it does not run. a16w4 takes the a16w-mix
+    port, which raises NotImplementedError for a tile_n that does not divide
+    inter_dim.
+    """
+    if b_dtype != "fp4" or a_dtype not in ("bf16", "fp8"):
+        return False
+    return (
+        inter_dim % tile_n != 0
+        and inter_dim % pick_flydsl_stage1_tile_n(inter_dim) == 0
+    )
 
 
 def _balanced_topk_ids(token, global_e, topk, seed, device):
@@ -758,6 +780,57 @@ def rank_moe_pairs(profile_df, policy):
     return frame
 
 
+# The tuner times each stage alone and ranks pairs by the sum, which misses
+# how a kernel runs after its neighbours in fused_moe. FlyDSL v2 pairs this
+# close to the best stage sum are re-timed through fused_moe and only the
+# fastest is kept.
+V2_E2E_FINALIST_GATE = 0.05
+V2_E2E_MAX_FINALISTS = 4
+
+
+def _v2_e2e_finalists(pairs):
+    """Index of the 2-stage v2 pairs within the gate of the best stage sum.
+
+    Raises ValueError when there are several and another pair is within the
+    gate too: it is not re-timed, so dropping the v2 leader could hand it the
+    row on its stage sum alone.
+    """
+    total = pairs["us1"] + pairs["us2"].fillna(0)
+    v2 = (_numeric_column(pairs, "v2", 0).fillna(0) == 1) & (
+        _numeric_column(pairs, "run_1stage", 0).fillna(0) == 0
+    )
+    close = total <= total.min() * (1 + V2_E2E_FINALIST_GATE)
+    finalists = list(total[close & v2].sort_values().index[:V2_E2E_MAX_FINALISTS])
+    if len(finalists) > 1 and (close & ~v2).any():
+        raise ValueError(
+            "a pair other than a 2-stage v2 one is within "
+            f"{V2_E2E_FINALIST_GATE:.0%} of the best stage sum"
+        )
+    return finalists
+
+
+def _v2_e2e_scores(kernel_us):
+    """fused_moe time of each finalist over the kernels it does not share.
+
+    ``kernel_us`` maps finalist -> {kernel name: median us per call}. A kernel
+    every finalist launches under the same name is left out: it cannot separate
+    the finalists, and its time varies with the buffers it is handed. Raises
+    ValueError when a finalist launched no other kernel, as when fused_moe did
+    not pick up its one-row config.
+    """
+    shared = set.intersection(*(set(k) for k in kernel_us.values()))
+    missed = [i for i, kernels in kernel_us.items() if not set(kernels) - shared]
+    if missed:
+        raise ValueError(
+            f"finalists {missed} launched only the kernels every finalist "
+            "launched; fused_moe did not run their configs"
+        )
+    return {
+        i: sum(us for name, us in kernels.items() if name not in shared)
+        for i, kernels in kernel_us.items()
+    }
+
+
 def _select_mxfp4_accuracy_promotion(candidates, performance_finalists):
     """Promote the most accurate candidate not already selected for speed."""
     selected = {
@@ -984,6 +1057,126 @@ class FmoeTuner(TunerCommon):
         if hasattr(fmoe_module, "get_2stage_cfgs"):
             fmoe_module.get_2stage_cfgs.cache_clear()
 
+    @contextmanager
+    def _fused_moe_config(self, config_file):
+        """Make fused_moe in this process read its configs from ``config_file``."""
+        from aiter.jit import core as jit_core
+
+        old_env = os.environ.get("AITER_CONFIG_FMOE")
+        os.environ["AITER_CONFIG_FMOE"] = config_file
+        jit_core.AITER_CONFIGS.get_config_file.cache_clear()
+        self._clear_op_caches()
+        try:
+            yield
+        finally:
+            if old_env is None:
+                os.environ.pop("AITER_CONFIG_FMOE", None)
+            else:
+                os.environ["AITER_CONFIG_FMOE"] = old_env
+            jit_core.AITER_CONFIGS.get_config_file.cache_clear()
+            self._clear_op_caches()
+
+    def _time_pairs_in_fused_moe(self, key, pairs, rounds=2, iters=20):
+        """Median us per call of each kernel fused_moe launches with each row of
+        ``pairs`` as the only tuned config, keyed by row.
+
+        Rounds interleave the pairs, so a slow spell of the GPU does not land
+        on one pair alone.
+        """
+        from torch.autograd import DeviceType
+        from torch.profiler import ProfilerActivity, profile
+
+        from aiter.ops.flydsl.moe_common import GateMode
+
+        (
+            _,
+            _,
+            token,
+            model_dim,
+            inter_dim,
+            expert,
+            topk,
+            act_type,
+            dtype,
+            q_dtype_a,
+            q_dtype_w,
+            q_type,
+            use_g1u1,
+            doweight_stage1,
+        ) = key
+        inputs = self._fmoe_inputs(
+            token,
+            model_dim,
+            inter_dim,
+            expert,
+            dtype,
+            q_type,
+            q_dtype_a,
+            q_dtype_w,
+            use_g1u1,
+        )
+        topk_weights, topk_ids = tuning_routing(inputs["hidden"], expert, topk)
+        situv2 = act_type == ActivationType.Situv2
+        # Left to itself fused_moe picks the activation dtype from the gate mode
+        # and the token count (bf16 below AITER_BF16_FP8_MOE_BOUND, for one) and
+        # looks up a key the one-row config does not hold. fp8 activations
+        # read the gate/up-interleaved W1 that _fmoe_inputs builds for them.
+        gate_mode = (
+            GateMode.INTERLEAVE if q_dtype_a == dtypes.fp8 else GateMode.SEPARATED
+        )
+
+        def call():
+            return fused_moe(
+                inputs["hidden"],
+                inputs["w1_qt_fmoe"],
+                inputs["w2_qt_fmoe"],
+                topk_weights,
+                topk_ids,
+                activation=act_type,
+                quant_type=q_type,
+                doweight_stage1=doweight_stage1,
+                beta=DEFAULT_SITUV2_BETA if situv2 else None,
+                linear_beta=DEFAULT_SITUV2_LINEAR_BETA if situv2 else None,
+                w1_scale=inputs["w1_scale_fmoe"],
+                w2_scale=inputs["w2_scale_fmoe"],
+                dtype=dtype,
+                gate_mode=gate_mode.value,
+                quant_dtype_a=q_dtype_a,
+            )
+
+        launches = {i: {} for i in pairs.index}
+        with tempfile.TemporaryDirectory(prefix="fmoe_e2e_") as tmp:
+            config_files = {}
+            for i, pair in pairs.iterrows():
+                row = {col: pair.get(col, 0) for col in self.columns}
+                row["us"] = pair["us1"] + pair["us2"]
+                config_dir = os.path.join(tmp, f"pair{i}")
+                os.makedirs(config_dir)
+                config_files[i] = os.path.join(config_dir, "tuned_fmoe.csv")
+                pd.DataFrame([row]).astype(str).to_csv(config_files[i], index=False)
+            for _ in range(rounds):
+                for i, config_file in config_files.items():
+                    with self._fused_moe_config(config_file):
+                        call()
+                        torch.cuda.synchronize()
+                        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+                            for _ in range(iters):
+                                call()
+                            torch.cuda.synchronize()
+                    for event in prof.events():
+                        if event.device_type == DeviceType.CUDA:
+                            launches[i].setdefault(event.name, []).append(
+                                event.time_range.elapsed_us()
+                            )
+        calls = rounds * iters
+        return {
+            i: {
+                name: float(torch.tensor(us).median()) * len(us) / calls
+                for name, us in kernels.items()
+            }
+            for i, kernels in launches.items()
+        }
+
     def _setup_specific_arguments(self):
 
         self.parser.add_argument(
@@ -1026,6 +1219,13 @@ class FmoeTuner(TunerCommon):
             "gate/up clamp. Only CK "
             "2-stage candidates can clamp; results are tagged in a _tag column "
             "and must go to a separate tuned file (-o).",
+        )
+        self.parser.add_argument(
+            "--no_fused_moe_rerank",
+            action="store_true",
+            help="Rank FlyDSL v2 pairs by their summed stage times only. By "
+            "default, pairs within 5%% of the best sum are re-timed through "
+            "fused_moe and all but the fastest dropped.",
         )
         self.parser.add_argument(
             "--ep-size",
@@ -4372,6 +4572,10 @@ class FmoeTuner(TunerCommon):
                     # Match the kernel assert; a floor divide lets tile_n=96 through.
                     if kparams["tile_n"] % (16 * _n_waves) != 0:
                         continue
+                if _flydsl_s1_tile_n_forced(
+                    a_dtype_str, b_dtype_str, inter_dim, kparams["tile_n"]
+                ):
+                    continue
 
                 # (kernel_name, kparams, is_fp4, is_fp8)
                 # out_dtype encodes fused quant type: "fp4" or "fp8"
@@ -4711,6 +4915,10 @@ class FmoeTuner(TunerCommon):
                 if kparams.get("tile_m") != blockM:
                     continue
                 if kparams.get("k_batch", 1) != 1:
+                    continue
+                if _flydsl_s1_tile_n_forced(
+                    adtype, bdtype, inter_dim, kparams["tile_n"]
+                ):
                     continue
                 # Only the FUSED variant (v2 always fuses quant). Fused name and
                 # params exactly as gen_flydsl_2stages_task builds them.
@@ -5387,6 +5595,163 @@ class FmoeTuner(TunerCommon):
 
         return tasks_flydsl
 
+    @classmethod
+    def _fmoe_inputs(
+        cls,
+        token,
+        model_dim,
+        inter_dim,
+        expert,
+        dtype,
+        q_type,
+        q_dtype_a,
+        q_dtype_w,
+        use_g1u1,
+    ):
+        """Random activations and weights for fused_moe.
+
+        Returns the quantized weights the torch reference reads and the
+        ``*_fmoe`` copies, in the layout the production kernels read.
+        """
+        torch.manual_seed(0)
+        hidden = torch.randn((token, model_dim), dtype=dtype, device="cuda") / 10
+        if use_g1u1:
+            w1 = (
+                torch.randn(
+                    (expert, inter_dim * 2, model_dim),
+                    dtype=dtype,
+                    device="cuda",
+                )
+                / 10
+            )
+        else:
+            w1 = (
+                torch.randn((expert, inter_dim, model_dim), dtype=dtype, device="cuda")
+                / 10
+            )
+        w2 = torch.randn((expert, model_dim, inter_dim), dtype=dtype, device="cuda")
+        w1_qt, w1_scale = cls.weight_quant(w1, q_type, quant_dtype=q_dtype_w)
+        w2_qt, w2_scale = cls.weight_quant(w2, q_type, quant_dtype=q_dtype_w)
+        if q_dtype_w is not dtypes.fp4x2:
+            w1_qt = w1_qt.view(w1.shape)
+            w2_qt = w2_qt.view(w2.shape)
+        else:
+            w1_qt = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
+            w2_qt = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
+
+        # Match the production/test path used by op_tests/test_moe_2stage.py.
+        w1_qt_fmoe = w1_qt
+        w2_qt_fmoe = w2_qt
+        w1_scale_fmoe = w1_scale
+        w2_scale_fmoe = w2_scale
+        if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
+            # a16wi4 OLD-kernel preshuffle -- match production/test_moe_2stage.py.
+            w1_qt_fmoe = (
+                pack_int8_to_packed_int4(
+                    shuffle_weight(w1_qt_fmoe.view(dtypes.i8), (16, 16))
+                )
+                .view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
+                .view(dtypes.i4x2)
+            )
+            w2_qt_fmoe = (
+                pack_int8_to_packed_int4(
+                    shuffle_weight(w2_qt_fmoe.view(dtypes.i8), (16, 16))
+                )
+                .view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
+                .view(dtypes.i4x2)
+            )
+            w1_scale_fmoe = (
+                shuffle_scale_for_int4(w1_scale, group_size=32).view(-1).contiguous()
+            )
+            w2_scale_fmoe = (
+                shuffle_scale_for_int4(w2_scale, group_size=32).view(-1).contiguous()
+            )
+        elif q_dtype_w == torch.int4:
+            w1_qt_fmoe = rearrange_4bit_elements(
+                convert_int8_to_uint32_int4(
+                    shuffle_weight(w1_qt_fmoe, (16, 16), use_int4=True)
+                )
+            )
+            w2_qt_fmoe = rearrange_4bit_elements(
+                convert_int8_to_uint32_int4(
+                    shuffle_weight(w2_qt_fmoe, (16, 16), use_int4=True)
+                )
+            )
+            w1_scale_fmoe = (
+                fp4_utils.e8m0_shuffle(w1_scale) if w1_scale is not None else None
+            )
+            w2_scale_fmoe = (
+                fp4_utils.e8m0_shuffle(w2_scale) if w2_scale is not None else None
+            )
+        elif (
+            q_type == QuantType.per_1x32
+            and q_dtype_a in [dtypes.bf16, dtypes.fp16, dtypes.fp8]
+            and q_dtype_w == dtypes.fp4x2
+        ):
+            # a16w4 / a8w4 (16-bit or fp8 activation, fp4 weight): the
+            # weight layout follows the *config* activation dtype, not the
+            # runtime-effective one (mirror op_tests/test_moe_2stage.py):
+            # a16w4 takes the standard GGUU W1, a8w4 the gate/up-
+            # interleaved GUGU one, as in the tuning path.
+            w1_gu = q_dtype_a == dtypes.fp8
+            w1_qt_fmoe = shuffle_weight_a16w4(w1_qt_fmoe, 16, w1_gu)
+            w1_scale_fmoe = shuffle_scale_a16w4(w1_scale, expert, w1_gu)
+            w2_qt_fmoe = shuffle_weight_a16w4(w2_qt_fmoe, 16, False)
+            w2_scale_fmoe = shuffle_scale_a16w4(w2_scale, expert, False)
+        elif (
+            q_type == QuantType.per_1x32
+            and q_dtype_a == dtypes.fp4x2
+            and q_dtype_w == dtypes.fp4x2
+        ):
+            # a4w4 (fp4 activation/weight): standard (16,16) weight shuffle
+            # + e8m0 scale shuffle (mirror test_moe_2stage preshuffle path).
+            w1_qt_fmoe = shuffle_weight(w1_qt_fmoe, layout=(16, 16))
+            w2_qt_fmoe = shuffle_weight(w2_qt_fmoe, layout=(16, 16))
+            w1_scale_fmoe = fp4_utils.e8m0_shuffle(w1_scale)
+            w2_scale_fmoe = fp4_utils.e8m0_shuffle(w2_scale)
+        elif (
+            q_type == QuantType.per_1x32
+            and q_dtype_a == dtypes.fp8
+            and q_dtype_w == dtypes.fp8
+        ):
+            # mxfp8 (a8w8): gate-up interleaved fp8 weight; w1 scale uses the
+            # a16w4 interleave, w2 scale uses plain e8m0 (mirror
+            # op_tests/test_moe_2stage.py is_mxfp8).
+            w1_qt_fmoe = shuffle_weight_a16w4(w1_qt_fmoe, 16, True)
+            w1_scale_fmoe = shuffle_scale_a16w4(w1_scale, expert, True)
+            w2_qt_fmoe = shuffle_weight_a16w4(w2_qt_fmoe, 16, False)
+            w2_scale_fmoe = fp4_utils.e8m0_shuffle(w2_scale)
+        elif q_dtype_w != dtypes.fp4x2:
+            w1_qt_fmoe = shuffle_weight(w1_qt_fmoe, (16, 16))
+            w2_qt_fmoe = shuffle_weight(w2_qt_fmoe, (16, 16))
+            w1_scale_fmoe = (
+                fp4_utils.e8m0_shuffle(w1_scale) if w1_scale is not None else None
+            )
+            w2_scale_fmoe = (
+                fp4_utils.e8m0_shuffle(w2_scale) if w2_scale is not None else None
+            )
+        else:
+            w1_scale_fmoe = (
+                fp4_utils.e8m0_shuffle(w1_scale) if w1_scale is not None else None
+            )
+            w2_scale_fmoe = (
+                fp4_utils.e8m0_shuffle(w2_scale) if w2_scale is not None else None
+            )
+
+        w1_qt_fmoe.is_shuffled = True
+        w2_qt_fmoe.is_shuffled = True
+        return {
+            "hidden": hidden,
+            "w1_qt": w1_qt,
+            "w2_qt": w2_qt,
+            "w1_scale": w1_scale,
+            "w2_scale": w2_scale,
+            "w1_qt_fmoe": w1_qt_fmoe,
+            "w2_qt_fmoe": w2_qt_fmoe,
+            "w1_scale_fmoe": w1_scale_fmoe,
+            "w2_scale_fmoe": w2_scale_fmoe,
+        }
+
     def run_config(self, args, target_fused_moe=None, config_string=""):
         from aiter.fused_moe import fused_moe, fused_topk
         from aiter.test_common import checkAllclose, run_perftest
@@ -5441,155 +5806,23 @@ class FmoeTuner(TunerCommon):
                 except (TypeError, ValueError):
                     kernel_us = None
             try:
-                torch.manual_seed(0)
-                hidden = (
-                    torch.randn((token, model_dim), dtype=dtype, device="cuda") / 10
+                inputs = self._fmoe_inputs(
+                    token,
+                    model_dim,
+                    inter_dim,
+                    expert,
+                    dtype,
+                    q_type,
+                    q_dtype_a,
+                    q_dtype_w,
+                    use_g1u1,
                 )
-                if use_g1u1:
-                    w1 = (
-                        torch.randn(
-                            (expert, inter_dim * 2, model_dim),
-                            dtype=dtype,
-                            device="cuda",
-                        )
-                        / 10
-                    )
-                else:
-                    w1 = (
-                        torch.randn(
-                            (expert, inter_dim, model_dim), dtype=dtype, device="cuda"
-                        )
-                        / 10
-                    )
-                w2 = torch.randn(
-                    (expert, model_dim, inter_dim), dtype=dtype, device="cuda"
-                )
-                w1_qt, w1_scale = self.weight_quant(w1, q_type, quant_dtype=q_dtype_w)
-                w2_qt, w2_scale = self.weight_quant(w2, q_type, quant_dtype=q_dtype_w)
-                if q_dtype_w is not dtypes.fp4x2:
-                    w1_qt = w1_qt.view(w1.shape)
-                    w2_qt = w2_qt.view(w2.shape)
-                else:
-                    w1_qt = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
-                    w2_qt = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
-
-                # Match the production/test path used by op_tests/test_moe_2stage.py.
-                w1_qt_fmoe = w1_qt
-                w2_qt_fmoe = w2_qt
-                w1_scale_fmoe = w1_scale
-                w2_scale_fmoe = w2_scale
-                if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
-                    # a16wi4 OLD-kernel preshuffle -- match production/test_moe_2stage.py.
-                    w1_qt_fmoe = (
-                        pack_int8_to_packed_int4(
-                            shuffle_weight(w1_qt_fmoe.view(dtypes.i8), (16, 16))
-                        )
-                        .view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
-                        .view(dtypes.i4x2)
-                    )
-                    w2_qt_fmoe = (
-                        pack_int8_to_packed_int4(
-                            shuffle_weight(w2_qt_fmoe.view(dtypes.i8), (16, 16))
-                        )
-                        .view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
-                        .view(dtypes.i4x2)
-                    )
-                    w1_scale_fmoe = (
-                        shuffle_scale_for_int4(w1_scale, group_size=32)
-                        .view(-1)
-                        .contiguous()
-                    )
-                    w2_scale_fmoe = (
-                        shuffle_scale_for_int4(w2_scale, group_size=32)
-                        .view(-1)
-                        .contiguous()
-                    )
-                elif q_dtype_w == torch.int4:
-                    w1_qt_fmoe = rearrange_4bit_elements(
-                        convert_int8_to_uint32_int4(
-                            shuffle_weight(w1_qt_fmoe, (16, 16), use_int4=True)
-                        )
-                    )
-                    w2_qt_fmoe = rearrange_4bit_elements(
-                        convert_int8_to_uint32_int4(
-                            shuffle_weight(w2_qt_fmoe, (16, 16), use_int4=True)
-                        )
-                    )
-                    w1_scale_fmoe = (
-                        fp4_utils.e8m0_shuffle(w1_scale)
-                        if w1_scale is not None
-                        else None
-                    )
-                    w2_scale_fmoe = (
-                        fp4_utils.e8m0_shuffle(w2_scale)
-                        if w2_scale is not None
-                        else None
-                    )
-                elif (
-                    q_type == QuantType.per_1x32
-                    and q_dtype_a in [dtypes.bf16, dtypes.fp16, dtypes.fp8]
-                    and q_dtype_w == dtypes.fp4x2
-                ):
-                    # a16w4 / a8w4 (16-bit or fp8 activation, fp4 weight): the
-                    # weight layout follows the *config* activation dtype, not the
-                    # runtime-effective one (mirror op_tests/test_moe_2stage.py):
-                    # a16w4 takes the standard GGUU W1, a8w4 the gate/up-
-                    # interleaved GUGU one, as in the tuning path.
-                    w1_gu = q_dtype_a == dtypes.fp8
-                    w1_qt_fmoe = shuffle_weight_a16w4(w1_qt_fmoe, 16, w1_gu)
-                    w1_scale_fmoe = shuffle_scale_a16w4(w1_scale, expert, w1_gu)
-                    w2_qt_fmoe = shuffle_weight_a16w4(w2_qt_fmoe, 16, False)
-                    w2_scale_fmoe = shuffle_scale_a16w4(w2_scale, expert, False)
-                elif (
-                    q_type == QuantType.per_1x32
-                    and q_dtype_a == dtypes.fp4x2
-                    and q_dtype_w == dtypes.fp4x2
-                ):
-                    # a4w4 (fp4 activation/weight): standard (16,16) weight shuffle
-                    # + e8m0 scale shuffle (mirror test_moe_2stage preshuffle path).
-                    w1_qt_fmoe = shuffle_weight(w1_qt_fmoe, layout=(16, 16))
-                    w2_qt_fmoe = shuffle_weight(w2_qt_fmoe, layout=(16, 16))
-                    w1_scale_fmoe = fp4_utils.e8m0_shuffle(w1_scale)
-                    w2_scale_fmoe = fp4_utils.e8m0_shuffle(w2_scale)
-                elif (
-                    q_type == QuantType.per_1x32
-                    and q_dtype_a == dtypes.fp8
-                    and q_dtype_w == dtypes.fp8
-                ):
-                    # mxfp8 (a8w8): gate-up interleaved fp8 weight; w1 scale uses the
-                    # a16w4 interleave, w2 scale uses plain e8m0 (mirror
-                    # op_tests/test_moe_2stage.py is_mxfp8).
-                    w1_qt_fmoe = shuffle_weight_a16w4(w1_qt_fmoe, 16, True)
-                    w1_scale_fmoe = shuffle_scale_a16w4(w1_scale, expert, True)
-                    w2_qt_fmoe = shuffle_weight_a16w4(w2_qt_fmoe, 16, False)
-                    w2_scale_fmoe = fp4_utils.e8m0_shuffle(w2_scale)
-                elif q_dtype_w != dtypes.fp4x2:
-                    w1_qt_fmoe = shuffle_weight(w1_qt_fmoe, (16, 16))
-                    w2_qt_fmoe = shuffle_weight(w2_qt_fmoe, (16, 16))
-                    w1_scale_fmoe = (
-                        fp4_utils.e8m0_shuffle(w1_scale)
-                        if w1_scale is not None
-                        else None
-                    )
-                    w2_scale_fmoe = (
-                        fp4_utils.e8m0_shuffle(w2_scale)
-                        if w2_scale is not None
-                        else None
-                    )
-                else:
-                    w1_scale_fmoe = (
-                        fp4_utils.e8m0_shuffle(w1_scale)
-                        if w1_scale is not None
-                        else None
-                    )
-                    w2_scale_fmoe = (
-                        fp4_utils.e8m0_shuffle(w2_scale)
-                        if w2_scale is not None
-                        else None
-                    )
-
-                w1_qt_fmoe.is_shuffled = True
-                w2_qt_fmoe.is_shuffled = True
+                hidden = inputs["hidden"]
+                w1_qt, w2_qt = inputs["w1_qt"], inputs["w2_qt"]
+                w1_scale, w2_scale = inputs["w1_scale"], inputs["w2_scale"]
+                w1_qt_fmoe, w2_qt_fmoe = inputs["w1_qt_fmoe"], inputs["w2_qt_fmoe"]
+                w1_scale_fmoe = inputs["w1_scale_fmoe"]
+                w2_scale_fmoe = inputs["w2_scale_fmoe"]
 
                 score = torch.randn((token, expert), dtype=dtype, device="cuda")
                 topk_weights, topk_ids = fused_topk(hidden, score, topk, True)
@@ -6755,6 +6988,40 @@ class FmoeTuner(TunerCommon):
                         f"  e2e head-to-head skipped/failed ({_e2e_err}); "
                         "falling back to additive fairness"
                     )
+
+            # Only latency is re-measured; the one-row config cannot carry the
+            # swiglu_limit tag, which fused_moe looks up in another table, and
+            # fused_moe here routes densely, not as --ep-size tunes.
+            if (
+                "v2" in profileDF.columns
+                and not policy.measures_power
+                and not self.swiglu_limit_tag
+                and not getattr(args, "no_fused_moe_rerank", False)
+                and not getattr(args, "ep_size", 0)
+            ):
+                finalists, scores = [], {}
+                try:
+                    finalists = _v2_e2e_finalists(profileDF)
+                    if len(finalists) > 1:
+                        scores = _v2_e2e_scores(
+                            self._time_pairs_in_fused_moe(key, profileDF.loc[finalists])
+                        )
+                except Exception as err:  # noqa: BLE001
+                    print(f"  fused_moe re-rank skipped ({err})", flush=True)
+                if scores:
+                    fastest = min(scores, key=scores.get)
+                    losers = [i for i in finalists if i != fastest]
+                    for i in finalists:
+                        pair = profileDF.loc[i]
+                        print(
+                            f"  fused_moe re-rank: block_m={pair['block_m']} "
+                            f"{pair['kernelName1']} / {pair['kernelName2']}: "
+                            f"stage sum {pair['us1'] + pair['us2']:.1f} us, "
+                            f"fused_moe unshared kernels {scores[i]:.1f} us"
+                            + (" (dropped)" if i in losers else ""),
+                            flush=True,
+                        )
+                    profileDF = profileDF.drop(index=losers)
 
             # v2 is a transient tuning-time pairing marker; the persistent layout
             # marker is kernelName2's ``_moe2_layout_`` segment. Drop it before the

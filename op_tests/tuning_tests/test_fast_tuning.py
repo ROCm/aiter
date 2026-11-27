@@ -1054,6 +1054,258 @@ class TestParallelMxfp4Precompile(unittest.TestCase):
         self.assertNotIn("swiglu_limit", precompiled[2])
 
 
+class TestV2FusedMoeRerank(unittest.TestCase):
+    @staticmethod
+    def _pairs(rows):
+        import pandas as pd
+
+        return pd.DataFrame(
+            [
+                {"us1": us1, "us2": us2, "v2": v2, "run_1stage": one_stage}
+                for us1, us2, v2, one_stage in rows
+            ],
+            index=[10 + i for i in range(len(rows))],
+        )
+
+    def test_finalists_are_v2_pairs_near_the_best_stage_sum(self):
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        pairs = self._pairs(
+            [
+                (60.0, 43.0, 1, 0),  # 103: inside the 5% gate of 100
+                (50.0, 50.0, 1, 0),  # 100: best
+                (50.0, 51.0, 1, 0),  # 101
+                (50.0, 56.0, 1, 0),  # 106: outside the gate
+                (106.0, 0.0, 1, 1),  # 106, 1-stage
+                (107.0, float("nan"), float("nan"), 1),  # 107, asm 1-stage row
+                (40.0, 68.0, 0, 0),  # 108, not a v2 pair
+            ]
+        )
+        self.assertEqual(gemm_moe_tune._v2_e2e_finalists(pairs), [11, 12, 10])
+
+    def test_finalists_refuse_a_pair_they_would_not_time_inside_the_gate(self):
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        v2_pairs = [(60.0, 43.0, 1, 0), (50.0, 51.0, 1, 0)]  # 103 and 101
+        for other in (
+            (40.0, 60.0, 0, 0),  # 100, not a v2 pair
+            (102.0, 0.0, 1, 1),  # 102, 1-stage
+            (101.0, float("nan"), float("nan"), 1),  # 101, asm 1-stage row
+        ):
+            with self.subTest(other=other):
+                pairs = self._pairs([*v2_pairs, other])
+                with self.assertRaisesRegex(ValueError, "within 5%"):
+                    gemm_moe_tune._v2_e2e_finalists(pairs)
+        # One v2 pair is not re-ranked, so the other pair does not matter.
+        pairs = self._pairs([v2_pairs[0], (40.0, 60.0, 0, 0)])
+        self.assertEqual(gemm_moe_tune._v2_e2e_finalists(pairs), [10])
+
+    def test_finalist_count_is_capped_by_stage_sum(self):
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        pairs = self._pairs([(50.0, 50.0 + i * 0.5, 1, 0) for i in range(6)][::-1])
+        finalists = gemm_moe_tune._v2_e2e_finalists(pairs)
+        self.assertEqual(len(finalists), gemm_moe_tune.V2_E2E_MAX_FINALISTS)
+        self.assertEqual(finalists, [15, 14, 13, 12])
+
+    def test_scores_leave_out_kernels_every_finalist_shares(self):
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        kernel_us = {
+            10: {"sort": 35.0, "moe1_t64": 577.0, "moe2_sbm64": 941.0, "reduce": 640.0},
+            11: {
+                "sort": 35.0,
+                "moe1_t128": 677.0,
+                "moe2_sbm128": 862.0,
+                "reduce": 575.0,
+            },
+            12: {
+                "sort": 35.0,
+                "moe1_t128": 677.0,
+                "moe2_sbm64": 941.0,
+                "reduce": 600.0,
+            },
+        }
+        # sort and reduce are shared by all three; moe1_t128 is not, so it counts.
+        self.assertEqual(
+            gemm_moe_tune._v2_e2e_scores(kernel_us),
+            {10: 1518.0, 11: 1539.0, 12: 1618.0},
+        )
+
+    def test_scores_refuse_a_finalist_without_kernels_of_its_own(self):
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        fallback = {"sort": 35.0, "moe1_default": 600.0, "moe2_default": 900.0}
+        for kernel_us in (
+            # Every finalist missed its config and ran the same fallback.
+            {10: dict(fallback), 11: dict(fallback)},
+            # 11 missed; 10 and 12 still differ in stage 2.
+            {
+                10: {**fallback, "moe2_sbm64": 940.0},
+                11: dict(fallback),
+                12: {**fallback, "moe2_sbm128": 860.0},
+            },
+        ):
+            with (
+                self.subTest(finalists=list(kernel_us)),
+                self.assertRaisesRegex(ValueError, "did not run their configs"),
+            ):
+                gemm_moe_tune._v2_e2e_scores(kernel_us)
+
+    def test_rerank_is_on_unless_disabled_on_the_command_line(self):
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        tuner = gemm_moe_tune.FmoeTuner("testFmoe", [], [], "test parser")
+        for flags, disabled in (([], False), (["--no_fused_moe_rerank"], True)):
+            with mock.patch.object(sys, "argv", ["gemm_moe_tune.py", *flags]):
+                self.assertIs(tuner.parse_args().no_fused_moe_rerank, disabled)
+
+    def test_config_switch_is_scoped_to_the_block(self):
+        import tempfile
+
+        from aiter.jit import core as jit_core
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        tuner = gemm_moe_tune.FmoeTuner.__new__(gemm_moe_tune.FmoeTuner)
+        fixture = REPO_ROOT / "aiter" / "configs" / "tuned_fmoe.csv"
+        old_env = os.environ.get("AITER_CONFIG_FMOE")
+        with tempfile.TemporaryDirectory() as tmp:
+            config_file = Path(tmp) / "tuned_fmoe.csv"
+            config_file.write_text(fixture.read_text().splitlines()[0] + "\n")
+            with (
+                mock.patch.object(tuner, "_clear_op_caches") as clear,
+                tuner._fused_moe_config(str(config_file)),
+            ):
+                self.assertEqual(os.environ["AITER_CONFIG_FMOE"], str(config_file))
+                merged = jit_core.AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
+                self.assertEqual(merged, str(config_file))
+            self.assertEqual(clear.call_count, 2)
+        self.assertEqual(os.environ.get("AITER_CONFIG_FMOE"), old_env)
+
+    def _post_process(self, extra_pairs=(), timer=None, **arg_overrides):
+        """Tuned row, timer mock and log of FmoeTuner.post_process on stub results.
+
+        v2 pairs: block_m 64 at a stage sum of 100 us, 128 at 103 (inside the
+        gate) and 32 at 120 (outside). ``extra_pairs`` adds (block_m, us1, us2)
+        pairs that are not v2. The key avoids the per_1x32 fairness benchmarks,
+        so nothing runs on a GPU.
+        """
+        import contextlib
+        import io
+        import tempfile
+
+        from aiter import ActivationType, QuantType, dtypes
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        key_cols = ["gfx", "cu_num", "token", "model_dim", "inter_dim", "expert"]
+        key_cols += ["topk", "act_type", "dtype", "q_dtype_a", "q_dtype_w"]
+        key_cols += ["q_type", "use_g1u1", "doweight_stage1"]
+        result_cols = ["block_m", "ksplit", "us1", "kernelName1", "err1", "us2"]
+        result_cols += ["kernelName2", "err2", "us", "run_1stage", "xbf16", "flat"]
+        result_cols += ["tflops", "bw", "nt"]
+        tuner = gemm_moe_tune.FmoeTuner("testFmoe", key_cols, result_cols, "test")
+        key = ("gfx950", 256, 16384, 4096, 1536, 512, 10, ActivationType.Silu)
+        key += (dtypes.bf16, dtypes.fp8, dtypes.fp8, QuantType.per_Token, True, False)
+
+        def stage_results(block_m, us1, us2, v2):
+            tag = f"t{block_m}_v{v2}"
+            return [
+                ((key, stage, f"{stage}_{tag}", block_m, 0, v2, 0), us, 0.0)
+                for stage, us in (("stage1", us1), ("stage2", us2))
+            ]
+
+        results = []
+        for block_m, us1, us2 in (
+            (64, 50.0, 50.0),
+            (128, 51.0, 52.0),
+            (32, 60.0, 60.0),
+        ):
+            results += stage_results(block_m, us1, us2, 1)
+        for block_m, us1, us2 in extra_pairs:
+            results += stage_results(block_m, us1, us2, 0)
+
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "aiter", "configs"))
+            args = SimpleNamespace(
+                select="latency",
+                tune_file=os.path.join(root, "tuned_fmoe.csv"),
+                profile_file="",
+                errRatio=0.1,
+                verbose=False,
+                no_fused_moe_rerank=False,
+                ep_size=0,
+            )
+            for name, value in arg_overrides.items():
+                setattr(args, name, value)
+            log = io.StringIO()
+            with (
+                mock.patch.object(gemm_moe_tune, "AITER_ROOT_DIR", root),
+                mock.patch.object(
+                    tuner, "_time_pairs_in_fused_moe", side_effect=timer
+                ) as timed,
+                contextlib.redirect_stdout(log),
+            ):
+                best = tuner.post_process(results, args)
+        self.assertEqual(len(best), 1)
+        return best.iloc[0], timed, log.getvalue()
+
+    @staticmethod
+    def _timer_favouring(block_m):
+        """Stub of _time_pairs_in_fused_moe where ``block_m`` runs fastest."""
+
+        def timer(key, pairs):
+            return {
+                i: {
+                    "sort": 30.0,
+                    pair["kernelName1"]: 500.0 if pair["block_m"] == block_m else 540.0,
+                    pair["kernelName2"]: 900.0,
+                }
+                for i, pair in pairs.iterrows()
+            }
+
+        return timer
+
+    def test_post_process_keeps_the_pair_fused_moe_times_fastest(self):
+        best, timed, log = self._post_process(timer=self._timer_favouring(128))
+        self.assertEqual(int(best["block_m"]), 128)
+        timed_pairs = timed.call_args.args[1]
+        self.assertEqual(sorted(timed_pairs["block_m"].astype(int)), [64, 128])
+        self.assertIn("(dropped)", log)
+
+    def test_post_process_keeps_the_stage_sum_pick_without_a_rerank(self):
+        cases = {
+            "disabled": ({"no_fused_moe_rerank": True}, ""),
+            "ep data": ({"ep_size": 8}, ""),
+            "untimed pair in the gate": (
+                {"extra_pairs": [(32, 50.0, 51.5)]},
+                "fused_moe re-rank skipped",
+            ),
+        }
+        for name, (overrides, expected_log) in cases.items():
+            with self.subTest(name):
+                best, timed, log = self._post_process(
+                    timer=self._timer_favouring(128), **overrides
+                )
+                timed.assert_not_called()
+                self.assertEqual(best["kernelName1"], "stage1_t64_v1")
+                self.assertIn(expected_log, log)
+
+    def test_post_process_keeps_the_stage_sum_pick_when_the_rerank_fails(self):
+        def raises(key, pairs):
+            raise RuntimeError("no GPU")
+
+        def same_kernels(key, pairs):
+            return {i: {"sort": 30.0, "moe1": 500.0} for i in pairs.index}
+
+        for timer in (raises, same_kernels):
+            with self.subTest(timer.__name__):
+                best, timed, log = self._post_process(timer=timer)
+                timed.assert_called_once()
+                self.assertEqual(best["kernelName1"], "stage1_t64_v1")
+                self.assertIn("fused_moe re-rank skipped", log)
+                self.assertNotIn("(dropped)", log)
+
+
 class TestMoePowerRanking(unittest.TestCase):
     def test_power_rank_orders_pairs_by_stage_energy(self):
         import pandas as pd
