@@ -3187,3 +3187,13 @@ namespace py = pybind11;
           py::arg("decode_gate")               = py::none(),                                  \
           py::arg("decode_slot_mapping")       = py::none(),                                  \
           py::arg("decode_positions")          = py::none());
+
+#define FUSED_INDEXED_GATED_RESIDUAL_PYBIND        \
+    m.def("fused_indexed_gated_residual_hip",      \
+          &fused_indexed_gated_residual,           \
+          py::arg("residual"),                     \
+          py::arg("x"),                            \
+          py::arg("gate"),                         \
+          py::arg("indices"),                      \
+          py::arg("out"),                          \
+          py::arg("round_intermediate"));
