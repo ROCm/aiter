@@ -283,13 +283,16 @@ def get_GEMM_A16W16_config(
     N: int,
     K: int,
     bias: bool,
-    dtype: str,
-    otype: str,
+    dtype: torch.dtype | str,
+    otype: torch.dtype | str,
     scaleAB: bool = False,
     bpreshuffle: bool = False,
     gfx: str | None = None,
     cu_num: int | None = None,
 ):
+    # Tensor callers key the LRU with dtype objects; CSV strings are needed only
+    # on a miss. Keep accepting the string keys used by tuning tools.
+    dtype, otype = str(dtype), str(otype)
     cu_num = get_cu_num() if cu_num is None else cu_num
     if gfx is None:
         gfx = get_gfx_runtime()
@@ -356,6 +359,12 @@ def get_GEMM_A16W16_config(
     return config
 
 
+@functools.cache
+def _record_gemm_shapes() -> bool:
+    """AITER_TUNE_GEMM, read once: shape recording is on or off for the run."""
+    return bool(int(os.environ.get("AITER_TUNE_GEMM", "0")))
+
+
 def save_shapes(
     M,
     N,
@@ -366,9 +375,8 @@ def save_shapes(
     scaleAB,
     bpreshuffle,
 ):
-    save_gemm = int(os.environ.get("AITER_TUNE_GEMM", "0"))
     global tuned_df
-    if save_gemm:
+    if _record_gemm_shapes():
         tuned_df = pd.concat(
             [
                 tuned_df,
@@ -439,6 +447,24 @@ def gemm_a16w16_out(
         raise RuntimeError("gemm_a16w16_out: the result was not written into out=")
 
 
+def _gemm_gfx_cu(device: torch.device) -> tuple[str, int]:
+    """The config lookup's architecture, scoped to the tensor's actual device."""
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    return _gemm_gfx_cu_cached(device)
+
+
+@functools.lru_cache(maxsize=64)
+def _gemm_gfx_cu_cached(device: torch.device) -> tuple[str, int]:
+    from aiter.ops.opus._arch import SUPPORTED_OPUS_ARCHES, _device_arch_and_cu
+
+    gfx, cu_num = _device_arch_and_cu(device)
+    if gfx not in SUPPORTED_OPUS_ARCHES:
+        gfx = get_gfx_runtime()
+        cu_num = get_cu_num()
+    return gfx, cu_num
+
+
 def _opus_reads_layout(operand: Tensor, k: int) -> bool:
     """Whether the OPUS launcher accepts this 2D operand: K-contiguous rows
     with an optional padded leading dimension. It raises on any other layout."""
@@ -499,26 +525,21 @@ def _gemm_a16w16(
     otype = otype if otype is not None else inp_view.dtype
     if out is not None and out.dtype != otype:
         raise ValueError(f"gemm_a16w16: out is {out.dtype} but otype is {otype}")
-    from aiter.ops.opus._arch import SUPPORTED_OPUS_ARCHES, _device_arch_and_cu
-
     try:
-        gfx, cu_num = _device_arch_and_cu(inp_view.device)
+        gfx, cu_num = _gemm_gfx_cu(inp_view.device)
     except RuntimeError:
         # The arch lookup rejects non-GPU tensors; those keep the Torch fallback.
         if inp_view.is_cuda:
             raise
         config = {"libtype": "torch", "solidx": 0}
     else:
-        if gfx not in SUPPORTED_OPUS_ARCHES:
-            gfx = get_gfx_runtime()
-            cu_num = get_cu_num()
         config = get_GEMM_A16W16_config(
             M=m,
             N=n,
             K=k,
             bias=use_bias,
-            dtype=str(inp_view.dtype),
-            otype=str(otype),
+            dtype=inp_view.dtype,
+            otype=otype,
             scaleAB=scale_a is not None or scale_b is not None,
             bpreshuffle=bpreshuffle,
             gfx=gfx,

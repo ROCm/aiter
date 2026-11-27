@@ -73,7 +73,12 @@ def _hipb_mm_out_dtype(
 
 # torch-free kernel entry: writes into caller-allocated `result` (the de-torched C++
 # TU can no longer torch::empty). outDtype is read from result.dtype() on the C++ side.
-@compile_ops("module_hipbsolgemm", fc_name="hipb_mm", develop=True)
+@compile_ops(
+    "module_hipbsolgemm",
+    fc_name="hipb_mm",
+    develop=True,
+    tensor_cache_args=("mat2",),
+)
 def _hipb_mm(
     mat1: torch.Tensor,
     mat2: torch.Tensor,
