@@ -10,13 +10,13 @@ Shapes from Qwen3.8-Flash-Next-120B:
 Usage:
     python op_tests/op_benchmarks/triton/bench_qsa.py
     python op_tests/op_benchmarks/triton/bench_qsa.py --op select
-    python op_tests/op_benchmarks/triton/bench_qsa.py --op gqa -metric bandwidth
+    python op_tests/op_benchmarks/triton/bench_qsa.py --op gqa --metric bandwidth
     python op_tests/op_benchmarks/triton/bench_qsa.py --op logits \
         --index-dtype fp4 --stacked-decode
     python op_tests/op_benchmarks/triton/bench_qsa.py --op gqa --kv-dtype fp8
 """
 
-import argparse
+import functools
 import math
 
 import torch
@@ -29,7 +29,16 @@ from aiter.ops.qsa import (
     qsa_store_quantized_rows,
 )
 from aiter.ops.triton.attention.qsa import qsa_sparse_paged_gqa
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+    override_parser_action,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 # Qwen3.8-Flash-Next-120B model config
 BLOCK_SIZE = 64
@@ -70,19 +79,49 @@ def _row_bytes(fmt, dim):
     return layout.dim * layout.dtype.itemsize + scale_bytes
 
 
-def _make_scenario(batch, tokens_per_seq, context_len, index_dtype, kv_dtype):
-    """Build tensors for a multi-request paged QSA scenario.
+def _page_counts(batch, context_len):
+    pages_per_req = (context_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+    total_pages = batch * pages_per_req
+    return pages_per_req, total_pages
+
+
+def _make_kv_cache(batch, context_len, kv_dtype):
+    """Paged KV cache: keys/values (and their scales) at total_pages capacity.
+
+    qsa_sparse_paged_gqa gathers only `selected`'s topk rows out of this per
+    call, so bench_gqa builds it once per shape (as a fixed, shared pool
+    field) instead of once per pool entry -- regenerating the full capacity
+    every entry would pay for, and count toward sizing, bytes the kernel
+    never reads most of.
+    """
+    _, total_pages = _page_counts(batch, context_len)
+    keys = torch.randn(
+        total_pages,
+        BLOCK_SIZE,
+        KV_HEADS,
+        QUERY_DIM,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    values = torch.randn_like(keys)
+    keys, k_scale = _quantize(keys, kv_dtype)
+    values, v_scale = _quantize(values, kv_dtype)
+    return keys, values, k_scale, v_scale
+
+
+def _make_scenario(batch, tokens_per_seq, context_len, index_dtype):
+    """Build the per-token positions/select-scratch/query tensors for a
+    multi-request paged QSA scenario (everything but the paged KV cache
+    itself -- see _make_kv_cache).
 
     Args:
         batch: number of requests
         tokens_per_seq: tokens per request (1 for decode, >1 for prefill/verify)
         context_len: context length per request
         index_dtype: compressed index-key cache format (bf16 / fp8 / fp4)
-        kv_dtype: K/V cache format (bf16 / fp8)
     """
     rows = batch * tokens_per_seq
-    pages_per_req = (context_len + BLOCK_SIZE - 1) // BLOCK_SIZE
-    total_pages = batch * pages_per_req
+    pages_per_req, total_pages = _page_counts(batch, context_len)
 
     positions = torch.arange(rows, dtype=torch.int32, device="cuda")
     for b in range(batch):
@@ -117,37 +156,22 @@ def _make_scenario(batch, tokens_per_seq, context_len, index_dtype, kv_dtype):
     query = torch.randn(
         rows, QUERY_HEADS, QUERY_DIM, dtype=torch.bfloat16, device="cuda"
     )
-    keys = torch.randn(
+    return (
+        positions,
+        tables,
+        requests,
+        lengths,
+        index_q,
+        compressed,
+        compressed_scale,
+        query,
+        rows,
         total_pages,
-        BLOCK_SIZE,
-        KV_HEADS,
-        QUERY_DIM,
-        dtype=torch.bfloat16,
-        device="cuda",
+        pages_per_req,
     )
-    values = torch.randn_like(keys)
-    keys, k_scale = _quantize(keys, kv_dtype)
-    values, v_scale = _quantize(values, kv_dtype)
-    return {
-        "positions": positions,
-        "tables": tables,
-        "requests": requests,
-        "lengths": lengths,
-        "index_q": index_q,
-        "compressed": compressed,
-        "compressed_scale": compressed_scale,
-        "query": query,
-        "keys": keys,
-        "values": values,
-        "k_scale": k_scale,
-        "v_scale": v_scale,
-        "rows": rows,
-        "total_pages": total_pages,
-        "pages_per_req": pages_per_req,
-    }
 
 
-# -- qsa_select_paged_tokens (scoring + topk + expand) --------------------
+# -- qsa_select_paged_tokens / qsa_paged_mqa_logits -----------------------
 
 # (batch, tokens_per_seq, context_len)
 _SELECT_SHAPES = [
@@ -170,10 +194,100 @@ _SELECT_SHAPES = [
 ]
 
 
+def _generate_select_pool_inputs(batch, tokens_per_seq, context_len, index_dtype):
+    """select/logits never read query -- _make_scenario only builds it because
+    bench_gqa's generator needs it too. Drop it here rather than pay for
+    (and count toward sizing) a tensor this call path never touches."""
+    (
+        positions,
+        tables,
+        requests,
+        lengths,
+        index_q,
+        compressed,
+        compressed_scale,
+        _query,
+        rows,
+        total_pages,
+        pages_per_req,
+    ) = _make_scenario(batch, tokens_per_seq, context_len, index_dtype)
+    return (
+        positions,
+        tables,
+        requests,
+        lengths,
+        index_q,
+        compressed,
+        compressed_scale,
+        rows,
+        total_pages,
+        pages_per_req,
+    )
+
+
+_SELECT_POOL_FIELDS = [
+    "positions",
+    "tables",
+    "requests",
+    "lengths",
+    "index_q",
+    "compressed",
+    "compressed_scale",
+    "rows",
+    "total_pages",
+    "pages_per_req",
+]
+
+
+def _make_select_kernel_fn(name, stacked_decode):
+    def kernel_fn(
+        index_q,
+        compressed,
+        compressed_scale,
+        tables,
+        requests,
+        positions,
+        lengths,
+        **_,
+    ):
+        kwargs = {
+            "compressed_k_scale": compressed_scale,
+            "stacked_decode": stacked_decode,
+        }
+        if name == "logits":
+            qsa_paged_mqa_logits(
+                index_q,
+                compressed,
+                tables,
+                requests,
+                positions,
+                lengths,
+                RATIO,
+                **kwargs,
+            )
+        else:
+            qsa_select_paged_tokens(
+                index_q,
+                compressed,
+                tables,
+                requests,
+                positions,
+                lengths,
+                BUDGET,
+                RATIO,
+                **kwargs,
+            )
+
+    return kernel_fn
+
+
 def bench_select(args):
     unit = "ms" if args.metric == "time" else "GB/s"
     name = "logits" if args.op == "logits" else "select"
     fn_name = "qsa_paged_mqa_logits" if name == "logits" else "qsa_select_paged_tokens"
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
 
     config = triton.testing.Benchmark(
         x_names=["batch", "tokens_per_seq", "context_len"],
@@ -190,41 +304,19 @@ def bench_select(args):
     @triton.testing.perf_report([config])
     def _run(batch, tokens_per_seq, context_len, provider):
         torch.manual_seed(42)
-        s = _make_scenario(
-            batch, tokens_per_seq, context_len, args.index_dtype, args.kv_dtype
+        pool_gen = functools.partial(
+            _generate_select_pool_inputs,
+            batch,
+            tokens_per_seq,
+            context_len,
+            args.index_dtype,
         )
-        columns = s["pages_per_req"] * COMPRESSED_PAGE_SIZE
-        rows = s["rows"]
+        rot_bufs = bencher.build_pool([pool_gen], [_SELECT_POOL_FIELDS])
+        columns = rot_bufs[0]["pages_per_req"] * COMPRESSED_PAGE_SIZE
+        rows = rot_bufs[0]["rows"]
         elem = 2  # bf16
-        kwargs = {
-            "compressed_k_scale": s["compressed_scale"],
-            "stacked_decode": args.stacked_decode,
-        }
 
-        fn = lambda: qsa_select_paged_tokens(
-            s["index_q"],
-            s["compressed"],
-            s["tables"],
-            s["requests"],
-            s["positions"],
-            s["lengths"],
-            BUDGET,
-            RATIO,
-            **kwargs,
-        )
-        if name == "logits":
-            fn = lambda: qsa_paged_mqa_logits(
-                s["index_q"],
-                s["compressed"],
-                s["tables"],
-                s["requests"],
-                s["positions"],
-                s["lengths"],
-                RATIO,
-                **kwargs,
-            )
-
-        ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+        ms = bencher.bench(_make_select_kernel_fn(name, args.stacked_decode))
         if args.metric == "time":
             return ms
         mem = (
@@ -265,8 +357,79 @@ _GQA_SHAPES = [
 ]
 
 
+def _generate_gqa_pool_entry(batch, tokens_per_seq, context_len, index_dtype):
+    """query/selected/tables/requests + the scalars vary per pool entry, so
+    replaying through the pool exercises different gather indices into the
+    shared keys/values (built once per shape -- see _make_kv_cache and
+    bench_gqa's gens_fixed).
+
+    qsa_sparse_paged_gqa needs qsa_select_paged_tokens' output as input, so
+    each pool entry primes it the same way moe2 is primed by moe1's output in
+    the MoE benchmarks: one untimed call ahead of time, per entry.
+    """
+    (
+        positions,
+        tables,
+        requests,
+        lengths,
+        index_q,
+        compressed,
+        compressed_scale,
+        query,
+        rows,
+        total_pages,
+        pages_per_req,
+    ) = _make_scenario(batch, tokens_per_seq, context_len, index_dtype)
+    selected = qsa_select_paged_tokens(
+        index_q,
+        compressed,
+        tables,
+        requests,
+        positions,
+        lengths,
+        BUDGET,
+        RATIO,
+        compressed_k_scale=compressed_scale,
+    )
+    return (query, selected, tables, requests, rows, total_pages, pages_per_req)
+
+
+_GQA_POOL_FIELDS = [
+    "query",
+    "selected",
+    "tables",
+    "requests",
+    "rows",
+    "total_pages",
+    "pages_per_req",
+]
+_GQA_FIXED_FIELDS = ["keys", "values", "k_scale", "v_scale"]
+
+
+def _make_gqa_kernel_fn(batch, tokens_per_seq):
+    def kernel_fn(
+        query, keys, values, k_scale, v_scale, selected, tables, requests, **_
+    ):
+        qsa_sparse_paged_gqa(
+            query,
+            keys,
+            values,
+            selected,
+            tables,
+            requests,
+            num_decode_requests=batch if tokens_per_seq == 1 else None,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+
+    return kernel_fn
+
+
 def bench_gqa(args):
     unit = "ms" if args.metric == "time" else "GB/s"
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
 
     config = triton.testing.Benchmark(
         x_names=["batch", "tokens_per_seq", "context_len"],
@@ -283,38 +446,26 @@ def bench_gqa(args):
     @triton.testing.perf_report([config])
     def _run(batch, tokens_per_seq, context_len, provider):
         torch.manual_seed(42)
-        s = _make_scenario(
-            batch, tokens_per_seq, context_len, args.index_dtype, args.kv_dtype
+        pool_gen = functools.partial(
+            _generate_gqa_pool_entry,
+            batch,
+            tokens_per_seq,
+            context_len,
+            args.index_dtype,
         )
-        rows = s["rows"]
+        fixed_gen = functools.partial(_make_kv_cache, batch, context_len, args.kv_dtype)
+        rot_bufs = bencher.build_pool(
+            [pool_gen],
+            [_GQA_POOL_FIELDS],
+            inp_gen_fixed_fns=[fixed_gen],
+            inp_fixed_keys=[_GQA_FIXED_FIELDS],
+        )
+        rows = rot_bufs[0]["rows"]
+        topk = rot_bufs[0]["selected"].shape[1]
         elem = 2  # bf16
 
-        selected = qsa_select_paged_tokens(
-            s["index_q"],
-            s["compressed"],
-            s["tables"],
-            s["requests"],
-            s["positions"],
-            s["lengths"],
-            BUDGET,
-            RATIO,
-            compressed_k_scale=s["compressed_scale"],
-        )
-        topk = selected.shape[1]
-
-        fn = lambda: qsa_sparse_paged_gqa(
-            s["query"],
-            s["keys"],
-            s["values"],
-            selected,
-            s["tables"],
-            s["requests"],
-            num_decode_requests=batch if tokens_per_seq == 1 else None,
-            k_scale=s["k_scale"],
-            v_scale=s["v_scale"],
-        )
-
-        ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+        kernel_fn = _make_gqa_kernel_fn(batch, tokens_per_seq)
+        ms = bencher.bench(kernel_fn)
         if args.metric == "time":
             return ms
         kv_row = _row_bytes(args.kv_dtype, QUERY_DIM)
@@ -333,7 +484,10 @@ def bench_gqa(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(prog="Benchmark QSA", allow_abbrev=False)
+    parser = get_parser(kernel_name="QSA")
+    override_parser_action(
+        parser, action="--metric", choices=["time", "bandwidth"], default="time"
+    )
     parser.add_argument(
         "--op",
         choices=["select", "logits", "gqa", "all"],
@@ -357,13 +511,6 @@ def parse_args():
         action="store_true",
         default=False,
         help="Score decode-sized calls with the stacked-head MFMA scorer",
-    )
-    parser.add_argument(
-        "-metric",
-        nargs="?",
-        const="time",
-        choices=["time", "bandwidth"],
-        default="time",
     )
     parser.add_argument("-o", action="store_true", default=False)
     return parser.parse_args()
