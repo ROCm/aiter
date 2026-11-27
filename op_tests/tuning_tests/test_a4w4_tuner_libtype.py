@@ -33,6 +33,10 @@ ASM_NAMES = {
     (32, 128, 0, 1): "_ZN5aiter_fake_32x128_ps",
 }
 SHAPE = (1, 512, 4096)  # M < 32: no Triton/FlyDSL candidates, so no optional deps
+# Shape with real Triton/FlyDSL candidates: M >= 32, N % 16 == 0, K % 256 == 0.
+PRESHUFFLE_SHAPE = (32, 1024, 4096)
+# An invalid backend name that no PR is going to add (unlike "opus", see #7979).
+NO_SUCH_BACKEND = "no_such_backend"
 
 
 def _parse(argv):
@@ -44,7 +48,7 @@ class TestLibtypeArgs(unittest.TestCase):
     def test_libtype_list(self):
         self.assertEqual(tune_mod.libtype_list("ck,asm"), ["ck", "asm"])
         self.assertEqual(tune_mod.libtype_list("all"), ["all"])
-        for bad in ("opus", "ck,nope", "", "cktile"):
+        for bad in (NO_SUCH_BACKEND, "ck,nope", "", "cktile"):
             with self.assertRaises(argparse.ArgumentTypeError):
                 tune_mod.libtype_list(bad)
 
@@ -72,7 +76,7 @@ class TestLibtypeArgs(unittest.TestCase):
             tune_mod.resolve_libtypes(None, "ck,asm,triton,flydsl"),
             {"ck", "asm", "triton", "flydsl"},
         )
-        for bad in ("all", "opus", "ck,", ""):
+        for bad in ("all", NO_SUCH_BACKEND, "ck,", ""):
             with self.assertRaisesRegex(ValueError, "Unknown --backends"):
                 tune_mod.resolve_libtypes(None, bad)
 
@@ -92,7 +96,7 @@ class TestLibtypeArgs(unittest.TestCase):
     def test_parse_args_rejects_conflict_and_bad_values(self):
         for argv in (
             ["--libtype", "ck", "--backends", "ck"],
-            ["--backends", "opus"],
+            ["--backends", NO_SUCH_BACKEND],
             ["--libtype", "cktile"],
         ):
             tuner = tune_mod.GemmA4W4BlockScaleTuner("t", description="t")
@@ -105,8 +109,8 @@ class TestLibtypeArgs(unittest.TestCase):
             self.assertEqual(ctx.exception.code, 2, argv)
 
 
-class TestCandidateSets(unittest.TestCase):
-    """Candidates tune() enumerates for one shape, per libtype."""
+class TunerFixture(unittest.TestCase):
+    """Runs tune() without a GPU: stubs the chip, mp_tuner and the ASM kernel list."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -138,8 +142,8 @@ class TestCandidateSets(unittest.TestCase):
         pd.DataFrame(rows).to_csv(asm_dir / "f4gemm_bf16_per1x32Fp4.csv", index=False)
         self.asm_dir = self.tmp.name
 
-    def enumerate(self, **opts):
-        """[(backend, kernelId, kernelName)] from tune() for SHAPE; opts go to args."""
+    def enumerate(self, shape=SHAPE, **opts):
+        """[(backend, kernelId, kernelName)] from tune() for `shape`; opts go to args."""
         args = SimpleNamespace(
             splitK=False,
             mp=1,
@@ -152,7 +156,7 @@ class TestCandidateSets(unittest.TestCase):
         )
         vars(args).update(opts)
         tuner = tune_mod.GemmA4W4BlockScaleTuner("t", description="t")
-        untuned = pd.DataFrame([dict(zip("MNK", SHAPE))])
+        untuned = pd.DataFrame([dict(zip("MNK", shape))])
         captured = []
         with contextlib.ExitStack() as stack:
             stack.enter_context(
@@ -181,12 +185,16 @@ class TestCandidateSets(unittest.TestCase):
         out = []
         for task in captured:
             (_shape, kernel_id, _split_k, name), fn = task[0], task[3]
-            self.assertEqual(task[0][0], ("gfx950", 256, *SHAPE))
+            self.assertEqual(task[0][0], ("gfx950", 256, *shape))
             out.append((by_fn[fn], kernel_id, name))
         return out
 
     def backends(self, rows):
         return {backend for backend, _, _ in rows}
+
+
+class TestCandidateSets(TunerFixture):
+    """Candidates tune() enumerates for one shape, per libtype."""
 
     def test_default_is_ck_and_asm(self):
         rows = self.enumerate()
@@ -253,6 +261,89 @@ class TestCandidateSets(unittest.TestCase):
                     None, kernel_id
                 )
                 self.assertTrue(ck_name and not ck_name.startswith("_ZN"), ck_name)
+
+
+class TestRealPreshuffleCandidates(TunerFixture):
+    """The names `--libtype triton|flydsl` generate must be launchable by the runtime.
+
+    Uses the real `preshuffle_candidates` for an M >= 32 shape and checks every name
+    with the parsers `gemm_a4w4` applies to a tuned row (aiter/ops/gemm_op_a4w4.py).
+    Nothing is launched, so no GPU kernel runs; Triton and FlyDSL must be importable.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from aiter.ops import gemm_op_a4w4
+            from aiter.ops.flydsl.gemm_tune import (
+                flydsl_gemm_mxscale_preshuffle_common as fly,
+            )
+        except ImportError as e:  # optional backends are absent on this host
+            raise unittest.SkipTest(f"Triton/FlyDSL not importable: {e}") from e
+        cls.runtime = gemm_op_a4w4
+        cls.fly = fly
+
+    def candidates(self, backends, split_k=False):
+        return tune_mod.preshuffle_candidates(*PRESHUFFLE_SHAPE, backends, split_k)
+
+    def check_triton(self, name, split_k):
+        params = self.runtime._parse_triton_a4w4_kernel(name)  # raises if invalid
+        if not split_k:
+            self.assertEqual(params["NUM_KSPLIT"], 1, name)
+
+    def check_flydsl(self, name):
+        params = self.fly.parse_kernel_name(name)
+        self.assertIsNotNone(params, name)
+        self.assertEqual((params["a_dtype"], params["b_dtype"]), ("fp4", "fp4"), name)
+        self.assertFalse(params["fused_split_k"], name)
+        inst = self.fly.kernelInstance(**params)
+        self.assertTrue(self.fly.instance_valid(inst), name)
+        self.assertTrue(
+            self.fly.fits_shape(
+                inst,
+                *PRESHUFFLE_SHAPE,
+                a_scale_block="1x32",
+                b_scale_block="1x32",
+                a_scale_layout="mfma_tile",
+                b_scale_layout="mfma_tile",
+            ),
+            name,
+        )
+
+    def test_triton_names_parse_in_the_runtime(self):
+        for split_k in (False, True):
+            names = self.candidates({"triton"}, split_k)
+            self.assertTrue(names)
+            for name in names:
+                self.assertTrue(name.startswith("triton_preshuffle_"), name)
+                self.check_triton(name, split_k)
+
+    def test_flydsl_names_parse_in_the_runtime(self):
+        for split_k in (False, True):
+            names = self.candidates({"flydsl"}, split_k)
+            self.assertTrue(names)
+            for name in names:
+                self.assertTrue(name.startswith("flydsl_"), name)
+                self.check_flydsl(name)
+
+    def test_backends_gate_the_generated_names(self):
+        self.assertEqual(self.candidates({"ck", "asm"}), [])
+        both = self.candidates({"triton", "flydsl"})
+        self.assertEqual(
+            sorted(both),
+            sorted(self.candidates({"triton"}) + self.candidates({"flydsl"})),
+        )
+
+    def test_tune_enumerates_launchable_names_per_libtype(self):
+        """End to end through tune(): `--libtype` decides which families appear."""
+        for libtype, prefix in (("triton", "triton_"), ("flydsl", "flydsl_")):
+            rows = self.enumerate(shape=PRESHUFFLE_SHAPE, libtype=[libtype])
+            self.assertEqual({b for b, _, _ in rows}, {"preshuffle"}, libtype)
+            self.assertTrue(rows)
+            for _, _, name in rows:
+                self.assertTrue(name.startswith(prefix), name)
+        rows = self.enumerate(shape=PRESHUFFLE_SHAPE, libtype=["all"])
+        self.assertEqual({b for b, _, _ in rows}, {"ck", "asm", "preshuffle"})
 
 
 if __name__ == "__main__":
