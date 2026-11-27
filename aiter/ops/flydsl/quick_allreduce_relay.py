@@ -10,9 +10,14 @@
   single outgoing bounce on ``relay_devices[rank]`` and exports the handle to
   its three peers, keeping HIP context overhead to one lending GPU per rank.
 
-Nothing runs on any relay GPU itself. By the time a rank's last kernel
-finishes, its peers have already retired every write into its bounce, so
-teardown needs no extra barrier.
+Nothing runs on any relay GPU itself. For TP2 (receiver-owned), by the time a
+rank's last kernel finishes, its peer has already retired every write into its
+bounce, so local synchronization suffices before teardown. For TP4
+(sender-owned), peers read this rank's outgoing bounce during all-gather, so
+callers should ensure every rank has finished its last all-reduce (e.g.
+``torch.cuda.synchronize()`` followed by a group barrier) before calling
+``close()``; ``close()`` itself stays non-collective so ``__del__`` and
+exception unwind cannot deadlock.
 """
 
 from __future__ import annotations
@@ -155,6 +160,10 @@ def open_sender_relay_bounces(
     Each rank creates a HIP context on only one relay GPU (its own sender-owned
     relay), exports its IPC handle, and opens the ``world_size - 1`` peer
     handles on its own ``device``. Collective: raises on every rank or on none.
+
+    Because peers read this rank's outgoing bounce during all-gather, callers
+    should synchronize all ranks (e.g. ``torch.cuda.synchronize()`` + group
+    barrier) before invoking ``close()``.
     """
     heap = UncachedIpcHeap
     relay_out = int(relay_devices[rank])

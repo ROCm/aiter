@@ -895,6 +895,13 @@ class FlyQuickAllReduce:
                 preload_launcher(eng.launch, *args)
 
     def close(self):
+        """Release IPC handles and device allocations.
+
+        Non-collective (also called from ``__del__`` and exception unwind).
+        With TP4 sender-owned relay, callers should ensure all ranks have
+        finished their last all-reduce (e.g. ``torch.cuda.synchronize()`` +
+        group barrier) before calling ``close()``.
+        """
         engines = getattr(self, "_by_cfg", None)
         relay_engines = getattr(self, "_relay_by_cfg", None) or {}
         relay_bounces = getattr(self, "_relay_bounces", None) or ()
