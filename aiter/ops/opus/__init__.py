@@ -8,6 +8,12 @@ import torch
 from torch import Tensor
 
 from .dispatch import _opus_dispatch
+from .gemm_op_a8w8_blockscale_grouped import (
+    k_grouped_fp8_blockscale_gemm_tn_contiguous,
+    m_grouped_fp8_blockscale_gemm_nn_contiguous,
+    m_grouped_fp8_blockscale_gemm_nt_contiguous,
+    m_grouped_fp8_blockscale_gemm_nt_masked,
+)
 
 
 def opus_gemm(
@@ -104,6 +110,10 @@ def gemm_a16w16_opus(
 
 __all__ = [
     "gemm_a16w16_opus",
+    "k_grouped_fp8_blockscale_gemm_tn_contiguous",
+    "m_grouped_fp8_blockscale_gemm_nn_contiguous",
+    "m_grouped_fp8_blockscale_gemm_nt_contiguous",
+    "m_grouped_fp8_blockscale_gemm_nt_masked",
     "opus_bmm",
     "opus_gemm",
 ]

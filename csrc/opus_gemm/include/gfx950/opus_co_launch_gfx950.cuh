@@ -21,16 +21,16 @@ struct CoModule {
     std::vector<char> image;
     AiterAsmKernelFast kernel;
 
-    CoModule(const std::string& symbol, const std::string& image_name)
-        : image(read_co(image_name)),
+    CoModule(const std::string& symbol, const std::string& image_name, const std::string& co_dir)
+        : image(read_co(image_name, co_dir)),
           kernel(symbol.c_str(), image.data(), AiterAsmKernelFast::SkipGfx1250Gate{}) {}
 
 private:
-    static std::vector<char> read_co(const std::string& image_name) {
+    static std::vector<char> read_co(const std::string& image_name, const std::string& co_dir) {
         const char* env = std::getenv("OPUS_GEN_CO_DIR");
         const std::string root = env && *env ? env : OPUS_GEN_CO_DIR;
         AITER_CHECK(!root.empty(), "gfx950 CO directory is empty");
-        const auto path = root + "/gfx950/a8w8_blockscale_bpreshuffle/" + image_name;
+        const auto path = root + "/" + co_dir + "/" + image_name;
         std::ifstream file(path, std::ios::binary | std::ios::ate);
         AITER_CHECK(file.is_open(), "gfx950 cannot open CO: ", path);
         const std::streamsize size = file.tellg();
@@ -43,16 +43,19 @@ private:
         return bytes;
     }
 };
-inline AiterAsmKernelFast& co_kernel(const std::string& symbol, const std::string& image_name) {
+// co_dir: the family's directory under gen_co/ (default: the a8w8 blockscale bpreshuffle images).
+inline AiterAsmKernelFast& co_kernel(const std::string& symbol, const std::string& image_name,
+                                     const std::string& co_dir = "gfx950/a8w8_blockscale_bpreshuffle") {
     static SynchronizedCache<std::string, CoModule> cache;
-    const std::string cache_key = image_name + '\0' + symbol;
-    return cache.get_or_create(cache_key, [&]() { return CoModule(symbol, image_name); }).kernel;
+    const std::string cache_key = co_dir + '/' + image_name + '\0' + symbol;
+    return cache.get_or_create(cache_key, [&]() { return CoModule(symbol, image_name, co_dir); }).kernel;
 }
 } // namespace opus_gfx950_co
-template<class Kargs>
+// KARGS_BYTES: the kernarg size the .co images were built with.
+template<int KARGS_BYTES = 96, class Kargs>
 inline void opus_co_launch_gfx950(AiterAsmKernelFast& kernel, dim3 grid, dim3 block,
                                   Kargs& args, hipStream_t stream, unsigned dynamic_lds = 0) {
-    static_assert(sizeof(args) == 96);
+    static_assert(sizeof(args) == KARGS_BYTES);
     size_t arg_size = sizeof(args);
     kernel.launch_kernel({&args, &arg_size,
                           int(grid.x), int(grid.y), int(grid.z),

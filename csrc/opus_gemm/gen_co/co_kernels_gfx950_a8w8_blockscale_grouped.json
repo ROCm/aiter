@@ -1,0 +1,42 @@
+{
+  "_comment": [
+    "gfx950 FP8 blockscale grouped GEMMs (the DeepGEMM interfaces) on the MXFP8 1x128 4-wave pipeline,",
+    "include/gfx950/opus_gemm_pipeline_a8w8_blockscale_grouped_gfx950.cuh. READ BY opus_gemm_a8w8_blockscale_grouped_common.py.",
+    "Built offline: gen_co/build_co.py --arch gfx950 --family a8w8_blockscale_grouped (AGPR-pinning LLVM).",
+    "FP8 e4m3 operands, E8M0 scales, nothing shuffled.",
+    "",
+    "Per-entry fields:",
+    "  kid   local kid of the FP8 grouped entries (opus_gemm.cu): m_grouped 0-9, k_grouped 10-19.",
+    "  kind  m_grouped : opus_gemm_a8w8_blockscale_grouped_launch (fwd / dgrad, contiguous or masked),",
+    "                    256-row tiles; A scales 1x128, B 128x128; images <name>_nt / <name>_nn.",
+    "        k_grouped : opus_gemm_a8w8_blockscale_k_grouped_launch (wgrad), TN, A / B scales 128x1;",
+    "                    images <name>_tn (bf16 C) / <name>_tn_f32 (fp32 C), each with <image>_plan.",
+    "  tile  [B_M, B_N]; B_M 256; B_N 256 or 128 (m_grouped), 256 (k_grouped)."
+  ],
+  "gfx950": [
+    {
+      "kid": 0,
+      "kind": "m_grouped",
+      "tile": [
+        256,
+        256
+      ]
+    },
+    {
+      "kid": 1,
+      "kind": "m_grouped",
+      "tile": [
+        256,
+        128
+      ]
+    },
+    {
+      "kid": 10,
+      "kind": "k_grouped",
+      "tile": [
+        256,
+        256
+      ]
+    }
+  ]
+}

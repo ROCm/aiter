@@ -24,6 +24,11 @@ from codegen.common import (
     reset_written_paths,
     write_if_changed,
 )
+from opus_gemm_a8w8_blockscale_grouped_common import (
+    A8W8_BLOCKSCALE_GROUPED_CO_DIR,
+    a8w8_blockscale_k_grouped_kids,
+    a8w8_blockscale_m_grouped_kids,
+)
 from opus_gemm_common import (
     KERNEL_REGISTRY,
     KernelKey,
@@ -808,6 +813,39 @@ class opus_gemm_codegen:
                 _emit_non_workspace_map(f, arch, "fp32_t")
                 _emit_workspace_map(f, arch)
 
+    def gen_a8w8_blockscale_grouped_kid_table(self):
+        """Emit the gfx950 FP8 blockscale grouped kid table {kid, B_M, B_N, image name stem} of the kids whose
+        images are present (opus_gemm_a8w8_blockscale_grouped_common.py), for opus_gemm.cu.
+        """
+
+        def table(macro, kids):
+            rows = [
+                f'    {{ {kid}, {k.B_M}, {k.B_N}, "{k.name}" }},'
+                for kid, k in sorted(kids.items())
+            ]
+            return f"#define {macro} \\\n" + " \\\n".join(rows) + "\n"
+
+        header = "opus_gemm_a8w8_blockscale_grouped_kid_table.h"
+        with open_if_changed(os.path.join(self.working_path, header)) as f:
+            f.write(
+                "#pragma once\n"
+                "// SPDX-License-Identifier: MIT\n"
+                "// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.\n"
+                "//\n"
+                "// Auto-generated. Do not edit. See gen_instances.py:gen_a8w8_blockscale_grouped_kid_table.\n"
+                "// gfx950 M-grouped kids (images <name>_<nt|nn>.co) and K-grouped kids (images\n"
+                "// <name>_<tn|tn_f32>.co) present: { kid, B_M, B_N, name }.\n"
+                f'#define OPUS_A8W8_BLOCKSCALE_GROUPED_CO_DIR "{A8W8_BLOCKSCALE_GROUPED_CO_DIR}"\n'
+                + table(
+                    "OPUS_A8W8_BLOCKSCALE_M_GROUPED_KID_TABLE",
+                    a8w8_blockscale_m_grouped_kids,
+                )
+                + table(
+                    "OPUS_A8W8_BLOCKSCALE_K_GROUPED_KID_TABLE",
+                    a8w8_blockscale_k_grouped_kids,
+                )
+            )
+
     def gen_a8w8_kid_dispatch(self, kernels_dict):
         """Emit sorted A8W8 launcher tables for each interface."""
         header = """#pragma once
@@ -1324,6 +1362,7 @@ void
 
         self.gen_manifest_head(by_symbol)
         self.gen_a16w16_kid_dispatch(kernels_dict)
+        self.gen_a8w8_blockscale_grouped_kid_table()
         self.gen_a8w8_kid_dispatch(kernels_dict)
         self.gen_bmm_mxscale_kid_dispatch(kernels_dict)
 

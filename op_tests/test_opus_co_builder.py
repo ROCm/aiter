@@ -50,6 +50,38 @@ class NamedRegisterEvidenceTests(unittest.TestCase):
         self.assertEqual(a0, _BUILDER_PATH.parent / "gfx1250-strict")
         self.assertEqual(normal, _BUILDER_PATH.parent / "named_reg" / "gfx1250")
 
+    def test_build_info_sort_accepts_rejected_records(self):
+        built = [
+            {"kid": 3, "symbol": "b", "status": "ready"},
+            {"kid": 1, "status": "rejected", "reason": "kernarg"},
+            {"kid": 3, "symbol": "a", "status": "ready"},
+        ]
+        built.sort(key=builder._built_sort_key)
+        self.assertEqual(
+            [(row["kid"], row.get("symbol")) for row in built],
+            [(1, None), (3, "a"), (3, "b")],
+        )
+
+    def test_grouped_family_is_gfx950_only(self):
+        grouped = Path(
+            builder._default_co_output_dir(
+                "gfx950", "gfx950", "a8w8_blockscale_grouped"
+            )
+        )
+        self.assertEqual(
+            grouped, _BUILDER_PATH.parent / "gfx950" / "a8w8_blockscale_grouped"
+        )
+        argv = ["build_co.py", "--arch", "gfx1250", "--family"]
+        with (
+            mock.patch("sys.argv", argv + ["a8w8_blockscale_grouped"]),
+            mock.patch("sys.stderr"),
+            mock.patch.object(builder.os, "makedirs") as makedirs,
+            self.assertRaises(SystemExit) as raised,
+        ):
+            builder.main()
+        self.assertEqual(raised.exception.code, 2)
+        makedirs.assert_not_called()
+
     def test_strict_layout_guard_does_not_change_the_target(self):
         source = builder._STUB_TEMPLATE
         self.assertIn("defined(__gfx1250_strict__)", source)
