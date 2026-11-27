@@ -480,22 +480,53 @@ def _modes_reference(q, kv, scales, weights, starts, ends):
     return out, inside
 
 
-@pytest.mark.parametrize("rows,keys", [(2048, 1025), (2051, 3001), (4097, 777)])
+# fp32 head sum (2048 to 4097 rows), the few-row config, the matrix-core head sum
+@pytest.mark.parametrize(
+    "rows,keys", [(2048, 1025), (2051, 3001), (4097, 777), (5, 3001), (300, 9000)]
+)
 @torch.inference_mode()
 def test_fp8_mqa_logits_modes_bit_identical(rows, keys):
-    q, kv, scales, weights, starts, ends = _modes_case(rows, keys, rows + keys)
+    _check_modes(*_modes_case(rows, keys, rows + keys))
+
+
+# the per-row kernel for short windows, and KV splits sized for the window
+@pytest.mark.parametrize("rows,keys,window", [(5, 5000, 300), (64, 9000, 2000)])
+@torch.inference_mode()
+def test_fp8_mqa_logits_max_window_modes_bit_identical(rows, keys, window):
+    q, kv, scales, weights, starts, ends = _modes_case(rows, keys, rows * keys)
+    starts = torch.clamp(ends - (ends - starts) % (window + 1), min=0).int()
+    hint = int((ends - starts).clamp(min=0).max())
+    _check_modes(q, kv, scales, weights, starts, ends, max_window=hint)
+
+
+@torch.inference_mode()
+def test_fp8_mqa_logits_tuning_kwargs_bit_identical():
+    case = _modes_case(4099, 24577, 7)
+    ref = fp8_mqa_logits(*case).view(torch.int32)
+    for kw in ({"big_tiles": False}, {"key_vec": 1}, {"key_vec": 2, "k_early": False}):
+        assert torch.equal(fp8_mqa_logits(*case, **kw).view(torch.int32), ref), kw
+
+
+def _check_modes(q, kv, scales, weights, starts, ends, **hint):
+    rows, keys = q.shape[0], kv.shape[0]
     ref, inside = _modes_reference(q, kv, scales, weights, starts, ends)
 
-    dense = fp8_mqa_logits(q, kv, scales, weights, starts, ends, clean_logits=False)
+    dense = fp8_mqa_logits(
+        q, kv, scales, weights, starts, ends, clean_logits=False, **hint
+    )
     err = (dense[inside] - ref[inside]).abs().max() / ref[inside].abs().max()
     assert err < 1e-3, f"max-abs relative error {err:.2e}"
 
-    clean = fp8_mqa_logits(q, kv, scales, weights, starts, ends, clean_logits=True)
+    clean = fp8_mqa_logits(
+        q, kv, scales, weights, starts, ends, clean_logits=True, **hint
+    )
     assert torch.equal(clean[inside], dense[inside])
     assert torch.isneginf(clean[~inside]).all()
 
     out = torch.full((rows, keys), float("nan"), device="cuda")
-    fp8_mqa_logits(q, kv, scales, weights, starts, ends, clean_logits=False, out=out)
+    fp8_mqa_logits(
+        q, kv, scales, weights, starts, ends, clean_logits=False, out=out, **hint
+    )
     assert torch.equal(out[inside], dense[inside])
 
     lens = (ends - starts).clamp(min=0).long()
@@ -503,7 +534,15 @@ def test_fp8_mqa_logits_modes_bit_identical(rows, keys):
     offsets[1:] = lens.cumsum(0)[:-1]
     packed = torch.full((int(lens.sum()) + 8,), float("nan"), device="cuda")
     fp8_mqa_logits(
-        q, kv, scales, weights, starts, ends, out=packed[4:-4], out_offsets=offsets
+        q,
+        kv,
+        scales,
+        weights,
+        starts,
+        ends,
+        out=packed[4:-4],
+        out_offsets=offsets,
+        **hint,
     )
     row_ids = torch.repeat_interleave(torch.arange(rows, device="cuda"), lens)
     first = lens.cumsum(0) - lens
@@ -513,3 +552,129 @@ def test_fp8_mqa_logits_modes_bit_identical(rows, keys):
         dense[row_ids, starts[row_ids] + columns],
     )
     assert torch.isnan(packed[:4]).all() and torch.isnan(packed[-4:]).all()
+
+
+_ROWSPLIT_KEYS = (
+    "BM",
+    "NUM_WARPS",
+    "BLOCK_KV",
+    "SUB_N",
+    "NUM_BUFFERS",
+    "MIN_TILES_PER_SPLIT",
+)
+_ROWSPLIT_LAUNCHES = [
+    (1, 1, 128, 32, 3, 1),
+    (1, 4, 128, 32, 3, 2),
+    (2, 4, 128, 16, 2, 4),
+    (2, 2, 64, 32, 4, 1),
+]
+
+
+@pytest.mark.parametrize("clean_logits", [False, True])
+@pytest.mark.parametrize("headsum_mma", [0, 1])
+@torch.inference_mode()
+def test_fp8_mqa_logits_rowsplit_launch_independent(
+    monkeypatch, clean_logits, headsum_mma
+):
+    """gfx1250 32 x 128: every row-split launch shape and key_vec / k_early agree."""
+    import aiter.ops.triton.attention.fp8_mqa_logits as mod
+
+    if mod.arch not in ("gfx1250", "gfx1250-strict"):
+        pytest.skip("gfx1250 row-split kernel")
+    rows, keys = 67, 2049
+    q, kv, scales, weights, starts, ends = _modes_case(rows, keys, 7 * rows + keys)
+    base_cfg = mod._gfx1250_launch_config(keys, 32, 128)
+    outs = []
+    for li, launch in enumerate(_ROWSPLIT_LAUNCHES):
+        if headsum_mma and launch[0] % 2:
+            continue  # the matrix-core head sum needs an even BM
+        for ti, target in enumerate((1, 4096)):
+            cfg = dict(base_cfg)
+            rs = dict(
+                base_cfg["rowsplit"],
+                TARGET_PROGRAMS=target,
+                waves_per_eu=0,
+                HEADSUM_MMA=headsum_mma,
+                KEY_VEC=(1, 2, 4)[(li + ti) % 3],
+                K_EARLY=(li + ti) % 2,
+            )
+            rs.update(zip(_ROWSPLIT_KEYS, launch))
+            rs["SMALL_ROWS"] = 0
+            rs["PR_MAX_ROWS"] = 0  # always the row-split kernel
+            cfg["rowsplit"] = rs
+            monkeypatch.setattr(mod, "_gfx1250_launch_config", lambda *a, _c=cfg: _c)
+            outs.append(
+                fp8_mqa_logits(
+                    q, kv, scales, weights, starts, ends, clean_logits=clean_logits
+                )
+            )
+    _, inside = _modes_reference(q, kv, scales, weights, starts, ends)
+    for out in outs[1:]:
+        assert torch.equal(out[inside], outs[0][inside])
+        if clean_logits:
+            assert torch.equal(out, outs[0])
+
+
+# page-sharing kernel (next_n 1, one and two rows per warp), per-row kernel (hint)
+@pytest.mark.parametrize(
+    "batch,next_n,ctx,ctx_per_row,hint",
+    [
+        (1, 1, 100, False, False),
+        (2, 5, 3000, False, False),
+        (5, 8, 1500, True, False),
+        (3, 4, 777, True, True),
+        (5, 2, 64, False, True),
+    ],
+)
+@torch.inference_mode()
+def test_fp8_paged_mqa_logits(batch, next_n, ctx, ctx_per_row, hint):
+    import aiter.ops.triton.attention.fp8_mqa_logits as mod
+
+    if mod.arch not in ("gfx1250", "gfx1250-strict"):
+        pytest.skip("gfx1250 paged kernel")
+    g = torch.Generator(device="cuda").manual_seed(batch * 1000 + ctx)
+    bs, max_model_len = 64, 4096
+    pages = (ctx + bs - 1) // bs
+    num_blocks = batch * pages + 3
+    kv = torch.randn(num_blocks, bs, 128, device="cuda", generator=g).to(e4m3_type)
+    scales = torch.rand(num_blocks, bs, device="cuda", generator=g) + 0.5
+    cache = torch.cat(
+        [
+            kv.view(torch.uint8).reshape(num_blocks, -1),
+            scales.view(torch.uint8).reshape(num_blocks, -1),
+        ],
+        1,
+    ).view(num_blocks, bs, 1, 132)
+    perm = torch.randperm(num_blocks, device="cuda", generator=g)
+    block_tables = perm[: batch * pages].reshape(batch, pages).int()
+    q = torch.randn(batch, next_n, 32, 128, device="cuda", generator=g).to(e4m3_type)
+    weights = torch.randn(batch * next_n, 32, device="cuda", generator=g)
+    row_ctx = (ctx - next_n + 1 + torch.arange(next_n, device="cuda")).repeat(batch)
+    if ctx_per_row:
+        row_ctx = (
+            row_ctx - torch.randint(0, 40, row_ctx.shape, device="cuda", generator=g)
+        ).clamp(min=0)
+        context_lens = row_ctx.int().reshape(batch, next_n)
+    else:
+        context_lens = torch.full((batch,), ctx, dtype=torch.int32, device="cuda")
+    out = torch.full((batch * next_n, max_model_len), float("nan"), device="cuda")
+    mod.fp8_paged_mqa_logits(
+        q,
+        cache,
+        weights,
+        context_lens,
+        block_tables,
+        max_model_len,
+        out=out,
+        max_ctx=ctx if hint else None,
+    )
+    keys = kv[block_tables.long()].reshape(batch, -1, 128).float()
+    sc = scales[block_tables.long()].reshape(batch, -1)
+    s = torch.einsum("bnhd,bkd->bnhk", q.float(), keys).relu()
+    ref = (s * weights.view(batch, next_n, 32, 1)).sum(2) * sc[:, None, :]
+    ref = ref.reshape(batch * next_n, -1)
+    inside = torch.arange(ref.shape[1], device="cuda")[None, :] < row_ctx[:, None]
+    got = out[:, : ref.shape[1]]
+    assert torch.isnan(got[~inside]).all() and torch.isnan(out[:, ref.shape[1] :]).all()
+    err = (got[inside] - ref[inside]).abs().max() / ref[inside].abs().max()
+    assert err < 1e-3, f"max-abs relative error {err:.2e}"

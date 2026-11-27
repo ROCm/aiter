@@ -128,3 +128,61 @@ def _fp8_mqa_logits_kernel(
     # masked store
     in_window = (kv_col_offsets >= start_ind) & (kv_col_offsets < end_ind)
     tl.store(logits_ptrs, scores, mask=in_window)
+
+
+@triton.jit
+def _fp8_paged_mqa_logits_rows_kernel(
+    q_ptr,  # fp8 [B, NEXT_N, 32, 128], contiguous per request
+    kv_val_ptr,  # fp8 view of the block-flat cache [num_blocks, PAGE * 132]
+    kv_scale_ptr,  # fp32 view of the same cache
+    weights_ptr,  # fp32 [B * NEXT_N, 32]
+    ctx_ptr,  # int32 [B], or [B * NEXT_N] with CTX_PER_ROW
+    block_tables_ptr,  # int32 [B, max_blocks]
+    logits_ptr,  # fp32 [B * NEXT_N, >= max_model_len]
+    stride_q_b,
+    stride_blk,  # bytes per cache page
+    stride_bt,
+    stride_logits,
+    max_blocks,
+    num_blocks,
+    max_model_len,
+    NEXT_N: tl.constexpr,
+    CTX_PER_ROW: tl.constexpr,
+    PAGE: tl.constexpr,
+    N_SPLITS: tl.constexpr,
+    NUM_STAGES: tl.constexpr = 1,
+):
+    """Short-context paged decode logits: one query row, pages s, s + N_SPLITS, ..."""
+    row = tl.program_id(0)
+    split = tl.program_id(1)
+    b = row // NEXT_N
+    n = row % NEXT_N
+    if CTX_PER_ROW:
+        ctx = tl.load(ctx_ptr + row)
+    else:
+        ctx = tl.load(ctx_ptr + b) - NEXT_N + n + 1
+    ctx = tl.minimum(tl.maximum(ctx, 0), max_model_len)
+    h = tl.arange(0, 32)
+    d = tl.arange(0, 128)
+    q = tl.load(
+        q_ptr + b.to(tl.int64) * stride_q_b + (n * 32 + h[:, None]) * 128 + d[None, :]
+    )
+    w = tl.load(weights_ptr + row * 32 + h)
+    kc = tl.arange(0, PAGE)
+    bt_row = block_tables_ptr + b.to(tl.int64) * stride_bt
+    o_row = logits_ptr + row.to(tl.int64) * stride_logits
+    for p in tl.range(split, tl.cdiv(ctx, PAGE), N_SPLITS, num_stages=NUM_STAGES):
+        page = tl.load(bt_row + tl.minimum(p, max_blocks - 1))
+        page = tl.minimum(tl.maximum(page, 0), num_blocks - 1).to(tl.int64)
+        pos = p * PAGE + kc
+        valid = pos < ctx
+        base = page * stride_blk
+        k = tl.load(
+            kv_val_ptr + base + kc[:, None] * 128 + d[None, :],
+            mask=valid[:, None],
+            other=0.0,
+        )
+        sc = tl.load(kv_scale_ptr + base // 4 + PAGE * 32 + kc, mask=valid, other=0.0)
+        s = tl.dot(k, tl.trans(q))  # [PAGE, 32]
+        logit = tl.sum(tl.maximum(s, 0.0) * w[None, :], axis=1) * sc
+        tl.store(o_row + pos, logit, mask=valid)

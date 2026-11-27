@@ -6,6 +6,7 @@ from packaging.version import Version
 
 from aiter.ops.triton._triton_kernels.attention.fp8_mqa_logits import (
     _fp8_mqa_logits_kernel,
+    _fp8_paged_mqa_logits_rows_kernel,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.config_utils import (
@@ -29,7 +30,8 @@ if TRITON_GE_36:
         elif arch in ("gfx1250", "gfx1250-strict"):
             from aiter.ops.triton._gluon_kernels.gfx1250.attention.fp8_mqa_logits import (
                 _gluon_fp8_mqa_logits_kernel,
-                _gluon_fp8_mqa_logits_rowgroup_kernel,
+                _gluon_fp8_mqa_logits_rowsplit_kernel,
+                _gluon_fp8_paged_mqa_logits_kernel,
             )
     except Exception:  # noqa: BLE001
         _gluon_fp8_mqa_logits_kernel = None
@@ -71,6 +73,10 @@ FOLDED_REDUCTED_SUPPORT = _permute_accepts_constexpr_tuple()
 
 # gfx942 (MI300X) LDS size per CU.
 _GFX942_CU_LDS_BYTES = 64 * 1024
+
+# paged max_ctx hint: per-row kernel up to this B * next_n * max_ctx, by next_n
+_PAGED_ROWS_MAX_WORK = {1: 131072, 2: 65536, 3: 65536, 4: 65536}
+_PAGED_ROWS_MAX_WORK_DEFAULT = 196608
 
 
 def _gfx950_kv_splits(seq_len, seq_len_kv, block_m, num_warps, waves_per_eu):
@@ -117,6 +123,10 @@ def fp8_mqa_logits(
     clean_logits=True,
     out: torch.Tensor | None = None,
     out_offsets: torch.Tensor | None = None,
+    key_vec: int | None = None,
+    k_early: bool | None = None,
+    max_window: int | None = None,
+    big_tiles: bool | None = None,
 ):
     """
     This function computes the logits to be used by a topk function for sparse attention.
@@ -141,6 +151,13 @@ def fp8_mqa_logits(
                   elements. The wrapper does not check this (it needs a host
                   sync). The rows must not overlap. Other elements of out are
                   not written; clean_logits has no effect.
+    max_window:  optional host upper bound on cu_ends[i] - cu_starts[i] (e.g. vLLM's
+                  max_seqlen_k); picks the kernel and KV split only, so a wrong bound
+                  costs speed, not correctness.
+    key_vec, k_early, big_tiles: gfx1250 32 x 128 tuning (None: the config):
+                  keys per vector store (1, 2 or 4), next K sub-tile load before the
+                  WMMAs (matrix-core head sum only), longer KV tiles for many rows x
+                  long KV. The logits do not depend on them.
 
     Returns:
     logits:      out, or an allocated [seq_len, seq_len_kv] float32 tensor. Only
@@ -362,14 +379,74 @@ def fp8_mqa_logits(
             grid = ((seq_len + block_m - 1) // block_m, num_kv_splits)
         else:
             cfg = _gfx1250_launch_config(seq_len_kv, num_heads, head_size)
-            rg = cfg.get("rowgroup")
-            if rg and seq_len >= max(rg["BLOCK_M"], rg["MIN_ROWS"]):
-                _gluon_fp8_mqa_logits_rowgroup_kernel[
-                    (triton.cdiv(seq_len, rg["BLOCK_M"]),)
-                ](
+            rs = cfg.get("rowsplit")
+            # few rows x short KV or windows: the per-row kernel's chain is shorter
+            short = rs and (
+                (
+                    seq_len <= rs.get("PR_MAX_ROWS", 0)
+                    and seq_len * seq_len_kv <= rs.get("PR_MAX_WORK", 0)
+                )
+                or (
+                    max_window is not None
+                    and seq_len <= rs.get("HINT_MAX_ROWS", 0)
+                    and max_window <= rs.get("HINT_MAX_WINDOW", 0)
+                )
+            )
+            if rs and stride_q_d == 1 and stride_kv_d == 1 and not short:
+                # 32 x 128 row-split kernel; a logit does not depend on the launch
+                rcfg = rs["small"] if seq_len < rs["SMALL_ROWS"] else rs
+                # many rows x long KV: longer tiles, fewer barriers per key
+                big = rs.get("big", {}) if big_tiles is None or big_tiles else {}
+                if (
+                    seq_len >= big.get("FROM_ROWS", 1 << 62)
+                    and seq_len_kv >= big["FROM_KV"]
+                ):
+                    rcfg = {**rs, **big}
+                rows_per_block = rcfg["BM"] * rcfg["NUM_WARPS"]
+                n_blocks = triton.cdiv(seq_len, rows_per_block)
+                # a hint well below the KV length: size the splits for one window
+                span = seq_len_kv
+                if max_window is not None and 2 * (max_window + rows_per_block) <= span:
+                    span = max(1, max_window + rows_per_block)
+                kv_tiles = triton.cdiv(span, rcfg["BLOCK_KV"])
+                num_kv_splits = max(
+                    1,
+                    min(
+                        triton.cdiv(rs["TARGET_PROGRAMS"], n_blocks),
+                        triton.cdiv(kv_tiles, rcfg["MIN_TILES_PER_SPLIT"]),
+                    ),
+                )
+                # few row blocks: equal splits down to one tile, up to MIN_PROGRAMS
+                boost = min(triton.cdiv(rs.get("MIN_PROGRAMS", 0), n_blocks), kv_tiles)
+                if boost > num_kv_splits:
+                    num_kv_splits = triton.cdiv(kv_tiles, triton.cdiv(kv_tiles, boost))
+                kv_scales_flat = kv_scales.reshape(-1).contiguous()
+                # buffer stores are re-based per row block
+                rs_buffer_store = (
+                    not packed
+                    and rows_per_block * stride_logits_s + seq_len_kv <= INT32_MAX
+                )
+                if key_vec is None:
+                    # 4-key stores need 16-byte aligned rows; 1 at many rows per key
+                    aligned = (
+                        not packed
+                        and stride_logits_s % 16 == 0
+                        and logits.data_ptr() % 16 == 0
+                    )
+                    key_vec = rcfg.get("KEY_VEC", 1)
+                    key_vec = key_vec if aligned else min(key_vec, 2)
+                    max_rpk = rcfg.get("KEY_VEC_MAX_RPK", float("inf"))
+                    key_vec = 1 if seq_len / seq_len_kv >= max_rpk else key_vec
+                if key_vec not in (1, 2, 4):
+                    raise ValueError(f"key_vec must be 1, 2 or 4, got {key_vec}")
+                while rcfg["BLOCK_KV"] % (rcfg["SUB_N"] * key_vec):
+                    key_vec //= 2  # a key group must fit in a tile
+                if k_early is None:
+                    k_early = rcfg.get("K_EARLY", 0)
+                _gluon_fp8_mqa_logits_rowsplit_kernel[(n_blocks, num_kv_splits)](
                     Q,
                     KV,
-                    kv_scales,
+                    kv_scales_flat,
                     weights,
                     cu_starts,
                     cu_ends,
@@ -377,35 +454,26 @@ def fp8_mqa_logits(
                     out_offsets,
                     seq_len=seq_len,
                     seq_len_kv=seq_len_kv,
-                    NUM_HEADS=num_heads,
-                    HEAD_SIZE=head_size,
                     stride_q_s=stride_q_s,
                     stride_q_h=stride_q_h,
-                    stride_q_d=stride_q_d,
                     stride_kv_s=stride_kv_s,
-                    stride_kv_d=stride_kv_d,
                     stride_w_s=stride_w_s,
                     stride_w_h=stride_w_h,
                     stride_logits_s=stride_logits_s,
-                    stride_logits_k=stride_logits_k,
-                    BLOCK_M=rg["BLOCK_M"],
-                    BLOCK_KV=rg["BLOCK_KV"],
-                    NUM_WARPS=rg["NUM_WARPS"],
-                    WARPS_M=rg["WARPS_M"],
-                    USE_BUFFER_LOAD=use_buffer_load,
-                    USE_BUFFER_STORE=use_buffer_store,
+                    num_kv_splits=num_kv_splits,
+                    BM=rcfg["BM"],
+                    NUM_WARPS=rcfg["NUM_WARPS"],
+                    BLOCK_KV=rcfg["BLOCK_KV"],
+                    SUB_N=rcfg["SUB_N"],
+                    NUM_BUFFERS=rcfg["NUM_BUFFERS"],
+                    HEADSUM_MMA=bool(rcfg["HEADSUM_MMA"]),
+                    USE_BUFFER_STORE=rs_buffer_store,
                     EXACT_ROWS=clean_logits or packed,
                     PACKED=packed,
-                    NUM_KV_BUFFERS=rg["NUM_KV_BUFFERS"],
-                    HEADSUM_WMMA=bool(rg["HEADSUM_WMMA"]),
-                    KV_PIPE=bool(rg["KV_PIPE"]),
-                    KVS_PREFETCH=bool(rg["KVS_PREFETCH"]),
-                    num_warps=rg["NUM_WARPS"],
-                    waves_per_eu=(
-                        rg["waves_per_eu_exact"]
-                        if (clean_logits or packed)
-                        else rg["waves_per_eu"]
-                    ),
+                    KEY_VEC=key_vec,
+                    K_EARLY=bool(k_early) and bool(rcfg["HEADSUM_MMA"]),
+                    num_warps=rcfg["NUM_WARPS"],
+                    waves_per_eu=rcfg["waves_per_eu"],
                 )
                 return logits
             loop_variant = cfg["LOOP_VARIANT"]
@@ -454,3 +522,115 @@ def fp8_mqa_logits(
         )
 
     return logits
+
+
+def fp8_paged_mqa_logits(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_model_len: int,
+    out: torch.Tensor | None = None,
+    max_ctx: int | None = None,
+    early_q: bool | None = None,
+) -> torch.Tensor:
+    """
+    gfx1250 decode / MTP-verify indexer logits over a paged, block-flat fp8 K cache.
+
+    q:            [B, next_n, 32, 128] float8_e4m3fn, contiguous per request
+    kv_cache:     [num_blocks, block_size, 1, 132] uint8; per page block_size x 128 fp8
+                  values, then block_size fp32 scales (vLLM's NORMAL indexer cache)
+    weights:      [B * next_n, 32] float32, contiguous
+    context_lens: [B] int32 (row n of request b sees ctx - next_n + n + 1 keys), or
+                  [B, next_n] / [B * next_n] int32, the keys each row sees
+    block_tables: [B, max_blocks] int32
+    out:          optional [B * next_n, >= max_model_len] float32, unit column stride
+    max_ctx:      optional host upper bound on the context lengths (not while capturing
+                  a CUDA graph); sizes the KV split, and small B * next_n * max_ctx runs
+                  a per-row kernel (other head-sum order, not bit-identical). A wrong
+                  bound costs speed, not correctness.
+    early_q:      load Q and the weights before the context lengths (None: on).
+
+    Returns out (or a new [B * next_n, max_model_len] float32 tensor) holding
+    relu(q . k) . weights * scale for the keys each row sees; other entries untouched.
+    """
+    batch, next_n, num_heads, head_size = q.shape
+    num_blocks, block_size = kv_cache.shape[:2]
+    if (
+        arch not in ("gfx1250", "gfx1250-strict")
+        or _gluon_fp8_mqa_logits_kernel is None
+    ):
+        raise NotImplementedError("fp8_paged_mqa_logits: gfx1250 Gluon kernel only")
+    if (num_heads, head_size) != (32, 128) or next_n > 8 or block_size % 32:
+        raise NotImplementedError(
+            "fp8_paged_mqa_logits: 32 heads x 128, next_n <= 8, block_size % 32 == 0"
+        )
+    if out is None:
+        out = torch.empty(
+            batch * next_n, max_model_len, dtype=torch.float32, device=q.device
+        )
+    cache = kv_cache.reshape(num_blocks, -1)
+    ctx = context_lens.reshape(-1)
+    ctx_per_row = ctx.numel() == batch * next_n and next_n > 1
+    span = max_model_len if max_ctx is None else max(1, min(max_ctx, max_model_len))
+    rows = batch * next_n
+    max_work = _PAGED_ROWS_MAX_WORK.get(next_n, _PAGED_ROWS_MAX_WORK_DEFAULT)
+    if max_ctx is not None and rows * span <= max_work:
+        splits = max(1, min(triton.cdiv(span, block_size), triton.cdiv(1024, rows)))
+        _fp8_paged_mqa_logits_rows_kernel[(rows, splits)](
+            q,
+            cache.view(torch.float8_e4m3fn),
+            cache.view(torch.float32),
+            weights,
+            ctx,
+            block_tables,
+            out,
+            q.stride(0),
+            cache.stride(0),
+            block_tables.stride(0),
+            out.stride(0),
+            block_tables.shape[1],
+            num_blocks,
+            max_model_len,
+            NEXT_N=next_n,
+            CTX_PER_ROW=ctx_per_row,
+            PAGE=block_size,
+            N_SPLITS=splits,
+            NUM_STAGES=2,
+            num_warps=4,
+        )
+        return out
+    # one row per warp (the shortest chain); 2 for next_n > 4 in a larger batch
+    bm, nw = (1, triton.next_power_of_2(next_n))
+    if next_n > 4 and batch > 4:
+        bm, nw = 2, 4
+    target = {1: 2048, 2: 2048, 4: 1024}.get(nw, 512) if bm == 1 else 512
+    splits = max(1, min(triton.cdiv(target, batch), triton.cdiv(span, block_size)))
+    _gluon_fp8_paged_mqa_logits_kernel[(batch, splits)](
+        q,
+        cache.view(torch.float8_e4m3fn),
+        cache.view(torch.float32),
+        weights,
+        ctx,
+        block_tables,
+        out,
+        stride_q_b=q.stride(0),
+        stride_blk=cache.stride(0),
+        stride_bt=block_tables.stride(0),
+        stride_logits=out.stride(0),
+        max_blocks=block_tables.shape[1],
+        num_blocks=num_blocks,
+        max_model_len=max_model_len,
+        num_kv_splits=splits,
+        NEXT_N=next_n,
+        CTX_PER_ROW=ctx_per_row,
+        PAGE=block_size,
+        BM=bm,
+        NUM_WARPS=nw,
+        SUB_N=32,
+        NUM_BUFFERS=3,
+        EARLY_Q=early_q is None or bool(early_q),
+        num_warps=nw,
+    )
+    return out
