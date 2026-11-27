@@ -1026,7 +1026,16 @@ class FmoeTuner(TunerCommon):
             "--grouped-routing",
             default="balanced",
             help="With --grouped-search descent: routing of the timed tokens, "
-            "balanced (default), uniform or zipf:<s> (skewed, e.g. zipf:0.6).",
+            "balanced (default), uniform or zipf:<s> (skewed, e.g. zipf:0.6); a "
+            "comma list times every routing and ranks by the summed time.",
+        )
+        self.parser.add_argument(
+            "--grouped-tokens",
+            default="1.0",
+            help="With --grouped-search descent: token counts to time, as "
+            "fractions in (0.5, 1] of the row's token bucket (default 1.0); a "
+            "comma list (e.g. 0.75,1.0) ranks by the summed time over the token "
+            "counts the bucket serves.",
         )
         self.parser.add_argument(
             "--grouped-min-gain",
@@ -1138,6 +1147,13 @@ class FmoeTuner(TunerCommon):
                 )
             if not 0 <= args.grouped_min_gain < 100:
                 self.parser.error("--grouped-min-gain is a percent in [0, 100)")
+            try:
+                args.grouped_token_fractions = [
+                    float(f) for f in args.grouped_tokens.split(",")
+                ]
+                grouped_search.bucket_tokens(1024, args.grouped_token_fractions)
+            except ValueError as exc:
+                self.parser.error(f"--grouped-tokens: {exc}")
             if args.select == "power":
                 self.parser.error("--select power needs --grouped-search tile_m")
         mxfp4_port = (
@@ -7477,6 +7493,9 @@ class GroupedFmoeTuner(FmoeTuner):
                     seeds=seeds,
                     routing=args.grouped_routing,
                     label=label,
+                    tokens=grouped_search.bucket_tokens(
+                        shape.token, getattr(args, "grouped_token_fractions", [1.0])
+                    ),
                 )
             )
             rows.append(jobs[-1])

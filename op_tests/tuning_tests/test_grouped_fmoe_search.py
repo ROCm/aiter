@@ -297,6 +297,29 @@ class TestSearch(unittest.TestCase):
         self.assertEqual(bench.calls[-1][0], 10)
         self.assertTrue(res["ok"])
 
+    def test_descends_from_the_start_point_too(self):
+        # The runtime default (tile 64x256x128) is fastest as is but a dead end
+        # two moves away from the start row; the optimum is two other moves
+        # away from the start row.
+        def cost(cfg):
+            if cfg["tile_m"] == 64 and cfg["tile_k"] == 128:
+                return 900.0, 0.0
+            g1 = 1000.0 * (0.8 if cfg["cluster_m"] == 2 else 1.0)
+            return g1 * (0.8 if cfg["rolled_drain"] else 1.0), 0.0
+
+        res = gfs.search(
+            K3,
+            self._seeds(),
+            FakeBench(cost=cost).measure,
+            gfs.SearchOptions(),
+            log=lambda m: None,
+        )
+        cfg = res["config"]
+        self.assertEqual(
+            (cfg["tile_k"], cfg["cluster_m"], cfg["rolled_drain"]), (256, 2, 1)
+        )
+        self.assertEqual(res["history"][0], "table row")
+
     def test_batches_respect_the_batch_size(self):
         bench = FakeBench()
         gfs.search(
@@ -335,8 +358,15 @@ class TestLookupKey(unittest.TestCase):
 
     def test_routing_names(self):
         self.assertEqual(gfs.check_routing("zipf:0.6"), "zipf:0.6")
+        self.assertEqual(gfs.check_routing("balanced,zipf:0.6"), "balanced,zipf:0.6")
         with self.assertRaises(ValueError):
-            gfs.check_routing("skewed")
+            gfs.check_routing("balanced,skewed")
+
+    def test_bucket_tokens_stay_in_the_bucket(self):
+        self.assertEqual(gfs.bucket_tokens(16384, [0.887, 1.0]), [14533, 16384])
+        self.assertEqual(gfs.bucket_tokens(1, [0.75, 1.0]), [1])
+        with self.assertRaises(ValueError):
+            gfs.bucket_tokens(8192, [0.5])
 
 
 class TestWriteGuard(unittest.TestCase):

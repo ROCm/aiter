@@ -76,7 +76,9 @@ waves per TDM tensor, split-K, `rolled_drain`, `next_stage_prefetch`, ...):
 - coordinate descent, one knob group of one GEMM per batch, configs the
   kernels would reject (tile fit, wave grid, cluster and LDS limits) skipped;
   a move is taken when it saves `--grouped-min-gain` percent (default 1) of the
-  per-round time ratio; then moves that each gained less are combined;
+  per-round time ratio; then moves that each gained less are combined; when
+  another start point beats the row in use, the descent also runs from the row
+  in use and the better end wins;
 - timing: profiler device time of whole `fused_moe` calls (reported as gemm1,
   gemm2 and the rest), candidates interleaved over `--grouped-rounds` rounds
   (default 5) and ranked by the median per-round ratio, so clock and power
@@ -91,7 +93,12 @@ waves per TDM tensor, split-K, `rolled_drain`, `next_stage_prefetch`, ...):
   the search per shape. `-o2` writes every measured candidate.
 
 `--grouped-routing balanced|uniform|zipf:<s>` sets the token routing (default
-balanced). Rows with `ep_fused=1` or `topk=-1` need the multi-GPU EP bench and
+balanced) and `--grouped-tokens` the token counts, as fractions in (0.5, 1] of
+the row's bucket (default 1.0). Lists sum the time over every token count and
+routing: a bucket serves every M up to its token count, and balanced routing at
+exactly the bucket can favour tiles that lose below it or on skewed traffic
+(e.g. `--grouped-tokens 0.75,1.0 --grouped-routing balanced,zipf:0.6`).
+Rows with `ep_fused=1` or `topk=-1` need the multi-GPU EP bench and
 are skipped. A shape that another table merged at runtime already holds (for
 example a `model_configs/` file when `-o` is the shipped table) is not written;
 pass that table as `-o` to replace its row in place. `--grouped-search tile_m`

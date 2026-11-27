@@ -701,7 +701,8 @@ def search(
     log: Callable[[str], None] = print,
     clock: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
-    """Coordinate descent from the seeds, a small refine, then a confirmation.
+    """Coordinate descent and a small refine from the best seed and from the
+    start point, the better of the two, then a confirmation.
 
     ``measure(configs, rounds)`` times the configs in interleaved rounds and
     returns per config ``{"ok", "error", "total": [us per round], "stages":
@@ -712,14 +713,13 @@ def search(
     t0 = clock()
     records: list[dict] = []
     stage_us: dict[tuple, dict] = {}
-    tried: set[tuple] = set()
-    promising: list[tuple[float, dict]] = []
+    measured: set[tuple] = set()
 
     def run(phase, group, cands, rounds):
         """cands: [(label, cfg)], scored against cands[0] (or the first that ran)."""
         results = measure([c for _, c in cands], rounds)
         for c in cands:
-            tried.add(effective_key(c[1], shape))
+            measured.add(effective_key(c[1], shape))
         base = next((r for r in results if r.get("ok")), results[0])
         scored = []
         for (label, cfg), res in zip(cands, results):
@@ -754,6 +754,97 @@ def search(
         # Faster by min_gain in the median, and in most rounds.
         return scored[0] <= 1 - opts.min_gain and scored[1] >= opts.min_win
 
+    def descend(tag, inc_label, inc):
+        """Coordinate descent, one knob group per batch, then a refine that
+        combines moves which each gained less than min_gain."""
+        tried = {effective_key(c, shape) for _, c in seeds}
+        promising: list[tuple[float, dict]] = []
+        history = [inc_label]
+        log(f"{tag}: descent from {inc_label}")
+        for p in range(opts.passes):
+            improved = False
+            for group, gen in GROUPS:
+                if over_budget():
+                    break
+                moves, keys = [], set()
+                for label, cfg in gen(inc, shape):
+                    k = effective_key(cfg, shape)
+                    if k in tried or k in keys or check_config(cfg, shape):
+                        continue
+                    keys.add(k)
+                    moves.append((label, cfg))
+                for chunk_at in range(0, len(moves), opts.batch - 1):
+                    if over_budget():
+                        break
+                    chunk = moves[chunk_at : chunk_at + opts.batch - 1]
+                    tried.update(effective_key(c, shape) for _, c in chunk)
+                    scored = run(
+                        f"{tag}.pass{p + 1}",
+                        group,
+                        [("incumbent", inc)] + chunk,
+                        opts.rounds,
+                    )
+                    if not scored[0][4].get("ok"):
+                        log(f"{group}: incumbent failed ({scored[0][4].get('error')})")
+                        break
+                    cands = [s for s in scored[1:] if s[4].get("ok")]
+                    failed = len(scored) - 1 - len(cands)
+                    best = min(cands, key=lambda s: s[0]) if cands else None
+                    accept = best is not None and taken(best)
+                    desc = (
+                        f"best {best[2]} x{best[0]:.3f} (won {best[1]:.0%})"
+                        if best
+                        else "none ran"
+                    )
+                    log(
+                        f"{tag} {group}: {len(chunk)} moves ({failed} failed), {desc}"
+                        + (" -> accepted" if accept else "")
+                        + f" [{clock() - t0:.0f}s]"
+                    )
+                    for sc, _, label, cfg, _ in cands:
+                        if sc < 1 and not (accept and cfg is best[3]):
+                            promising.append((sc, _delta(cfg, inc)))
+                    if accept:
+                        inc = best[3]
+                        history.append(best[2])
+                        improved = True
+                        break
+            if not improved or over_budget():
+                break
+        if promising and not over_budget():
+            top = []
+            for sc, d in sorted(promising, key=lambda x: x[0]):
+                if d and d not in top and any(inc[c] != v for c, v in d.items()):
+                    top.append(d)
+            top = top[:4]
+            combos = [(d, _with(inc, **d)) for d in top]
+            for a, b in itertools.combinations(top[:3], 2):
+                if not set(a) & set(b):
+                    combos.append(({**a, **b}, _with(inc, **a, **b)))
+            cands, keys = [], set()
+            for d, cfg in combos:
+                k = effective_key(cfg, shape)
+                if k not in tried and k not in keys and not check_config(cfg, shape):
+                    keys.add(k)
+                    label = "refine " + ",".join(f"{c}={v}" for c, v in d.items())
+                    cands.append((label, cfg))
+            if cands:
+                cands = cands[: opts.batch - 1]
+                scored = run(
+                    f"{tag}.refine",
+                    "refine",
+                    [("incumbent", inc)] + cands,
+                    2 * opts.rounds,
+                )
+                ok = [s for s in scored[1:] if s[4].get("ok")]
+                if scored[0][4].get("ok") and ok:
+                    best = min(ok, key=lambda s: s[0])
+                    if taken(best):
+                        log(f"{tag} refine: {best[2]} x{best[0]:.3f} -> accepted")
+                        inc = best[3]
+                        history.append(best[2])
+        return inc, history
+
     # Seeds: the fastest becomes the incumbent. A start point that fails here
     # (e.g. a row this build rejects) hands over to the first seed that runs.
     scored = run("seed", "seeds", seeds[: opts.batch], opts.rounds)
@@ -770,101 +861,35 @@ def search(
         )
     start_label, start = ok[0][2], ok[0][3]
     best = min(ok, key=lambda s: s[0])
-    inc_label, inc = (
-        (best[2], best[3]) if best[0] <= 1 - opts.min_gain else (start_label, start)
-    )
-    log(
-        "seeds: "
-        + ", ".join(f"{s[2]} x{s[0]:.3f}" for s in ok)
-        + f"; incumbent {inc_label}"
-    )
-    history = [inc_label]
+    log("seeds: " + ", ".join(f"{s[2]} x{s[0]:.3f}" for s in ok))
 
-    # Coordinate descent, one knob group per batch.
-    for p in range(opts.passes):
-        improved = False
-        for group, gen in GROUPS:
-            if over_budget():
-                break
-            moves, keys = [], set()
-            for label, cfg in gen(inc, shape):
-                k = effective_key(cfg, shape)
-                if k in tried or k in keys or check_config(cfg, shape):
-                    continue
-                keys.add(k)
-                moves.append((label, cfg))
-            for chunk_at in range(0, len(moves), opts.batch - 1):
-                if over_budget():
-                    break
-                chunk = moves[chunk_at : chunk_at + opts.batch - 1]
-                scored = run(
-                    f"pass{p + 1}", group, [("incumbent", inc)] + chunk, opts.rounds
-                )
-                if not scored[0][4].get("ok"):
-                    log(f"{group}: incumbent failed ({scored[0][4].get('error')})")
-                    break
-                cands = [s for s in scored[1:] if s[4].get("ok")]
-                failed = len(scored) - 1 - len(cands)
-                best = min(cands, key=lambda s: s[0]) if cands else None
-                accept = best is not None and taken(best)
-                desc = (
-                    f"best {best[2]} x{best[0]:.3f} (won {best[1]:.0%})"
-                    if best
-                    else "none ran"
-                )
-                log(
-                    f"{group}: {len(chunk)} moves ({failed} failed), {desc}"
-                    + (" -> accepted" if accept else "")
-                    + f" [{clock() - t0:.0f}s]"
-                )
-                for sc, _, label, cfg, _ in cands:
-                    if sc < 1 and not (accept and cfg is best[3]):
-                        promising.append((sc, _delta(cfg, inc)))
-                if accept:
-                    inc = best[3]
-                    history.append(best[2])
-                    improved = True
-                    break
-        if not improved or over_budget():
+    # Descend from the best seed and, when another seed won, also from the
+    # start point: a row tuned for this bucket can lead to a better optimum
+    # than the seed that is fastest as is.
+    origins = [(start_label, start)]
+    if best[0] <= 1 - opts.min_gain:
+        origins.insert(0, (best[2], best[3]))
+    ends = []
+    for i, (label, cfg) in enumerate(origins):
+        if i and over_budget():
             break
-
-    # Refine: combine moves that each gained less than min_gain.
-    if promising and not over_budget():
-        top = []
-        for sc, d in sorted(promising, key=lambda x: x[0]):
-            if d and d not in top and any(inc[c] != v for c, v in d.items()):
-                top.append(d)
-        top = top[:4]
-        combos = [
-            ("refine " + ",".join(f"{c}={v}" for c, v in d.items()), _with(inc, **d))
-            for d in top
-        ]
-        for a, b in itertools.combinations(top[:3], 2):
-            if not set(a) & set(b):
-                combos.append(
-                    (
-                        "refine " + ",".join(f"{c}={v}" for c, v in {**a, **b}.items()),
-                        _with(inc, **a, **b),
-                    )
-                )
-        cands, keys = [], set()
-        for label, cfg in combos:
-            k = effective_key(cfg, shape)
-            if k not in tried and k not in keys and not check_config(cfg, shape):
-                keys.add(k)
-                cands.append((label, cfg))
-        if cands:
-            cands = cands[: opts.batch - 1]
-            scored = run(
-                "refine", "refine", [("incumbent", inc)] + cands, 2 * opts.rounds
-            )
-            ok = [s for s in scored[1:] if s[4].get("ok")]
-            if scored[0][4].get("ok") and ok:
-                best = min(ok, key=lambda s: s[0])
-                if taken(best):
-                    log(f"refine: {best[2]} x{best[0]:.3f} -> accepted")
-                    inc = best[3]
-                    history.append(best[2])
+        ends.append(descend(f"d{i + 1}", label, cfg))
+    inc, history = ends[0]
+    if len(ends) > 1 and effective_key(ends[0][0], shape) != effective_key(
+        ends[1][0], shape
+    ):
+        scored = run(
+            "multi-start",
+            "multi-start",
+            [(f"from {h[0]}", c) for c, h in ends],
+            2 * opts.rounds,
+        )
+        if scored[1][4].get("ok") and (not scored[0][4].get("ok") or scored[1][0] < 1):
+            inc, history = ends[1]
+        log(
+            f"multi-start: from {ends[1][1][0]} x{scored[1][0]:.3f} vs from "
+            f"{ends[0][1][0]}; keeping the descent from {history[0]}"
+        )
 
     # Confirmation: the start point against the result, fresh rounds (the
     # winner of many comparisons is also the one noise favoured most).
@@ -913,7 +938,7 @@ def search(
             round(_median(results[0]["total"]), 4) if results[0].get("ok") else None
         ),
         "stage_us": stage_us.get(effective_key(cfg, shape), {}),
-        "measured": len(tried),
+        "measured": len(measured),
         "seconds": round(clock() - t0, 1),
         "records": records,
     }
@@ -1007,7 +1032,8 @@ def launch_mismatch(calls: dict, cfg: dict) -> str | None:
 
 
 class _Worker:
-    """Owns one shape's tensors on one GPU and times candidate rows."""
+    """Owns one shape's tensors on one GPU and times candidate rows on one or
+    more cases (token count x routing); a candidate's time is the cases' sum."""
 
     def __init__(self, cfg_dir):
         import torch
@@ -1019,15 +1045,16 @@ class _Worker:
         self.serial = 0
         self.gfx = str(get_gfx())
         self.cu_num = int(get_cu_num())
-        self.case = None
-        self.ref = None
+        self.cases = []
+        self.kwargs = {}
+        self.refs = None
         self.ref_key = None
 
     def identity(self):
         return {"gfx": self.gfx, "cu_num": self.cu_num}
 
     # -- inputs
-    def setup(self, row, routing, seed):
+    def setup(self, row, routing, seed, tokens=None):
         import torch
 
         from aiter import ActivationType, QuantType
@@ -1035,15 +1062,9 @@ class _Worker:
         from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
         from aiter.utility.dtypes import str2ActivationType
 
-        self.case = None
-        self.ref = None
-        self.ref_key = None
+        self.cases, self.refs, self.ref_key = [], None, None
         torch.cuda.empty_cache()
-        m, d, i = (
-            int(float(row["token"])),
-            int(float(row["model_dim"])),
-            int(float(row["inter_dim"])),
-        )
+        d, i = int(float(row["model_dim"])), int(float(row["inter_dim"]))
         e, k = int(float(row["expert"])), int(float(row["topk"]))
         dev = "cuda"
         g = torch.Generator(device=dev).manual_seed(seed)
@@ -1065,8 +1086,17 @@ class _Worker:
         s1 = moe_shuffle_scale(s1, e, is_guinterleave=True, gate_up=True)
         s2 = moe_shuffle_scale(s2, e, is_guinterleave=True, gate_up=False)
         dtype = getattr(torch, str(row.get("dtype", "torch.bfloat16")).split(".")[-1])
-        hidden = (torch.randn(m, d, device=dev, generator=g) / 4).to(dtype)
-        ids, weights = make_routing(m, e, k, routing, g)
+        info = []
+        for m in tokens or [int(float(row["token"]))]:
+            hidden = (torch.randn(m, d, device=dev, generator=g) / 4).to(dtype)
+            for kind in str(routing).split(","):
+                ids, weights = make_routing(m, e, k, kind, g)
+                self.cases.append((hidden, w1, w2, weights, ids))
+                counts = torch.bincount(ids.reshape(-1).long(), minlength=e)
+                info.append(
+                    f"M={m} {kind}: max {int(counts.max())}/expert, "
+                    f"{int((counts == 0).sum())} empty"
+                )
         act = str2ActivationType(str(row["act_type"]).split(".")[-1])
         assert act in (
             ActivationType.Silu,
@@ -1079,31 +1109,22 @@ class _Worker:
             for c in ("beta", "linear_beta", "swiglu_limit")
             if cell_text(row.get(c))
         }
-        self.case = {
-            "args": (hidden, w1, w2, weights, ids),
-            "kwargs": dict(
-                activation=act,
-                quant_type=QuantType.per_1x32,
-                doweight_stage1=cell_text(row.get("doweight_stage1")) in ("1", "True"),
-                w1_scale=s1,
-                w2_scale=s2,
-                dtype=dtype,
-                # The grouped kernels read GUGU weights only, so they serve
-                # GateMode.INTERLEAVE; the lookup does not key on gate_mode.
-                gate_mode=GateMode.INTERLEAVE.value,
-                # The row's activation dtype, not the env-dependent default.
-                quant_dtype_a=getattr(torch, str(row["q_dtype_a"]).split(".")[-1]),
-                **extra,
-            ),
-        }
+        self.kwargs = dict(
+            activation=act,
+            quant_type=QuantType.per_1x32,
+            doweight_stage1=cell_text(row.get("doweight_stage1")) in ("1", "True"),
+            w1_scale=s1,
+            w2_scale=s2,
+            dtype=dtype,
+            # The grouped kernels read GUGU weights only, so they serve
+            # GateMode.INTERLEAVE; the lookup does not key on gate_mode.
+            gate_mode=GateMode.INTERLEAVE.value,
+            # The row's activation dtype, not the env-dependent default.
+            quant_dtype_a=getattr(torch, str(row["q_dtype_a"]).split(".")[-1]),
+            **extra,
+        )
         torch.cuda.synchronize()
-        counts = torch.bincount(ids.reshape(-1).long(), minlength=e).float()
-        return {
-            "routes": int(counts.sum().item()),
-            "max_per_expert": int(counts.max().item()),
-            "empty_experts": int((counts == 0).sum().item()),
-            **self.identity(),
-        }
+        return {"cases": info, **self.identity()}
 
     # -- one candidate
     def _write(self, cfg):
@@ -1128,51 +1149,57 @@ class _Worker:
             if hasattr(cached, "cache_clear"):
                 cached.cache_clear()
 
-    def _call(self):
+    def _call(self, case=0):
         from aiter.fused_moe import fused_moe
 
-        return fused_moe(*self.case["args"], **self.case["kwargs"])
+        return fused_moe(*self.cases[case], **self.kwargs)
 
     def _run(self, cfg, capture):
+        """Run ``cfg`` once per case; capture case 0's launches."""
         from aiter.ops.flydsl import grouped_moe_gfx1250 as grouped
 
         path = self._write(cfg)
         self._select(path)
         grouped.kernel_bench_callable = [] if capture else None
         try:
-            out = self._call()
-            self.torch.cuda.synchronize()
+            outs = [self._call(0)]
             calls = dict(grouped.kernel_bench_callable or [])
         finally:
             grouped.kernel_bench_callable = None
-        return path, out, calls
+        outs += [self._call(c) for c in range(1, len(self.cases))]
+        self.torch.cuda.synchronize()
+        return path, outs, calls
 
-    def _diff(self, out):
+    def _diff(self, outs):
+        """Largest output difference to the reference over the cases."""
         torch = self.torch
-        if not bool(torch.isfinite(out).all()):
-            return math.inf
-        if self.ref is None:
-            return 0.0
-        a, b = self.ref.float(), out.float()
-        den = float((a * a).sum() + (b * b).sum())
-        return float(1 - 2 * float((a * b).sum()) / den) if den > 0 else 0.0
+        worst = 0.0
+        for c, out in enumerate(outs):
+            if not bool(torch.isfinite(out).all()):
+                return math.inf
+            if self.refs is not None:
+                a, b = self.refs[c].float(), out.float()
+                den = float((a * a).sum() + (b * b).sum())
+                if den > 0:
+                    worst = max(worst, 1 - 2 * float((a * b).sum()) / den)
+        return worst
 
     def _ensure_ref(self, cfg):
         key = tuple(sorted(cfg.items()))
-        if self.ref is not None and self.ref_key == key:
+        if self.refs is not None and self.ref_key == key:
             return
-        self.ref = None
+        self.refs = None
         # A start row that fails is reported per candidate; the first candidate
         # that runs becomes the reference instead.
         try:
-            _, out, _ = self._run(cfg, capture=False)
+            _, outs, _ = self._run(cfg, capture=False)
         except Exception:  # noqa: BLE001
             return
-        if bool(self.torch.isfinite(out).all()):
-            self.ref, self.ref_key = out.clone(), key
+        if all(bool(self.torch.isfinite(o).all()) for o in outs):
+            self.refs, self.ref_key = [o.clone() for o in outs], key
 
     # -- timing
-    def _profile(self, iters):
+    def _profile(self, case, iters):
         """Device time per fused_moe call, by kernel group, over ``iters``
         eager calls. Device times leave host launch gaps out, and eager calls
         reuse the allocator's blocks, so every candidate runs on the same
@@ -1182,7 +1209,7 @@ class _Worker:
         torch = self.torch
         with profile(activities=[ProfilerActivity.CUDA]) as prof:
             for _ in range(iters):
-                self._call()
+                self._call(case)
             torch.cuda.synchronize()
         groups = {"gemm1": 0.0, "gemm2": 0.0, "other": 0.0}
         for e in prof.events():
@@ -1202,13 +1229,14 @@ class _Worker:
         for idx, cfg in enumerate(configs):
             conn.send(("start", idx))
             try:
-                path, out, calls = self._run(cfg, capture=True)
+                path, outs, calls = self._run(cfg, capture=True)
                 why = launch_mismatch(calls, cfg)
                 del calls
-                if self.ref is None and why is None and bool(torch.isfinite(out).all()):
-                    self.ref = out.clone()
-                diff = self._diff(out)
-                del out
+                finite = all(bool(torch.isfinite(o).all()) for o in outs)
+                if self.refs is None and why is None and finite:
+                    self.refs = [o.clone() for o in outs]
+                diff = self._diff(outs)
+                del outs
                 if why is None and not diff <= err_ratio:
                     why = f"output differs from the start row (diff {diff:.3g})"
                 if why:
@@ -1218,26 +1246,31 @@ class _Worker:
             except torch.cuda.OutOfMemoryError:
                 results[idx]["error"] = "out of memory"
                 torch.cuda.empty_cache()
-            # A per-candidate failure, e.g. a kernel the compiler rejects.
+            # A per-candidate failure, e.g. a kernel the compiler rejects. A
+            # launch the GPU refuses also kills the context: report and exit.
             except Exception as exc:  # noqa: BLE001
                 results[idx]["error"] = f"{type(exc).__name__}: {exc}"[:300]
-                torch.cuda.synchronize()
+                if context_lost(torch, exc):
+                    conn.send(("lost", results[idx]["error"]))
+                    os._exit(3)
         conn.send(("timing", None))
         if live:
             self._select(live[0][1])
-            for _ in range(max(1, warmup)):
-                self._call()
-            torch.cuda.synchronize()
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            self._call()
-            end.record()
-            end.synchronize()
-            # ~10 ms per sample: long enough to average out the clock swings
-            # of a power-capped GPU.
-            call_us = max(start.elapsed_time(end) * 1e3, 1.0)
-            iters = int(min(100, max(3, math.ceil(10000.0 / call_us))))
+            iters = []
+            for case in range(len(self.cases)):
+                for _ in range(max(1, warmup)):
+                    self._call(case)
+                torch.cuda.synchronize()
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                self._call(case)
+                end.record()
+                end.synchronize()
+                # ~10 ms per sample: long enough to average out the clock
+                # swings of a power-capped GPU.
+                call_us = max(start.elapsed_time(end) * 1e3, 1.0)
+                iters.append(int(min(100, max(3, math.ceil(10000.0 / call_us)))))
             samples = {idx: [] for idx, _, _ in live}
             # Interleaved rounds, rotating the order, so drift hits all alike.
             for r in range(rounds):
@@ -1246,9 +1279,13 @@ class _Worker:
                     order.reverse()
                 for idx, path, _ in order:
                     self._select(path)
-                    for _ in range(2):
-                        self._call()
-                    samples[idx].append(self._profile(iters))
+                    groups = {}
+                    for case, n in enumerate(iters):
+                        for _ in range(2):
+                            self._call(case)
+                        for kname, us in self._profile(case, n).items():
+                            groups[kname] = groups.get(kname, 0.0) + us
+                    samples[idx].append(groups)
             for idx, _, diff in live:
                 stages = {k: [s[k] for s in samples[idx]] for k in samples[idx][0]}
                 total = [sum(s.values()) for s in samples[idx]]
@@ -1291,16 +1328,44 @@ def make_routing(m, e, k, kind, gen):
     return ids.to(torch.int32).contiguous(), weights.float().contiguous()
 
 
-def check_routing(kind: str) -> str:
-    if kind in ("balanced", "uniform"):
-        return kind
-    if kind.startswith("zipf:"):
-        float(kind.split(":", 1)[1])
-        return kind
-    raise ValueError(f"routing must be balanced, uniform or zipf:<s>, got {kind!r}")
+def check_routing(kinds: str) -> str:
+    """A comma list of balanced, uniform and zipf:<s>."""
+    for kind in kinds.split(","):
+        if kind.startswith("zipf:"):
+            float(kind.split(":", 1)[1])
+        elif kind not in ("balanced", "uniform"):
+            raise ValueError(
+                f"routing must be balanced, uniform or zipf:<s>, got {kind!r}"
+            )
+    return kinds
+
+
+def bucket_tokens(token: int, fractions: Iterable[float]) -> list[int]:
+    """Token counts to time a bucket at: fractions of it, in (0.5, 1] so that
+    they still map to the bucket (the runtime pads M to the next power of 2)."""
+    out = []
+    for f in fractions:
+        if not 0.5 < f <= 1.0:
+            raise ValueError(f"token fractions must be in (0.5, 1], got {f}")
+        m = max(1, round(f * token))
+        if m not in out:
+            out.append(m)
+    return out
 
 
 _ENV_LOCK = threading.Lock()
+
+
+def context_lost(torch, exc) -> bool:
+    """Did ``exc`` leave the HIP context unusable (launch out of resources,
+    queue abort, memory fault)? Only a new process recovers from that."""
+    if type(exc).__name__ == "AcceleratorError":
+        return True
+    try:
+        torch.cuda.synchronize()
+    except Exception:  # noqa: BLE001
+        return True
+    return False
 
 
 def _worker_main(conn):
@@ -1332,6 +1397,8 @@ def _worker_main(conn):
                 conn.send(("error", f"unknown op {op}"))
         except Exception as exc:  # noqa: BLE001  reported to the parent
             conn.send(("error", f"{type(exc).__name__}: {exc}"[:400]))
+            if context_lost(torch, exc):
+                os._exit(3)
 
 
 class WorkerLost(RuntimeError):
@@ -1398,7 +1465,7 @@ class Bench:
     def _request(self, op, kw):
         self.conn.send((op, kw))
         kind, payload = self._recv()
-        if kind == "error":
+        if kind in ("error", "lost"):
             raise RuntimeError(payload)
         return payload
 
@@ -1422,8 +1489,13 @@ class Bench:
                 pass
         self._kill()
 
-    def setup(self, row, routing, seed, ref_cfg):
-        self.setup_kw = {"row": dict(row), "routing": routing, "seed": seed}
+    def setup(self, row, routing, seed, ref_cfg, tokens=None):
+        self.setup_kw = {
+            "row": dict(row),
+            "routing": routing,
+            "seed": seed,
+            "tokens": tokens,
+        }
         self.ref_cfg = ref_cfg
         if self.proc is None or not self.proc.is_alive():
             self._start()
@@ -1437,7 +1509,7 @@ class Bench:
         while pending:
             if self.proc is None or not self.proc.is_alive():
                 self._start()
-            started, timing = None, False
+            started, timing, lost = None, False, ""
             try:
                 self.conn.send(
                     (
@@ -1457,6 +1529,8 @@ class Bench:
                         started = pending[payload]
                     elif kind == "timing":
                         timing = True
+                    elif kind == "lost":
+                        lost = payload
                     elif kind == "ok":
                         for i, res in zip(pending, payload):
                             results[i] = res
@@ -1467,15 +1541,14 @@ class Bench:
             except WorkerLost as exc:
                 code = self._kill()
                 restarts += 1
+                why = lost or f"{exc} (exit {code})"
                 if started is not None and not timing:
                     results[started] = {
                         "ok": False,
-                        "error": f"{exc} (exit {code}) on this config",
+                        "error": f"{why}; worker restarted",
                     }
                     pending.remove(started)
-                    self.log(
-                        f"worker lost on a candidate ({exc}, exit {code}); restarting"
-                    )
+                    self.log(f"worker lost on a candidate ({why[:120]}); restarting")
                 elif restarts > 2:
                     for i in pending:
                         results[i] = {"ok": False, "error": f"{exc} (exit {code})"}
@@ -1495,6 +1568,7 @@ class Job:
     routing: str = "balanced"
     seed: int = 0
     label: str = ""
+    tokens: list | None = None
     result: dict = field(default_factory=dict)
 
 
@@ -1531,8 +1605,10 @@ def run_jobs(
                     glog(f"{job.label}: {msg}")
 
                 try:
-                    info = bench.setup(job.row, job.routing, job.seed, job.seeds[0][1])
-                    jlog(f"routing {job.routing}: {info}")
+                    info = bench.setup(
+                        job.row, job.routing, job.seed, job.seeds[0][1], job.tokens
+                    )
+                    jlog(f"timing cases {info['cases']}")
                     job.result = search(
                         job.shape, job.seeds, bench.measure, opts, log=jlog
                     )
