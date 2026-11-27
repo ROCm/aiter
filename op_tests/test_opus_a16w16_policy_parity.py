@@ -394,6 +394,10 @@ def test_shipped_tuned_selection_diff_is_exhaustive(
         ("gfx942", 80, 257, 1024, 7168, False, torch.bfloat16, (9, 4)),
         ("gfx942", 80, 32, 1537, 2048, False, torch.bfloat16, (15, 0)),
         ("gfx942", 80, 32, 256, 1024, False, torch.float32, (5, 8)),
+        ("gfx942", 304, 64, 4096, 4096, False, torch.bfloat16, (4, 8)),
+        ("gfx942", 152, 64, 4096, 4096, False, torch.bfloat16, (4, 5)),
+        ("gfx942", 38, 64, 4096, 4096, False, torch.bfloat16, (4, 2)),
+        ("gfx950", 64, 256, 256, 128, False, torch.bfloat16, (76, 0)),
     ),
 )
 def test_untuned_shape_launch_resolution(

@@ -45,6 +45,7 @@ from opus_gemm_common import (
     gfx1250_clusterlaunch_kernels_list,
     gfx1250_kernels_list,
     gfx1250_splitk_fuse_kernels_list,
+    opus_namespace_cu,
 )
 
 
@@ -58,6 +59,12 @@ def _registry_arch(gfx: str) -> str:
     from GPU_ARCHS.
     """
     return base_gfx_arch(gfx)
+
+
+def _table_key(key: KernelKey) -> KernelKey:
+    """Map a key with an unlisted CU count to the CU table that serves it."""
+    cu_num = opus_namespace_cu(key.family, key.gfx, key.cu_num)
+    return KernelKey(key.family, key.gfx, cu_num, key.kid)
 
 
 def _gfx950_num_xcd(targets: list[tuple[str, int]], targets_from_cli: bool) -> int:
@@ -116,7 +123,10 @@ def _build_targets_standalone(explicit_targets=()):
     )
     mod = importlib.util.module_from_spec(mod_spec)
     mod_spec.loader.exec_module(mod)
-    targets = {(_registry_arch(gfx), cu) for gfx, cu in mod.get_build_targets()}
+    targets = {
+        (_registry_arch(gfx), opus_namespace_cu("a16w16", gfx, cu))
+        for gfx, cu in mod.get_build_targets()
+    }
     for gfx, _cu in tuple(targets):
         targets.update(
             (gfx, cu)
@@ -1416,7 +1426,9 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     targets = _build_targets_standalone(args.targets)
-    requested_keys = {KernelKey.decode(value) for value in args.extra_kernel_keys}
+    requested_keys = {
+        _table_key(KernelKey.decode(value)) for value in args.extra_kernel_keys
+    }
     if args.tune_files is None and args.tune_file is not None:
         args.tune_files = args.tune_file
 
@@ -1499,7 +1511,9 @@ if __name__ == "__main__":
                         family = "a8w8_blockscale" if scale_ab else "a8w8"
                     else:
                         family = "a8w8_blockscale_bpreshuffle"
-                key = KernelKey(family, str(row["gfx"]), int(row["cu_num"]), int(value))
+                key = _table_key(
+                    KernelKey(family, str(row["gfx"]), int(row["cu_num"]), int(value))
+                )
             except (ValueError, KeyError, TypeError, OverflowError):
                 continue
             if (key.gfx, key.cu_num) not in targets:

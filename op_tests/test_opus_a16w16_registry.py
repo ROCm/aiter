@@ -140,5 +140,45 @@ class TestA16W16CachePolicyRegistry(unittest.TestCase):
                     )
 
 
+def _kernel_names(table):
+    return {kid: instance.name for kid, instance in table.items()}
+
+
+class TestPartitionCuTables(unittest.TestCase):
+    PARTITIONS = (
+        ("gfx942", 152, 304),
+        ("gfx942", 76, 304),
+        ("gfx942", 38, 304),
+        ("gfx950", 64, 256),
+        ("gfx950", 32, 256),
+    )
+
+    def test_unlisted_cu_count_uses_full_chip_table(self):
+        for gfx, cu_num, full_cu in self.PARTITIONS:
+            families = [
+                f for f, arches in registry.KERNEL_REGISTRY.items() if gfx in arches
+            ]
+            self.assertTrue(families)
+            for family in families:
+                with self.subTest(family=family, gfx=gfx, cu_num=cu_num):
+                    self.assertEqual(
+                        _kernel_names(registry.get_registry(family, gfx, cu_num)),
+                        _kernel_names(registry.get_registry(family, gfx, full_cu)),
+                    )
+            with self.subTest(gfx=gfx, cu_num=cu_num):
+                defaults = registry.default_compiled_kids(gfx, cu_num)
+                self.assertTrue(defaults)
+                self.assertEqual(defaults, registry.default_compiled_kids(gfx, full_cu))
+                self.assertEqual(
+                    registry.default_compiled_keys(gfx, cu_num),
+                    registry.default_compiled_keys(gfx, full_cu),
+                )
+
+    def test_invalid_cu_count_is_rejected(self):
+        for cu_num in (0, -1, "304", 304.0):
+            with self.subTest(cu_num=cu_num), self.assertRaises(ValueError):
+                registry.get_registry("a16w16", "gfx942", cu_num)
+
+
 if __name__ == "__main__":
     unittest.main()

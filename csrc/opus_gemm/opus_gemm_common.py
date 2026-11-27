@@ -2,7 +2,9 @@
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 """OPUS kernel registrations shared by selection and code generation."""
 
+import functools
 import json
+import logging
 import os
 import sys
 from dataclasses import asdict, dataclass, field
@@ -4024,6 +4026,19 @@ assert not _name_clashes, (
     "has to appear in OpusGemmInstance.name for their kernel_tag."
 )
 
+# opus_namespace_cu serves an unlisted CU count from another CU table of the
+# same family and arch. That is correct only while these tables are identical.
+for _family, _arches in KERNEL_REGISTRY.items():
+    for _gfx, _tables in _arches.items():
+        _named = [
+            {kid: inst.name for kid, inst in table.items()}
+            for table in _tables.values()
+        ]
+        if any(names != _named[0] for names in _named):
+            raise RuntimeError(
+                f"the CU tables of {_family}/{_gfx} hold different kernels"
+            )
+
 
 @dataclass(frozen=True, order=True)
 class KernelKey:
@@ -4049,6 +4064,33 @@ class KernelKey:
         return cls(family, gfx, int(cu_num), int(kid))
 
 
+@functools.cache
+def _log_namespace_fallback(gfx: str, cu_num: int, table_cu: int) -> None:
+    logging.getLogger("aiter").info(
+        "OPUS: no %s/%d kernel table, use the %s/%d kernels",
+        gfx,
+        cu_num,
+        gfx,
+        table_cu,
+    )
+
+
+def opus_namespace_cu(family: str, gfx: str, cu_num: int) -> int:
+    """Return the CU count of the kernel table that serves ``cu_num``.
+
+    A CU count without a table (a compute partition) uses the largest table.
+    """
+    if type(cu_num) is not int or cu_num <= 0:
+        raise ValueError(f"unregistered OPUS namespace {family}/{gfx}/{cu_num}")
+    gfx = base_gfx_arch(gfx)
+    tables = KERNEL_REGISTRY.get(family, {}).get(gfx, {})
+    if not tables or cu_num in tables:
+        return cu_num
+    table_cu = max(tables)
+    _log_namespace_fallback(gfx, cu_num, table_cu)
+    return table_cu
+
+
 def _get_registry_records(family: str, gfx: str, cu_num: int) -> dict[int, object]:
     # gfx1250-strict (A0) shares the gfx1250 kernel family in the registry;
     # callers keep the gfx1250-strict spelling in KernelKey (compile target).
@@ -4057,7 +4099,7 @@ def _get_registry_records(family: str, gfx: str, cu_num: int) -> dict[int, objec
     if not tables:
         return {}
     if type(cu_num) is not int or cu_num not in tables:
-        raise ValueError(f"unregistered OPUS namespace {family}/{gfx}/{cu_num}")
+        cu_num = opus_namespace_cu(family, gfx, cu_num)
     return tables[cu_num]
 
 
@@ -4116,10 +4158,18 @@ def kid_for_name(family: str, gfx: str, cu_num: int, name: str) -> int:
     return kid
 
 
+@functools.cache
+def default_compiled_kids(gfx: str, cu_num: int) -> frozenset[int]:
+    """Return the default compiled a16w16 kids of the table that serves ``cu_num``."""
+    gfx = base_gfx_arch(gfx)
+    table_cu = opus_namespace_cu("a16w16", gfx, cu_num)
+    return frozenset(DEFAULT_COMPILED_KIDS_BY_NAMESPACE.get((gfx, table_cu), ()))
+
+
 def default_compiled_keys(gfx: str, cu_num: int) -> set[KernelKey]:
     """Select the A16W16 compile floor from the current CU table."""
-    lookup_gfx = base_gfx_arch(gfx)
-    defaults = DEFAULT_COMPILED_KIDS_BY_NAMESPACE.get((lookup_gfx, cu_num), ())
+    cu_num = opus_namespace_cu("a16w16", gfx, cu_num)
+    defaults = default_compiled_kids(gfx, cu_num)
     return {
         KernelKey("a16w16", gfx, cu_num, kid)
         for kid in get_registry("a16w16", gfx, cu_num)

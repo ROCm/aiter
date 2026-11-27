@@ -20,10 +20,10 @@ import pandas as pd
 
 from aiter import logger
 from csrc.opus_gemm.opus_gemm_common import (
-    DEFAULT_COMPILED_KIDS_BY_NAMESPACE,
     GFX942_BF16WS_EXACT_N,
     MX32_KID_STRIDE,
     canonical_output_dtype,
+    default_compiled_kids,
     get_kernel_instance,
     get_registry,
     parse_integer,
@@ -232,7 +232,7 @@ def _gfx942_heuristic_symbol_to_kid(cu_num=None) -> dict[str, int]:
     """Build the canonical gfx942 launcher-symbol mapping from the registry."""
     cu_num = get_cu_num() if cu_num is None else cu_num
     result: dict[str, int] = {}
-    for kid in DEFAULT_COMPILED_KIDS_BY_NAMESPACE.get((GFX942, cu_num), ()):
+    for kid in default_compiled_kids(GFX942, cu_num):
         instance = get_kernel_instance(GFX942, "a16w16", kid, cu_num=cu_num)
         if instance is None:
             raise RuntimeError(f"gfx942 heuristic kid {kid} has no a16w16 instance")
@@ -420,7 +420,7 @@ def select_a16w16_heuristic_kid(
     cu_num = get_cu_num() if cu_num is None else cu_num
     args = (M, N, K, batch, has_bias, output_dtype)
     kid = int(heuristic(*args, cu_num=cu_num) if arch == GFX942 else heuristic(*args))
-    if kid not in DEFAULT_COMPILED_KIDS_BY_NAMESPACE.get((arch, cu_num), ()):
+    if kid not in default_compiled_kids(arch, cu_num):
         raise RuntimeError(
             f"{arch}/{cu_num} a16w16 heuristic returned kid {kid} outside its default compile set"
         )
