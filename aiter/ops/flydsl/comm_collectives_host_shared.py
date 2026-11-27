@@ -140,9 +140,7 @@ class _StEngine:
             )
         except Exception as exc:  # noqa: BLE001
             error = f"{type(exc).__name__}: {exc}"
-        _raise_on_rank_failures(
-            IpcHeap.gather_object_list_via_broadcast(group, error)
-        )
+        _raise_on_rank_failures(IpcHeap.gather_object_list_via_broadcast(group, error))
 
     def _open_peers(self, all_meta, *, rank: int, world_size: int, extra_ptrs=()):
         """Open the peers' inboxes and upload the pointer table and the colours."""
