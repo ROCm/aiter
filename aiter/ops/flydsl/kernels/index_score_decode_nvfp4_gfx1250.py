@@ -71,6 +71,14 @@ WAVES = 4  # a workgroup; wave w owns key tiles 2w, 2w+1 of every block
 THREADS = WAVE * WAVES
 MAX_ROWS = 32  # (index head, query row) pairs a request: two 16-row WMMA tiles
 MAX_BLOCKS = 64  # blocks a workgroup owns at most (two block-table VGPRs)
+FLAT_MAX_BLOCKS = 128  # the same under the flat plan (four VGPRs)
+
+
+def flat_lds_bytes(ring: int) -> int:
+    """LDS of a flat build: the waves' rings and the 128-block maxima."""
+    return WAVES * ring * SLOT + FLAT_MAX_BLOCKS * MAX_ROWS * 4
+
+
 SLOT_PAYLOAD = 32 * 64  # a wave's quarter block: 32 key rows (16 B pieces swizzled)
 SLOT = SLOT_PAYLOAD + 32 * 8  # + their 32 scale rows
 QOP_LANE = 64  # LDS bytes of one lane's 16-dword B operand (16 B pieces swizzled)
@@ -152,9 +160,23 @@ def _lds_i32(base_u8, off, n):
 
 
 @functools.cache
-def compile_index_score_decode_nvfp4(*, heads: int, query_len: int, ring: int = 4):
+def compile_index_score_decode_nvfp4(
+    *, heads: int, query_len: int, ring: int = 4, flat: bool = False
+):
     """Launcher for (index heads, query rows a request); ``ring``: LDS slots
-    (blocks in flight + 1) a wave."""
+    (blocks in flight + 1) a wave.
+
+    ``flat``: the length-proportional plan (:data:`FLAT_MAX_BLOCKS` blocks a
+    workgroup at most). The grid is 1-D, ``G`` workgroups, and the launch's
+    ``programs`` argument is the batch. Every workgroup reads all the
+    requests' lengths, ``live_b = ceil(len_b / 128)`` (at most ``blocks``),
+    ``T = sum live_b``, and cuts each request into splits of ``S = max(1,
+    ceil(T / (G - batch)))`` blocks (``sum ceil(live_b / S) < T / S + batch
+    <= G``: they always fit); workgroup g takes the g-th split in request
+    order and workgroups past the last split exit. A long request gets proportionally
+    more workgroups, so a ragged batch fills the machine as an even one does.
+    ``G >= batch * (ceil(blocks / FLAT_MAX_BLOCKS) + 1)`` keeps ``S`` within
+    the window (:func:`flat_programs`)."""
     ql = query_len
     rows = heads * ql
     nqt = (rows + 15) // 16  # 16-row query tiles
@@ -163,9 +185,15 @@ def compile_index_score_decode_nvfp4(*, heads: int, query_len: int, ring: int = 
     if not 2 <= ring <= 8:
         raise ValueError("ring must be in [2, 8]")
     RING = ring
-    name = f"index_score_decode_nvfp4_d128_h{heads}_q{ql}_ring{ring}"
+    name = f"index_score_decode_nvfp4_d128_h{heads}_q{ql}_ring{ring}" + (
+        "_flat" if flat else ""
+    )
+    NB = FLAT_MAX_BLOCKS if flat else MAX_BLOCKS  # a workgroup's window
     RING_BYTES = WAVES * RING * SLOT
-    PART = MAX_BLOCKS * 32  # maxima [block][row], combined by LDS atomic max
+    PART = NB * 32
+    assert not flat or RING_BYTES + 4 * PART == flat_lds_bytes(
+        ring
+    )  # maxima [block][row], combined by LDS atomic max
     # B operands staged in the last slots
     assert nqt * 2 * 32 * QOP_LANE <= WAVES * SLOT
     JH = 4 // (THREADS // (32 * nqt))  # K chunks a converting thread takes
@@ -216,29 +244,114 @@ def compile_index_score_decode_nvfp4(*, heads: int, query_len: int, ring: int = 
         tcol = tu + t_qt * 16
         tlive = (tcol < rows) & t_on
         tcol = tlive.select(tcol, zero)
-        tbase = fx.Int64(b * ql + tcol // heads) * fx.Int64(i32_q_tok) + fx.Int64(
-            tcol % heads
-        ) * fx.Int64(i32_q_head)
         bt = fx.recast_iter(fx.Int32, arg_bt)
         last_col = i32_blocks - 1
 
         def load_windows(block_fn):
             ws = []
-            for h in range_constexpr(MAX_BLOCKS // 32):
+            for h in range_constexpr(NB // 32):
                 blk = block_fn(lane + 32 * h)
                 blk = (blk < last_col).select(blk, last_col)
                 ws.append(fx.Int32(bt[b * i32_bt_stride + blk]))
             return ws
 
-        length = fx.Int32(fx.recast_iter(fx.Int32, arg_len)[b])
-        live_end = (length + (PAGE - 1)) // PAGE
-        live_end = (live_end < zero).select(zero, live_end)
-        live_end = (live_end < i32_blocks).select(live_end, i32_blocks)
-        # workgroup p: blocks [start, start + nblk), c = ceil(live / P)
-        chunk = (live_end + i32_programs - 1) // i32_programs
-        start = program * chunk
-        nblk = live_end - start
-        nblk = (nblk < chunk).select(nblk, chunk)
+        lens = fx.recast_iter(fx.Int32, arg_len)
+
+        def live_of(n_tok):
+            live = (n_tok + (PAGE - 1)) // PAGE
+            live = (live < zero).select(zero, live)
+            return (live < i32_blocks).select(live, i32_blocks)
+
+        if const_expr(flat):
+            # ---- the flat plan (see the builder), every wave on its own --
+            batch = i32_programs
+            G = fx.Int32(gpu.grid_dim.x)
+            groups = (batch + (WAVE - 1)) // WAVE
+
+            def lane_live(gi):
+                """(in the batch, length, live blocks) of request 32 gi + lane."""
+                r = fx.Int32(gi) * WAVE + lane
+                ok = r < batch
+                n_tok = fx.Int32(lens[ok.select(r, zero)])
+                return ok, n_tok, ok.select(live_of(n_tok), zero)
+
+            def wave_sum(x):
+                for d in range_constexpr(5):
+                    x = x + x.shuffle_xor(1 << d, WAVE)
+                return x
+
+            # The first 32 requests are read once (a decode batch rarely has
+            # more); the loops below run only for the rest.
+            ok0, len0, lv0 = lane_live(0)
+            total = wave_sum(lv0)
+            for gi in range(fx.Int32(1), groups):
+                _, _, lv = lane_live(gi)
+                total = total + wave_sum(lv)
+            # S = ceil(T / (G - batch)): sum ceil(live_b / S) <= T / S + batch
+            # <= G, and S <= FLAT_MAX_BLOCKS by the launch's G.
+            size = (total + (G - batch) - 1) // (G - batch)
+            size = (size < 1).select(fx.Int32(1), size)
+            # Raw readfirstlane: the size is wave-uniform, but it comes out of
+            # cross-lane sums, which fx cannot state; without it the main
+            # loop's ring tests become per-lane and every block waits for all
+            # copies (one block in flight a wave).
+            size = fx.Int32(rocdl.readfirstlane(T.i32, fx.as_ir_value(size)))
+
+            def find(gi, ok, n_tok, lv, first):
+                """(hit, request, split, its length, first split of the next
+                group) of group gi: workgroup b's request is the one whose
+                splits [excl, excl + n) hold b."""
+                n_r = ok.select((lv + size - 1) // size, zero)
+                incl = n_r
+                for d in range_constexpr(5):
+                    up = fx.Int32(fx.shuffle_up(incl, 1 << d, WAVE))
+                    incl = incl + (lane >= (1 << d)).select(up, zero)
+                excl = first + incl - n_r
+                hit = ok & (excl <= b) & (b < excl + n_r)
+                hits = fx.Int32(rocdl.ballot(T.i32, fx.as_ir_value(hit)))
+                at = fx.Int32(fx.cttz(hits)) & (WAVE - 1)
+
+                # Raw readlane: wave-uniform picks of the hit lane's values.
+                def pick(x):
+                    return fx.Int32(
+                        rocdl.readlane(T.i32, fx.as_ir_value(x), fx.as_ir_value(at))
+                    )
+
+                return (
+                    hits != zero,
+                    fx.Int32(gi) * WAVE + at,
+                    b - pick(excl),
+                    pick(n_tok),
+                    first + wave_sum(n_r),
+                )
+
+            hit, req, split, length, first = find(0, ok0, len0, lv0, zero)
+            for gi in range(fx.Int32(1), groups):
+                ok, n_tok, lv = lane_live(gi)
+                hit_g, req_g, split_g, len_g, first = find(gi, ok, n_tok, lv, first)
+                req = hit_g.select(req_g, req)
+                split = hit_g.select(split_g, split)
+                length = hit_g.select(len_g, length)
+                hit = hit | hit_g
+            b = hit.select(req, zero)
+            live_end = live_of(length)
+            chunk = size
+            start = split * chunk
+            nblk = live_end - start
+            nblk = (nblk < chunk).select(nblk, chunk)
+            nblk = hit.select(nblk, zero)
+        else:
+            length = fx.Int32(lens[b])
+            live_end = live_of(length)
+            # workgroup p: blocks [start, start + nblk), c = ceil(live / P)
+            chunk = (live_end + i32_programs - 1) // i32_programs
+            start = program * chunk
+            nblk = live_end - start
+            nblk = (nblk < chunk).select(nblk, chunk)
+
+        tbase = fx.Int64(b * ql + tcol // heads) * fx.Int64(i32_q_tok) + fx.Int64(
+            tcol % heads
+        ) * fx.Int64(i32_q_head)
 
         def block_of(j):
             return start + j
@@ -305,7 +418,18 @@ def compile_index_score_decode_nvfp4(*, heads: int, query_len: int, ring: int = 
                         T.i32, fx.as_ir_value(windows[1]), fx.as_ir_value(j % 32)
                     )
                 )
-                return (j < 32).select(lo, hi)
+                if const_expr(NB == 64):
+                    return (j < 32).select(lo, hi)
+                res = (j < 32).select(lo, hi)
+                for w in range_constexpr(2, NB // 32):
+                    # Raw readlane, as above.
+                    v = fx.Int32(
+                        rocdl.readlane(
+                            T.i32, fx.as_ir_value(windows[w]), fx.as_ir_value(j % 32)
+                        )
+                    )
+                    res = (j >= 32 * w).select(v, res)
+                return res
 
             def issue(j):
                 """Async copies of block j's quarter into ring slot j % RING."""
@@ -505,10 +629,10 @@ def compile_index_score_decode_nvfp4(*, heads: int, query_len: int, ring: int = 
             # ---- combine the four waves' maxima, scale, store: one row's
             # consecutive blocks per instruction (lane = block) --------------
             out = fx.recast_iter(fx.Float32, arg_out)
-            for it in range_constexpr(32 * MAX_BLOCKS // THREADS):
+            for it in range_constexpr(32 * NB // THREADS):
                 idx = tid + it * THREADS
-                jb = idx % MAX_BLOCKS
-                row = idx // MAX_BLOCKS
+                jb = idx % NB
+                row = idx // NB
                 if (jb < nblk) & (row < rows):
                     v = fx.Float32(fx.ptr_load(part + (jb * 32 + row))) * f32_scale
                     out[
@@ -538,6 +662,12 @@ def compile_index_score_decode_nvfp4(*, heads: int, query_len: int, ring: int = 
         i32_batch: fx.Int32,
         stream: fx.Stream,
     ):
+        # flat: `programs` is the grid (G) and the kernel's `programs` the batch
+        grid = (
+            (fx.Int64(i32_programs), 1, 1)
+            if flat
+            else (fx.Int64(i32_batch), fx.Int64(i32_programs), 1)
+        )
         index_score_kernel(
             arg_q,
             arg_kd,
@@ -553,10 +683,10 @@ def compile_index_score_decode_nvfp4(*, heads: int, query_len: int, ring: int = 
             i32_out_head,
             i32_out_row,
             i32_blocks,
-            i32_programs,
+            i32_batch if flat else i32_programs,
             f32_scale,
         ).launch(
-            grid=(fx.Int64(i32_batch), fx.Int64(i32_programs), 1),
+            grid=grid,
             block=(THREADS, 1, 1),
             stream=stream,
         )
