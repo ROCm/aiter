@@ -388,8 +388,8 @@ def make_gemm_a16w16_gfx950_kernel_name(param: GemmA16W16Gfx950Param):
     b_layout = "t" if param.b_is_transposed else "n"
     name += f"_l{a_layout}{b_layout}"
     name += f"_bpgr{param.b_stages - 1}" if param.b_stages > param.stages else ""
-    # The suffix invalidates native FlyDSL artifacts from before the LDS waits.
-    name += "_phti_lds2" if param.use_half_tile_interleaved else "_pft"
+    # The suffix invalidates native FlyDSL artifacts of an older HTI body.
+    name += "_phti_lds3" if param.use_half_tile_interleaved else "_pft"
     return name
 
 
@@ -1221,6 +1221,12 @@ def gemm_a16w16_hti_gfx950_kernel(
     half_ldg_a_iters = param.ldg_a_iters // 2
     half_ldg_b_iters = param.ldg_b_iters // 2
     cshuffle_r2g_vec_size = param.cshuffle_r2g_vec_size
+    # One C vector for each thread in an M step of the MMA: each wave group stores
+    # only the C rows that it wrote to LDS.
+    c_store_is_group_local = (
+        param.m_waves * param.mma_m * half_block_n
+        == block_threads * cshuffle_r2g_vec_size
+    )
     elem_dtype = (
         fx.Float16
         if const_expr(param.in_dtype_id == GEMM_A16W16_DTYPE_FP16)
@@ -1646,8 +1652,10 @@ def gemm_a16w16_hti_gfx950_kernel(
         store_half_tile_to_global(1, 0)
         store_half_tile_to_global(1, 1)
     else:
-        if wid // n_waves == 0:
-            rocdl.s_barrier()
+        if const_expr(not c_store_is_group_local):  # noqa: SIM102
+            # A group also stores C rows of the other group: align the two groups.
+            if wid // n_waves == 0:
+                rocdl.s_barrier()
         rocdl.s_waitcnt(lgkmcnt=0)
         wait_vmcnt_and_barrier(0)
         store_half_tile_to_global(0, 0)

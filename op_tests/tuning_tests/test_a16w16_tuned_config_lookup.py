@@ -713,8 +713,8 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
         self.assertNotEqual(atomic_name, workspace_name)
         self.assertNotIn("_skws", atomic_name)
         self.assertIn("_skws", workspace_name)
-        self.assertTrue(atomic_name.endswith("_phti_lds2"))
-        self.assertTrue(workspace_name.endswith("_phti_lds2"))
+        self.assertTrue(atomic_name.endswith("_phti_lds3"))
+        self.assertTrue(workspace_name.endswith("_phti_lds3"))
 
         b_prefetch = make(block_m=128, block_n=192)
         b_prefetch_name = make_gemm_a16w16_gfx950_kernel_name(b_prefetch)
