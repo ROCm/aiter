@@ -67,9 +67,11 @@ AOT_ARCH_DEFAULT = "gfx950"
 SCAN_ARCHS = ("gfx1250",)
 # The runtime's own limits at an M inside a row's range (``replay.py``): for
 # some untuned M, gemm_a8w8_blockscale_abpreshuffle has no FlyDSL kernel that
-# fits.
+# fits, and a shuffled-weight (bpreshuffle) BF16 GEMM has no default backend
+# below the smallest M its shape is tuned at.
 REFUSALS = (
     r"^RuntimeError: gemm_a8w8_blockscale_abpreshuffle: no FlyDSL config for M=",
+    r"^AssertionError: no solution for M=\d+ N=\d+ K=\d+ .*bpreshuffle=True$",
 )
 # Tables without a cu_num column were tuned on a full part of their gfx.
 _DEFAULT_CU_NUM = 256

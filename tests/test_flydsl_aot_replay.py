@@ -520,6 +520,65 @@ def test_int8_csv_rows_reach_the_4wave_kernel_through_public_replay(
     assert launched == [job["kernel_name"] for job in jobs]
 
 
+def test_bf16_ring_csv_rows_reach_flydsl_through_public_replay(tmp_path):
+    # The rg / rk rows used to fail their replay: the ring support checks asked
+    # torch.cuda.is_available() (False while the dry run hides the GPUs) and the rk row's
+    # split-K reduce was a Triton launch. Run as a wheel build's replay does, in a process
+    # with the GPUs hidden (``with torch.cuda.stream(...)`` of the hgemm wrapper needs that).
+    from aiter.aot.flydsl.common import replay_env
+
+    configs = _REPO_ROOT / "aiter/configs/model_configs"
+    rows, fieldnames = [], None
+    for name in (
+        "minimax_m3_eagle_bf16_tuned_gemm.csv",
+        "minimax_m3_mxfp4_bf16_tuned_gemm.csv",
+    ):
+        with (configs / name).open(newline="") as stream:
+            reader = csv.DictReader(stream)
+            fieldnames = reader.fieldnames
+            rows += [
+                row
+                for row in reader
+                if "_prg_" in row["kernelName"] or "_prk_" in row["kernelName"]
+            ]
+    assert {"_prg_" in r["kernelName"] for r in rows} == {True, False}
+    path = tmp_path / "bf16_tuned_gemm.csv"
+    with path.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    code = (
+        "import sys\n"
+        "from aiter.aot.flydsl import gemm, replay\n"
+        "from aiter.aot.flydsl.dry_run import dry_run\n"
+        "jobs = gemm.parse_csv(sys.argv[1])\n"
+        f"assert len(jobs) == {len(rows)}, len(jobs)\n"
+        "with dry_run('gfx950', 256, python_ops=True):\n"
+        "    for job in jobs:\n"
+        "        with replay.identified_kernels() as kernels:\n"
+        "            gemm.replay(job)\n"
+        "        assert kernels, job\n"
+        # The wheel build also replays the sizes below each row that it serves
+        # (m_low): a shuffled lm_head shape tuned from M=8 has no solution at M=1
+        # and must be reported as a refusal, not fail the build.
+        "for job in jobs:\n"
+        "    if job['m_low'] < job['m']:\n"
+        "        probe, _ = replay.replay_job(\n"
+        "            gemm, {**job, 'm': job['m_low']}, probe=True\n"
+        "        )\n"
+        "        assert probe['compile_time'] is not None, (job, probe)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(path)],
+        cwd=_REPO_ROOT,
+        env={**replay_env("gfx950"), "AITER_CONFIG_GEMM_BF16": str(path)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr[-4000:]
+
+
 def test_4wave_mxfp8_csv_rows_reach_flydsl_through_public_replay(tmp_path):
     # A 4-wave row used to fail its replay: the scale shuffle's Triton launch is another
     # backend's, and the dry run's Triton driver rejects it from under aiter/ops/flydsl.

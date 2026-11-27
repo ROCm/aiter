@@ -66,6 +66,8 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
                 "$TEST_DIR/flydsl_tests/test_flydsl_allreduce_rank_agreement.py" \
                 "$TEST_DIR/flydsl_tests/test_flydsl_quick_allreduce_codec.py" \
                 "$TEST_DIR/flydsl_tests/test_gemm2_valid_token_count.py" \
+                "$TEST_DIR/flydsl_tests/test_flydsl_gemm_a16w16_ring.py" \
+                "$TEST_DIR/flydsl_tests/test_flydsl_gemm_a16w16_cat_x_ring.py" \
                 "$TEST_DIR/tuning_tests/test_mp_tuner_fault.py" \
                 "$TEST_DIR/tuning_tests/test_dispatch_verification.py" \
                 "$TEST_DIR/tuning_tests/test_compare_logic.py" \

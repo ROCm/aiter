@@ -173,7 +173,7 @@ def get_GEMM_A16W16_tuned_config(
                 if flydsl_config is None or (
                     bpreshuffle
                     and (
-                        flydsl_config["policy"] not in ("ft", "sk")
+                        flydsl_config["policy"] not in ("ft", "sk", "rg", "rk")
                         or (
                             flydsl_config["policy"] == "ft"
                             and (
@@ -775,7 +775,11 @@ def flydsl_gemm(
     ), "FlyDSL hgemm does not support scaling yet."
     flydsl_gemm_kernels = _get_flydsl_gemm_kernels()
     flydsl_config = _flydsl_hgemm_kernel_params(config["kernelName"])
-    skinny = flydsl_config["policy"] == flydsl_gemm_kernels.SKINNY_POLICY
+    skinny = flydsl_config["policy"] in (
+        flydsl_gemm_kernels.SKINNY_POLICY,
+        flydsl_gemm_kernels.RING_POLICY,
+        flydsl_gemm_kernels.RING_SPLITK_POLICY,
+    )  # no bias fusion, input-dtype output
     fused_bias = None
     if (
         not skinny

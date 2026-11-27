@@ -11,6 +11,7 @@ Run:
 """
 
 import csv
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -594,6 +595,7 @@ class TestGfx950FlydslMemoryCandidates(unittest.TestCase):
             ),
             mock.patch.object(policy, "skinny_config_error", return_value=None),
             mock.patch.object(policy, "band_stream_config", return_value=None),
+            mock.patch.object(policy, "get_flydsl_ring_configs", return_value=[]),
         ):
             configs = policy.get_flydsl_a16w16_configs(
                 112, 18432, 1536, torch.bfloat16, torch.bfloat16, False
@@ -999,6 +1001,354 @@ class TestHgemmInterleavePreshuffleRouting(unittest.TestCase):
                     bpreshuffle=True,
                 )
             launch.assert_not_called()
+
+
+class TestFlydslRingPolicyNames(unittest.TestCase):
+    """The ring GEMM is a FlyDSL HGEMM policy (``prg``): names, validation and the tuner search space."""
+
+    def _name(self, config, **kw):
+        from aiter.ops.flydsl.gemm_kernels import flydsl_hgemm_kernel_name
+
+        return flydsl_hgemm_kernel_name(
+            dtype=torch.bfloat16,
+            out_dtype=torch.bfloat16,
+            config=config,
+            has_bias=kw.get("has_bias", False),
+            target_gfx=kw.get("target_gfx", "gfx950"),
+        )
+
+    def test_every_tiling_round_trips(self):
+        from aiter.ops.flydsl.gemm_a16w16_ring import (
+            ring_config,
+            ring_name_tiling,
+            ring_tilings,
+        )
+        from aiter.ops.flydsl.gemm_kernels import get_flydsl_hgemm_kernel_params
+
+        seen = set()
+        for m in (1, 16, 17, 64, 65, 96, 128):
+            for tiling in ring_tilings(m):
+                self.assertGreaterEqual(16 * tiling[0] * tiling[1], m)
+                config = ring_config(*tiling)
+                name = self._name(config)
+                self.assertTrue(name.endswith("_prg_gfx950"), name)
+                parsed = get_flydsl_hgemm_kernel_params(name)
+                self.assertEqual({key: parsed[key] for key in config}, config)
+                self.assertEqual(ring_name_tiling(parsed), tiling)
+                seen.add(name)
+        self.assertEqual(
+            len(seen),
+            len({t for m in (1, 16, 17, 64, 65, 96, 128) for t in ring_tilings(m)}),
+        )
+
+    def test_name_example(self):
+        from aiter.ops.flydsl.gemm_a16w16_ring import ring_config
+
+        self.assertEqual(
+            self._name(ring_config(4, 1, 4)),
+            "flydsl_hgemm_abf16_wbf16_bf16_t64x16x64x4_ks1_w1x4x1_bias0_ktail0_gm0_prg_gfx950",
+        )
+
+    def test_unsupported_names_are_rejected(self):
+        from aiter.ops.flydsl.gemm_a16w16_ring import ring_config
+        from aiter.ops.flydsl.gemm_kernels import get_flydsl_hgemm_kernel_params
+
+        name = self._name(ring_config(2, 2, 3))
+        self.assertIsNotNone(get_flydsl_hgemm_kernel_params(name))
+        for invalid in (
+            name.replace("_ks1_", "_ks2_"),
+            name.replace("_bias0_", "_bias1_"),
+            name.replace("gfx950", "gfx942"),
+            name.replace("_gm0_", "_gm4_"),
+            name.replace("_gm0_", "_gm0_stg1_"),
+            name.replace("_gm0_", "_gm0_bnt_"),
+            name.replace("w2x4x1", "w3x4x1"),
+            name.replace("w2x4x1", "w2x2x1"),
+            name.replace("w2x4x1", "w2x4x2"),
+            name.replace("t64x16x64x3", "t64x32x64x3"),
+            name.replace("t64x16x64x3", "t64x16x32x3"),
+            name.replace("t64x16x64x3", "t64x16x64x5"),
+            name.replace("t64x16x64x3", "t80x16x64x3"),
+            name.replace("t64x16x64x3", "t320x16x64x3"),
+            name.replace("abf16_wbf16_bf16", "afp16_wfp16_fp16"),
+            name.replace("_bf16_t", "_fp32_t"),
+        ):
+            self.assertIsNone(get_flydsl_hgemm_kernel_params(invalid), invalid)
+        for bad in (
+            {**ring_config(1, 1, 4), "m_waves": 3},
+            {**ring_config(1, 1, 4), "stages": 9},
+        ):
+            with self.assertRaises(ValueError):
+                self._name(bad)
+        with self.assertRaises(ValueError):
+            self._name(ring_config(1, 1, 4), has_bias=True)
+
+    def test_shape_limits(self):
+        from aiter.ops.flydsl.kernels.gemm_a16w16_ring_gfx950 import fits
+
+        self.assertTrue(fits(50016, 6144, 4, 1, 4))
+        self.assertFalse(
+            fits(50016, 6144, 8, 1, 4)
+        )  # 4 slots of an 8-fragment tile exceed the LDS
+        self.assertFalse(fits(50016 + 8, 6144, 4, 1, 4))  # N % 16
+        self.assertFalse(fits(50016, 6144 + 32, 4, 1, 4))  # K % 64
+        self.assertFalse(fits(16 * 255, 6144, 4, 1, 4))  # N / 16 < 256 tiles
+
+    def test_catalog_candidates_need_a_256_cu_gfx950_bf16_no_bias(self):
+        import aiter.ops.flydsl.gemm_a16w16_policy as policy
+
+        with mock.patch.object(policy, "ring_supported", return_value=True):
+            configs = policy.get_flydsl_ring_configs(
+                64, 50016, 6144, torch.bfloat16, torch.bfloat16, False
+            )
+            self.assertTrue(configs)
+            self.assertTrue(
+                all(c["policy"] == "rg" and c["block_m"] >= 64 for c in configs)
+            )
+            for args in (
+                (129, 50016, 6144, torch.bfloat16, torch.bfloat16, False),
+                (64, 50016, 6144, torch.float16, torch.float16, False),
+                (64, 50016, 6144, torch.bfloat16, torch.float32, False),
+                (64, 50016, 6144, torch.bfloat16, torch.bfloat16, True),
+            ):
+                self.assertEqual(policy.get_flydsl_ring_configs(*args), [])
+        with mock.patch.object(policy, "ring_supported", return_value=False):
+            self.assertEqual(
+                policy.get_flydsl_ring_configs(
+                    64, 50016, 6144, torch.bfloat16, torch.bfloat16, False
+                ),
+                [],
+            )
+
+    def test_tuned_lookup_accepts_ring_row_for_preshuffled_weight(self):
+        from aiter.ops.flydsl import gemm_kernels
+        from aiter.ops.flydsl.gemm_a16w16_ring import ring_config
+
+        name = self._name(ring_config(4, 1, 4))
+        key = ("gfx950", 256, 64, 50016, 6144, False, BF16, BF16, False, True)
+        row = {"libtype": "flydsl", "solidx": 0, "splitK": 1, "kernelName": name}
+        with (
+            mock.patch.object(tuned, "get_GEMM_A16W16_config_", lambda: {key: row}),
+            mock.patch.object(tuned, "get_gfx_runtime", lambda: "gfx950"),
+            mock.patch.object(tuned, "get_cu_num", lambda: 256),
+            mock.patch.object(tuned, "get_padded_m", lambda m, _n, _k, _gl: m),
+            mock.patch.object(tuned, "_get_flydsl_gemm_kernels", lambda: gemm_kernels),
+        ):
+            got = tuned.get_GEMM_A16W16_tuned_config(
+                64, 50016, 6144, False, BF16, BF16, bpreshuffle=True
+            )
+        self.assertEqual(got, row)
+
+    def test_tuned_gemm_dispatch_passes_the_tiling_and_preshuffle(self):
+        from aiter.ops.flydsl import gemm_kernels
+        from aiter.ops.flydsl.gemm_a16w16_ring import ring_config
+
+        name = self._name(ring_config(2, 2, 3))
+        seen = {}
+        with (
+            mock.patch.object(tuned, "_get_flydsl_gemm_kernels", lambda: gemm_kernels),
+            mock.patch.object(
+                gemm_kernels,
+                "flydsl_hgemm",
+                side_effect=lambda *a, **kw: seen.update(kw) or torch.empty(1),
+            ),
+        ):
+            tuned._flydsl_hgemm_kernel_params.cache_clear()
+            tuned.flydsl_gemm(
+                torch.empty(1),
+                torch.empty(1),
+                0,
+                otype=torch.bfloat16,
+                bpreshuffle=True,
+                config={"kernelName": name},
+            )
+        self.assertEqual(
+            (seen["policy"], seen["block_m"], seen["stages"], seen["m_waves"]),
+            ("rg", 64, 3, 2),
+        )
+        self.assertTrue(seen["bpreshuffle"])
+        self.assertIsNone(seen["out_dtype"])
+
+
+class TestFlydslRingTunerCandidates(unittest.TestCase):
+    """Tuner side of the ring policies (``csrc/gemm_a16w16/gemm_a16w16_tune.py``) and the committed ring rows."""
+
+    FT = types.MappingProxyType(
+        {
+            "block_m": 64,
+            "block_n": 64,
+            "block_k": 64,
+            "stages": 3,
+            "split_k": 1,
+            "m_waves": 2,
+            "n_waves": 2,
+            "k_waves": 1,
+            "group_m": 0,
+            "use_half_tile_interleaved": False,
+        }
+    )
+
+    @classmethod
+    def _tune(cls):
+        from csrc.gemm_a16w16 import gemm_a16w16_tune
+
+        return gemm_a16w16_tune
+
+    def _configs(self):
+        from aiter.ops.flydsl.gemm_a16w16_cat_x_ring import ring_splitk_config
+        from aiter.ops.flydsl.gemm_a16w16_ring import ring_config
+
+        return [dict(self.FT), ring_config(4, 1, 4), ring_splitk_config(4, 10, 5)]
+
+    def _catalog(self, **kw):
+        tune = self._tune()
+        tune.get_flydsl_bf16_catalog.cache_clear()
+        self.addCleanup(tune.get_flydsl_bf16_catalog.cache_clear)
+        with (
+            mock.patch.object(
+                tune, "get_flydsl_a16w16_configs", return_value=self._configs()
+            ),
+            mock.patch.object(tune, "get_gfx_runtime", return_value="gfx950"),
+        ):
+            return tune.get_flydsl_bf16_catalog(
+                64, 1536, 30720, torch.bfloat16, False, torch.bfloat16, **kw
+            )
+
+    @staticmethod
+    def _policies(catalog):
+        return sorted(cfg.get("policy", "ft") for _, _, cfg in catalog)
+
+    def test_policies_filter_keeps_only_the_named_policies(self):
+        self.assertEqual(self._policies(self._catalog()), ["ft", "rg", "rk"])
+        self.assertEqual(self._policies(self._catalog(policies=("rg",))), ["rg"])
+        self.assertEqual(
+            self._policies(self._catalog(policies=("ft", "rk"))), ["ft", "rk"]
+        )
+        self.assertEqual(self._policies(self._catalog(policies=("sk",))), [])
+
+    def test_policy_tuple_parsing(self):
+        tune = self._tune()
+        self.assertIsNone(tune._policy_tuple(None))
+        self.assertIsNone(tune._policy_tuple(""))
+        self.assertEqual(tune._policy_tuple("rg, rk,"), ("rg", "rk"))
+
+    def test_shuffled_catalog_is_ring_only(self):
+        catalog = self._catalog(is_shuffle=True)
+        self.assertEqual(self._policies(catalog), ["rg", "rk"])
+        for _, name, _ in catalog:
+            self.assertRegex(name, r"_p(rg|rk)_gfx950$")
+        # The policies filter composes with the shuffle restriction.
+        self.assertEqual(
+            self._policies(self._catalog(is_shuffle=True, policies=("rk",))), ["rk"]
+        )
+        self.assertEqual(
+            self._policies(self._catalog(is_shuffle=True, policies=("ft",))), []
+        )
+
+    def test_b_non_temporal_modes_pass_ring_configs_through_once(self):
+        tune = self._tune()
+        for mode, ft_count in (("off", 1), ("on", 1), ("both", 2)):
+            out = tune._flydsl_b_non_temporal_configs(self._configs(), mode, "gfx950")
+            by_policy = [c.get("policy", "ft") for c in out]
+            self.assertEqual(by_policy.count("ft"), ft_count, mode)
+            self.assertEqual(by_policy.count("rg"), 1, mode)
+            self.assertEqual(by_policy.count("rk"), 1, mode)
+            for c in out:
+                if c.get("policy") in ("rg", "rk"):
+                    self.assertFalse(c.get("b_non_temporal", False), mode)
+
+    def test_run_flydsl_gemm_bf16_forwards_bpreshuffle(self):
+        from aiter.ops.flydsl.gemm_a16w16_ring import ring_config
+
+        tune = self._tune()
+
+        def run(**kw):
+            seen = {}
+            with mock.patch.object(
+                tune,
+                "flydsl_hgemm",
+                side_effect=lambda *a, **kwargs: seen.update(kwargs) or torch.empty(1),
+            ):
+                tune.run_flydsl_gemm_bf16(
+                    torch.empty(1),
+                    torch.empty(1),
+                    torch.empty(1),
+                    config=ring_config(4, 1, 4),
+                    **kw,
+                )
+            return seen
+
+        for shuffled in (False, True):
+            seen = run(bpreshuffle=shuffled)
+            self.assertEqual(seen["policy"], "rg")
+            self.assertIs(seen["bpreshuffle"], shuffled)
+        seen = run()
+        self.assertFalse(seen["bpreshuffle"])  # default stays row-major B
+
+    def test_committed_ring_rows_resolve(self):
+        from aiter.ops.flydsl import gemm_kernels
+        from aiter.ops.flydsl.gemm_a16w16_cat_x_ring import (
+            ring_splitk_config,
+            ring_splitk_name_tiling,
+        )
+        from aiter.ops.flydsl.gemm_a16w16_ring import ring_config, ring_name_tiling
+
+        root = Path(__file__).resolve().parents[2] / "aiter" / "configs"
+        rows = []
+        for path in sorted(root.rglob("*_tuned_gemm.csv")):
+            with open(path, newline="") as f:
+                rows += [
+                    r
+                    for r in csv.DictReader(f)
+                    if r.get("libtype") == "flydsl"
+                    and r["kernelName"].startswith("flydsl_hgemm_")
+                ]
+        seen = {"rg": 0, "rk": 0}
+        for r in rows:
+            match = gemm_kernels._HGEMM_KERNEL_RE.match(r["kernelName"])
+            self.assertIsNotNone(match, r["kernelName"])
+            policy = match.group("policy")
+            if policy not in seen:
+                continue
+            seen[policy] += 1
+            params = gemm_kernels.get_flydsl_hgemm_kernel_params(r["kernelName"])
+            self.assertIsNotNone(params, r["kernelName"])
+            m = int(r["M"])
+            self.assertGreaterEqual(params["block_m"], m, r["kernelName"])
+            if policy == "rg":
+                tiling = ring_name_tiling(params)
+                config = ring_config(*tiling) if tiling else None
+            else:
+                tiling = ring_splitk_name_tiling(params)
+                config = ring_splitk_config(*tiling) if tiling else None
+                self.assertEqual(int(r["splitK"]), params["split_k"])
+            self.assertIsNotNone(tiling, r["kernelName"])
+            # The row's name is exactly what the tuner would emit for its tiling.
+            self.assertEqual(
+                gemm_kernels.flydsl_hgemm_kernel_name(
+                    dtype=torch.bfloat16,
+                    out_dtype=torch.bfloat16,
+                    config=config,
+                    has_bias=False,
+                    target_gfx="gfx950",
+                ),
+                r["kernelName"],
+            )
+        # lm_head (rg) and DSpark FC (rk) rows are both committed.
+        self.assertGreater(seen["rg"], 0)
+        self.assertGreater(seen["rk"], 0)
+
+    def test_ring_policy_exports(self):
+        self.assertEqual(gemm_kernels_module().RING_POLICY, "rg")
+        self.assertEqual(gemm_kernels_module().RING_SPLITK_POLICY, "rk")
+        for name in ("RING_POLICY", "RING_SPLITK_POLICY"):
+            self.assertIn(name, gemm_kernels_module().__all__)
+
+
+def gemm_kernels_module():
+    from aiter.ops.flydsl import gemm_kernels
+
+    return gemm_kernels
 
 
 if __name__ == "__main__":
