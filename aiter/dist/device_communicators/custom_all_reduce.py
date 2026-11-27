@@ -20,7 +20,7 @@ import functools
 import os
 import pickle
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import timedelta
 from typing import Any, ClassVar, NamedTuple
 
@@ -39,6 +39,7 @@ from aiter.utility.dtypes import fp8
 
 from .flydsl_backends import (
     FlyDSLAllReduceRMSNorm,
+    FlyDSLPullAllReduceRMSNorm,
     all_ranks_agree,
     all_ranks_agree_on_plan,
     preload_fly_engines,
@@ -1615,6 +1616,8 @@ class CustomAllreduce:
         self._init_fly_oneshot()
         self._fly_rms = None
         self._init_fly_rms()
+        self._fly_pull = None
+        self._init_fly_pull()
 
         # Rows a source the gfx1250 DCP merge takes, 0 where it does not run
         # (see custom_dcp_merge).
@@ -1645,6 +1648,49 @@ class CustomAllreduce:
             rms.close()
             return
         self._fly_rms = rms
+
+    def _init_fly_pull(self):
+        """Build the exact Gemma all-reduce + RMSNorm on graph-registered
+        inputs (``AITER_FLY_AR_PULL=1``).
+
+        Like ``_init_fly_rms``, the construction votes, so it is not gated on
+        the local setting here."""
+        if self.disabled:
+            return
+        try:
+            pull = FlyDSLPullAllReduceRMSNorm(group=self.group, device=self.device)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "FlyDSL pull AR+Gemma RMSNorm disabled: construction failed.",
+                exc_info=True,
+            )
+            return
+        if pull.disabled:
+            pull.close()
+            return
+        self._fly_pull = pull
+
+    def should_fly_pull_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> bool:
+        """Whether the pull Gemma fused AR+RMSNorm serves this call: only
+        inside a graph capture entered through ``capture()``. Never raises."""
+        if getattr(self, "_fly_pull", None) is None:
+            return False
+        return self._fly_pull.should_fly_pull_rms(inp, residual_inp, weight)
+
+    def fly_pull_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(out, residual_out)`` of the pull Gemma fused AR+RMSNorm."""
+        return self._fly_pull.fly_pull_rms(inp, residual_inp, weight, eps)
 
     def _init_fly_oneshot(self):
         """Build the FlyDSL exact one-shot that fronts small plain all-reduces,
@@ -2291,7 +2337,22 @@ class CustomAllreduce:
         try:
             self._IS_CAPTURING = True
             try:
-                yield
+                # The pull schedule reads the graph's inputs in place: it
+                # registers them when the capture ends, the same IPC export the
+                # registered custom-allreduce path uses. Only take that path when
+                # _agree_capture_path() (above) agreed to it on every rank: when
+                # expandable_segments is on or the host opted out
+                # (enable_register_for_capturing=False, e.g. ATOM's PIECEWISE
+                # graphs), self._register_for_capturing is False and pull must
+                # decline every call instead of registering unexportable
+                # pointers, exactly like the registered path does.
+                fly_pull = getattr(self, "_fly_pull", None)
+                with (
+                    fly_pull.capture()
+                    if fly_pull is not None and self._register_for_capturing
+                    else nullcontext()
+                ):
+                    yield
             finally:
                 self._IS_CAPTURING = False
             # A failed capture is discarded; registering its buffers would
@@ -4259,6 +4320,8 @@ class CustomAllreduce:
         self._fly_oneshot = None
         _close_quietly(getattr(self, "_fly_rms", None))
         self._fly_rms = None
+        _close_quietly(getattr(self, "_fly_pull", None))
+        self._fly_pull = None
         if getattr(self, "_ptr", 0):
             try:
                 self._ops_dispose(self._ptr)

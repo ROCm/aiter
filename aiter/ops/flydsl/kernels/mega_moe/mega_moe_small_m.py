@@ -22,6 +22,7 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.flydsl.aot_launch import aot_factory
 
 from .. import communication_ops_utils as comm_ops
 from ..flydsl_dispatch_combine_intranode_op import (
@@ -848,6 +849,7 @@ def _use_direct_fixed_slot(npes, experts_per_rank, max_tokens_per_rank, cap, til
 
 
 # fmt: off
+@aot_factory("mega_moe_small_m_stage1")
 @functools.cache
 def compile_mega_moe_stage1(
     *, model_dim: int, inter_dim: int, rank: int, experts_per_rank: int, fuse_npes: int, fuse_topk: int,
@@ -1933,7 +1935,7 @@ class SmallMRuntime:
         return config
 
     def _launcher(self, config: MegaMoEConfig):
-        """compile_mega_moe_stage1's launcher for a config, cached per runtime."""
+        """compile_mega_moe_stage1's launch handle for a config, cached per runtime."""
         launch = self._launchers.get(config)
         if launch is not None:
             return launch
@@ -1941,7 +1943,7 @@ class SmallMRuntime:
         assert config.p2p_quant == "none" and stage2.block_m == stage1.sort_block_m
         fused = (stage2.block_n, stage2.block_k, int(self.max_recv), self._reducers)
         # fmt: off
-        launch = compile_mega_moe_stage1(
+        launch = compile_mega_moe_stage1.lazy(
             model_dim=self.model_dim, inter_dim=self.inter_dim, rank=self.rank,
             experts_per_rank=self.epr, fuse_npes=self.world_size, fuse_topk=self.topk,
             fuse_cap=self._s1_cap, fuse_mtpr=self.mtpr, fuse_scale_dim=self._s1_scale_dim,

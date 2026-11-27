@@ -3,12 +3,16 @@
 
 """FlyDSL 1x32 MXFP4/MXFP8 quantization with E8M0 scales."""
 
+import functools
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import ReductionOp, T
+
+from aiter.ops.flydsl.aot_launch import aot_factory
 
 from ..tensor_shim import _run_compiled, buf_copy_atom, ptr_buf_tensor
 
@@ -150,16 +154,16 @@ def build_per_1x32_mx_quant_module(n: int, quant_mode: str):
     return launch
 
 
-_LAUNCHER_CACHE = {}
+@aot_factory("mega_moe_mx_quant")
+@functools.cache
+def _quant_launcher(n: int, quant_mode: str):
+    return build_per_1x32_mx_quant_module(n, quant_mode)
 
 
 def _get_launcher(n: int, quant_mode: str):
-    key = (int(n), quant_mode)
-    launcher = _LAUNCHER_CACHE.get(key)
-    if launcher is None:
-        launcher = build_per_1x32_mx_quant_module(n, quant_mode)
-        _LAUNCHER_CACHE[key] = launcher
-    return launcher
+    """The launch handle of the 1x32 MX quant launcher (``_quant_launcher.lazy``):
+    pass it to ``_run_compiled`` or ``_preload_compiled``."""
+    return _quant_launcher.lazy(int(n), quant_mode)
 
 
 def per_1x32_mx_quant(x, quant_mode="fp4", stream=None, out=None):
