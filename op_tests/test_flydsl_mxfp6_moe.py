@@ -23,6 +23,11 @@ Correctness against torch references and timing, one markdown table per test fun
   test_tuned_row      every row of the tuned config for this device: the op runs the
                       row's kernels, against the torch reference and bitwise equal to
                       the heuristic's kernels, with both timed in alternating rounds
+  test_fused_moe      aiter.fused_moe on the prepared (tagged) weights: bitwise equal
+                      to the op called directly, also into output= (a buffer, and
+                      hidden_states itself), under torch.inference_mode() and with
+                      the neutral spellings of the other arguments; both timed in
+                      alternating rounds
 No GPU needed (aiter's dry run):
   test_agpr_form      the 256x256 tiles keep their accumulators in AGPRs through
                       rocdl.experimental.sched_agpr and the LLVM option
@@ -36,7 +41,11 @@ No GPU needed (aiter's dry run):
   test_contract       the public entry: the calls it takes (casts of the routing
                       tensors, no tokens) and the ones it refuses before a kernel is
                       picked (dtype, shape, device, architecture, argument types);
-                      weight preparation on the CPU and its refusals
+                      the same through aiter.fused_moe: tagged weights reach the op,
+                      every argument this path does not implement is refused, and so
+                      are weights that are not one prepared layer (a copy without
+                      the tag, tags that differ, scales missing or swapped); weight
+                      preparation on the CPU and its refusals
   test_tuned_dispatch the tuned config: a row is picked for exactly its device and
                       shape and the heuristic for every other call; a malformed row
                       and one whose kernels do not fit the layer are refused before a
@@ -72,8 +81,9 @@ from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 import aiter
-from aiter import dtypes
+from aiter import ActivationType, QuantType, dtypes
 from aiter.aot.flydsl.dry_run import dry_run
+from aiter.fused_moe import fused_moe
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.flydsl import (
@@ -626,6 +636,7 @@ def _empty_layer(hidden, inter, experts, afmt, wfmt="e2m3"):
     s1 = _empty(experts, 2 * inter // 16, q.kq(hidden), 64, dtype=torch.int32)
     b2 = _empty(experts, hidden // bn2, inter // 128, bn2 // 16, 1536)
     s2 = _empty(experts, hidden // 16, q.kq(inter), 64, dtype=torch.int32)
+    b1.mxfp6_fmt = b2.mxfp6_fmt = (afmt, wfmt)
     return Mxfp6MoeWeights(
         experts=experts,
         model_dim=hidden,
@@ -855,6 +866,74 @@ def test_h_layout(hidden, inter, experts, topk, tokens, afmt):
     return {"gfx": SUPPORTED_GFX[0], "checks": len(got), "err": float(len(bad))}
 
 
+_ROUTING = ("topk_weight", "topk_ids")
+# fused_moe arguments this path does not implement, each off its default; the tensor
+# arguments (_FUSED_TENSORS) are refused whatever they hold
+_FUSED_UNSUPPORTED = {
+    "activation": ActivationType.Gelu,
+    "doweight_stage1": True,
+    "block_size_M": 64,
+    "dtype": dtypes.fp32,
+    "hidden_pad": 1,
+    "intermediate_pad": 1,
+    "splitk": 2,
+    "swiglu_limit": 7.0,
+    "beta": 1.0,
+    "linear_beta": 1.0,
+    "gate_mode": "interleave",
+    "shared_expert_id": 0,
+    "stage2_scatter": object(),
+    "quant_type_a": QuantType.per_1x32,
+    "quant_dtype_a": dtypes.fp8,
+    "quant_dtype_a2": dtypes.fp8,
+    "herd_topk": 1,
+    "deterministic": True,
+}
+_FUSED_TENSORS = (
+    "expert_mask",
+    "a1_scale",
+    "a2_scale",
+    "num_local_tokens",
+    "bias1",
+    "bias2",
+    "shared_w1",
+    "shared_w2",
+    "shared_w1_scale",
+    "shared_w2_scale",
+    "w1_global_scale",
+    "w2_global_scale",
+)
+# spellings of "nothing asked" that fused_moe takes besides the defaults, and the
+# arguments no call of this path reads
+_FUSED_NEUTRAL = (
+    ("dtype", dtypes.bf16),
+    ("swiglu_limit", 0),
+    ("swiglu_limit", math.inf),
+    ("block_size_M", 0),
+    ("block_size_M", -1),
+    ("splitk", 1),
+    ("activation", ActivationType.Silu),
+    ("gate_mode", "separated"),
+    ("moe_sorting_dispatch_policy", 1),
+    ("herd_routed_scaling_factor", 2.0),
+    ("clamp_shared", False),
+)
+
+
+def _fused_args(x, st, w, ids):
+    """Keyword arguments of the aiter.fused_moe call on the prepared layer st."""
+    return {
+        "hidden_states": x,
+        "w1": st.w1_frags,
+        "w2": st.w2_frags,
+        "topk_weight": w,
+        "topk_ids": ids,
+        "quant_type": QuantType.per_1x32,
+        "w1_scale": st.w1_scales,
+        "w2_scale": st.w2_scales,
+    }
+
+
 @benchmark()
 def test_contract(hidden, inter, experts, topk, tokens, afmt):
     # host code only, as test_h_layout: no reference and no timing
@@ -944,11 +1023,83 @@ def test_contract(hidden, inter, experts, topk, tokens, afmt):
             got["gfx942 refused"] = _raises(RuntimeError, call)
         got["no kernel picked by a refused call"] = not calls
 
+        # through aiter.fused_moe: the tag on the prepared weights sends the call here
+        via = _fused_args(good["hidden_states"], st, *map(good.get, _ROUTING))
+
+        def fused(**kw):
+            return fused_moe(**{**via, **kw})
+
+        def fused_taken(**kw):
+            del calls[:]
+            y = fused(**kw)
+            return (
+                len(calls) == 2
+                and y.shape == (tokens, hidden)
+                and y.dtype == dtypes.bf16
+            )
+
+        got["fused_moe taken"] = fused_taken()
+        for name, value in _FUSED_NEUTRAL:
+            got[f"fused_moe {name}={value} taken"] = fused_taken(**{name: value})
+        buf = _empty(tokens, hidden, dtype=dtypes.bf16)
+        del calls[:]
+        got["fused_moe output= returned"] = fused(output=buf) is buf and len(calls) == 2
+        del calls[:]
+
+        # an argument this path does not implement is refused, not ignored; a new
+        # argument of fused_moe fails here until it is in one of the three lists
+        t = _empty(1)
+        unsupported = dict(_FUSED_UNSUPPORTED, **dict.fromkeys(_FUSED_TENSORS, t))
+        names = set(inspect.signature(fused_moe).parameters) - set(via)
+        got["every other fused_moe argument is classified"] = names == set(
+            unsupported
+        ) | {"output", *mxfp6_moe._FUSED_MOE_UNUSED}
+        for name, value in unsupported.items():
+            got[f"fused_moe {name} refused"] = _raises(
+                NotImplementedError, fused, **{name: value}
+            )
+        other = _empty_layer(hidden + 128, inter, experts, afmt)
+        copy = st.w1_frags.clone()
+        got["a copy drops the tag"] = not hasattr(copy, "mxfp6_fmt")
+        retagged = st.w1_frags.clone()
+        retagged.mxfp6_fmt = ("e2m1", "e2m3")
+        refusals = {
+            "quant_type No": {"quant_type": QuantType.No},
+            "w1 copied without its tag": {"w1": copy},
+            "w2 copied without its tag": {"w2": st.w2_frags.clone()},
+            "an unknown tag": {"w1": retagged, "w2": retagged},
+            "no w1_scale": {"w1_scale": None},
+            "no w2_scale": {"w2_scale": None},
+            "swapped scales": {"w1_scale": st.w2_scales, "w2_scale": st.w1_scales},
+            "w1 of another layer": {"w1": other.w1_frags},
+            "w1_scale on the CPU": {
+                "w1_scale": torch.empty(
+                    st.w1_scales.shape, dtype=torch.int32, device="cpu"
+                )
+            },
+            "fp32 hidden_states": {
+                "hidden_states": _empty(tokens, hidden, dtype=dtypes.fp32)
+            },
+        }
+        for name, kw in refusals.items():
+            got[f"fused_moe {name} refused"] = _refused(fused, **kw)
+        for name, bad in {
+            "another shape": _empty(tokens + 1, hidden, dtype=dtypes.bf16),
+            "another dtype": _empty(tokens, hidden, dtype=dtypes.fp32),
+        }.items():
+            got[f"fused_moe output= of {name} refused"] = _raises(
+                RuntimeError, fused, output=bad
+            )
+        got["no kernel picked by a refused fused_moe call"] = not calls
+
     # weight preparation is torch only: a layer of the smallest shape, on the CPU
     E, H, I = 2, 256, 128
     w1, w2 = torch.randn(E, 2 * I, H), torch.randn(E, H, I)
     cpu = prepare_mxfp6_moe_weights(w1, w2, a_fmt=afmt)
     bn1, bn2 = cpu.slab_n1, cpu.slab_n2
+    got["prepared weights are tagged"] = (
+        cpu.w1_frags.mxfp6_fmt == cpu.w2_frags.mxfp6_fmt == (afmt, "e2m3")
+    )
     got["prepared on the CPU"] = (
         cpu.w1_frags.shape == (E, 2 * I // bn1, H // 128, bn1 // 16, 1536)
         and cpu.w1_scales.shape == (E, 2 * I // 16, q.kq(H), 64)
@@ -1255,6 +1406,62 @@ def test_tuned_row(tokens, hidden, inter, experts, topk, wfmt, afmt):
     }
 
 
+@benchmark()
+def test_fused_moe(tokens, hidden, inter, experts, topk, wfmt, afmt):
+    w1, w2, x, ids, w = _moe_inputs(tokens, hidden, inter, experts, topk)
+    st = prepare_mxfp6_moe_weights(w1, w2, a_fmt=afmt, w_fmt=wfmt)
+    via = _fused_args(x, st, w, ids)
+    buf = torch.full_like(x, float("nan"))
+
+    def direct():
+        return flydsl_mxfp6_moe(x, st, w, ids)
+
+    def fused(**kw):
+        return fused_moe(**{**via, **kw})
+
+    def inference_mode():
+        with torch.inference_mode():
+            return fused(hidden_states=x.clone())
+
+    want = direct()
+    err, row, med = _check_moe(
+        want, run_torch_mx(x, ids, w, w1, w2, wfmt, afmt), f"mxfp6_moe {wfmt}/{afmt}: "
+    )
+    calls = []
+    with _spy_gemm(calls):
+        out = fused()
+    assert len(calls) == 2, f"fused_moe launched {len(calls)} stage kernels"
+    assert torch.equal(out, want), "fused_moe: output bits differ from the op's"
+    assert fused(output=buf) is buf, "fused_moe did not return its output= buffer"
+    assert torch.equal(buf, want), "fused_moe output=: bits differ from the op's"
+    assert torch.equal(inference_mode(), want), "inference_mode: bits differ"
+    xc = x.clone()  # in place: the result is copied once the kernels are done
+    assert fused(hidden_states=xc, output=xc) is xc, "output=x: not returned"
+    assert torch.equal(xc, want), "fused_moe output=x: bits differ from the op's"
+    for name, value in _FUSED_NEUTRAL:
+        assert torch.equal(
+            fused(**{name: value}), want
+        ), f"fused_moe {name}={value}: output bits differ from the op's"
+    # alternating rounds: the two are compared within this process
+    us_d, us_f = [], []
+    for _ in range(3):
+        for fn, samples in ((direct, us_d), (fused, us_f)):
+            samples.append(run_perftest(fn, num_iters=20, num_warmup=3, **TIMING)[1])
+    us = statistics.median(us_f)
+    flops, nbytes = _moe_work(tokens, hidden, inter, experts, topk, afmt)
+    return {
+        "gfx": get_gfx_runtime(),
+        "fused_moe us": us,
+        "fused_moe TFLOPS": flops / us / 1e6,
+        "fused_moe TB/s": nbytes / us / 1e6,
+        "fused_moe err": err,
+        "max row rel_l2": row,
+        "median row rel_l2": med,
+        "direct us": statistics.median(us_d),
+        "fused_moe / direct": statistics.median(f / d for f, d in zip(us_f, us_d)),
+    }
+
+
 def summarize(name, rows):
     df = pd.DataFrame(rows)
     aiter.logger.info("%s summary (markdown):\n%s", name, df.to_markdown(index=False))
@@ -1342,8 +1549,8 @@ def main():
         type=dtypes.str2tuple,
         nargs="*",
         default=[(2048, 1024, 8, 4, 4096), (1152, 640, 16, 8, 300)],
-        help="hidden,inter,experts,topk,tokens of the h layouts, the autograd modes\n"
-        "and the op contract (256-row and 128-row tiles)",
+        help="hidden,inter,experts,topk,tokens of the h layouts, the autograd modes,\n"
+        "the op contract and fused_moe (256-row and 128-row tiles)",
     )
     args = parser.parse_args()
 
@@ -1405,6 +1612,13 @@ def main():
         "mxfp6_moe modes",
         [
             test_moe_modes(t, h, i, e, k, args.wfmt[0], af)
+            for (h, i, e, k, t), af in itertools.product(args.modes, args.afmt)
+        ],
+    )
+    summarize(
+        "fused_moe",
+        [
+            test_fused_moe(t, h, i, e, k, args.wfmt[0], af)
             for (h, i, e, k, t), af in itertools.product(args.modes, args.afmt)
         ],
     )

@@ -696,7 +696,19 @@ def fused_moe(
     gfx950 NVFP4 MoE (:mod:`aiter.ops.moe_nvfp4`): w1 / w2 in the
     ``shuffle_weight(w, (16, 32))`` layout, E4M3 ``w1_scale`` / ``w2_scale`` in
     the ``shuffle_scale_nvfp4_moe`` layout.
+
+    ``w1`` / ``w2`` tagged ``mxfp6_fmt`` select the gfx950 MXFP6 MoE
+    (:mod:`aiter.ops.flydsl.mxfp6_moe`): the ``w1_frags`` / ``w2_frags`` of
+    ``prepare_mxfp6_moe_weights``, with its ``w1_scales`` / ``w2_scales`` as
+    ``w1_scale`` / ``w2_scale`` and ``quant_type=QuantType.per_1x32``. A copy of a
+    tensor does not carry the tag: 5-D weights without it are refused.
     """
+    # torch has no 6-bit dtype to dispatch on: prepared MXFP6 weights say so in a
+    # tag, and only they are 5-D. First statement: locals() is the call.
+    if getattr(w1, "mxfp6_fmt", None) is not None or getattr(w1, "ndim", 0) == 5:
+        from aiter.ops.flydsl.mxfp6_moe import _fused_moe_mxfp6
+
+        return _fused_moe_mxfp6(dict(locals()))
     if herd_topk and (w1_global_scale is not None or w2_global_scale is not None):
         raise ValueError("herd_topk does not support NVFP4 global scales")
     # NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).

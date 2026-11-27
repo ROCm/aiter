@@ -9749,8 +9749,8 @@ class Mxfp6FlydslTuner(FmoeTuner):
     fixed seed, as by the other tuners here. The heuristic's own kernels are among
     the candidates: the row names them where nothing found is faster.
 
-    Shapes run one after another on the current GPU. The op is not behind fused_moe,
-    so the options that benchmark through it are refused.
+    Shapes run one after another on the current GPU. The search times the op and
+    its stages directly, so the options that benchmark through fused_moe are refused.
     """
 
     SUPPORTS_POWER_SELECT = False
@@ -9791,7 +9791,7 @@ class Mxfp6FlydslTuner(FmoeTuner):
         if refused:
             self.parser.error(
                 f"--mxfp6-flydsl does not support {', '.join(refused)}: it times "
-                "flydsl_mxfp6_moe directly, which fused_moe does not dispatch to"
+                "flydsl_mxfp6_moe directly, not through fused_moe"
             )
         return args
 

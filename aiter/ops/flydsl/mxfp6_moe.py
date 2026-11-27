@@ -12,6 +12,10 @@ reference (scale 2^ceil(log2(amax / 7.5)), round-half-even onto the grid, clamp)
 Usage:
     weights = prepare_mxfp6_moe_weights(w1, w2, a_fmt="e2m3")  # once per layer
     y = flydsl_mxfp6_moe(x, weights, topk_weight, topk_ids)   # per step
+or, through aiter.fused_moe, which sends weights tagged by the preparation here:
+    y = fused_moe(x, weights.w1_frags, weights.w2_frags, topk_weight, topk_ids,
+                  quant_type=QuantType.per_1x32,
+                  w1_scale=weights.w1_scales, w2_scale=weights.w2_scales)
 
 `prepare_mxfp6_moe_weights` quantizes and preshuffles a layer's weights (torch only);
 `flydsl_mxfp6_moe` runs a call (all FlyDSL, on the current stream, no host syncs,
@@ -30,7 +34,12 @@ count; weights > 4 GiB ok.
 
 from __future__ import annotations
 
+import functools
+import inspect
+import math
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
@@ -47,6 +56,7 @@ from .mxfp6_moe_kernels import (
 from .mxfp6_moe_policy import Mxfp6MoeConfig, select_config, stage_bn
 
 __all__ = [
+    "MXFP6_FMT_ATTR",
     "SUPPORTED_GFX",
     "Mxfp6MoeWeights",
     "flydsl_mxfp6_moe",
@@ -54,6 +64,11 @@ __all__ = [
 ]
 
 SUPPORTED_GFX = ("gfx950",)  # scaled F8F6F4 MFMA + 160 KiB LDS
+# The tag of prepared weights, (a_fmt, w_fmt) on w1_frags and w2_frags: torch has no
+# 6-bit dtype for aiter.fused_moe to dispatch on. A copy of a tensor does not carry
+# it; set it on the copy.
+MXFP6_FMT_ATTR = "mxfp6_fmt"
+_W_FMTS = ("e2m3", "e3m2")
 _ID_DTYPES = (torch.int32, torch.int64)
 
 
@@ -65,7 +80,7 @@ class Mxfp6MoeWeights:
     and w1_scales [E][2I/16][KQ(H)][64] int32; w2_frags [E][H/BN2][I/128][BN2/16][1536]
     and w2_scales [E][H/16][KQ(I)][64]. slab_n1 / slab_n2 (BN1 / BN2): the slab widths
     the fragments are grouped in; w1_bytes / w2_bytes: bytes of each stage's fragments
-    and scales."""
+    and scales. w1_frags and w2_frags are tagged MXFP6_FMT_ATTR = (a_fmt, w_fmt)."""
 
     experts: int
     model_dim: int
@@ -80,6 +95,19 @@ class Mxfp6MoeWeights:
     slab_n2: int
     w1_bytes: int
     w2_bytes: int
+
+
+def _layer_shapes(E: int, H: int, I: int, a_fmt: str):
+    """(shapes of w1_frags, w1_scales, w2_frags, w2_scales; slab_n1, slab_n2) of a
+    prepared layer."""
+    bn1, bn2 = stage_bn(2 * I, a_fmt), stage_bn(H, a_fmt)
+    shapes = (
+        (E, 2 * I // bn1, H // 128, bn1 // 16, 64 * 24),
+        (E, 2 * I // 16, q.kq(H), 64),
+        (E, H // bn2, I // 128, bn2 // 16, 64 * 24),
+        (E, H // 16, q.kq(I), 64),
+    )
+    return shapes, bn1, bn2
 
 
 def prepare_mxfp6_moe_weights(
@@ -117,21 +145,19 @@ def prepare_mxfp6_moe_weights(
         raise ValueError(
             f"w1 and w2 must be on one device, got {w1.device} and {w2.device}"
         )
-    if a_fmt not in q.FORMATS or w_fmt not in ("e2m3", "e3m2"):
+    if a_fmt not in q.FORMATS or w_fmt not in _W_FMTS:
         raise ValueError(
             f"a_fmt {a_fmt!r} must be one of {tuple(q.FORMATS)}, w_fmt {w_fmt!r} "
             "'e2m3' or 'e3m2'"
         )
     dev = w1.device
-    bn1, bn2 = stage_bn(N1, a_fmt), stage_bn(H, a_fmt)
-    b1 = torch.empty(
-        E, N1 // bn1, H // 128, bn1 // 16, 64 * 24, dtype=torch.uint8, device=dev
-    )
-    s1 = torch.empty(E, N1 // 16, q.kq(H), 64, dtype=torch.int32, device=dev)
-    b2 = torch.empty(
-        E, H // bn2, I // 128, bn2 // 16, 64 * 24, dtype=torch.uint8, device=dev
-    )
-    s2 = torch.empty(E, H // 16, q.kq(I), 64, dtype=torch.int32, device=dev)
+    shapes, bn1, bn2 = _layer_shapes(E, H, I, a_fmt)
+    b1 = torch.empty(shapes[0], dtype=torch.uint8, device=dev)
+    s1 = torch.empty(shapes[1], dtype=torch.int32, device=dev)
+    b2 = torch.empty(shapes[2], dtype=torch.uint8, device=dev)
+    s2 = torch.empty(shapes[3], dtype=torch.int32, device=dev)
+    setattr(b1, MXFP6_FMT_ATTR, (a_fmt, w_fmt))
+    setattr(b2, MXFP6_FMT_ATTR, (a_fmt, w_fmt))
     # per expert: the fp32 working copy of all experts does not fit
     for e in range(E):
         c, s = q.quant_mx(w1[e : e + 1], w_fmt)
@@ -316,3 +342,171 @@ def flydsl_mxfp6_moe(
         h_layout=config.h_layout,
     )
     return flydsl_mxfp6_moe_combine(o, pos, topk_weight)
+
+
+# fused_moe arguments of a MXFP6 call that this path reads
+_FUSED_MOE_READ = (
+    "hidden_states",
+    "w1",
+    "w2",
+    "topk_weight",
+    "topk_ids",
+    "quant_type",
+    "w1_scale",
+    "w2_scale",
+    "output",
+)
+# what one of the other arguments may be besides its default, as fused_moe reads
+# them: bf16 output, no limit on SiLU, the routing tile left to aiter, no split-K
+_FUSED_MOE_NEUTRAL = {
+    "dtype": (torch.bfloat16,),
+    "swiglu_limit": (0, math.inf),
+    "block_size_M": (0, -1),
+    "splitk": (1,),
+}
+# read by no call this path takes: the policy schedules aiter's own token sort (the
+# routing here is a kernel of this op), the other two belong to HERD candidates and
+# to shared experts, both refused
+_FUSED_MOE_UNUSED = (
+    "moe_sorting_dispatch_policy",
+    "herd_routed_scaling_factor",
+    "clamp_shared",
+)
+
+
+@functools.cache
+def _fused_moe_defaults() -> dict[str, Any]:
+    from aiter.fused_moe import fused_moe
+
+    parameters = inspect.signature(fused_moe).parameters
+    return {
+        name: parameter.default
+        for name, parameter in parameters.items()
+        if name not in _FUSED_MOE_READ and name not in _FUSED_MOE_UNUSED
+    }
+
+
+def _neutral(name: str, value: Any, default: Any) -> bool:
+    """value asks no more than fused_moe's default of the argument name."""
+    if isinstance(value, torch.Tensor):  # no default is a tensor
+        return False
+    return value == default or value in _FUSED_MOE_NEUTRAL.get(name, ())
+
+
+def _tagged_weights(w1, w2, w1_scale, w2_scale) -> Mxfp6MoeWeights:
+    """The prepared layer of fused_moe's weight arguments. Raises ValueError unless
+    they are the four tensors of one prepare_mxfp6_moe_weights call: the kernels read
+    raw pointers."""
+    fmt = getattr(w1, MXFP6_FMT_ATTR, None)
+    if fmt is None or getattr(w2, MXFP6_FMT_ATTR, None) != fmt:
+        raise ValueError(
+            f"w1 is tagged {MXFP6_FMT_ATTR}={fmt!r} and w2 "
+            f"{getattr(w2, MXFP6_FMT_ATTR, None)!r}: MXFP6 weights carry the tag of "
+            "one prepare_mxfp6_moe_weights call (a copy of a tensor drops it: set "
+            "it on the copy)"
+        )
+    known = isinstance(fmt, tuple) and len(fmt) == 2
+    if not (known and fmt[0] in q.FORMATS and fmt[1] in _W_FMTS):
+        raise ValueError(
+            f"{MXFP6_FMT_ATTR} must be (a_fmt, w_fmt) with a_fmt one of "
+            f"{tuple(q.FORMATS)} and w_fmt of {_W_FMTS}, got {fmt!r}"
+        )
+    a_fmt, w_fmt = fmt
+    if w1_scale is None or w2_scale is None:
+        raise ValueError(
+            "MXFP6 weights take w1_scale and w2_scale, the w1_scales and w2_scales "
+            "of prepare_mxfp6_moe_weights"
+        )
+    ok = w1.dim() == 5 and w2.dim() == 5
+    if ok:
+        E, H, I = w1.shape[0], 128 * w1.shape[2], 128 * w2.shape[2]
+        ok = E > 0 and H > 0 and I > 0
+    if ok:
+        shapes, bn1, bn2 = _layer_shapes(E, H, I, a_fmt)
+        ok = (
+            (w1.shape, w1_scale.shape, w2.shape, w2_scale.shape) == shapes
+            and w1.dtype == w2.dtype == torch.uint8
+            and w1_scale.dtype == w2_scale.dtype == torch.int32
+            and w1.is_contiguous()
+            and w2.is_contiguous()
+            and w1_scale.is_contiguous()
+            and w2_scale.is_contiguous()
+        )
+    if not ok:
+        raise ValueError(
+            "w1, w1_scale, w2 and w2_scale must be the w1_frags, w1_scales, w2_frags "
+            "and w2_scales of one prepare_mxfp6_moe_weights call, got "
+            + ", ".join(
+                f"{t.dtype} {tuple(t.shape)}" for t in (w1, w1_scale, w2, w2_scale)
+            )
+        )
+    # get_device(): the index, -1 on the CPU
+    dev = w1.get_device()
+    if not (dev == w2.get_device() == w1_scale.get_device() == w2_scale.get_device()):
+        raise ValueError("w1, w2, w1_scale and w2_scale must be on one device")
+    return Mxfp6MoeWeights(
+        experts=E,
+        model_dim=H,
+        inter_dim=I,
+        a_fmt=a_fmt,
+        w_fmt=w_fmt,
+        w1_frags=w1,
+        w1_scales=w1_scale,
+        w2_frags=w2,
+        w2_scales=w2_scale,
+        slab_n1=bn1,
+        slab_n2=bn2,
+        w1_bytes=w1.nbytes + w1_scale.nbytes,
+        w2_bytes=w2.nbytes + w2_scale.nbytes,
+    )
+
+
+def _fused_moe_mxfp6(call: Mapping[str, Any]) -> torch.Tensor:
+    """aiter.fused_moe for weights tagged MXFP6_FMT_ATTR: flydsl_mxfp6_moe on them.
+
+    Args:
+        call: fused_moe's arguments by name. w1 / w2 / w1_scale / w2_scale: the
+            w1_frags / w2_frags / w1_scales / w2_scales of one
+            prepare_mxfp6_moe_weights call; quant_type: QuantType.per_1x32;
+            hidden_states, topk_weight, topk_ids: as flydsl_mxfp6_moe takes them;
+            output: fused_moe's optional destination.
+
+    Raises:
+        NotImplementedError: any other argument off its default, which this path would
+            otherwise ignore: expert parallelism, bias, shared experts, an activation
+            other than SiLU or a limit on it, padding, another output dtype, ...
+        ValueError: another quant_type; weights that are not one prepared layer; and
+            as flydsl_mxfp6_moe raises.
+        RuntimeError: an output buffer fused_moe refuses; and as flydsl_mxfp6_moe
+            raises.
+    """
+    from aiter.moev2.execute.output import (
+        _return_output,
+        _validate_output_buffer_metadata,
+    )
+    from aiter.ops.enum import QuantType
+
+    unsupported = [
+        name
+        for name, default in _fused_moe_defaults().items()
+        if call[name] is not default and not _neutral(name, call[name], default)
+    ]
+    if unsupported:
+        raise NotImplementedError(
+            f"fused_moe with MXFP6 weights does not support {', '.join(unsupported)}"
+        )
+    if call["quant_type"] != QuantType.per_1x32:
+        raise ValueError(
+            "fused_moe with MXFP6 weights takes quant_type=QuantType.per_1x32, got "
+            f"{call['quant_type']}"
+        )
+    weights = _tagged_weights(
+        call["w1"], call["w2"], call["w1_scale"], call["w2_scale"]
+    )
+    x, output = call["hidden_states"], call["output"]
+    if output is not None:
+        shape = (x.shape[0], weights.model_dim)
+        _validate_output_buffer_metadata(output, shape, torch.bfloat16, x.device)
+    # the result is copied into output once the kernels are done: it may be x
+    out = flydsl_mxfp6_moe(x, weights, call["topk_weight"], call["topk_ids"])
+    return _return_output(out, output)

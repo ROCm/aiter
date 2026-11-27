@@ -103,8 +103,9 @@ where nothing found is faster, and a rerun skips the shape either way.
 
 Weights are random and the routing uniformly random. Shapes run one after
 another on the current GPU. `--compare`, `--run_config`, `--e2e_tune`,
-`--ep-size`, `--swiglu_limit` and `--select power` are refused: the op is not
-dispatched by `fused_moe`. `-o2` stores every stage kernel tried.
+`--ep-size`, `--swiglu_limit` and `--select power` are refused: the search
+times the op directly, not through `fused_moe`. `-o2` stores every stage kernel
+tried.
 
 ```bash
 python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py --mxfp6-flydsl
