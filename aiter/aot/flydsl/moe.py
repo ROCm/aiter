@@ -62,6 +62,7 @@ import sys
 import time
 import zlib
 from collections import Counter
+from collections.abc import Callable
 from contextlib import contextmanager
 from unittest import mock
 
@@ -78,6 +79,7 @@ from aiter.aot.flydsl.common import (
     replay_env,
     resolve_target_arch,
     run_jobs_parallel,
+    shared_worker_slots,
     worker_waves,
 )
 from aiter.aot.flydsl.replay import requested_kernels
@@ -696,10 +698,17 @@ def _replay_arch(jobs: list[dict], arch: str) -> int:
     return failed + probes_failed
 
 
-def run(csv_paths: list[str], *, edges: bool = True, check: bool = False) -> int:
+def run(
+    csv_paths: list[str],
+    *,
+    edges: bool = True,
+    check: bool = False,
+    prepared: Callable[[], None] | None = None,
+) -> int:
     """Replay every FlyDSL row of ``csv_paths`` whose arch ``GPU_ARCHS`` names
     (every row when it names none), one process per arch. Returns the number of
-    archs whose replay failed."""
+    archs whose replay failed. ``prepared`` is called once the C++ modules the
+    replays import are built, before the first replay starts."""
     jobs = collect_aot_jobs(csv_paths, functools.partial(parse_csv, edges=edges))
     targets = aot_target_archs()
     available = [job_arch(job) for job in jobs]
@@ -757,19 +766,24 @@ def run(csv_paths: list[str], *, edges: bool = True, check: bool = False) -> int
             )
         command = [sys.executable, "-c", prepare]
         subprocess.run(command, env=replay_env(arch), check=True)
+    if prepared is not None:
+        prepared()
     failed = 0
-    for wave in worker_waves(workers, jobs_per_arch):
-        replays = []
-        for arch, share in wave.items():
-            command = [sys.executable, "-m", "aiter.aot.flydsl.moe", "--arch", arch]
-            command += ["--csv"]
-            command += csv_paths
-            if not edges:
-                command.append("--row-tokens-only")
-            if check:
-                command.append("--check")
-            replays.append(subprocess.Popen(command, env=replay_env(arch, share)))
-        failed += sum(replay.wait() != 0 for replay in replays)
+    # The archs' pools share the budget worker by worker, so that an arch that
+    # finishes leaves its workers to the others.
+    with shared_worker_slots(workers):
+        for wave in worker_waves(workers, jobs_per_arch):
+            replays = []
+            for arch, share in wave.items():
+                command = [sys.executable, "-m", "aiter.aot.flydsl.moe"]
+                command += ["--arch", arch, "--csv"]
+                command += csv_paths
+                if not edges:
+                    command.append("--row-tokens-only")
+                if check:
+                    command.append("--check")
+                replays.append(subprocess.Popen(command, env=replay_env(arch, share)))
+            failed += sum(replay.wait() != 0 for replay in replays)
     return failed
 
 
