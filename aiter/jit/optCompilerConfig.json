@@ -1227,7 +1227,7 @@
             "f'{AITER_CSRC_DIR}/kernels/binary_operator.cu'"
         ],
         "flags_extra_cc": [],
-        "flags_extra_hip": [],
+        "flags_extra_hip": ["'-fno-gpu-flush-denormals-to-zero'"],
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",

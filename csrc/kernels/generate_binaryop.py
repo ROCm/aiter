@@ -40,6 +40,13 @@ OPERATOR_MAP = {
     "div": "aiter::DivOp",
 }
 
+# binary_scalar's op values (aiter_operator.h); div has none, it runs as mul by the reciprocal
+SCALAR_OP_MAP = {
+    "add": "BINARY_SCALAR_ADD",
+    "sub": "BINARY_SCALAR_SUB",
+    "mul": "BINARY_SCALAR_MUL",
+}
+
 
 class BinaryOpCodegen:
     API_COMMON_HEADER = """
@@ -49,6 +56,7 @@ class BinaryOpCodegen:
 #include "aiter_tensor.h"
 #include "aiter_stream.h"
 #include "aiter_dispatch.h"
+#include "aiter_operator.h"
 #include "binary_operator.cuh"
 
 template <typename Op, typename T0, typename T1>
@@ -263,8 +271,23 @@ bool binary_op_dispatch(const std::string& op_type,
                        aiter_tensor_t &input,
                        aiter_tensor_t &other,
                        aiter_tensor_t &output) {{
+    // a CPU tensor never reaches a GPU kernel: the caller falls back to torch
+    if (other.is_cpu())
+        return false;
     // Dispatch based on operator and input types
 {F_dispatch}
+    return false;
+}}
+
+// output = input (op) a host scalar for this module's add / sub / mul; false when it does not apply
+bool binary_scalar(aiter_tensor_t &input,
+                   int op,
+                   double other,
+                   aiter_tensor_t &output) {{
+    if (!input.is_gpu())
+        return false;
+    HipDeviceGuard device_guard(input.device_id);
+{F_scalar_dispatch}
     return false;
 }}
 """
@@ -276,6 +299,16 @@ bool binary_op_dispatch(const std::string& op_type,
 
     API_PER_DTYPE = """        {F_if}(input.dtype() == {F_in0_type} && other.dtype() == {F_in1_type}) {{
             return binary_op_impl<{F_op_cpp}, {F_in0_cpp}, {F_in1_cpp}>(input, other, output);
+        }}
+"""
+
+    API_PER_SCALAR_OPERATOR = """    {F_if}(op == {F_op_const}) {{
+{F_per_dtype}
+    }}
+"""
+
+    API_PER_SCALAR_DTYPE = """        {F_if}(input.dtype() == {F_in0_type}) {{
+            return binary_scalar_process<{F_op_cpp}, {F_in0_cpp}>(input, static_cast<float>(other), output);
         }}
 """
 
@@ -343,6 +376,9 @@ bool binary_op_dispatch(const std::string& op_type,
                 op_dict[blob.F_op_type][blob.F_dtype_pair] = blob
 
         dispatch_str = ""
+        scalar_dispatch_str = ""
+        # div by a host scalar runs as a multiply by its reciprocal, through the mul module
+        scalar_ops = [op for op in op_dict if op != "div"]
         for i_op, (op_type, dtype_blobs) in enumerate(op_dict.items()):
             dtype_str = ""
             for i_dtype, (dtype_key, blob) in enumerate(dtype_blobs.items()):
@@ -362,7 +398,28 @@ bool binary_op_dispatch(const std::string& op_type,
                 F_per_dtype=dtype_str,
             )
 
-        return self.API_BASE.format(F_traits_define="", F_dispatch=dispatch_str)
+            if op_type not in scalar_ops:
+                continue
+            in0_types = list(dict.fromkeys(k.split(",")[0] for k in dtype_blobs))
+            scalar_dtype_str = ""
+            for i_dtype, in0 in enumerate(in0_types):
+                scalar_dtype_str += self.API_PER_SCALAR_DTYPE.format(
+                    F_if=get_if_str(i_dtype, len(in0_types)),
+                    F_in0_type=AITER_DTYPE_MAP[in0],
+                    F_op_cpp=OPERATOR_MAP[op_type],
+                    F_in0_cpp=DATA_TYPE_MAP[in0],
+                )
+            scalar_dispatch_str += self.API_PER_SCALAR_OPERATOR.format(
+                F_if=get_if_str(scalar_ops.index(op_type), len(scalar_ops)),
+                F_op_const=SCALAR_OP_MAP[op_type],
+                F_per_dtype=scalar_dtype_str,
+            )
+
+        return self.API_BASE.format(
+            F_traits_define="",
+            F_dispatch=dispatch_str,
+            F_scalar_dispatch=scalar_dispatch_str,
+        )
 
     def get_blobs(self):
         operators = self.op_type
