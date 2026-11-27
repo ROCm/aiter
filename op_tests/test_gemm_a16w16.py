@@ -831,6 +831,24 @@ def test_asm_skinny_m_at_allocation_end():
                 _check_asm_exact(x, w, out, None, bps, None, case)
 
 
+def test_asm_no_split_heuristic_at_large_k():
+    """splitK = 0 or 1 without a kernel name must never run a split-K kernel.
+
+    The Python wrapper passes an empty semaphore for splitK <= 1. At large K and
+    small N the heuristic prefers a split-K kernel to fill the CUs, which then
+    launched with a null semaphore (ROCm/aiter#5781, address (nil) fault).
+    """
+    torch.cuda.empty_cache()
+    m, n, k = 64, 64, 1 << 20
+    x = torch.randn(m, k, dtype=dtypes.bf16, device="cuda")
+    w = torch.randn(n, k, dtype=dtypes.bf16, device="cuda")
+    out = torch.empty(m, n, dtype=dtypes.bf16, device="cuda")
+    for bps in (False, True):
+        for split in (0, 1):
+            case = f"large-K {(m, n, k)} splitK={split} heuristic"
+            _check_asm_exact(x, w, out, None, bps, split, case)
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of a16w16_gemm_test",
@@ -848,7 +866,8 @@ parser.add_argument(
           or -t out    # tgemm.mm(out=) on every backend
           or -t compile    # torch.compile with weights/biases in one storage
           or -t asm_4g    # asm with A or out of 4 GiB, and A ending
-                          # an allocation with a 1-row last tile or M <= 2""",
+                          # an allocation with a 1-row last tile or M <= 2,
+                          # and splitK=1 at large K""",
 )
 parser.add_argument(
     "-d",
@@ -941,6 +960,7 @@ for test in args.test:
     elif test == "asm_4g":
         test_asm_last_tile_at_allocation_end()
         test_asm_skinny_m_at_allocation_end()
+        test_asm_no_split_heuristic_at_large_k()
         test_asm_4gib_operands()
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)

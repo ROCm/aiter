@@ -82,6 +82,9 @@ get_heuristic_kernel(int M,
 
     std::string selectedKernelName = "";
     int selectedsplitK             = 1;
+    // The caller asked for no split (splitK 0 or 1, which the Python wrapper pairs with an
+    // empty semaphore). A split-K kernel cannot run then, whatever the heuristic prefers.
+    const bool no_split_requested = splitk == 0 || splitk == 1;
 
     for(const auto& el : *cfgs)
     {
@@ -136,9 +139,11 @@ get_heuristic_kernel(int M,
             }
         }
         // auto select splitk or kernel
-        // A split-K kernel needs splitK >= 2, so it cannot run on a single K block.
+        // A split-K kernel needs splitK >= 2, so it cannot run on a single K block, nor when
+        // the caller asked for no split.
         if(N % cfg.tileN == 0 && cfg.bPreshuffle == (bpreshuffle ? 1 : 0) &&
-           (add_bias == 0 || cfg.bias == 1) && (cfg.splitK == 0 || K / cfg.subK >= 2))
+           (add_bias == 0 || cfg.bias == 1) &&
+           (cfg.splitK == 0 || (K / cfg.subK >= 2 && !no_split_requested)))
         {
             // 1. select splitk
             int split_K = 1;
