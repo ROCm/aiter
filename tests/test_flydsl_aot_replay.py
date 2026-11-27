@@ -574,3 +574,101 @@ def test_4wave_mxfp8_csv_rows_reach_flydsl_through_public_replay(tmp_path):
         check=False,
     )
     assert result.returncode == 0, result.stderr[-4000:]
+
+
+def test_a_replay_traces_the_kernel_of_an_aot_entry_once(tmp_path, monkeypatch):
+    """A prebuild requests each kernel many times; a launcher bound to the AOT
+    cache is traced for its entry's build and for nothing after it, and every
+    request is still recorded as that kernel."""
+    import functools
+
+    from aiter.ops.flydsl.aot_launch import aot_factory
+    from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+
+    jit_cache = tmp_path / "jit"
+    monkeypatch.setenv("FLYDSL_RUNTIME_CACHE_DIR", str(jit_cache))
+    monkeypatch.setenv("AITER_FLYDSL_AOT_CACHE_DIR", str(tmp_path / "aot"))
+    monkeypatch.delenv("FLYDSL_RUNTIME_RUN_ONLY", raising=False)
+    traces = []
+    trace = JitFunction._trace
+
+    def counted(self, *args, **kwargs):
+        traces.append(self.func.__name__)
+        return trace(self, *args, **kwargs)
+
+    monkeypatch.setattr(JitFunction, "_trace", counted)
+
+    @aot_factory("test_replay_traces_once", sources=[], env=[])
+    @functools.cache
+    def factory(n):
+        @flyc.jit
+        def launch(a: fx.Tensor):
+            pass
+
+        return launch
+
+    def request(collect=replay.requested_kernels):
+        with collect() as kernels:
+            _run_compiled(factory(4), torch.empty(8, device="cuda"))
+        return kernels
+
+    with dry_run("gfx950", 256):
+        built = request()
+        assert len(built) == 1 and len(traces) == 1
+        assert request() == built and request(replay.identified_kernels) == built
+        assert len(traces) == 1
+        # An enclosing collection sees the request, as it would see a launch.
+        with replay.requested_kernels() as enclosing:
+            assert request() == built
+        assert enclosing == built and len(traces) == 1
+        # Without the kernel in FlyDSL's own cache the launch is made, for
+        # FlyDSL to fill it (this process's launcher still holds the kernel
+        # in memory, so here it writes nothing).
+        (artifact,) = jit_cache.glob("*/*.pkl")
+        artifact.unlink()
+        assert request() == built and len(traces) == 2
+    assert len(list((tmp_path / "aot").glob("*/*/*.o"))) == 1
+
+
+def test_a_prebuild_tells_an_entry_built_from_other_ir(tmp_path, monkeypatch):
+    """What leaving the launch out relies on, checked whenever it is made: the
+    key an entry recorded is the key a launch of its request derives."""
+    import functools
+    import json
+
+    from aiter.ops.flydsl import aot_cache
+    from aiter.ops.flydsl.aot_launch import aot_factory
+    from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+
+    monkeypatch.setenv("FLYDSL_RUNTIME_CACHE_DIR", str(tmp_path / "jit"))
+    monkeypatch.setenv("AITER_FLYDSL_AOT_CACHE_DIR", str(tmp_path / "aot"))
+    monkeypatch.delenv("FLYDSL_RUNTIME_RUN_ONLY", raising=False)
+    errors = []
+    monkeypatch.setattr(aot_cache.logger, "error", errors.append)
+
+    @aot_factory("test_entry_of_other_ir", sources=[], env=[])
+    @functools.cache
+    def factory(n):
+        @flyc.jit
+        def launch(a: fx.Tensor):
+            pass
+
+        return launch
+
+    def request():
+        with replay.requested_kernels() as kernels:
+            _run_compiled(factory(4), torch.empty(8, device="cuda"))
+        return kernels
+
+    with dry_run("gfx950", 256):
+        built = request()
+        # An entry that says it was built from another kernel, one FlyDSL's
+        # cache does not hold: the launch is made, and tells the two apart.
+        (sidecar,) = (tmp_path / "aot").glob("*/*/*.json")
+        meta = json.loads(sidecar.read_text())
+        sidecar.write_text(json.dumps({**meta, "ir": "0" * 64}))
+        assert request() == built
+        assert len(errors) == 1 and "built from other IR" in errors[0]
+        # The key of the launch, where the entry records it, raises nothing.
+        sidecar.write_text(json.dumps(meta))
+        assert request() == built and len(errors) == 1

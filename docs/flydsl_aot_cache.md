@@ -376,12 +376,52 @@ bisection then stops early and skips kernels. On the mxfp8 CSV below this
 lost 7 of 49 kernels. The export runs first. When the
 export just built the entry, its own compile already showed the replay the
 request and filled FlyDSL's cache (the same artifact), so the JIT launch is
-skipped. Otherwise it runs and also fills FlyDSL's own cache for mode `0`
-and the fallback, like before this cache.
+skipped. Otherwise it would run and also fill FlyDSL's own cache for mode
+`0` and the fallback, like before this cache.
+
+That launch traces the kernel, because FlyDSL derives its key from the
+trace, only to find it compiled, and a prebuild requests each kernel many
+times: the full `gfx942;gfx950` build makes about 90,000 requests for 17,000
+entries, and tracing was 60% of its CPU time. So a prebuild leaves the launch
+out for an entry already on disk when both of its purposes are served
+without it:
+
+- the entry's sidecar records FlyDSL's key of its kernel (`"ir"`), which is
+  the key the launch would derive. The cache hands it to whoever collects
+  requests (`aot_cache.entry_requests(report)`, which `requested_kernels()`
+  enters), so the bisection sees the same requests. Collect a replay's
+  requests through `requested_kernels()`: watching FlyDSL's launches alone
+  misses these, which is the loss described above;
+- FlyDSL's own cache holds that kernel (`_jit_artifact_built`: a
+  `<launcher>/<disk key>.pkl` under `FLYDSL_RUNTIME_CACHE_DIR`).
+
+Otherwise the launch is made as before: an entry without a recorded key, a
+FlyDSL cache that was cleared or is disabled while the entries were kept, a
+FlyDSL whose cache files are named otherwise (without `_disk_cache_key` the
+prebuild says so once), a launch inside another launcher's trace, which
+FlyDSL inlines. Only a prebuild leaves it out; under the `COMPILE_ONLY` of a
+preload (below) the launch is made.
+
+What this relies on is what a launch relies on already, that an entry's key
+decides its kernel: then the recorded key is the one a launch of the request
+derives. Two things watch it. Whenever the launch is made for an entry with
+a recorded key, the key it derived is compared with the recorded one
+(`_check_launch`), and a difference is logged as an error. And under
+`AITER_FLYDSL_AOT_CACHE=verify` a prebuild leaves no launch out and raises on
+a difference, so a prebuild in mode `verify` over built caches checks every
+request. Replaying the full `gfx942;gfx950` build that way raised nothing,
+with the comparison made for each request. Run it after a FlyDSL upgrade and
+when binding a new launcher.
 
 Cost, gfx950 mxfp8 and a4w4 CSVs above, run one after the other on fresh
 directories: 155 s at HEAD, 164 s with the cache (62 GPU binaries, the same
-set). A replay whose entries all exist still traces every request.
+set), measured before the launch was left out. The full `gfx942;gfx950`
+build (`run_aot`'s stages, 96 workers, fresh directories, MI308X host): 35.2
+min and 1790 CPU-min before, 15.9 min and 861 CPU-min after, with the same
+kernels in both caches. MoE 677 s to 170 s, GEMM 606 s to 196 s, FP8
+attention 185 s to 20 s; MegaMoE, 486 s to 437 s, is LLVM time (7170 kernels,
+one set per rank). `--check` of the MoE tables on the built caches takes
+57 s.
 
 A preload (`tensor_shim._preload_compiled`) also turns `COMPILE_ONLY` on for
 the process, to warm one launcher up in a serving or tuning process. That is
@@ -403,8 +443,8 @@ Parallel replays share both caches safely. FlyDSL's own disk cache takes a
 per-artifact file lock, so one process runs LLVM and the others load its
 result; the export takes `flock <digest>.lock`. Measured on the mxfp8 CSV,
 two replays at once on one directory (40 workers): 58 LLVM compiles and 58
-exports for 58 kernels, none twice. Each process still traces the kernels it
-requests, which the replay needs. With `FLYDSL_RUNTIME_ENABLE_CACHE=0` or an
+exports for 58 kernels, none twice. A process traces a kernel only to build
+its entry, or where the launch above is still made. With `FLYDSL_RUNTIME_ENABLE_CACHE=0` or an
 IR dump, FlyDSL skips its cache and lock, and processes compile the same
 kernel in parallel; exports stay single. `flock` assumes a local file system.
 

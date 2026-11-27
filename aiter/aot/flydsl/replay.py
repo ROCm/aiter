@@ -158,6 +158,12 @@ def requested_kernels(*, stop: bool = False, memo: dict | None = None) -> Iterat
     scan identifies thousands of sizes that request a handful of kernels.
     Share one only among launches under one environment (one dry run).
 
+    A launcher bound to aiter's AOT cache makes no launch for an entry a
+    prebuild finds built, with its kernel in FlyDSL's cache: the cache reports
+    the key the entry recorded when it was built (``aot_cache.entry_requests``),
+    which is the one that launch would derive. So collect a replay's requests
+    here, not by watching FlyDSL's launches directly, which would miss those.
+
     Hooks private names of FlyDSL's ``jit_function`` module:
     ``JitFunction._compile_or_execute``, which every launch (``__call__``,
     ``flyc.compile``) goes through, ``_artifact_cache_key``, which it calls
@@ -169,6 +175,8 @@ def requested_kernels(*, stop: bool = False, memo: dict | None = None) -> Iterat
 
     from flydsl.compiler import jit_function
     from flydsl.compiler.jit_function import JitFunction
+
+    from aiter.ops.flydsl import aot_cache
 
     kernels = set()
     build_key = jit_function._artifact_cache_key
@@ -223,6 +231,7 @@ def requested_kernels(*, stop: bool = False, memo: dict | None = None) -> Iterat
         return result
 
     patches = [
+        aot_cache.entry_requests(kernels.add),
         mock.patch.object(jit_function, "_artifact_cache_key", record),
         mock.patch.object(JitFunction, "_compile_or_execute", launch),
     ]

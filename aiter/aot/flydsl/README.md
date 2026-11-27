@@ -79,7 +79,9 @@ need no AOT change.
   code, and not every toolchain builds every arch (ROCm 7.2 cannot build the
   cluster launch gfx1250 builds turn on).
 - A worker replays up to 12 jobs of one row in turn, so the kernels they share
-  compile once. `AITER_FLYDSL_AOT_TIMEOUT` applies to the worker's whole batch.
+  compile once. A kernel whose AOT cache entry is already built is not traced
+  again either: the cache reports the kernel the entry was built from
+  (`docs/flydsl_aot_cache.md`, 4.4). `AITER_FLYDSL_AOT_TIMEOUT` applies to the worker's whole batch.
 - `--check` compiles nothing and fails on any kernel the replay would need but
   the cache lacks; it is the CPU-side counterpart of the step-2 test below.
 
@@ -438,6 +440,18 @@ python op_tests/test_moe_2stage.py
   its `convert_to_jit_arguments` / `get_ir_types`, to trace each distinct
   launch once (`replay._trace_identity`). Update `requested_kernels` for that
   release.
+- **The build got slow after a FlyDSL upgrade, or logs `this FlyDSL has no
+  jit_function._disk_cache_key`**: a request whose AOT cache entry is built
+  is answered from the entry, untraced, only while aiter can tell that
+  FlyDSL's own cache holds the entry's kernel
+  (`aot_cache._jit_artifact_built`, which knows FlyDSL's cache file names).
+  Otherwise every request is traced, as before; the kernels are the same.
+- **`built from other IR` in the log, or a `_StaleEntryError` that says so**:
+  an entry of the AOT cache recorded another kernel than a launch of its
+  request traces to, so its key does not decide its kernel
+  (`docs/flydsl_aot_cache.md`, 4.2 and 4.4). To check every request of a
+  build, replay it again over the built caches with
+  `AITER_FLYDSL_AOT_CACHE=verify`.
 - **Worker OOM / killed (exitcode -9)**: abnormal exits are auto-retried
   (`AITER_FLYDSL_AOT_MAX_RETRIES`) and the default worker count is already
   bounded by the shared CPU and memory policy. If it still happens,

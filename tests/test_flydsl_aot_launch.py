@@ -738,6 +738,122 @@ def _bound_preload_setup(monkeypatch, tmp_path, name):
     return factory, events, _errors(monkeypatch, aot_cache)
 
 
+def test_a_prebuild_does_not_launch_an_entry_already_built(monkeypatch, tmp_path):
+    from aiter.ops.flydsl import aot_cache
+    from aiter.ops.flydsl.kernels import tensor_shim
+
+    factory, events, errors = _bound_preload_setup(
+        monkeypatch, tmp_path, "test_prebuild_built"
+    )
+    in_flydsl_cache, requested = [], []
+    monkeypatch.setattr(aot_cache, "_ir_key", lambda exe, cf: "kernel key")
+    monkeypatch.setattr(aot_cache, "_jit_artifact_built", in_flydsl_cache.__contains__)
+    monkeypatch.setenv("COMPILE_ONLY", "1")
+
+    def prebuild():
+        events.clear()
+        with aot_cache.entry_requests(requested.append):
+            tensor_shim._run_compiled(factory.lazy(4), 1, 2)
+        return list(events)
+
+    # The export's compile is the launch of a new entry.
+    assert prebuild() == ["export"] and not requested
+    # Built, but FlyDSL's own cache lacks its kernel: the launch fills it.
+    assert prebuild() == ["jit compile-only"] and not requested
+    # Both there: nothing to trace, and the entry's key stands for the launch.
+    in_flydsl_cache.append("kernel key")
+    assert prebuild() == [] and requested == ["kernel key"]
+    assert prebuild() == [] and requested == ["kernel key"] * 2
+    # Another process of the same prebuild finds the entry as well.
+    factory, events, errors = _bound_preload_setup(
+        monkeypatch, tmp_path, "test_prebuild_built"
+    )
+    monkeypatch.setenv("COMPILE_ONLY", "1")
+    assert prebuild() == [] and len(requested) == 3
+    # The COMPILE_ONLY of a preload is no prebuild: it makes the launch.
+    monkeypatch.setattr(aot_cache, "_preloading", True)
+    assert prebuild() == ["jit compile-only"] and len(requested) == 3
+    monkeypatch.setattr(aot_cache, "_preloading", False)
+    # So does a launch inside another launcher's trace, which FlyDSL inlines.
+    monkeypatch.setattr(aot_cache, "_tracing", lambda: True)
+    assert prebuild() == ["jit compile-only"] and len(requested) == 3
+    monkeypatch.setattr(aot_cache, "_tracing", lambda: False)
+    assert prebuild() == [] and len(requested) == 4
+    # Every collection under way is told, and none once it has ended.
+    outer = []
+    with aot_cache.entry_requests(outer.append):
+        assert prebuild() == [] and outer == ["kernel key"] and len(requested) == 5
+    assert prebuild() == [] and outer == ["kernel key"] and len(requested) == 6
+    assert not aot_cache._request_listeners
+    # Mode verify makes the launch, to compare its key with the entry's.
+    monkeypatch.setattr(aot_cache, "_MODE", "verify")
+    monkeypatch.setattr(aot_cache.FlyDSLAotCache, "_verify", lambda *a: None)
+    assert prebuild() == ["jit compile-only"] and len(requested) == 6
+    monkeypatch.setattr(aot_cache, "_MODE", "1")
+    # An entry that records no key (FlyDSL kept none to read) is launched.
+    for sidecar in tmp_path.glob("*.json"):
+        meta = json.loads(sidecar.read_text())
+        sidecar.write_text(json.dumps({**meta, "ir": None}))
+    assert prebuild() == ["jit compile-only"] and len(requested) == 6
+    assert len(list(tmp_path.glob("*.o"))) == 1 and not errors
+
+
+def test_a_launch_is_compared_with_the_key_its_entry_recorded(monkeypatch, tmp_path):
+    from aiter.ops.flydsl import aot_cache
+
+    monkeypatch.setattr(aot_cache, "_MODE", "1")
+    cache = aot_cache.FlyDSLAotCache("test_check_launch")
+    errors = _errors(monkeypatch, aot_cache)
+    entry = tmp_path / "digest-variant"
+    first, again, other = ("built", object()), ("built", object()), ("other", object())
+
+    def check(before, after):
+        cache._check_launch(("k",), entry, "built", before, after)
+
+    # The launch derived the recorded key, or none (an identifying replay
+    # stops it before; a FlyDSL that keeps no last compile).
+    check(None, first)
+    check(first, again)
+    check(first, first)
+    check(first, None)
+    assert not errors
+    # Another key: the entry is not the kernel this request traces to.
+    check(first, other)
+    assert len(errors) == 1 and "built from other IR" in errors[0]
+    # Said once per entry, however often a prebuild requests it.
+    check(first, other)
+    assert len(errors) == 1
+    monkeypatch.setattr(aot_cache, "_MODE", "verify")
+    with pytest.raises(aot_cache._StaleEntryError, match="built from other IR"):
+        check(None, other)
+
+
+def test_the_kernel_of_an_entry_is_looked_up_in_flydsl_s_cache(monkeypatch, tmp_path):
+    from flydsl.compiler import jit_function
+
+    from aiter.ops.flydsl import aot_cache
+
+    monkeypatch.setenv("FLYDSL_RUNTIME_CACHE_DIR", str(tmp_path))
+    assert not aot_cache._jit_artifact_built("kernel key")
+    launcher_dir = tmp_path / "launch_some_kernel"
+    launcher_dir.mkdir()
+    (launcher_dir / f"{jit_function._disk_cache_key('kernel key')}.pkl").touch()
+    assert aot_cache._jit_artifact_built("kernel key")
+    assert not aot_cache._jit_artifact_built("another key")
+    # A FlyDSL without the key of its cache files: the launch is made, and
+    # the prebuild is told once why it is slow.
+    warnings = []
+    monkeypatch.setattr(aot_cache.logger, "warning", warnings.append)
+    monkeypatch.setattr(aot_cache, "_jit_layout_warned", False)
+    monkeypatch.delattr(jit_function, "_disk_cache_key")
+    assert not aot_cache._jit_artifact_built("kernel key")
+    assert not aot_cache._jit_artifact_built("kernel key")
+    assert len(warnings) == 1 and "traces every request" in warnings[0]
+    monkeypatch.undo()
+    monkeypatch.setenv("FLYDSL_RUNTIME_CACHE_DIR", "")
+    assert not aot_cache._jit_artifact_built("kernel key")
+
+
 def test_preload_of_a_bound_launcher(monkeypatch, tmp_path):
     from aiter.ops.flydsl.kernels import tensor_shim
 
