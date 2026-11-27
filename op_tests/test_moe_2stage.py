@@ -2509,6 +2509,31 @@ def test_relu2_gate_only_regression():
         aiter.logger.info("skip Relu2 gate-only regression on %s", get_gfx())
         return
     model_dim, inter_dim, E, topk = 1024, 2688, 512, 22
+
+    torch.manual_seed(0)
+    _check_token = 16
+    _check_input = torch.randn((_check_token, model_dim), dtype=torch.bfloat16)
+    _check_w1 = torch.randn((E, inter_dim, model_dim), dtype=torch.bfloat16)
+    _check_score = torch.randn((_check_token, E), dtype=torch.bfloat16)
+    _check_topk_weights, _check_topk_ids = fused_topk(
+        _check_input, _check_score, topk, True
+    )
+    assert (_check_input < 0).any(), (
+        "expected negative activations in the gate-only Relu2 regression "
+        "input (exercises the relu(x)=0 branch), but none were present"
+    )
+    _check_w1_flat = _check_w1.view(E, -1)
+    assert not torch.allclose(_check_w1_flat[0], _check_w1_flat[1]), (
+        "expected distinct per-expert weights in the gate-only Relu2 "
+        "regression, but expert 0 and expert 1 weights matched"
+    )
+    assert not torch.allclose(
+        _check_topk_weights, torch.ones_like(_check_topk_weights)
+    ), (
+        "expected non-unit routed weights (applied in stage 2) in the "
+        "gate-only Relu2 regression, but all routed weights were 1.0"
+    )
+
     dispatched = []
     orig_ck_moe_stage1 = ck_moe_stage1
 
