@@ -7,6 +7,7 @@ import triton.language as tl
 
 from aiter.ops.triton._triton_kernels.common.pid_preprocessing import pid_grid
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 
 def matmul_launch_metadata(grid, kernel, args):
@@ -101,7 +102,45 @@ def unswizzle_mx_scale_cdna4(
     return x
 
 
-@triton.jit(launch_metadata=matmul_launch_metadata)
+@triton.jit
+def _untile_w(
+    w,
+    BLOCK_N: tl.constexpr,
+    PACKED_BLOCK_K_W: tl.constexpr,
+    W_STEPS: tl.constexpr,
+    W_LANE_BYTES: tl.constexpr,
+):
+    """[step, lane group j, n, 4 i + d] tile-major bytes -> [K byte, n] with
+    K byte 64 step + 16 i + 4 j + d."""
+    w = w.reshape(W_STEPS, 4, BLOCK_N, W_LANE_BYTES // 4, 4)
+    w = w.permute(0, 3, 1, 4, 2)
+    return w.reshape(PACKED_BLOCK_K_W, BLOCK_N)
+
+
+@triton.jit
+def _tile_rounds_scale_offs(offs_b, SCALE_ROUND: tl.constexpr):
+    """Offsets of K blocks offs_b in a row of `codes_tile_rounds` codes (16-row
+    tiles, rounds of SCALE_ROUND blocks, a round's 16 rows stored together)."""
+    return (offs_b // SCALE_ROUND) * (16 * SCALE_ROUND) + offs_b % SCALE_ROUND
+
+
+_moe_gemm_a16w4_repr = make_kernel_repr(
+    "_moe_gemm_a16w4",
+    [
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLOCK_K",
+        "GROUP_M",
+        "SPLIT_K",
+        "EVEN_K",
+        "SWIZZLE_MX_SCALE",
+        "APPLY_SWIGLU",
+        "W_TILE_MAJOR",
+    ],
+)
+
+
+@triton.jit(launch_metadata=matmul_launch_metadata, repr=_moe_gemm_a16w4_repr)
 def _moe_gemm_a16w4(
     Y,
     stride_y_k,
@@ -156,6 +195,9 @@ def _moe_gemm_a16w4(
     SPLIT_K: tl.constexpr,
     W_CACHE_MODIFIER: tl.constexpr,
     UPCAST_INDICES: tl.constexpr = False,
+    # W is the gfx942 mono copy: unpadded [E, N, K / 2] rows in fp4_tile_major
+    # byte order, read through the transposed (E, K / 2, N) view
+    W_TILE_MAJOR: tl.constexpr = False,
 ):
     tl.assume(stride_y_k >= 0)
     tl.assume(stride_y_m >= 0)
@@ -281,29 +323,73 @@ def _moe_gemm_a16w4(
         + offs_w_k_scale.to(index_type)[None, :] * stride_w_mx_k
         + offs_w_n_scale.to(index_type)[:, None] * stride_w_mx_n
     )
+    if SWIZZLE_MX_SCALE == "GFX942_TILE_ROUNDS":
+        # `codes_tile_rounds`: stride_w_mx_n is a row's K / 32 codes. Rows can
+        # wrap inside the last N tile, so no contiguity hint here.
+        SCALE_ROUND: tl.constexpr = 8
+        offs_n_rounds = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+        WMxScaleRows = WMxScale + (
+            (offs_n_rounds // 16).to(index_type) * (16 * stride_w_mx_n)
+            + (offs_n_rounds % 16) * SCALE_ROUND
+        )
 
     # W pointers
-    offs_w_n = pid_n * PACKED_BLOCK_N_W + tl.arange(0, PACKED_BLOCK_N_W)
-    offs_w_n = tl.max_contiguous(
-        tl.multiple_of(offs_w_n % (N // W_N_DIVISOR), PACKED_BLOCK_N_W),
-        PACKED_BLOCK_N_W,
-    )
-    offs_w_k = PACKED_BLOCK_K_W * pid_k + tl.arange(0, PACKED_BLOCK_K_W)
-    W += w_expt_id * stride_w_e
-    WPtrs = W + (
-        offs_w_k.to(index_type)[:, None] * stride_w_k
-        + offs_w_n.to(index_type)[None, :] * stride_w_n
-    )
+    if W_TILE_MAJOR:
+        tl.static_assert(SPLIT_K == 1, "W_TILE_MAJOR needs SPLIT_K == 1")
+        tl.static_assert(PACKED_BLOCK_K_W % 32 == 0, "W_TILE_MAJOR: BLOCK_K >= 64")
+        # A K iteration reads whole 64-byte steps, or half of one step.
+        W_STEPS: tl.constexpr = PACKED_BLOCK_K_W // 64 if PACKED_BLOCK_K_W >= 64 else 1
+        W_LANE_BYTES: tl.constexpr = PACKED_BLOCK_K_W // (4 * W_STEPS)
+        # stride_w_n is the row bytes K / 2. N % 16 == 0, so rows wrap in tiles.
+        offs_w_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+        offs_w_r = offs_w_n % 16
+        w_tile_off = (offs_w_n // 16).to(index_type) * (16 * stride_w_n)
+        offs_w_s = tl.arange(0, W_STEPS)
+        offs_w_j = tl.arange(0, 4)
+        offs_w_b = tl.arange(0, W_LANE_BYTES)
+        # a whole step: lane group j of row r at 256 j + 16 r
+        WOffs = (
+            (offs_w_s * 1024)[:, None, None, None]
+            + (offs_w_j * 256)[None, :, None, None]
+            + (w_tile_off + offs_w_r * 16)[None, None, :, None]
+            + offs_w_b[None, None, None, :]
+        )
+        W += w_expt_id * stride_w_e
+        # The wrapper sets the split. The masked tail reads the last
+        # MASK_K_LIMIT of K, which holds the 16- or 32-byte step of a row.
+        num_k_iter = (K - MASK_K_LIMIT) // BLOCK_K
+    else:
+        offs_w_n = pid_n * PACKED_BLOCK_N_W + tl.arange(0, PACKED_BLOCK_N_W)
+        offs_w_n = tl.max_contiguous(
+            tl.multiple_of(offs_w_n % (N // W_N_DIVISOR), PACKED_BLOCK_N_W),
+            PACKED_BLOCK_N_W,
+        )
+        offs_w_k = PACKED_BLOCK_K_W * pid_k + tl.arange(0, PACKED_BLOCK_K_W)
+        W += w_expt_id * stride_w_e
+        WPtrs = W + (
+            offs_w_k.to(index_type)[:, None] * stride_w_k
+            + offs_w_n.to(index_type)[None, :] * stride_w_n
+        )
 
-    num_k_iter = tl.cdiv(K, BLOCK_K * SPLIT_K)
-    if not EVEN_K:
-        num_k_iter -= 1
+        num_k_iter = tl.cdiv(K, BLOCK_K * SPLIT_K)
+        if not EVEN_K:
+            num_k_iter -= 1
 
     # compute output
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k in range(num_k_iter):
         x = tl.load(XPtrs)
-        w = tl.load(WPtrs, cache_modifier=W_CACHE_MODIFIER)
+        if W_TILE_MAJOR:
+            # row byte c0 (a multiple of 32): step c0 // 64 is 1 KB of the
+            # tile, and step byte 16 i + 4 j + d is lane group j's 4 i + d
+            c0 = k * PACKED_BLOCK_K_W
+            k_off = tl.multiple_of(
+                (c0 // 64) * 1024 + (c0 % 64) // 16 * 4, W_LANE_BYTES
+            )
+            w = tl.load(W + k_off + WOffs, cache_modifier=W_CACHE_MODIFIER)
+            w = _untile_w(w, BLOCK_N, PACKED_BLOCK_K_W, W_STEPS, W_LANE_BYTES)
+        else:
+            w = tl.load(WPtrs, cache_modifier=W_CACHE_MODIFIER)
 
         x_scales: tl.constexpr = None
         if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
@@ -311,6 +397,12 @@ def _moe_gemm_a16w4(
                 tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER),
                 BLOCK_N,
                 MX_SCALE_BLOCK_K,
+            )
+        elif SWIZZLE_MX_SCALE == "GFX942_TILE_ROUNDS":
+            offs_b = k * PACKED_MX_BLOCK + offs_w_k_scale
+            w_scales = tl.load(
+                WMxScaleRows[:, None]
+                + _tile_rounds_scale_offs(offs_b, SCALE_ROUND)[None, :]
             )
         else:
             w_scales = tl.load(WMxScalePtrs)
@@ -322,18 +414,43 @@ def _moe_gemm_a16w4(
         WMxScalePtrs += (PACKED_MX_BLOCK * SPLIT_K) * stride_w_mx_k
 
         XPtrs += (BLOCK_K * SPLIT_K) * stride_x_k
-        WPtrs += (PACKED_BLOCK_K_W * SPLIT_K) * stride_w_k
+        if not W_TILE_MAJOR:
+            WPtrs += (PACKED_BLOCK_K_W * SPLIT_K) * stride_w_k
 
     if not EVEN_K:
         mask_x_k = offs_x_k < MASK_K_LIMIT
-        mask_w_k = offs_w_k < (MASK_K_LIMIT // W_K_DIVISOR)
-        if SWIZZLE_MX_SCALE is None:
+        if SWIZZLE_MX_SCALE is None or SWIZZLE_MX_SCALE == "GFX942_TILE_ROUNDS":
             mask_w_k_scale = offs_w_k_scale * MX_PACK_DIVISOR < MASK_K_LIMIT
 
         x = tl.load(XPtrs, mask=mask_x_k[None, :], other=0.0)
-        w = tl.load(
-            WPtrs, mask=mask_w_k[:, None], other=0, cache_modifier=W_CACHE_MODIFIER
-        )
+        if W_TILE_MAJOR:
+            # The tail starts at a step. The last step of a row has sb = 16 or
+            # 32 bytes, sb / 4 a lane group: lane group j of row r at
+            # 4 sb j + sb / 4 r. Bytes past the row (K / 2) are masked to 0.
+            s_abs = num_k_iter * PACKED_BLOCK_K_W // 64 + offs_w_s
+            sb = tl.minimum(stride_w_n - 64 * s_abs, 64)[:, None, None, None]
+            tail_offs = (
+                (s_abs * 1024)[:, None, None, None]
+                + 4 * sb * offs_w_j[None, :, None, None]
+                + w_tile_off[None, None, :, None]
+                + sb // 4 * offs_w_r[None, None, :, None]
+                + offs_w_b[None, None, None, :]
+            )
+            col = (
+                (64 * s_abs)[:, None, None, None]
+                + 4 * offs_w_j[None, :, None, None]
+                + (16 * (offs_w_b // 4) + offs_w_b % 4)[None, None, None, :]
+            )
+            mask_w = tl.broadcast_to(col < stride_w_n, tail_offs.shape)
+            w = tl.load(
+                W + tail_offs, mask=mask_w, other=0, cache_modifier=W_CACHE_MODIFIER
+            )
+            w = _untile_w(w, BLOCK_N, PACKED_BLOCK_K_W, W_STEPS, W_LANE_BYTES)
+        else:
+            mask_w_k = offs_w_k < (MASK_K_LIMIT // W_K_DIVISOR)
+            w = tl.load(
+                WPtrs, mask=mask_w_k[:, None], other=0, cache_modifier=W_CACHE_MODIFIER
+            )
 
         x_scales: tl.constexpr = None
         if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
@@ -342,6 +459,17 @@ def _moe_gemm_a16w4(
                 BLOCK_N,
                 MX_SCALE_BLOCK_K,
             )
+        elif SWIZZLE_MX_SCALE == "GFX942_TILE_ROUNDS":
+            offs_b = num_k_iter * PACKED_MX_BLOCK + offs_w_k_scale
+            w_scales = tl.load(
+                WMxScaleRows[:, None]
+                + _tile_rounds_scale_offs(offs_b, SCALE_ROUND)[None, :],
+                mask=mask_w_k_scale[None, :],
+                other=0,
+            )
+        elif W_TILE_MAJOR:
+            # code 0, as in the zero padding of a padded copy
+            w_scales = tl.load(WMxScalePtrs, mask=mask_w_k_scale[None, :], other=0)
         else:
             w_scales = tl.load(WMxScalePtrs, mask=mask_w_k_scale[None, :])
 

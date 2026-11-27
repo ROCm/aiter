@@ -19,6 +19,9 @@ setup is unchanged either way (moe2 needs moe1's output, so layer 1 always runs
 once outside the timed region), so a row means the same thing whichever subset
 it came from.
 
+--w-layout GFX942_TILE_MAJOR re-lays both weights with gfx942_tile_major_pack
+(no padding, gfx942 mono decode order) and runs the triton backend.
+
 --act-dtype picks the activation dtype: bf16 or fp16. Unlike moe_gemm_a8w4,
 moe_gemm_a16w4 never quantizes the activations -- they are plain 16-bit
 tensors end to end (moe_gemm_a16w4 hard-asserts x_scales/x_static_scale/
@@ -54,7 +57,7 @@ from aiter.ops.triton.moe.moe_op_gemm_a16w4 import moe_gemm_a16w4
 from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
+from aiter.ops.triton.utils.shuffle import gfx942_tile_major_pack, shuffle_scale_moe
 from op_tests.op_benchmarks.triton.utils.argparse import (
     get_do_bench_graph_kwargs,
     get_parser,
@@ -174,6 +177,17 @@ def check_and_shuffle_scales(scale, N, K):
         return scale, None
 
 
+def tile_major(w, w_scales):
+    """(E, K/2, N) weights and (E, K/32, N) codes -> the w_layout="GFX942_TILE_MAJOR"
+    inputs. The codes go in rounds when K/32 is a multiple of 8."""
+    kc = w_scales.shape[1]
+    return gfx942_tile_major_pack(
+        w.transpose(1, 2).contiguous(),
+        w_scales.transpose(1, 2).contiguous(),
+        scale_rounds=kc % 8 == 0,
+    )
+
+
 def quantize(x, dtype):
     """bf16 passthrough / mxfp4 weight quantization.
 
@@ -249,6 +263,7 @@ def _generate_pool_inputs(
     w_dtype,
     TP,
     backend,
+    w_layout=None,
 ):
     """One full weight-init draw: weights, routing, and the layer-1 swiglu
     output layer 2 reads. Regenerated per pool entry, so replaying through the
@@ -276,10 +291,16 @@ def _generate_pool_inputs(
     wg, _ = quantize(wg, "bf16")
     w1, w1_scales = quantize(w1, w_dtype)
     w2, w2_scales = quantize(w2, w_dtype)
-    w1_scales, swizzle_mx_scale1 = check_and_shuffle_scales(w1_scales, dim2 // TP, dim1)
-    w2_scales, swizzle_mx_scale2 = check_and_shuffle_scales(
-        w2_scales, dim1, dim2 // TP // 2
-    )
+    if w_layout == "GFX942_TILE_MAJOR":
+        w1, w1_scales, swizzle_mx_scale1 = tile_major(w1, w1_scales)
+        w2, w2_scales, swizzle_mx_scale2 = tile_major(w2, w2_scales)
+    else:
+        w1_scales, swizzle_mx_scale1 = check_and_shuffle_scales(
+            w1_scales, dim2 // TP, dim1
+        )
+        w2_scales, swizzle_mx_scale2 = check_and_shuffle_scales(
+            w2_scales, dim1, dim2 // TP // 2
+        )
 
     # -- routing + layer-1 activations --
     x1 = torch.randn((batch, dim1), dtype=x_dtype_torch, device=dev)
@@ -301,6 +322,7 @@ def _generate_pool_inputs(
             out_dtype=out_dtype,
             apply_swiglu=True,
             backend=backend,
+            w_layout=w_layout,
         )
 
     # layer 2 reads layer 1's swiglu output as-is -- a16w4 never quantizes
@@ -329,7 +351,7 @@ def _generate_pool_inputs(
     )
 
 
-def _layer1_fn(out_dtype, backend):
+def _layer1_fn(out_dtype, backend, w_layout=None):
     def _fn(x1, w1, w1_scales, b1, rdata, gather_indx, swizzle_mx_scale1, **_):
         return moe_gemm_a16w4(
             x1,
@@ -345,12 +367,13 @@ def _layer1_fn(out_dtype, backend):
             out_dtype=out_dtype,
             apply_swiglu=True,
             backend=backend,
+            w_layout=w_layout,
         )
 
     return _fn
 
 
-def _layer2_fn(out_dtype, backend):
+def _layer2_fn(out_dtype, backend, w_layout=None):
     def _fn(x2, w2, w2_scales, b2, rdata, scatter_indx, swizzle_mx_scale2, **_):
         return moe_gemm_a16w4(
             x2,
@@ -366,6 +389,7 @@ def _layer2_fn(out_dtype, backend):
             out_dtype=out_dtype,
             apply_swiglu=False,
             backend=backend,
+            w_layout=w_layout,
         )
 
     return _fn
@@ -392,6 +416,7 @@ def bench_mlp(
     backend,
     layers=LAYERS,
     num_weight_inits=1,
+    w_layout=None,
 ):
     assert dim2 % TP == 0, f"{dim2=}, {TP=}, dim2 must be divisible by TP"
     assert x_dtype in ACT_DTYPES, f"{x_dtype=} must be one of {ACT_DTYPES}"
@@ -412,6 +437,7 @@ def bench_mlp(
         w_dtype,
         TP,
         backend,
+        w_layout,
     )
     # pool_len == num_weight_inits: each captured call in the graph replays a
     # distinct weight/routing draw, the same role the old averaging loop played.
@@ -420,8 +446,8 @@ def bench_mlp(
         [_POOL_FIELDS],
     )
 
-    layer1_fn = _layer1_fn(x_dtype_torch, backend)
-    layer2_fn = _layer2_fn(x_dtype_torch, backend)
+    layer1_fn = _layer1_fn(x_dtype_torch, backend, w_layout)
+    layer2_fn = _layer2_fn(x_dtype_torch, backend, w_layout)
     both_fn = _both_fn(layer1_fn, layer2_fn)
 
     # -- analytic FLOPs / bytes, matching the proton metadata the original
@@ -517,6 +543,7 @@ def roofline_mlp(
     layers=LAYERS,
     num_weight_inits=1,
     name="",
+    w_layout=None,
 ):
     # Put all outputs under logs/<name>/ and write a CSV file (not a directory-as-stem).
     out_dir = Path("logs") / name
@@ -531,6 +558,8 @@ def roofline_mlp(
     if tuple(layers) != LAYERS:
         # a partial run holds a subset of the rows, so give it its own file
         stem += "-layers=" + "+".join(layers)
+    if w_layout is not None:
+        stem += f"-{w_layout.lower()}"
     out_csv = out_dir / f"{stem}.csv"
 
     compute_roofline(
@@ -549,6 +578,7 @@ def roofline_mlp(
         intensity_proxy_name="batch",  # intensity proxy name
         intensity_proxy_values=batch_sizes,  # intensity proxy values to sweep
         out_path=out_csv,  # output path
+        w_layout=w_layout,
     )
 
 
@@ -613,6 +643,14 @@ def parse_args(args: list[str] | None = None):
         "alone. Default: all three.",
     )
     parser.add_argument(
+        "--w-layout",
+        choices=["GFX942_TILE_MAJOR"],
+        default=None,
+        help="Weight layout. GFX942_TILE_MAJOR re-lays the weights with "
+        "gfx942_tile_major_pack and runs the triton backend (gfx942 only). "
+        "Default: the column-major layout.",
+    )
+    parser.add_argument(
         "--num-weight-inits",
         type=int,
         default=1,
@@ -655,11 +693,13 @@ def main(args: list[str] | None = None) -> None:
         parsed_args.act_dtype,
         "mx4",
         TP=parsed_args.TP,
-        backend=parsed_args.backend,
+        # w_layout runs only on the triton backend
+        backend="triton" if parsed_args.w_layout else parsed_args.backend,
         # dedupe, keeping the canonical report order rather than argv order
         layers=tuple(n for n in LAYERS if n in parsed_args.layers),
         num_weight_inits=parsed_args.num_weight_inits,
         name="moe_gemm_a16w4",
+        w_layout=parsed_args.w_layout,
     )
 
 

@@ -169,6 +169,29 @@ def get_kernel_config_triton(m, n, k, routing_data):
     return ret
 
 
+def _check_gfx942_tile_major(x, w, w_scales, swizzle_mx_scale, unpadded_N, unpadded_K):
+    """Check the w_layout="GFX942_TILE_MAJOR" inputs: transposed views of
+    contiguous unpadded [E, N, K / 2] bytes and [E, N, K / 32] codes."""
+    assert w.dtype == torch.uint8 and w.ndim == 3, (w.dtype, w.shape)
+    e, kb, n = w.shape
+    assert w.stride() == (n * kb, 1, kb), "w must be a transposed contiguous tensor"
+    assert n % 16 == 0 and kb % 16 == 0 and kb % 64 in (0, 16, 32), w.shape
+    assert x.shape[-1] == 2 * kb, (x.shape, w.shape)
+    kc = kb // 16
+    assert w_scales.shape == (e, kc, n), (w_scales.shape, w.shape)
+    assert w_scales.stride() == (
+        n * kc,
+        1,
+        kc,
+    ), "w_scales must be a transposed contiguous tensor"
+    assert swizzle_mx_scale in (None, "GFX942_TILE_ROUNDS"), swizzle_mx_scale
+    if swizzle_mx_scale == "GFX942_TILE_ROUNDS":
+        assert kc % 8 == 0, w_scales.shape
+    assert (
+        unpadded_N is None and unpadded_K is None
+    ), "GFX942_TILE_MAJOR weights are not padded"
+
+
 def get_kernel_config_gluon_gfx950_pipelined(m, n, k, routing_data):
     block_m = routing_data.block_m
     group_m = 4
@@ -358,6 +381,7 @@ def moe_gemm_a16w4(
     backend: str | None = None,
     expert_map=None,
     gate_valid=None,
+    w_layout: str | None = None,
 ):
     """
     Computes MoE GEMM with 16-bit activations and MxFP4 weights
@@ -385,10 +409,24 @@ def moe_gemm_a16w4(
         limit(float):
         swiglu_add_residual(bool): Whether to add swiglu residual
         backend(Optional[str]): "triton", "gluon" or None(auto-detect).
+        w_layout(Optional[str]): None (default) or "GFX942_TILE_MAJOR". With
+            "GFX942_TILE_MAJOR", `w` is the transposed view (E, K/2, N) of a
+            contiguous unpadded [E, N, K/2] tensor whose bytes are in the gfx942
+            mono `fp4_tile_major` order (16-row tiles; the last K step of a row
+            can be 16 or 32 bytes). `w_scales` is the transposed view
+            (E, K/32, N) of contiguous [E, N, K/32] codes: row-major with
+            swizzle_mx_scale=None, or in `codes_tile_rounds` order (rounds of 8
+            K blocks) with swizzle_mx_scale="GFX942_TILE_ROUNDS". N % 16 == 0.
+            Triton backend only, SPLIT_K 1, BLOCK_K >= 64, no unpadded_N/K.
 
     Returns:
         torch.Tensor: Output with shape as x(num_tokens, K/hidden_dim/emb_dim)
     """
+
+    assert w_layout in (None, "GFX942_TILE_MAJOR"), f"Unknown w_layout {w_layout}"
+    if w_layout is not None:
+        assert backend in (None, "triton"), "w_layout needs the triton backend"
+        backend = "triton"
 
     if backend in (None, "gluon"):
         if _is_gluon_available():
@@ -404,7 +442,11 @@ def moe_gemm_a16w4(
         "gluon",
     ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
 
-    if get_arch() in ("gfx1250", "gfx1250-strict"):
+    if w_layout is not None:
+        _check_gfx942_tile_major(
+            x, w, w_scales, swizzle_mx_scale, unpadded_N, unpadded_K
+        )
+    elif get_arch() in ("gfx1250", "gfx1250-strict"):
         assert swizzle_mx_scale in (
             None,
             "GFX1250_SCALE",
@@ -463,6 +505,16 @@ def moe_gemm_a16w4(
 
     else:
         config = get_kernel_config_triton(M, N, K, routing_data)
+
+    even_k, mask_k_limit = K % config["block_k"] == 0, K % config["block_k"]
+    if w_layout is not None:
+        assert config["block_k"] >= 64 and config["split_k"] == 1, config
+        # The loop reads only whole 64-byte steps. The masked tail reads the
+        # rest: whole steps that do not fill a BLOCK_K, and a 16- or 32-byte
+        # last step. Example: BLOCK_K 256 and K 640 give 2 loop iterations
+        # (4 steps) and a tail of 1 step.
+        k_loop = (K // 128) * 128 // config["block_k"] * config["block_k"]
+        even_k, mask_k_limit = k_loop == K, K - k_loop
 
     if backend == "gluon":
         w_scales_kernel = w_scales.transpose(1, 2)
@@ -740,12 +792,13 @@ def moe_gemm_a16w4(
             XCD_SWIZZLE=config["xcd_swizzle"],
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
             SPLIT_K=config["split_k"],
-            EVEN_K=K % config["block_k"] == 0,
-            MASK_K_LIMIT=K % config["block_k"],
+            EVEN_K=even_k,
+            MASK_K_LIMIT=mask_k_limit,
             W_CACHE_MODIFIER=config["w_cache_modifier"],
             num_warps=config["num_warps"],
             num_stages=config["num_stages"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
+            W_TILE_MAJOR=w_layout is not None,
             waves_per_eu=config["waves_per_eu"],
             matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
             kpack=config["kpack"],
