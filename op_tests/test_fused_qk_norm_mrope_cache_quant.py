@@ -458,6 +458,7 @@ def test_mrope_3d_rms_set_kv_shuffle(
         0, max_positions, pos_shape, dtype=torch.int64, device="cuda"
     )
     if positions_view:
+        assert is_mrope, "positions_view applies to MRoPE positions only"
         # Row 3 holds an index far outside cos_sin, so a kernel that reads
         # past the three position rows faults instead of passing by chance.
         buf = torch.full((4, num_tokens), 1 << 40, dtype=torch.int64, device="cuda")
