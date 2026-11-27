@@ -404,11 +404,6 @@ class BenchArgs:
             "--window-size-left": str(window_left),
             "--window-size-right": str(window_right),
             "--metric": metric.name,
-            # Shorter CUDA graph timing: the bench_mha default (1000 kernels per
-            # graph, 3 + 10 replays) takes minutes per large shape.
-            "--graph-kernels-per-graph": "20",
-            "--graph-warmup-replays": "1",
-            "--graph-num-replays": "3",
         }
 
         args_list: list[str] = [kv for k, v in args_dict.items() for kv in (k, v)]
