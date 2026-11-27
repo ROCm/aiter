@@ -818,8 +818,7 @@ def test_workers_end_with_the_pool_that_supervises_them(tmp_path):
     pid_file = tmp_path / "worker.pid"
     with common.worker_slots(1) as slot_dir:
         script = tmp_path / "pool.py"
-        script.write_text(
-            f"""
+        body = f"""
 import os, sys, time
 sys.path.insert(0, {str(_REPO_ROOT)!r})
 from aiter.aot.flydsl import common
@@ -832,7 +831,7 @@ def hangs(**_job):
 
 common.run_jobs_parallel(hangs, [{{"kernel_name": "k"}}])
 """
-        )
+        script.write_text(body)
         pool = subprocess.Popen([sys.executable, str(script)])
         try:
             deadline = time.monotonic() + 120
