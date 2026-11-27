@@ -3,6 +3,9 @@
 import pytest
 import torch
 
+from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_a8w8_blockscale_mul_add import (
+    _get_config,
+)
 from aiter.ops.triton.gemm.fused.fused_gemm_a8w8_blockscale_mul_add import (
     fused_gemm_a8w8_blockscale_mul_add,
 )
@@ -18,17 +21,10 @@ from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
 from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
     run_torch as run_torch_gemm_a8w8_blockscale,
 )
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 
-def get_x_vals():
-
-    x_vals = [
-        (v, 7168, 256) for v in [2, 4, 8, 16, 1024]
-    ]  # TODO M = 1 triton upstream compilation error without AMDGCN_USE_BUFFER_OPS=0
-    return x_vals
-
-
-@pytest.mark.parametrize("M, N, K", get_x_vals())
+@pytest.mark.parametrize("M, N, K", get_shapes(min_k=128, max_size=1024 * 7168 * 256))
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("layout", ["TN"])
 @pytest.mark.parametrize("output", [True, False])
@@ -116,5 +112,28 @@ def test_fused_gemm_a8w8_blockscale_mul_add(
             dtype,
             fuse_type=fuse_type,
         )
+
+    torch.testing.assert_close(torch_out, triton_out, atol=0.1, rtol=0.1)
+
+
+@pytest.mark.parametrize("num_ksplit", [3, 6])
+def test_fused_gemm_a8w8_blockscale_mul_add_uneven_splitk(num_ksplit):
+    # K=1792 has 14 K blocks. compute_splitk_params rounds 3 splits to 5 blocks
+    # each and 6 splits to 5 splits of 3 blocks, so the last split runs past K.
+    M, N, K, dtype = 32, 7168, 1792, torch.bfloat16
+    x, w, _, x_scales, _, w_scales, _ = generate_gemm_a8w8_blockscale_inputs(
+        M, N, K, 128, 128, dtype
+    )
+    _, a, b = generate_fused_mul_add_inputs(
+        [M, N], (torch.Tensor, False), (torch.Tensor, False), dtype
+    )
+    config = {**_get_config(M, N, K)[0], "NUM_KSPLIT": num_ksplit}
+
+    torch_out = run_torch_fused_mul_add(
+        run_torch_gemm_a8w8_blockscale(x, w, x_scales, w_scales, torch.float32), a, b
+    ).to(dtype)
+    triton_out = fused_gemm_a8w8_blockscale_mul_add(
+        x, w, x_scales, w_scales, a, b, dtype, config=config
+    )
 
     torch.testing.assert_close(torch_out, triton_out, atol=0.1, rtol=0.1)

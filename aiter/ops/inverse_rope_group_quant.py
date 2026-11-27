@@ -12,6 +12,7 @@ import torch
 from torch import Tensor
 
 from ..jit.core import compile_ops
+from ..plugin import route as _route
 from ..utility.dtypes import get_dtype_fp8
 
 # Mirrors aiter::ScaleLayout in csrc/include/inverse_rope_group_quant.h.
@@ -88,7 +89,7 @@ def scale_shape(
     return (s, num_groups, scale_groups)
 
 
-def inverse_rope_group_quant(
+def _inverse_rope_group_quant_native(
     o: Tensor,
     positions: Tensor,
     cos_cache: Tensor,
@@ -213,3 +214,131 @@ def inverse_rope_group_quant(
         SCALE_LAYOUTS[scale_layout],
     )
     return x_fp8, x_scale
+
+
+def _inverse_rope_group_quant_contract_fake(
+    o: Tensor,
+    positions: Tensor,
+    cos_cache: Tensor,
+    sin_cache: Tensor,
+    num_groups: int,
+    quant_group_size: int = 128,
+    scale_layout: str = "row",
+) -> tuple[Tensor, Tensor]:
+    """The two tensors the v2 contract returns, shaped but not filled.
+
+    Allocating rather than handing back arguments is the whole reason v2
+    carries no output buffers: see :func:`inverse_rope_group_quant`.
+    """
+    from .. import dtypes
+
+    s, h, head_dim = o.shape
+    d = (h * head_dim) // num_groups
+    scale_groups = d // quant_group_size
+    return (
+        torch.empty((s, num_groups, d), dtype=get_dtype_fp8(), device=o.device),
+        torch.empty(
+            scale_shape(s, num_groups, scale_groups, scale_layout, quant_group_size),
+            dtype=dtypes.fp8_e8m0,
+            device=o.device,
+        ),
+    )
+
+
+# v2 drops the ``x_fp8=`` and ``x_scale=`` buffers v1 carried. The older version
+# stays acceptable: the only change is removing OPTIONAL output buffers, so a v1
+# provider handed a v2 call sees both as None and allocates -- which is v2's
+# semantics exactly. (`rmsnorm` v1 was left out of its own supersedes for the
+# opposite reason: a v1 kernel handed a v2 call writes the caller's INPUT.)
+@_route(
+    op="inverse_rope_group_quant",
+    version=2,
+    supersedes={1: "a later aiter release"},
+    fake=_inverse_rope_group_quant_contract_fake,
+    mutates_args=[],
+)
+def _inverse_rope_group_quant_routed(
+    o: Tensor,
+    positions: Tensor,
+    cos_cache: Tensor,
+    sin_cache: Tensor,
+    num_groups: int,
+    quant_group_size: int = 128,
+    scale_layout: str = "row",
+) -> tuple[Tensor, Tensor]:
+    """Inverse-RoPE V4 attention output and FP8 group-quant rows -- the routed
+    contract.
+
+    Arguments and meanings are those of :func:`inverse_rope_group_quant`, minus
+    its output buffers.
+
+    Returns a newly allocated ``(x_fp8, x_scale)``. It writes through none of
+    its arguments: a provider serving this contract must allocate both results
+    too, and a caller that wants them in buffers it owns passes ``x_fp8=`` or
+    ``x_scale=``, which does not route.
+    """
+    return _inverse_rope_group_quant_native(
+        o,
+        positions,
+        cos_cache,
+        sin_cache,
+        num_groups,
+        quant_group_size,
+        scale_layout,
+        None,
+        None,
+    )
+
+
+def inverse_rope_group_quant(
+    o: Tensor,
+    positions: Tensor,
+    cos_cache: Tensor,
+    sin_cache: Tensor,
+    num_groups: int,
+    quant_group_size: int = 128,
+    scale_layout: str = "row",
+    x_fp8: Tensor | None = None,
+    x_scale: Tensor | None = None,
+) -> tuple[Tensor, Tensor]:
+    """Inverse-RoPE V4 attention output and emit FP8 group-quant rows.
+
+    Arguments and output are those of the routed contract; see
+    :func:`_inverse_rope_group_quant_routed`, and
+    :func:`_inverse_rope_group_quant_native` for the shape rules and the
+    undefined-padding note.
+
+    ``x_fp8`` and ``x_scale`` are pre-allocated output buffers, and passing
+    either one bypasses routing. The reason is a schema one rather than a policy
+    one: with a buffer this op RETURNS the tensor it was given, while the schema
+    a custom op is registered under declares that its results do not alias its
+    inputs. `opcheck` reports the contradiction, and under compile both ways of
+    resolving it are wrong -- a fake that allocates leaves the caller's buffer
+    UNWRITTEN while still returning the right value, with nothing to say so.
+
+    Leaving the buffers out of the contract removes the contradiction instead of
+    picking a side of it. A provider therefore serves the allocating form only;
+    the buffered form runs AITER's own kernel, which is what naming a buffer
+    asked for.
+    """
+    if x_fp8 is None and x_scale is None:
+        return _inverse_rope_group_quant_routed(
+            o,
+            positions,
+            cos_cache,
+            sin_cache,
+            num_groups,
+            quant_group_size,
+            scale_layout,
+        )
+    return _inverse_rope_group_quant_native(
+        o,
+        positions,
+        cos_cache,
+        sin_cache,
+        num_groups,
+        quant_group_size,
+        scale_layout,
+        x_fp8,
+        x_scale,
+    )

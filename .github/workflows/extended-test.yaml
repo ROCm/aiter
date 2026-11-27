@@ -1,18 +1,35 @@
 name: Extended Test
 
-run-name: Extended test for PR #${{ github.event.pull_request.number }}
+run-name: "Extended test for ${{ github.event_name == 'pull_request_target' && format('PR #{0}', github.event.pull_request.number) || github.sha }}"
 
 on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - '.github/**'
+      - 'LICENSE'
+      - 'LICENSE*'
+      - '.gitignore'
   pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review, labeled]
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - '.github/**'
+      - 'LICENSE'
+      - 'LICENSE*'
+      - '.gitignore'
 
 permissions:
   contents: read
   statuses: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request_target' && github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   DISPATCH_EVENT_TYPE: aiter-pr-test
@@ -21,34 +38,45 @@ jobs:
   dispatch:
     name: Dispatch extended tests
     if: >-
-      github.event.pull_request.head.repo.fork == false &&
+      github.event_name == 'push' ||
+      (github.event.pull_request.head.repo.fork == false &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       contains(github.event.pull_request.labels.*.name, 'ci:extended-test') &&
-      (github.event.action != 'labeled' || github.event.label.name == 'ci:extended-test')
+      (github.event.action != 'labeled' || github.event.label.name == 'ci:extended-test'))
     runs-on: linux-aiter-build-mi250
 
     steps:
       - name: Build dispatch payload
         env:
           AITER_REPOSITORY: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
-          HEAD_REF: ${{ github.event.pull_request.head.ref }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number || '' }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref || github.ref_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref || github.ref_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message || '' }}
           EVENT_TYPE: ${{ env.DISPATCH_EVENT_TYPE }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
           import json
           import os
+          import re
+
+          pr_number = os.environ["PR_NUMBER"]
+          if not pr_number:
+              match = re.search(r"(?:\(#|Merge pull request #)(\d+)", os.environ["HEAD_COMMIT_MESSAGE"])
+              if match:
+                  pr_number = match.group(1)
 
           payload = {
               "event_type": os.environ["EVENT_TYPE"],
               "client_payload": {
                   "aiter_repo": os.environ["AITER_REPOSITORY"],
-                  "pr_number": int(os.environ["PR_NUMBER"]),
+                  "event_name": os.environ["EVENT_NAME"],
+                  "pr_number": int(pr_number) if pr_number else None,
                   "head_repo": os.environ["HEAD_REPOSITORY"],
                   "head_ref": os.environ["HEAD_REF"],
                   "head_sha": os.environ["HEAD_SHA"],
@@ -87,7 +115,7 @@ jobs:
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
           AITER_REPOSITORY: ${{ github.repository }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           STATUS_CONTEXT: extended-tests/aiter
           WAIT_TIMEOUT_MINUTES: ${{ vars.EXTENDED_TEST_WAIT_TIMEOUT_MINUTES || '180' }}
         run: |

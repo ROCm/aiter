@@ -54,7 +54,7 @@ def apply_SL(
     max_seq_len: int,
 ) -> torch.Tensor:
     threshold = int(max_seq_len ** (alpha / 2.0))
-    no_sample_prob = (max_seq_len**alpha) / torch.pow(lengths, 2)
+    no_sample_prob = (max_seq_len**alpha) / torch.pow(lengths, 2).to(torch.float32)
     users_to_sample = torch.logical_and(
         lengths > threshold,
         torch.rand_like(no_sample_prob) < 1 - no_sample_prob,

@@ -76,6 +76,7 @@ For a new kernel to be run by the script, the corresponding benchmark must be im
 | `comment`| string | Optional label (e.g. `"Prefill"`, `"Text"`, `"Vision"`). |
 | `sink`   | bool   | Optional. When true, enables attention sink in the MHA benchmark. |
 | `sliding_window_left` | int | Optional. Left sliding-window size (`--window-size-left`); omit for no window. |
+| `sliding_window_right` | int | Optional. Right sliding-window size (`--window-size-right`); omit for no window. Default Triton skips a right window unless `-impl dao_ai` or an fp8 dtype. |
 
 ### MLA — Multi-head Latent Attention (`mla`)
 
@@ -86,6 +87,14 @@ For a new kernel to be run by the script, the corresponding benchmark must be im
 | `dqk`    | int    | Query/key head dimension. |
 | `dv`     | int    | Value head dimension. |
 | `comment`| string | Optional label (e.g. `"Decode"`). |
+
+**Warning:** The MLA benchmark (`bench_mla_decode.py`) doesn't read these fields. It takes the head
+count from `op_tests/op_benchmarks/triton/utils/model_configs.json` and hardcodes the DeepSeek-V3
+MLA dimensions (`kv_lora_rank=512`, `qk_rope_head_dim=64`). To bench a new MLA model, add it to
+`MLA_BENCH_MODELS` in `bench_models.py` and `bench_attn_models.py`, which map the model name to a
+`model_configs.json` entry, and to `MLA_MODEL_FAMILIES` in `bench_mla_decode.py`. The model must use
+the DeepSeek-V3 MLA dimensions. Models without a mapping are skipped. The scripts check the head
+count reported by the benchmark against `hq`.
 
 ### Unified Attention (`unified_attention`)
 

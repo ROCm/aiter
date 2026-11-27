@@ -233,6 +233,7 @@ _deepgemm_fp8_paged_mqa_logits_stage1_repr = make_kernel_repr(
         "HiddenDim",
         "KVBlockSize",
         "SplitKV",
+        "ContextLenStride",
     ],
 )
 
@@ -266,6 +267,7 @@ def _deepgemm_fp8_paged_mqa_logits_stage1(
     HiddenDim: tl.constexpr,
     KVBlockSize: tl.constexpr,
     SplitKV: tl.constexpr = 1,
+    ContextLenStride: tl.constexpr = 1,
 ):
     pid = tl.program_id(0)
     num_block_q_head = tl.cdiv(heads_num, ChunkQ)
@@ -274,7 +276,9 @@ def _deepgemm_fp8_paged_mqa_logits_stage1(
     pid_next_n, remain_pid = remain_pid % next_n, remain_pid // next_n
     pid_batch, pid_split_kv = remain_pid % batch_size, remain_pid // batch_size
 
-    context_length = tl.load(context_len_ptr + pid_batch)
+    context_length = tl.load(
+        context_len_ptr + pid_batch * ContextLenStride + ContextLenStride - 1
+    )
 
     context_chunk_num = tl.cdiv(context_length, ChunkK)
     split_context_chunk_num = tl.cdiv(context_chunk_num, SplitKV)
@@ -353,6 +357,7 @@ _deepgemm_fp8_paged_mqa_logits_varctx_schedule_repr = make_kernel_repr(
         "ChunkK",
         "AlignedBatchSize",
         "TryCount",
+        "ContextLenStride",
     ],
 )
 
@@ -454,11 +459,15 @@ def _deepgemm_fp8_paged_mqa_logits_varctx_schedule(
     ChunkK: tl.constexpr,
     AlignedBatchSize: tl.constexpr,
     TryCount: tl.constexpr,
+    ContextLenStride: tl.constexpr = 1,
 ):
     pid = tl.program_id(0)
 
     ctx_lens = tl.load(
-        context_len_ptr + tl.arange(0, AlignedBatchSize),
+        context_len_ptr
+        + tl.arange(0, AlignedBatchSize) * ContextLenStride
+        + ContextLenStride
+        - 1,
         mask=tl.arange(0, AlignedBatchSize) < batch_size,
         other=0,
     )
@@ -499,6 +508,7 @@ _deepgemm_fp8_paged_mqa_logits_repr = make_kernel_repr(
         "HiddenDim",
         "KVBlockSize",
         "SplitKV",
+        "ContextLenStride",
     ],
 )
 
@@ -531,6 +541,7 @@ def _deepgemm_fp8_paged_mqa_logits(
     HiddenDim: tl.constexpr,
     KVBlockSize: tl.constexpr,
     SplitKV: tl.constexpr = 1,
+    ContextLenStride: tl.constexpr = 1,
 ):
     pid = tl.program_id(0)
     num_block_q_head = tl.cdiv(heads_num, ChunkQ)
@@ -539,7 +550,9 @@ def _deepgemm_fp8_paged_mqa_logits(
     pid_next_n, remain_pid = remain_pid % next_n, remain_pid // next_n
     pid_batch, pid_split_kv = remain_pid % batch_size, remain_pid // batch_size
 
-    context_length = tl.load(context_len_ptr + pid_batch)
+    context_length = tl.load(
+        context_len_ptr + pid_batch * ContextLenStride + ContextLenStride - 1
+    )
 
     context_chunk_num = tl.cdiv(context_length, ChunkK)
     split_context_chunk_num = tl.cdiv(context_chunk_num, SplitKV)

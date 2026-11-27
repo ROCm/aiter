@@ -343,6 +343,10 @@ def benchmark_candidate_gain(
 
 
 class GemmA6W6Tuner(GemmCommonTuner):
+    # The min-gain guard re-benchmarks the energy winner and keeps it only
+    # for a latency speedup, so the published row would not be a power pick.
+    SUPPORTS_POWER_SELECT = False
+
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": AITER_CONFIG_GEMM_A6W6,

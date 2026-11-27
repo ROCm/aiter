@@ -320,6 +320,7 @@ class AttentionConfig:
     SHUFFLED_KV_CACHE: gl.constexpr
     KV_SHUFFLE_WIDTH: gl.constexpr
     USE_SOFTCAP: gl.constexpr
+    USE_EXPLICIT_FMA: gl.constexpr
     # constexpr so the allocated-once vLLM cache strides constant-fold into addressing
     stride_k_cache_0: gl.constexpr
     stride_k_cache_1: gl.constexpr
@@ -363,6 +364,7 @@ class AttentionConfig:
         stride_v_cache_1,
         stride_v_cache_2,
         stride_v_cache_3,
+        USE_EXPLICIT_FMA=False,
     ):
         self.HEAD_SIZE = gl.constexpr(HEAD_SIZE)
         self.BLOCK_SIZE = gl.constexpr(BLOCK_SIZE)
@@ -388,6 +390,7 @@ class AttentionConfig:
         self.SHUFFLED_KV_CACHE = gl.constexpr(SHUFFLED_KV_CACHE)
         self.KV_SHUFFLE_WIDTH = gl.constexpr(KV_SHUFFLE_WIDTH)
         self.USE_SOFTCAP = gl.constexpr(USE_SOFTCAP)
+        self.USE_EXPLICIT_FMA = gl.constexpr(USE_EXPLICIT_FMA)
         # CDNA4 shapes: bf16 32x32x16 / 16x16x32, fp8 32x32x64 / 16x16x128.
         if MFMA_DIM == 32:
             mfma_instr = [32, 32, 16] if not self.DOT_FP8 else [32, 32, 64]
@@ -547,6 +550,8 @@ class AsyncKVLoader:
         kv_head_idx,
         num_blocks,
         REMOVE_INDIRECT_ACCESS,
+        PRELOAD_PAGES: gl.constexpr = 0,
+        PRELOAD_TABLE_STRIDE: gl.constexpr = 0,
     ):
         kv_cfg = AsyncKVLoaderConfig(cfg, REMOVE_INDIRECT_ACCESS)
         KW: gl.constexpr = cfg.KV_SHUFFLE_WIDTH
@@ -750,9 +755,9 @@ class AsyncKVLoader:
             blk = i
         else:
             # clamp to the last column so the loop's j+2 prefetch
-            # never reads past the (padded) block table
-            if self.cfg.ALL_DECODE:
-                i = gl.minimum(i, self.block_table_stride - 1)
+            # never reads past the block table; this applies to prefill and
+            # mixed batches too, since the last row has no padding after it
+            i = gl.minimum(i, self.block_table_stride - 1)
             blk = gl.load(self.block_tables_ptr_shifted + i)
         # For >2 GB caches (not USE_LOAD_BUFFER_OP) this is the one term that can exceed int32
         if self.cfg.USE_LOAD_BUFFER_OP:
@@ -784,6 +789,17 @@ class AsyncGatherKVLoader:
     offs_n_k: gl.tensor
     offs_n_v: gl.tensor
     num_blocks: gl.tensor
+    preload_enabled: gl.constexpr
+    preload_pages: gl.constexpr
+    preload_table_stride: gl.constexpr
+    page_0: gl.tensor
+    page_1: gl.tensor
+    page_2: gl.tensor
+    page_3: gl.tensor
+    page_4: gl.tensor
+    page_5: gl.tensor
+    page_6: gl.tensor
+    page_7: gl.tensor
 
     @gluon.constexpr_function
     def __init__(
@@ -801,6 +817,17 @@ class AsyncGatherKVLoader:
         offs_n_k,
         offs_n_v,
         num_blocks,
+        preload_enabled,
+        preload_pages,
+        preload_table_stride,
+        page_0,
+        page_1,
+        page_2,
+        page_3,
+        page_4,
+        page_5,
+        page_6,
+        page_7,
     ):
         self.cfg = cfg
         self.kv_cfg = kv_cfg
@@ -815,6 +842,17 @@ class AsyncGatherKVLoader:
         self.offs_n_k = offs_n_k
         self.offs_n_v = offs_n_v
         self.num_blocks = num_blocks
+        self.preload_enabled = gl.constexpr(preload_enabled)
+        self.preload_pages = gl.constexpr(preload_pages)
+        self.preload_table_stride = gl.constexpr(preload_table_stride)
+        self.page_0 = page_0
+        self.page_1 = page_1
+        self.page_2 = page_2
+        self.page_3 = page_3
+        self.page_4 = page_4
+        self.page_5 = page_5
+        self.page_6 = page_6
+        self.page_7 = page_7
 
     @gluon.jit
     def initialize(
@@ -826,6 +864,8 @@ class AsyncGatherKVLoader:
         kv_head_idx,
         num_blocks,
         REMOVE_INDIRECT_ACCESS,
+        PRELOAD_PAGES: gl.constexpr = 0,
+        PRELOAD_TABLE_STRIDE: gl.constexpr = 0,
     ):
         kv_cfg = AsyncKVLoaderConfig(cfg, REMOVE_INDIRECT_ACCESS)
         KW: gl.constexpr = cfg.KV_SHUFFLE_WIDTH
@@ -915,6 +955,83 @@ class AsyncGatherKVLoader:
                 kv_head_idx * cfg.stride_v_cache_2 + offs_d_v * cfg.stride_v_cache_3
             )
 
+        # The dispatch opts in only when this many entries cover the block
+        # table. Page-contained tiles can share one scalar page ID for K/V.
+        gl.static_assert(
+            PRELOAD_PAGES >= 0 and PRELOAD_PAGES <= 8,
+            "PRELOAD_PAGES must be in [0, 8]",
+        )
+        PRELOAD_ENABLED: gl.constexpr = (
+            PRELOAD_PAGES >= PRELOAD_TABLE_STRIDE
+            and PRELOAD_TABLE_STRIDE > 0
+            and cfg.BLOCK_SIZE % cfg.TILE_SIZE == 0
+            and not cfg.SHUFFLED_KV_CACHE
+        )
+        if PRELOAD_ENABLED and PRELOAD_PAGES > 0:
+            page_0 = gl.load(
+                block_tables_ptr_shifted + 0,
+                mask=0 < PRELOAD_TABLE_STRIDE,
+                other=0,
+            )
+        else:
+            page_0 = gl.program_id(0) * 0
+        if PRELOAD_ENABLED and PRELOAD_PAGES > 1:
+            page_1 = gl.load(
+                block_tables_ptr_shifted + 1,
+                mask=1 < PRELOAD_TABLE_STRIDE,
+                other=0,
+            )
+        else:
+            page_1 = gl.program_id(0) * 0
+        if PRELOAD_ENABLED and PRELOAD_PAGES > 2:
+            page_2 = gl.load(
+                block_tables_ptr_shifted + 2,
+                mask=2 < PRELOAD_TABLE_STRIDE,
+                other=0,
+            )
+        else:
+            page_2 = gl.program_id(0) * 0
+        if PRELOAD_ENABLED and PRELOAD_PAGES > 3:
+            page_3 = gl.load(
+                block_tables_ptr_shifted + 3,
+                mask=3 < PRELOAD_TABLE_STRIDE,
+                other=0,
+            )
+        else:
+            page_3 = gl.program_id(0) * 0
+        if PRELOAD_ENABLED and PRELOAD_PAGES > 4:
+            page_4 = gl.load(
+                block_tables_ptr_shifted + 4,
+                mask=4 < PRELOAD_TABLE_STRIDE,
+                other=0,
+            )
+        else:
+            page_4 = gl.program_id(0) * 0
+        if PRELOAD_ENABLED and PRELOAD_PAGES > 5:
+            page_5 = gl.load(
+                block_tables_ptr_shifted + 5,
+                mask=5 < PRELOAD_TABLE_STRIDE,
+                other=0,
+            )
+        else:
+            page_5 = gl.program_id(0) * 0
+        if PRELOAD_ENABLED and PRELOAD_PAGES > 6:
+            page_6 = gl.load(
+                block_tables_ptr_shifted + 6,
+                mask=6 < PRELOAD_TABLE_STRIDE,
+                other=0,
+            )
+        else:
+            page_6 = gl.program_id(0) * 0
+        if PRELOAD_ENABLED and PRELOAD_PAGES > 7:
+            page_7 = gl.load(
+                block_tables_ptr_shifted + 7,
+                mask=7 < PRELOAD_TABLE_STRIDE,
+                other=0,
+            )
+        else:
+            page_7 = gl.program_id(0) * 0
+
         return AsyncGatherKVLoader(
             cfg,
             kv_cfg,
@@ -929,6 +1046,17 @@ class AsyncGatherKVLoader:
             offs_n_k,
             offs_n_v,
             num_blocks,
+            PRELOAD_ENABLED,
+            PRELOAD_PAGES,
+            PRELOAD_TABLE_STRIDE,
+            page_0,
+            page_1,
+            page_2,
+            page_3,
+            page_4,
+            page_5,
+            page_6,
+            page_7,
         )
 
     @gluon.jit
@@ -1044,12 +1172,36 @@ class AsyncGatherKVLoader:
         block_table_idx_v = gl.minimum(
             seq_offset_v // self.cfg.BLOCK_SIZE, self.block_table_stride - 1
         ).to(gl.int32)
-        block_ids_k = gl.amd.cdna4.buffer_load(
-            ptr=self.block_tables_ptr_shifted, offsets=block_table_idx_k
-        )
-        block_ids_v = gl.amd.cdna4.buffer_load(
-            ptr=self.block_tables_ptr_shifted, offsets=block_table_idx_v
-        )
+        if self.preload_enabled:
+            # Retain the original clamp for the loop's two-tile lookahead.
+            page_idx = gl.minimum(
+                i // (self.cfg.BLOCK_SIZE // self.cfg.TILE_SIZE),
+                self.preload_table_stride - 1,
+            ).to(gl.int32)
+            page = self.page_0
+            if self.preload_pages > 1:
+                page = gl.where(page_idx == 1, self.page_1, page)
+            if self.preload_pages > 2:
+                page = gl.where(page_idx == 2, self.page_2, page)
+            if self.preload_pages > 3:
+                page = gl.where(page_idx == 3, self.page_3, page)
+            if self.preload_pages > 4:
+                page = gl.where(page_idx == 4, self.page_4, page)
+            if self.preload_pages > 5:
+                page = gl.where(page_idx == 5, self.page_5, page)
+            if self.preload_pages > 6:
+                page = gl.where(page_idx == 6, self.page_6, page)
+            if self.preload_pages > 7:
+                page = gl.where(page_idx == 7, self.page_7, page)
+            block_ids_k = page
+            block_ids_v = page
+        else:
+            block_ids_k = gl.amd.cdna4.buffer_load(
+                ptr=self.block_tables_ptr_shifted, offsets=block_table_idx_k
+            )
+            block_ids_v = gl.amd.cdna4.buffer_load(
+                ptr=self.block_tables_ptr_shifted, offsets=block_table_idx_v
+            )
         if self.cfg.SHUFFLED_KV_CACHE:
             within_block_k = (
                 seq_offset_k % self.cfg.BLOCK_SIZE
@@ -1205,10 +1357,18 @@ class AttentionProgram:
         # Split-KV: carve the sequence as reduce_segments does, so every query
         # block of a sequence agrees on the split boundaries
         if NUM_SPLITS > 1:
-            split_len = NUM_SPLITS * cfg.TILE_SIZE
             seq_len = context_len + cur_batch_query_len
-            tiles_per_split = (seq_len + split_len - 1) // split_len
-            split_start = split_idx * tiles_per_split
+            if cfg.SLIDING_WINDOW > 0:
+                # only the window's tiles: no row sees a key before row 0's first
+                kv_lo = gl.maximum(context_len - cfg.SLIDING_WINDOW + 1, 0)
+                tile_lo = kv_lo // cfg.TILE_SIZE
+                seq_tiles = (seq_len + cfg.TILE_SIZE - 1) // cfg.TILE_SIZE
+                tiles_per_split = (seq_tiles - tile_lo + NUM_SPLITS - 1) // NUM_SPLITS
+                split_start = tile_lo + split_idx * tiles_per_split
+            else:
+                split_len = NUM_SPLITS * cfg.TILE_SIZE
+                tiles_per_split = (seq_len + split_len - 1) // split_len
+                split_start = split_idx * tiles_per_split
             tile_end = gl.minimum(split_start + tiles_per_split, tile_end)
             tile_start = gl.maximum(split_start, tile_start)
 
@@ -1300,14 +1460,15 @@ class AttentionProgram:
             ]
         )
 
-        seq_mask = seq_offset < (self.context_len_q_pos_qk + 1)
         if self.cfg.SLIDING_WINDOW > 0:
-            seq_mask = seq_mask & (
-                (self.context_len_q_pos_qk - seq_offset) < self.cfg.SLIDING_WINDOW
-            )
-        full_mask = seq_mask
-        S = gl.where(full_mask, S, float("-inf"))
-        return S
+            # keys lo..ctx are visible; one unsigned compare covers both bounds
+            lo = self.context_len_q_pos_qk - (self.cfg.SLIDING_WINDOW - 1)
+            seq_mask = (seq_offset - lo).to(
+                gl.uint32, bitcast=True
+            ) < self.cfg.SLIDING_WINDOW
+        else:
+            seq_mask = seq_offset < (self.context_len_q_pos_qk + 1)
+        return gl.where(seq_mask, S, float("-inf"))
 
     @gluon.jit
     def softmax_part0(self, S, M):
@@ -1320,9 +1481,15 @@ class AttentionProgram:
         # Guard against all-masked rows
         m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
         m_ij_scaled = m_ij * self.SM_scale
-        q_shifted = S * self.SM_scale - m_ij_scaled[:, None]
+        if self.cfg.USE_EXPLICIT_FMA:
+            q_shifted = gl.fma(S, self.SM_scale, -m_ij_scaled[:, None])
+        else:
+            q_shifted = S * self.SM_scale - m_ij_scaled[:, None]
         p = gl.exp2(q_shifted)
-        m_diff_scaled = M * self.SM_scale - m_ij_scaled
+        if self.cfg.USE_EXPLICIT_FMA:
+            m_diff_scaled = gl.fma(M, self.SM_scale, -m_ij_scaled)
+        else:
+            m_diff_scaled = M * self.SM_scale - m_ij_scaled
         alpha = gl.exp2(m_diff_scaled)
         return p, alpha, m_ij
 
@@ -1332,7 +1499,10 @@ class AttentionProgram:
         # Delaying the scaling fixes certain compilation issues
         m_ij = gl.maximum(M, gl.max(S, axis=1) * self.SM_scale)
         m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
-        p = gl.exp2(S * self.SM_scale - m_ij[:, None])
+        if self.cfg.USE_EXPLICIT_FMA:
+            p = gl.exp2(gl.fma(S, self.SM_scale, -m_ij[:, None]))
+        else:
+            p = gl.exp2(S * self.SM_scale - m_ij[:, None])
         alpha = gl.exp2(M - m_ij)
         return p, alpha, m_ij
 
@@ -1344,7 +1514,10 @@ class AttentionProgram:
             p = p.to(target_dtype)
         else:
             p = p.to(target_dtype, fp_downcast_rounding="rtz")
-        L = L * alpha + l_ij
+        if self.cfg.USE_EXPLICIT_FMA:
+            L = gl.fma(L, alpha, l_ij)
+        else:
+            L = L * alpha + l_ij
         return p, L, acc
 
     @gluon.jit
@@ -1759,6 +1932,9 @@ def _unified_attention_gluon_kernel(
     partial_m_ptr=None,  # [num_tokens, num_query_heads, NUM_SPLITS]
     partial_l_ptr=None,  # [num_tokens, num_query_heads, NUM_SPLITS]
     partial_acc_ptr=None,  # [num_tokens, num_query_heads, NUM_SPLITS, head_size]
+    PRELOAD_PAGES: gl.constexpr = 0,
+    PRELOAD_TABLE_STRIDE: gl.constexpr = 0,
+    USE_EXPLICIT_FMA: gl.constexpr = False,
 ):
     NUM_WARPS: gl.constexpr = gl.num_warps()
     if ALL_DECODE:
@@ -1803,6 +1979,7 @@ def _unified_attention_gluon_kernel(
         stride_v_cache_1,
         stride_v_cache_2,
         stride_v_cache_3,
+        USE_EXPLICIT_FMA=USE_EXPLICIT_FMA,
     )
 
     if not USE_STORE_BUFFER_OP:
@@ -1908,14 +2085,34 @@ def _unified_attention_gluon_kernel(
     )
 
     if NUM_SPLITS > 1 and pgm.tile_start >= pgm.tile_end:
-        # past this block's causal edge, but reduce_segments still reads it
+        # past this block's causal or window edge, but reduce_segments still
+        # reads it
         if pgm.tile_start * TILE_SIZE < seq_len:
-            empty = gl.zeros(
+            empty_m = gl.zeros(
                 [BLOCK_M], dtype=gl.float32, layout=gl.SliceLayout(1, cfg.pv_layout)
             )
+            empty_l = empty_m
+            if USE_SINKS:
+                offs_m_pv = gl.arange(
+                    0, BLOCK_M, layout=gl.SliceLayout(1, cfg.pv_layout)
+                )
+                query_offset_1_pv = (
+                    kv_head_idx * cfg.NUM_QUERIES_PER_KV
+                    + offs_m_pv % cfg.NUM_QUERIES_PER_KV
+                )
+                empty_m = (
+                    gl.amd.cdna4.buffer_load(
+                        ptr=sink_ptr,
+                        offsets=query_offset_1_pv,
+                        mask=(query_offset_1_pv < NUM_QUERY_HEADS) & (split_idx == 0),
+                        other=float("-inf"),
+                    ).to(dtype=gl.float32)
+                    * cfg.RCP_LN2
+                )
+                empty_l = gl.where(empty_m > float("-inf"), 1.0, 0.0)
             pgm.store_partial(
-                empty,
-                empty,
+                empty_m,
+                empty_l,
                 gl.zeros([BLOCK_M, HEAD_SIZE], dtype=gl.float32, layout=cfg.pv_layout),
                 partial_m_ptr,
                 partial_l_ptr,
@@ -1935,15 +2132,20 @@ def _unified_attention_gluon_kernel(
     else:
         KVLoader: gl.constexpr = AsyncGatherKVLoader
 
+    # Clamp page ids to this sequence's pages: the K/V loads are unmasked, and
+    # entries past them may name freed blocks (fault) or NaN blocks (0 * NaN).
+    seq_pages = gl.minimum((seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE, block_table_stride)
     kv_loader = KVLoader.initialize(
         cfg,
         key_cache_ptr,
         value_cache_ptr,
         block_tables_ptr_shifted,
-        block_table_stride,
+        gl.maximum(seq_pages, 1),
         kv_head_idx,
         num_blocks,
         REMOVE_INDIRECT_ACCESS,
+        PRELOAD_PAGES=PRELOAD_PAGES,
+        PRELOAD_TABLE_STRIDE=PRELOAD_TABLE_STRIDE,
     )
 
     if not USE_SINKS:

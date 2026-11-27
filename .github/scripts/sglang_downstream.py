@@ -11,7 +11,7 @@ from pathlib import Path
 
 TESTS = [
     {
-        "runner": "linux-aiter-do-mi350x-8",
+        "runner": "linux-aiter-do-mi350x-dpx-8",
         "label": "MI35X",
         "model": "DeepSeek-R1-MXFP4",
         "model_id": "amd/DeepSeek-R1-MXFP4-Preview",
@@ -24,7 +24,7 @@ TESTS = [
         "run_on_schedule": True,
     },
     {
-        "runner": "linux-aiter-do-mi350x-8",
+        "runner": "linux-aiter-do-mi350x-dpx-8",
         "label": "MI35X",
         "model": "DeepSeek-R1-MXFP4",
         "model_id": "amd/DeepSeek-R1-MXFP4-Preview",
@@ -38,7 +38,7 @@ TESTS = [
         "run_on_schedule": True,
     },
     {
-        "runner": "linux-aiter-do-mi350x-8",
+        "runner": "linux-aiter-do-mi350x-dpx-8",
         "label": "MI35X",
         "model": "Qwen3-235B-MXFP4",
         "model_id": "amd/Qwen3-235B-A22B-Instruct-2507-mxfp4",
@@ -52,7 +52,7 @@ TESTS = [
         "comment": "issue https://github.com/ROCm/aiter/issues/2857 not resolved yet",
     },
     {
-        "runner": "linux-aiter-do-mi350x-8",
+        "runner": "linux-aiter-do-mi350x-dpx-8",
         "label": "MI35X",
         "model": "Qwen 3.5",
         "model_id": "Qwen/Qwen3.5-397B-A17B",
@@ -66,7 +66,7 @@ TESTS = [
         "run_on_schedule": True,
     },
     {
-        "runner": "linux-aiter-do-mi350x-8",
+        "runner": "linux-aiter-do-mi350x-dpx-8",
         "label": "MI35X",
         "model": "Qwen 3.5 FP8",
         "model_id": "Qwen/Qwen3.5-397B-A17B-FP8",
@@ -79,7 +79,7 @@ TESTS = [
         "run_on_schedule": True,
     },
     {
-        "runner": "linux-aiter-do-mi350x-8",
+        "runner": "linux-aiter-do-mi350x-dpx-8",
         "label": "MI35X",
         "model": "DeepSeek-V3.2",
         "model_id": "deepseek-ai/DeepSeek-V3.2",
@@ -92,7 +92,7 @@ TESTS = [
         "run_on_schedule": True,
     },
     {
-        "runner": "linux-aiter-do-mi350x-8",
+        "runner": "linux-aiter-do-mi350x-dpx-8",
         "label": "MI35X",
         "model": "DeepSeek-V3.2 Basic",
         "model_id": "deepseek-ai/DeepSeek-V3.2",
@@ -126,13 +126,13 @@ SGLANG_CI_PATCHES = [
     },
     {
         "path": "scripts/ci/amd/amd_ci_install_dependency.sh",
-        "old": "docker cp human-eval ci_sglang:/",
-        "new": "docker cp human-eval ci_sglang:/\n  docker exec ci_sglang git config --global --add safe.directory /human-eval",
+        "old": 'docker cp human-eval "$CI_CONTAINER_NAME":/',
+        "new": 'docker cp human-eval "$CI_CONTAINER_NAME":/\n  docker exec "$CI_CONTAINER_NAME" git config --global --add safe.directory /human-eval',
     },
     {
         "path": "scripts/ci/amd/amd_ci_install_dependency.sh",
-        "old": "install_with_retry docker exec -w /human-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .",
-        "new": "install_with_retry docker exec -w /human-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache --no-build-isolation -e .",
+        "old": 'install_with_retry docker exec -w /human-eval "$CI_CONTAINER_NAME" pip install --cache-dir=/sgl-data/pip-cache -e .',
+        "new": 'install_with_retry docker exec -w /human-eval "$CI_CONTAINER_NAME" pip install --cache-dir=/sgl-data/pip-cache --no-build-isolation -e .',
     },
     {
         "path": "scripts/ci/amd/amd_ci_start_container.sh",

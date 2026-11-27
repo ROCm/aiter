@@ -34,6 +34,7 @@ from aiter.fhmoe_contract import (
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.moe_common import GateMode
+from aiter.presorted_moe import drop_presort_on_error
 
 
 def _validate_fhmoe_contract(
@@ -939,8 +940,8 @@ def fhmoe_fake(
     )
 
 
-@torch_compile_guard(gen_fake=fhmoe_fake)
-def fhmoe_(
+@drop_presort_on_error
+def _fhmoe_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -1081,6 +1082,74 @@ def fhmoe_(
             "shared_w2_scale": shared_w2_scale,
             "shared_expert_id": shared_expert_id,
         },
+    )
+
+
+@torch_compile_guard(gen_fake=fhmoe_fake)
+def fhmoe_(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_mask: torch.Tensor | None = None,
+    activation: int = ActivationType.Silu.value,
+    quant_type: int = QuantType.No.value,
+    doweight_stage1: bool = False,
+    w1_scale: torch.Tensor | None = None,
+    w2_scale: torch.Tensor | None = None,
+    a1_scale: torch.Tensor | None = None,
+    a2_scale: torch.Tensor | None = None,
+    block_size_M: int = -1,
+    num_local_tokens: torch.Tensor | None = None,
+    moe_sorting_dispatch_policy: int = 0,
+    dtype: torch.dtype | None = None,
+    hidden_pad: int = 0,
+    intermediate_pad: int = 0,
+    bias1: torch.Tensor | None = None,
+    bias2: torch.Tensor | None = None,
+    swiglu_limit: float | None = None,
+    gate_mode: str = GateMode.SEPARATED.value,
+    shared_w1: torch.Tensor | None = None,
+    shared_w2: torch.Tensor | None = None,
+    shared_w1_scale: torch.Tensor | None = None,
+    shared_w2_scale: torch.Tensor | None = None,
+    shared_expert_id: int = -1,
+    output: torch.Tensor | None = None,
+    # Keep this schema default aligned with fused_moe's public API.
+    clamp_shared: bool = True,
+) -> torch.Tensor:
+    return _fhmoe_impl(
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        topk_weight=topk_weight,
+        topk_ids=topk_ids,
+        expert_mask=expert_mask,
+        activation=activation,
+        quant_type=quant_type,
+        doweight_stage1=doweight_stage1,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+        block_size_M=block_size_M,
+        num_local_tokens=num_local_tokens,
+        moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
+        dtype=dtype,
+        hidden_pad=hidden_pad,
+        intermediate_pad=intermediate_pad,
+        bias1=bias1,
+        bias2=bias2,
+        swiglu_limit=swiglu_limit,
+        gate_mode=gate_mode,
+        shared_w1=shared_w1,
+        shared_w2=shared_w2,
+        shared_w1_scale=shared_w1_scale,
+        shared_w2_scale=shared_w2_scale,
+        shared_expert_id=shared_expert_id,
+        output=output,
+        clamp_shared=clamp_shared,
     )
 
 

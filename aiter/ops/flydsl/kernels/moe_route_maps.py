@@ -26,9 +26,30 @@ MAX_G2L_EXPERTS = 512
 # The per-block LDS counter array is sized to this; the dispatcher falls back to
 # the plain device-atomic kernel when the local bucket count (E) exceeds it.
 MAX_ROUTE_BUCKETS = 512
+# Ordinary TP histograms have a private allocation, independent of EP scratch.
+# Bound their size to 16 KiB; larger expert sets retain the original router.
+MAX_TP_ROUTE_BUCKETS = 4096
 
-# ``topids_to_rows`` value for an EP route that owns no grouped row (non-local
-# expert, or dead-tail padding). Such routes claim no per-expert slot, so
+
+def tp_route_bucket_capacity(n_buckets: int) -> int:
+    if not 0 < n_buckets <= MAX_TP_ROUTE_BUCKETS:
+        raise ValueError(f"LDS route bucket count out of range: {n_buckets}")
+    return max(
+        MAX_ROUTE_BUCKETS,
+        ((n_buckets + BLOCK_THREADS - 1) // BLOCK_THREADS) * BLOCK_THREADS,
+    )
+
+
+def tp_route_min_routes(n_buckets: int) -> int:
+    """Amortize extra histogram sweeps for wide, diffuse expert sets."""
+    tp_route_bucket_capacity(n_buckets)
+    sweeps = (n_buckets + BLOCK_THREADS - 1) // BLOCK_THREADS
+    return BLOCK_THREADS * sweeps * max(4, 2 * sweeps)
+
+
+# ``topids_to_rows`` value for a route that owns no grouped row: an EP route to a
+# non-local expert or in the dead-tail padding, or a route to expert -1 (a pad
+# row the router left unrouted). Such routes claim no per-expert slot, so
 # masked_m / psum / the grouped GEMM cover only the routes this rank owns instead
 # of every route it received. Consumers (psum remap, the stage1 route-indexed
 # quant scatter, gather-reduce) must skip it rather than use it as a row index.
@@ -147,10 +168,16 @@ def build_moe_topids_to_rows_module():
             out_p = ptr_buf_tensor(topids_to_rows)
 
             e = topk_p[route]
-            ptr = _i32_ptr(atomic_buffer) + e
-            slot = fx.atomic_add(ptr, c1_i32, syncscope="agent")
-            row = fx.Uint32(slot) + fx.Uint32(e) * fx.Uint32(max_m)
-            out_p[route] = row
+            # The counter is indexed through a raw pointer, so an id of -1
+            # must not reach the atomic.
+            routed = fx.Int32(e) >= 0
+            if routed:
+                ptr = _i32_ptr(atomic_buffer) + e
+                slot = fx.atomic_add(ptr, c1_i32, syncscope="agent")
+                row = fx.Uint32(slot) + fx.Uint32(e) * fx.Uint32(max_m)
+                out_p[route] = row
+            else:
+                out_p[route] = fx.Int32(DROPPED_ROUTE_ROW)
 
     @flyc.jit
     def launch_topids_to_rows(
@@ -164,6 +191,101 @@ def build_moe_topids_to_rows_module():
     ):
         launch = route_kernel(topk_ids, atomic_buffer, topids_to_rows, numel, max_m)
         launch.launch(
+            grid=(fx.Int64(grid_blocks), 1, 1),
+            block=(BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    launch_topids_to_rows.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+        },
+    }
+    return launch_topids_to_rows
+
+
+def build_moe_topids_to_rows_lds_module(n_buckets: int):
+    """Aggregate ordinary TP route counts per workgroup before global atomics.
+
+    Each workgroup reserves one disjoint interval per nonempty expert. Local
+    atomic ranks select unique slots within that interval; route order within
+    an expert remains unspecified, as in the original device-atomic kernel.
+    The caller still supplies the initialized global counters.
+    """
+    capacity = tp_route_bucket_capacity(n_buckets)
+
+    if capacity == MAX_ROUTE_BUCKETS:
+        storage = _RouteCntStorage
+    else:
+
+        @fx.struct
+        class TpRouteCntStorage:
+            cnt: fx.Array[fx.Int32, capacity, 16]
+
+        storage = TpRouteCntStorage
+
+    @flyc.kernel(name="moe_route_lds", known_block_size=[BLOCK_THREADS, 1, 1])
+    def route_kernel(
+        topk_ids: fx.Pointer,
+        atomic_buffer: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        numel: Int32,
+        max_m: Int32,
+    ):
+        tid = fx.Uint32(fx.thread_idx.x)
+        route = fx.Uint32(fx.block_idx.x) * BLOCK_THREADS + tid
+        counts = fx.SharedAllocator().allocate(storage).peek().cnt.ptr
+        for b in range(tid, fx.Uint32(n_buckets), BLOCK_THREADS):
+            counts[fx.Uint32(b)] = fx.Int32(0)
+        gpu.barrier()
+
+        in_range = route < fx.Uint32(numel)
+        expert = fx.Int32(-1)
+        if in_range:
+            expert = fx.Int32(ptr_buf_tensor(topk_ids)[route])
+        # Negative expert IDs are unrouted padding, not a counter access.
+        # Valid ordinary-TP expert IDs are in [0, n_buckets).
+        kept = (expert >= 0) & (expert < n_buckets)
+        local_rank = fx.Uint32(0)
+        if kept:
+            local_rank = fx.Uint32(
+                fx.atomic_add(
+                    counts + fx.Uint32(expert), fx.Int32(1), syncscope="workgroup"
+                )
+            )
+        gpu.barrier()
+
+        # Replace each local count with its reserved global base. No cross-grid
+        # wait: global atomic intervals cannot overlap, even with preset counts.
+        for b in range(tid, fx.Uint32(n_buckets), BLOCK_THREADS):
+            count = counts[fx.Uint32(b)]
+            base = fx.Int32(0)
+            if count != 0:
+                base = fx.Int32(
+                    fx.atomic_add(_i32_ptr(atomic_buffer) + b, count, syncscope="agent")
+                )
+            counts[fx.Uint32(b)] = base
+        gpu.barrier()
+
+        if in_range:
+            row = fx.Int32(DROPPED_ROUTE_ROW)
+            if kept:
+                slot = fx.Uint32(counts[fx.Uint32(expert)]) + local_rank
+                row = fx.Int32(slot + fx.Uint32(expert) * fx.Uint32(max_m))
+            ptr_buf_tensor(topids_to_rows)[route] = row
+
+    @flyc.jit
+    def launch_topids_to_rows(
+        topk_ids: fx.Pointer,
+        atomic_buffer: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        numel: fx.Int32,
+        max_m: fx.Int32,
+        grid_blocks: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        route_kernel(topk_ids, atomic_buffer, topids_to_rows, numel, max_m).launch(
             grid=(fx.Int64(grid_blocks), 1, 1),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
@@ -344,6 +466,8 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16", direct_mask: bool = Fals
         topk: Int32,
         ep_rowmap: fx.Pointer,  # (cap,2) i32 or null; sentinel-filled here
         ep_rowmap_cap: Int32,  # cap_rows_plus1; 0 when ep_rowmap is null
+        row_to_token: fx.Pointer,  # (rows,) i32 or null; -1-filled here
+        row_to_token_len: Int32,  # 0 when row_to_token is null
     ):
         w_fx = fx.BFloat16 if weight_dtype == "bf16" else fx.Float16
         c0 = fx.Int32(0)
@@ -393,6 +517,19 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16", direct_mask: bool = Fals
             )
             for i in range(route, n_fill, grid_threads):
                 ep_i64[i] = sentinel
+        # The A-preshuffle scatter's grouped-row -> token map takes -1 for
+        # padding; the psum remap that follows overwrites every kept row.
+        has_r2t = fx.Int64(ptrtoint(row_to_token)) != 0
+        if has_r2t:
+            r2t_p = ptr_buf_tensor(row_to_token)
+            n_r2t = fx.Uint32(row_to_token_len)
+            r2t_stride = (
+                (fx.Uint32(numel) + fx.Uint32(BLOCK_THREADS - 1))
+                // fx.Uint32(BLOCK_THREADS)
+                * fx.Uint32(BLOCK_THREADS)
+            )
+            for i in range(route, n_r2t, r2t_stride):
+                r2t_p[i] = fx.Int32(-1)
 
         gpu.barrier()
 
@@ -436,7 +573,7 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16", direct_mask: bool = Fals
             my_rank = fx.Uint32(
                 fx.atomic_add(
                     lds_cnt + eff_e,
-                    fx.Int32(c1),
+                    c1,
                     syncscope="workgroup",
                 )
             )
@@ -485,6 +622,8 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16", direct_mask: bool = Fals
         grid_blocks,
         ep_rowmap,
         ep_rowmap_cap,
+        row_to_token,
+        row_to_token_len,
         stream,
     ):
         route_kernel(
@@ -502,6 +641,8 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16", direct_mask: bool = Fals
             topk,
             ep_rowmap,
             ep_rowmap_cap,
+            row_to_token,
+            row_to_token_len,
         ).launch(
             grid=(fx.Int64(grid_blocks), 1, 1),
             block=(BLOCK_THREADS, 1, 1),
@@ -527,6 +668,8 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16", direct_mask: bool = Fals
             grid_blocks: fx.Int32,
             ep_rowmap: fx.Pointer,
             ep_rowmap_cap: fx.Int32,
+            row_to_token: fx.Pointer,
+            row_to_token_len: fx.Int32,
             stream: fx.Stream = fx.Stream(None),  # noqa: B008
         ):
             _launch(
@@ -545,6 +688,8 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16", direct_mask: bool = Fals
                 grid_blocks,
                 ep_rowmap,
                 ep_rowmap_cap,
+                row_to_token,
+                row_to_token_len,
                 stream,
             )
 
@@ -565,6 +710,8 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16", direct_mask: bool = Fals
             grid_blocks: fx.Int32,
             ep_rowmap: fx.Pointer,
             ep_rowmap_cap: fx.Int32,
+            row_to_token: fx.Pointer,
+            row_to_token_len: fx.Int32,
             stream: fx.Stream = fx.Stream(None),  # noqa: B008
         ):
             # These two operands compile away when direct_mask=False. Reusing an
@@ -586,6 +733,8 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16", direct_mask: bool = Fals
                 grid_blocks,
                 ep_rowmap,
                 ep_rowmap_cap,
+                row_to_token,
+                row_to_token_len,
                 stream,
             )
 

@@ -26,9 +26,12 @@ from aiter.ops.asm.mla_decode_v4 import (
     mla_v4_fused_slot_f32,
 )
 from aiter.ops.attention import (
-    get_mla_decode_fwd_max_splits,
+    _mla_decode_launch_plan,
+    _MlaBackendId,
+    _MlaHeadPlanKind,
     mla_ps64_qh128_fp8_asm_fwd,
 )
+from aiter.plugin import route as _route
 
 _FLYDSL_MLA_REDUCE_TARGET_GFX = ("gfx942", "gfx950")
 _FLYDSL_MLA_REDUCE_TARGET_H = 16
@@ -288,7 +291,7 @@ def _fwd_kernel_stage2_asm(
 
 
 @functools.lru_cache
-def get_meta_param(
+def _get_num_kv_splits(
     num_kv_splits,
     bs,
     total_kv,
@@ -324,7 +327,7 @@ def get_meta_param(
         # Take the max so either path applies; for V3 callers (tg_factor=1) the
         # gfx1250 auto-rule still kicks in, and for v4 callers the explicit
         # tg_factor governs.
-        is_gfx1250 = get_gfx() == "gfx1250"
+        is_gfx1250 = get_gfx() in ("gfx1250", "gfx1250-strict")
         wg_per_split = 2 if nhead == 128 and is_gfx1250 else 1
         bs_occ = bs * max(tg_factor, wg_per_split)
         if ignore_total_kv:
@@ -377,6 +380,38 @@ def get_meta_param(
                 int(abs(total_kv / bs - max_seqlen_q) // min_block_n) + 1,
             )
 
+    return num_kv_splits
+
+
+def get_meta_param(
+    num_kv_splits,
+    bs,
+    total_kv,
+    nhead,
+    max_seqlen_q,
+    dtype,
+    tg_factor=1,
+    ignore_total_kv=0,
+):
+    """Pick the split count and build the matching uniform split indptr.
+
+    Only the split count is cached: an indptr returned from the cache is
+    captured into a CUDA graph as a bare pointer with no producing kernel, so
+    replay reads recycled storage once the entry is evicted. Eviction is
+    routine, since `total_kv` is part of the key and moves almost every decode
+    step. Rebuilding the indptr per call records `torch.arange` into the graph,
+    so every replay re-initialises the buffer.
+    """
+    num_kv_splits = _get_num_kv_splits(
+        num_kv_splits,
+        bs,
+        total_kv,
+        nhead,
+        max_seqlen_q,
+        dtype,
+        tg_factor,
+        ignore_total_kv,
+    )
     num_kv_splits_indptr = torch.arange(
         0, (bs + 1) * num_kv_splits, num_kv_splits, dtype=torch.int, device="cuda"
     )
@@ -687,7 +722,7 @@ def _mla_scale_on_device(scale, q: torch.Tensor, name: str) -> torch.Tensor:
 
 def _check_mla_qh128_inputs(q, kv, out, seq_lens, page_table, lse):
     """Validate the public contract without reading any GPU tensor contents."""
-    if get_gfx() != "gfx1250":
+    if get_gfx() not in ("gfx1250", "gfx1250-strict"):
         raise RuntimeError("kv_shuffled MLA ASM requires gfx1250")
     if not isinstance(q, torch.Tensor) or not q.is_cuda:
         raise RuntimeError("Q must be a GPU tensor")
@@ -815,7 +850,7 @@ def _mla_decode_fwd_kv_shuffled(
 
 def _check_mla_qh64_shuffled_inputs(q, kv, out, qo, indptr, indices, last, splits):
     """Check the packed CSR contract without synchronizing GPU metadata."""
-    if get_gfx() != "gfx1250":
+    if get_gfx() not in ("gfx1250", "gfx1250-strict"):
         raise RuntimeError("kv_shuffled QH64 requires gfx1250")
     if not isinstance(q, torch.Tensor) or not q.is_cuda:
         raise ValueError("Q must be a GPU tensor")
@@ -953,6 +988,13 @@ def mla_decode_prepare_page_csr(
     return kv_indptr, kv_indices, kv_last_page_lens
 
 
+# Routed on the public entry point: it is the op's one spelling, it takes no
+# backend pin, and `@compile_ops` sits on the asm bindings beneath it. The
+# contract is the whole signature, schedule metadata included: a provider with
+# its own schedule reads what it needs from it and ignores the rest.
+# v2 adds has_partials, a hint that only permits skipping work: a v1 provider
+# that ignores it still computes the v2 result, so v1 stays accepted.
+@_route(op="mla_decode_fwd", version=2, supersedes={1: "a later aiter release"})
 def mla_decode_fwd(
     q,
     kv_buffer,
@@ -992,8 +1034,22 @@ def mla_decode_fwd(
     seq_lens=None,
     page_table=None,
     kv_csr_layout="page",
+    fast_mode=True,
+    *,
+    q_aux=None,
+    kv_aux=None,
+    nvfp4_params=None,
+    nvfp4_lse=None,
+    has_partials=True,
 ):
     """MLA decode with explicit KV byte-layout selection.
+
+    ``has_partials=False`` declares that the persistent work plan has no split
+    rows (``reduce_indptr[-1] == 0``, e.g. ``kv_granularity`` covers each row).
+    The split buffers are then left empty and the reduce launch is skipped;
+    stage 1 writes every row to ``o`` directly. The planner output lives on the
+    GPU, so only the caller can know this; passing False for a plan that has
+    split rows makes stage 1 write past the empty split buffers.
 
     ``token_major`` preserves the existing segmented page64 dispatch.
     ``kv_shuffled`` on gfx1250 supports FP8 Q/KV, BF16 O and page64.
@@ -1025,7 +1081,84 @@ def mla_decode_fwd(
     indptr, ignoring last-page values (the tensor is still required).
     Physical ``page_size`` remains 64. Token CSR is only supported by the
     shuffled QH64 path; it does not change the KV byte layout.
+
+    ``nvfp4_n128`` uses separate packed q/q_aux and kv_buffer/kv_aux tensors,
+    page CSR, H128 and one query per request. Provide nvfp4_params prepared by
+    prepare_mla_nvfp4_params; it owns the softmax scale and fixed NVFP4 gains,
+    so leave sm_scale/q_scale/kv_scale unset. This backend requires
+    return_lse=False; nvfp4_lse is optional and remains untouched.
+    No planner, split-K, CP or implicit conversion.
+
+    Output: the attention is written in place into ``o``, and ``o`` is the
+    result. The call returns ``(logits, lse)``. With ``return_logits=False``,
+    ``logits`` is the implementation's scratch -- the per-split partial
+    results, or a view of ``o`` when nothing was split -- so callers read
+    ``o``, never it, and a provider may return ``o`` there. With
+    ``return_logits=True`` the caller reads the per-split partial results: a
+    provider must return them or decline. ``lse`` is the natural-log FP32 final LSE
+    ``[total_q, nhead]`` when ``return_lse`` is set; without it the second
+    element is unspecified (None or scratch).
     """
+    if kv_layout == "nvfp4_n128":
+        from aiter.ops.mla_nvfp4 import mla_decode_nvfp4_fwd
+
+        if max_seqlen_q != 1 or page_size != 64 or nhead_kv != 1:
+            raise ValueError(
+                "nvfp4_n128 requires max_seqlen_q=1, page_size=64, nhead_kv=1"
+            )
+        if kv_csr_layout != "page" or num_kv_splits not in (None, 1):
+            raise ValueError("nvfp4_n128 requires page CSR and num_kv_splits=1")
+        if return_logits or logit_cap != 0 or intra_batch_mode:
+            raise ValueError(
+                "nvfp4_n128 has no partial logits, logit cap or persistent mode"
+            )
+        if cp_world_size != 1 or cp_rank != 0 or g_kv_indptr is not None:
+            raise ValueError("nvfp4_n128 does not support context parallelism")
+        if any(
+            x is not None
+            for x in (
+                num_kv_splits_indptr,
+                work_meta_data,
+                work_indptr,
+                work_info_set,
+                reduce_indptr,
+                reduce_final_map,
+                reduce_partial_map,
+                seq_lens,
+                page_table,
+            )
+        ):
+            raise ValueError(
+                "nvfp4_n128 uses page CSR without planner or dense metadata"
+            )
+        if any(x is not None for x in (sm_scale, q_scale, kv_scale)):
+            raise ValueError(
+                "NVFP4 scales are encoded in nvfp4_params; omit scalar scales"
+            )
+        if q_aux is None or kv_aux is None or nvfp4_params is None:
+            raise ValueError("nvfp4_n128 requires q_aux, kv_aux and nvfp4_params")
+        if qo_indptr is not None and (
+            qo_indptr.dtype != torch.int32
+            or qo_indptr.device != q.device
+            or qo_indptr.shape != (q.shape[0] + 1,)
+            or not qo_indptr.is_contiguous()
+        ):
+            raise ValueError("qo_indptr must be int32 [B+1], containing [0,1,...,B]")
+        return mla_decode_nvfp4_fwd(
+            q,
+            q_aux,
+            kv_buffer,
+            kv_aux,
+            o,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            params=nvfp4_params,
+            lse=nvfp4_lse,
+            return_lse=return_lse,
+        )
+    if any(x is not None for x in (q_aux, kv_aux, nvfp4_params, nvfp4_lse)):
+        raise ValueError("NVFP4 auxiliary tensors require kv_layout='nvfp4_n128'")
     if kv_csr_layout not in ("page", "token"):
         raise ValueError(f"unknown MLA kv_csr_layout: {kv_csr_layout!r}")
     kv_indptr_is_token_level = kv_csr_layout == "token"
@@ -1240,6 +1373,27 @@ def mla_decode_fwd(
             and (max_seqlen_q == 1 or kv_shuffled_flag)
         ):
             mgc = 64
+        # gfx950 bf16 gqa32 kernel (qh16_m16x4_n32x1) deals SUB_KV=32 tiles to splits
+        # round-robin and skips splits without a tile, so only the first
+        # cdiv(kv, 32) splits are written. gfx942's gqa32 kernel uses 16-token tiles.
+        if (
+            nhead == 32
+            and q.dtype == dtypes.bf16
+            and kv_buffer.dtype == dtypes.bf16
+            and max_seqlen_q == 1
+            and get_gfx() == "gfx950"
+        ):
+            mgc = 32
+        # gfx950 fp8 gqa16 qlen1 kernel (a8w8_qh16_qseqlen1) does the same with
+        # SUB_KV=128 tiles.
+        if (
+            nhead == 16
+            and q.dtype == dtypes.fp8
+            and kv_buffer.dtype == dtypes.fp8
+            and max_seqlen_q == 1
+            and get_gfx() == "gfx950"
+        ):
+            mgc = 128
 
         # QH64's BF16 direct-output epilogue does not write LSE. Request FP32
         # partials and merge even a single split when the caller needs LSE.
@@ -1248,7 +1402,7 @@ def mla_decode_fwd(
             and num_kv_splits == 1
             and nhead == 64
             and (max_seqlen_q == 1 or kv_shuffled_flag)
-            and get_gfx() == "gfx1250"
+            and get_gfx() in ("gfx1250", "gfx1250-strict")
             and q.dtype == dtypes.fp8
             and kv_buffer.dtype == dtypes.fp8
         )
@@ -1404,100 +1558,33 @@ def mla_decode_fwd(
         if fp32_single_split_lse:
             return o, final_lse
     else:
-        if num_kv_splits is None:
-            num_kv_splits = get_mla_decode_fwd_max_splits(
-                ori_nhead, max_seqlen_q, q.dtype, kv_buffer.dtype
-            )
-        use_flydsl_ps1 = (
-            os.environ.get("AITER_MLA_DECODE_PS1_FLYDSL", "0") == "1"
-            and get_gfx() == "gfx1250"
-            and page_size == 1
-            and q.dtype == dtypes.fp8
-            and kv_buffer.dtype == dtypes.fp8
-            and nhead in (16, 32, 64, 96, 128)
-            and (nhead in (16, 96) or max_seqlen_q == 1)
-            and (cp_world_size == 1 or g_kv_indptr is not None)
-            and not intra_batch_mode
-            and q_scale is not None
-            and kv_scale is not None
+        head_plan, max_splits = _mla_decode_launch_plan(
+            ori_nhead,
+            max_seqlen_q,
+            q.dtype,
+            kv_buffer.dtype,
+            fast_mode,
+            intra_batch_mode,
+            page_size,
+            cp_world_size,
+            g_kv_indptr is not None,
+            q_scale is not None and kv_scale is not None,
         )
+        if num_kv_splits is None:
+            num_kv_splits = max_splits
+        use_ps1_asm = head_plan.backend == _MlaBackendId.PS1_FP8_ASM
+        use_flydsl_ps1 = use_ps1_asm or head_plan.backend == _MlaBackendId.FLYDSL_PS1
         if use_flydsl_ps1:
             pass
-        elif (
-            nhead == 16
-            or (
-                get_gfx() == "gfx942"
-                and nhead == 128
-                and q.dtype == dtypes.fp8
-                and kv_buffer.dtype == dtypes.fp8
-            )
-            or (
-                get_gfx() == "gfx950"
-                and nhead == 128
-                and q.dtype == dtypes.fp8
-                and kv_buffer.dtype == dtypes.fp8
-                and is_experimental_enabled()
-            )
-            or (
-                get_gfx() == "gfx942"
-                and nhead in (16, 32, 64)
-                and nhead * max_seqlen_q == 128
-                and q.dtype == dtypes.fp8
-                and kv_buffer.dtype == dtypes.fp8
-                and is_experimental_enabled()
-            )
-            or (
-                get_gfx() == "gfx950"
-                and q.dtype == dtypes.fp8
-                and kv_buffer.dtype == dtypes.fp8
-                and ((nhead == 32) or (nhead == 64) or (nhead == 128))
-            )
-            or (
-                get_gfx() == "gfx950"
-                and nhead == 8
-                and q.dtype == dtypes.fp8
-                and kv_buffer.dtype == dtypes.fp8
-                and max_seqlen_q == 4
-            )
-            or (
-                get_gfx() == "gfx942"
-                and nhead == 8
-                and q.dtype == dtypes.bf16
-                and kv_buffer.dtype == dtypes.bf16
-                and max_seqlen_q == 2
-            )
-            or (
-                get_gfx() == "gfx942"
-                and nhead == 64
-                and q.dtype == dtypes.fp8
-                and kv_buffer.dtype == dtypes.fp8
-                and max_seqlen_q == 1
-            )
-            or (
-                get_gfx() == "gfx950"
-                and q.dtype == dtypes.bf16
-                and kv_buffer.dtype == dtypes.bf16
-            )
-            or (
-                get_gfx() == "gfx950"
-                and nhead == 96
-                and q.dtype == dtypes.fp8
-                and kv_buffer.dtype == dtypes.fp8
-                and max_seqlen_q <= 6
-            )
-            or (
-                get_gfx() == "gfx950"
-                and q.dtype == dtypes.fp8
-                and kv_buffer.dtype == dtypes.fp8
-                and nhead == 12
-                and nhead * max_seqlen_q <= 128
-            )
+        elif head_plan.plan in (
+            _MlaHeadPlanKind.NATIVE,
+            _MlaHeadPlanKind.ACCEPTED_NON_NATIVE,
         ):
             # Natively support cases
             pass
-        elif nhead in range(32, 128 + 1, 16) and persistent_mode:
-            fold_factor = ori_nhead // 16
-            nhead = 16
+        elif head_plan.plan == _MlaHeadPlanKind.FOLDED:
+            fold_factor = head_plan.qk_batch_ratio
+            nhead = head_plan.kernel_num_heads
             total_s = ori_total_s * fold_factor
             if max_seqlen_q == 1:
                 q = q.view(total_s, nhead, -1)
@@ -1528,13 +1615,14 @@ def mla_decode_fwd(
         else:
             assert False, f"{nhead=} and {max_seqlen_q=} not supported"
 
+        split_rows = reduce_partial_map.size(0) * max_seqlen_q if has_partials else 0
         logits = torch.empty(
-            (reduce_partial_map.size(0) * max_seqlen_q, 1, nhead, v_head_dim),
+            (split_rows, 1, nhead, v_head_dim),
             dtype=dtypes.fp32,
             device=device,
         )
         attn_lse = torch.empty(
-            (reduce_partial_map.size(0) * max_seqlen_q, 1, nhead, 1),
+            (split_rows, 1, nhead, 1),
             dtype=dtypes.fp32,
             device=device,
         )
@@ -1544,40 +1632,10 @@ def mla_decode_fwd(
             else None
         )
 
-        use_hk = (
-            get_gfx() in ("gfx942", "gfx950")
-            and nhead * max_seqlen_q == 128
-            and q.dtype == dtypes.fp8
-            and kv_buffer.dtype == dtypes.fp8
-            and page_size in (1, 64)
-            and is_experimental_enabled()
-        ) or (
-            get_gfx() == "gfx950"
-            and nhead * max_seqlen_q == 64
-            and q.dtype == dtypes.fp8
-            and kv_buffer.dtype == dtypes.fp8
-            and page_size in (1, 64)
-            and is_experimental_enabled()
-        )
+        use_hk = head_plan.backend == _MlaBackendId.HK
 
-        use_opus = (
-            os.environ.get("AITER_MLA_USE_OPUS", "0") == "1"
-            and get_gfx() == "gfx950"
-            and page_size == 1
-            and (
-                (q.dtype == dtypes.bf16 and kv_buffer.dtype == dtypes.bf16)
-                or (q.dtype == dtypes.fp8 and kv_buffer.dtype == dtypes.fp8)
-            )
-        )
+        use_opus = head_plan.backend == _MlaBackendId.OPUS
 
-        # Head counts with code objects exported from the FlyDSL PS1 kernel
-        # (hsa/gfx1250/mla_dsl/mla_dsl.csv) take them by default;
-        # AITER_MLA_DECODE_PS1_ASM=0 keeps them on FlyDSL JIT.
-        use_ps1_asm = (
-            use_flydsl_ps1
-            and nhead in (96, 128)
-            and os.environ.get("AITER_MLA_DECODE_PS1_ASM", "1") == "1"
-        )
         if use_ps1_asm:
             aiter.mla_ps1_fp8_asm_fwd(
                 logits.view(-1, nhead, v_head_dim),
@@ -1599,6 +1657,28 @@ def mla_decode_fwd(
                 g_kv_indptr,
                 cp_world_size,
                 cp_rank,
+            )
+        elif use_flydsl_ps1 and q.dtype == dtypes.bf16:
+            from aiter.ops.flydsl.mla_kernels import flydsl_mla_pagesize1_bf16_bf16
+
+            flydsl_mla_pagesize1_bf16_bf16(
+                logits.view(-1, nhead, v_head_dim),
+                attn_lse.view(-1, nhead),
+                o,
+                q,
+                kv_buffer,
+                kv_indices,
+                work_indptr,
+                work_info_set,
+                sm_scale,
+                final_lse=final_lse,
+                max_seqlen_q=max_seqlen_q,
+                causal=causal,
+                qo_indptr=qo_indptr,
+                kv_indptr=kv_indptr,
+                g_kv_indptr=g_kv_indptr,
+                cp_world_size=cp_world_size,
+                cp_rank=cp_rank,
             )
         elif use_flydsl_ps1:
             from aiter.ops.flydsl.mla_kernels import flydsl_mla_pagesize1_fp8_fp8
@@ -1694,17 +1774,18 @@ def mla_decode_fwd(
                 causal,
             )
 
-        _mla_decode_reduce_v1_dispatch(
-            logits,
-            attn_lse,
-            reduce_indptr,
-            reduce_final_map,
-            reduce_partial_map,
-            max_seqlen_q,
-            num_kv_splits,
-            o,
-            final_lse,
-        )
+        if has_partials:
+            _mla_decode_reduce_v1_dispatch(
+                logits,
+                attn_lse,
+                reduce_indptr,
+                reduce_final_map,
+                reduce_partial_map,
+                max_seqlen_q,
+                num_kv_splits,
+                o,
+                final_lse,
+            )
 
     if io_transformed:
         if return_logits:
@@ -2327,6 +2408,7 @@ def mla_prefill_reduce(
 # DSv4 MLA -- additive entry point. Does NOT touch any existing
 #   gqa_ratio=64, sub_Q=64, page_size=1, q_dtype=fp8, kv_dtype=fp8
 # ---------------------------------------------------------------------------
+@_route(op="mla_decode_fwd_v4_nm", version=1)
 def mla_decode_fwd_v4_nm(
     q,  # [total_query_len, num_heads, head_size]   FP8 packed Q+e8m0
     qrope,  # [total_query_len, num_heads, kv_rotary]   BF16
@@ -2693,6 +2775,7 @@ def mla_decode_fwd_v4_nm(
     return logits, attn_lse
 
 
+@_route(op="mla_decode_fwd_v4_nm_ps", version=1)
 def mla_decode_fwd_v4_nm_ps(
     q_packed,  # [N, 128, 512] FP8 packed Q+e8m0
     q_rope,  # [N, 128, 64] BF16

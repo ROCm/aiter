@@ -25,8 +25,11 @@ rm -f "$STATUS"   # fresh run: never inherit a previous run's verdict
 # agent/job timeout kills with SIGTERM, which skips a plain EXIT trap) that did NOT classify
 # itself still leaves a status so _notify.py routes it -- to the bot owner (flow) for triage --
 # instead of dying silently. Trap both the exit and the terminating signals.
-_on_exit() { local ec=$?; [ "$ec" -ne 0 ] && [ ! -f "$STATUS" ] && printf "flow\trun_one exited unexpectedly (code %s) with no classified failure -- see the job log\n" "$ec" > "$STATUS"; return 0; }
-_on_signal() { [ -f "$STATUS" ] || printf "flow\trun_one was killed by a signal (likely the job or agent timeout) -- see the job log\n" > "$STATUS"; exit 143; }
+# "see the job log" is the one thing this must not say silently: the log is where the reader
+# already is. An unclassified exit wrote STATUS and printed nothing, so a run that died inside
+# the fetch pipeline ended the log mid-sentence after "fetch..." with no line saying so.
+_on_exit() { local ec=$?; if [ "$ec" -ne 0 ] && [ ! -f "$STATUS" ]; then printf "flow\trun_one exited unexpectedly (code %s) with no classified failure -- see the job log\n" "$ec" > "$STATUS"; echo "run_one exited unexpectedly (code $ec) with no classified failure -- the last line above is where it stopped" >&2; fi; return 0; }
+_on_signal() { [ -f "$STATUS" ] || { printf "flow\trun_one was killed by a signal (likely the job or agent timeout) -- see the job log\n" > "$STATUS"; echo "run_one was killed by a signal (likely the job or agent timeout)" >&2; }; exit 143; }
 trap _on_exit EXIT
 trap _on_signal TERM INT
 
@@ -37,6 +40,17 @@ trap _on_signal TERM INT
 # that starts counting after them can still overrun the job cap.
 : "${AITER_RUN_BUDGET:=6000}"      # 100 min, under the job's timeout-minutes of 120
 : "${AITER_AGENT_TIMEOUT:=2400}"   # 40 min per agent attempt; one default, read everywhere below
+# The two knobs are coupled, and the coupling has no other enforcement. A review runs TWO
+# agents in series -- the worker and the independent refuter -- and the budget gate below
+# refuses to START one that cannot finish inside the deadline. So if a raised
+# AITER_AGENT_TIMEOUT leaves less than one more agent's worth of budget, the refuter never
+# runs, the `independent` gate reds, and the review is withheld. Raising one knob alone is
+# the obvious thing to do and it silently breaks the run an hour later, reported as a
+# timeout whose named fix (raise AGENT_TIMEOUT) makes it worse. Hit for real on ATOM#2762.
+if [ $(( AITER_AGENT_TIMEOUT * 2 )) -gt "$AITER_RUN_BUDGET" ]; then
+  echo "::error title=review-pr::AITER_AGENT_TIMEOUT=${AITER_AGENT_TIMEOUT}s x2 agents (worker + refuter) exceeds AITER_RUN_BUDGET=${AITER_RUN_BUDGET}s, so the refuter could not start and the review would be withheld after the worker had already run. Raise AITER_RUN_BUDGET to at least $(( AITER_AGENT_TIMEOUT * 2 ))s, or lower AITER_AGENT_TIMEOUT." >&2
+  exit 2
+fi
 DEADLINE=$(( $(date +%s) + AITER_RUN_BUDGET ))
 
 # GLM-5.3 is not in Claude's model catalog; disable the unknown-model window enforcement.
@@ -96,14 +110,51 @@ fi
 # 1) fetch (the skill's own Step-1 fetcher) -> WORK dir
 say "fetch..."
 FL="$(mktemp)"
+# errexit must not win here. A failing fetch aborts run_one inside this pipeline, before the
+# classification below can run -- so the log ends mid-sentence after "fetch..." and the reader
+# is left to guess. Take the status as a value and classify it.
+set +e
 if [ -n "$GH_FALLBACK_TOK" ]; then
   (cd "$PROJ" && GH_TOKEN="$GH_FALLBACK_TOK" GITHUB_TOKEN="$GH_FALLBACK_TOK" bash "$SKILL/fetch.sh" "$PR" "$REPO") 2>&1 | tee "$FL"
 else
   (cd "$PROJ" && bash "$SKILL/fetch.sh" "$PR" "$REPO") 2>&1 | tee "$FL"
 fi
-W="$(grep -oE 'WORK=[^[:space:]]+/review-pr-[A-Za-z0-9]+' "$FL" | tail -1 | cut -d= -f2)"
+set -e
+# `|| true` is load-bearing under `set -euo pipefail`: on a dead fetch this grep matches
+# nothing, exits 1, and pipefail makes the whole substitution fail -- a fatal assignment that
+# killed run_one here, BEFORE any of the classification below could run. Every improvement to
+# that classification was unreachable in production while this line stayed unguarded.
+W="$(grep -oE 'WORK=[^[:space:]]+/review-pr-[A-Za-z0-9]+' "$FL" | tail -1 | cut -d= -f2 || true)"
+if [ -z "$W" ] || [ ! -d "$W" ]; then
+  # Name the cause the runner can act on. "check gh auth/token, network, git and disk" sends
+  # someone hunting a broken credential when the credential is fine and a quota is empty --
+  # that one resets on a clock and the only correct response is to wait and re-run.
+  if grep -qi 'rate limit' "$FL" 2>/dev/null; then
+    rm -f "$FL"
+    # "an hour at most" is not an answer anyone can plan around. GitHub's /rate_limit endpoint
+    # does not itself count against the quota, so the exact refill time is readable even while
+    # the quota is spent -- say the minute, and fall back to the vague form only if it cannot
+    # be read. One line: what is wrong, how long, and that nothing was looked at.
+    _rl=$(GH_TOKEN="$GH_FALLBACK_TOK" GITHUB_TOKEN="$GH_FALLBACK_TOK" \
+      gh api rate_limit --jq '"\(.resources.core.limit) \(.resources.graphql.limit) \([.resources[].reset]|min)"' 2>/dev/null || true)
+    _cl=${_rl%% *}; _gl=$(printf '%s' "$_rl" | cut -d" " -f2); _rs=$(printf '%s' "$_rl" | cut -d" " -f3)
+    _rs=$(printf '%s' "$_rs" | grep -oE '^[0-9]+$' || true)
+    # An authenticated account gets 5000/5000. 60 core with 0 graphql is the profile GitHub
+    # leaves on an account it has restricted, and waiting does not change it -- telling someone
+    # to come back in 40 minutes would send them to wait for something that never arrives.
+    if [ "$_cl" = "60" ] && [ "$_gl" = "0" ]; then
+      fail env 1 "GitHub is not throttling this bot, it has restricted the account: an authenticated token gets 5000 API calls an hour and this one is capped at 60 with GraphQL disabled entirely. Waiting will not clear it -- the account needs to be unflagged with GitHub, or the bot needs a different one. Nothing about this PR was examined."
+    fi
+    if [ -n "$_rs" ]; then
+      _mins=$(( (_rs - $(date +%s) + 59) / 60 )); [ "$_mins" -lt 1 ] && _mins=1
+      fail env 1 "GitHub's API quota for this bot is spent (the token is fine) -- it refills at $(date -u -d "@$_rs" '+%H:%M UTC'), in about ${_mins} min; re-comment then. Nothing about this PR was examined."
+    fi
+    fail env 1 "GitHub's API quota for this bot is spent (the token is fine) -- it refills on GitHub's own clock, within the hour; re-comment then. Nothing about this PR was examined."
+  fi
+  rm -f "$FL"
+  fail env 1 "fetch produced no WORK dir -- check gh auth/token, network, git and disk on the runner"
+fi
 rm -f "$FL"
-[ -n "$W" ] && [ -d "$W" ] || fail env 1 "fetch produced no WORK dir -- check gh auth/token, network, git and disk on the runner"
 
 # applies.txt fix: the skill's fetch.sh checks `git apply` against PROJECT_ROOT's worktree but
 # reports it as the merge target; re-check on the merge-target worktree checked out at BASE_SHA.
@@ -196,6 +247,23 @@ fi
 # independent gate red-fails every review whose refuter did its job (kills a finding). No-op on a
 # 0-finding card (NONE AVAILABLE) or a count mismatch.
 python3 "$SKILL/_apply_refutation.py" "$W/card.md" "$W/independent.txt"
+
+# 3c) citation check -- advisory, and deliberately not a gate.
+#
+# Measured on seven real ATOM reviews (this check is ported from there; it has not been
+# rerun on aiter's own cards): the deterministic half -- does the cited file resolve, is
+# the line within it -- never fired, while the proximity half caught a real defect, a
+# finding citing envs.py:263 for a construct that lives at :253. Proximity is a heuristic
+# and it misfires: a finding legitimately quotes symbols that live elsewhere (the remedy
+# it proposes, a caller, a related flag). It ran 1-for-2 on real cards. A 50%-precision
+# heuristic that WITHHOLDS correct reviews costs more than the defect it catches, so this
+# writes its verdict and never fails the run (`|| true`, and it is not in _gates.py).
+#
+# The verdict is not only for the log. _publish.py reads citations.txt to decide which
+# findings may be posted inline on the lines they cite: a flagged citation forfeits the
+# inline slot, and no citations.txt at all means nothing is anchored. Removing this step
+# does not break publishing -- it silently degrades it to the whole card in the summary.
+python3 "$SKILL/check_citations.py" "$W" 2>&1 | tee "$W/citations.txt" || true
 
 # 4) gates + collect (call the python directly; no thin shell wrappers)
 say "gates..."

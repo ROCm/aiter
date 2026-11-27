@@ -195,7 +195,7 @@ def _exp(x):
 def _is_zero_or_nan(value):
     """Preserve the ordered-zero or unordered-NaN reduction invalidity test."""
     value = fx.Float32(value)
-    return (value == fx.Float32(0.0)) | fly_math.isnan(value)
+    return (value == 0.0) | fly_math.isnan(value)
 
 
 # Massive-path sub-tiers (mirror MlaReduceProblemSize, reduce.cu:121).
@@ -490,7 +490,7 @@ def compile_mla_reduce(
                     in_bounds = (row_i32 >= fx.Int32(0)) & (row_i32 < num_partial_rows)
                     safe_row_i32 = in_bounds.select(row_i32, fx.Int32(0))
                 else:
-                    in_bounds = fx.Int32(0) == fx.Int32(0)
+                    in_bounds = fx.Int32(0) == 0
                     safe_row_i32 = row_i32
                 return safe_row_i32, in_bounds
 

@@ -299,24 +299,20 @@ def create_vk_gdr_decode_kernel(
                 softplus_big = (f32_1 / softplus_beta_) * fx.math.log1p(
                     _fast_exp(beta_x)
                 )
-                softplus_x = (
-                    fx.Float32(beta_x) <= fx.Float32(softplus_threshold_)
-                ).select(softplus_big, x)
+                softplus_x = (fx.Float32(beta_x) <= softplus_threshold_).select(
+                    softplus_big, x
+                )
 
                 r_g_value = -_fast_exp(r_A_log) * softplus_x
                 r_beta = f32_1 / (f32_1 + _fast_exp(-r_b))
                 r_g = _fast_exp(r_g_value)
 
-                r_g_vec = fx.Vector.filled(
-                    VALUES_PER_THREAD_K, fx.Float32(r_g), fx.Float32
-                )
+                r_g_vec = fx.full(VALUES_PER_THREAD_K, fx.Float32(r_g), fx.Float32)
 
                 sq_vecs = [0] * WARP_TILE_K_ITERS
                 sk_vecs = [0] * WARP_TILE_K_ITERS
 
-                scale_vec = fx.Vector.filled(
-                    VALUES_PER_THREAD_K, fx.Float32(scale), fx.Float32
-                )
+                scale_vec = fx.full(VALUES_PER_THREAD_K, scale, fx.Float32)
 
                 for ki in range_constexpr(WARP_TILE_K_ITERS):
                     warp_k_vec_i = warp_k_vec_start + ki * WARP_TILE_K
@@ -394,10 +390,10 @@ def create_vk_gdr_decode_kernel(
                     )
                     inv_norm_q = fx.math.rsqrt(local_sum_q + 1e-6)
                     inv_norm_k = fx.math.rsqrt(local_sum_k + 1e-6)
-                    inv_norm_q_vec = fx.Vector.filled(
+                    inv_norm_q_vec = fx.full(
                         VALUES_PER_THREAD_K, fx.Float32(inv_norm_q), fx.Float32
                     )
-                    inv_norm_k_vec = fx.Vector.filled(
+                    inv_norm_k_vec = fx.full(
                         VALUES_PER_THREAD_K, fx.Float32(inv_norm_k), fx.Float32
                     )
                     for ki in range_constexpr(WARP_TILE_K_ITERS):
@@ -456,7 +452,7 @@ def create_vk_gdr_decode_kernel(
                         width_i32,
                     )
                     sum_hq = sum_hq_old + v_new * dot_kq
-                    v_new_bcast = fx.Vector.filled(
+                    v_new_bcast = fx.full(
                         VALUES_PER_THREAD_K, fx.Float32(v_new), fx.Float32
                     )
 
@@ -768,9 +764,12 @@ def create_vk_gdr_mtp_kernel(
 
         if const_expr(CHAIN):
             nacc_view = _gview(num_accepted, None, (batch_size, 1), (1, 1))
-            read_token = fx.Int32(
-                _load_vec(cp_i32, fx.slice(nacc_view, (b_i, None)), 1, fx.Int32)
-            ) - fx.Int32(1)
+            read_token = (
+                fx.Int32(
+                    _load_vec(cp_i32, fx.slice(nacc_view, (b_i, None)), 1, fx.Int32)
+                )
+                - 1
+            )
             read_slot = _slot_at(read_token)
         else:
             read_slot = _slot_at(0)
@@ -1016,14 +1015,12 @@ def create_vk_gdr_mtp_kernel(
                 r_beta = f32_1 / (f32_1 + _fast_exp(-r_b))
                 r_g = _fast_exp(r_g_value)
 
-                r_g_vec = fx.Vector.filled(
-                    VALUES_PER_THREAD_K, fx.Float32(r_g), fx.Float32
-                )
+                r_g_vec = fx.full(VALUES_PER_THREAD_K, fx.Float32(r_g), fx.Float32)
 
                 sq_vecs = [0] * WARP_TILE_K_ITERS
                 sk_vecs = [0] * WARP_TILE_K_ITERS
 
-                scale_vec = fx.Vector.filled(VALUES_PER_THREAD_K, scale, fx.Float32)
+                scale_vec = fx.full(VALUES_PER_THREAD_K, scale, fx.Float32)
 
                 if const_expr(STATE_REGS >= VGPR_PER_WAVE_AT_4):
                     # Only the arithmetic is held; the mask exempts every
@@ -1101,10 +1098,10 @@ def create_vk_gdr_mtp_kernel(
                     local_sum_k = fx.shuffle_idx(sum_k_partial, lane0, WARP_SIZE)
                     inv_norm_q = fx.math.rsqrt(local_sum_q + 1e-6)
                     inv_norm_k = fx.math.rsqrt(local_sum_k + 1e-6)
-                    inv_norm_q_vec = fx.Vector.filled(
+                    inv_norm_q_vec = fx.full(
                         VALUES_PER_THREAD_K, fx.Float32(inv_norm_q), fx.Float32
                     )
-                    inv_norm_k_vec = fx.Vector.filled(
+                    inv_norm_k_vec = fx.full(
                         VALUES_PER_THREAD_K, fx.Float32(inv_norm_k), fx.Float32
                     )
                     for ki in range_constexpr(WARP_TILE_K_ITERS):
@@ -1156,7 +1153,7 @@ def create_vk_gdr_mtp_kernel(
                         v_new, w_tid // WARP_THREADS_K * WARP_THREADS_K, WARP_SIZE
                     )
                     sum_hq = sum_hq_old + v_new * dot_kq
-                    v_new_bcast = fx.Vector.filled(
+                    v_new_bcast = fx.full(
                         VALUES_PER_THREAD_K, fx.Float32(v_new), fx.Float32
                     )
 

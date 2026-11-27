@@ -9,6 +9,8 @@ from typing import Any
 
 import torch
 
+from aiter.presorted_moe import drop_presort_on_error
+
 _BeforeStage2 = Callable[[], torch.Tensor]
 _BeforeStage2ForRows = Callable[[int], torch.Tensor]
 _BeforeSharedAdd = Callable[[], None]
@@ -64,6 +66,7 @@ class CommFusedMoeRuntime:
             return False
         return self.runners[bucket].supports_ragged_m
 
+    @drop_presort_on_error
     def run(
         self,
         *,

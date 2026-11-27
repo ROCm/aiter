@@ -19,7 +19,11 @@ from aiter import benchmark_data_init as bench_init
 from aiter import dtypes
 from aiter.benchmark_reporting import print_json_table
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
-from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_ck, gemm_a8w8_blockscale_cktile
+from aiter.ops.gemm_op_a8w8 import (
+    gemm_a8w8_blockscale_ck,
+    gemm_a8w8_blockscale_cktile,
+    gemm_a8w8_blockscale_flydsl,
+)
 from aiter.ops.shuffle import shuffle_mxfp8fp4_a, shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.utility import fp4_utils
@@ -29,8 +33,8 @@ TEST_NUM_ITERS = 100
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
-def run_torch(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
-    block_shape_n, block_shape_k = block_shape
+def run_torch(x, weight, x_scale, w_scale, dtype=dtypes.bf16, scale_shape=block_shape):
+    block_shape_n, block_shape_k = scale_shape
     m, k = x.shape
     n = weight.shape[0]
     scale_n = (n + block_shape_n - 1) // block_shape_n
@@ -40,7 +44,7 @@ def run_torch(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
     if w_scale.dtype == dtypes.fp8_e8m0:
         w_scale = fp4_utils.e8m0_to_f32(w_scale)
     x = x.to(x_scale.dtype).view(
-        m, k // block_shape[1], block_shape[1]
+        m, k // block_shape_k, block_shape_k
     ) * x_scale.unsqueeze(-1)
     x = x.view(m, k)
 
@@ -110,9 +114,11 @@ def test_gemm(
     scale_init="auto",
     seed=0,
     apre=False,
+    w_scale_block="128x128",
 ):
     ret = {}
-    block_shape_n, block_shape_k = block_shape
+    scale_shape = (32, 32) if w_scale_block == "32x32" else block_shape
+    block_shape_n, block_shape_k = scale_shape
     scale_m = m
     scale_n = (n + block_shape_n - 1) // block_shape_n
     scale_k = (k + block_shape_k - 1) // block_shape_k
@@ -140,7 +146,7 @@ def test_gemm(
         w_scale_raw = bench_init.fill_scale_e8m0(
             (scale_n, scale_k), scale_init, generator
         )
-    use_flydsl_fp8_scale = use_flydsl and ck_preshuffle
+    use_flydsl_fp8_scale = (use_flydsl or w_scale_block == "32x32") and ck_preshuffle
     if use_flydsl_fp8_scale:
         x_scale = x_scale_raw.view(dtypes.fp8_e8m0)
         w_scale = w_scale_raw.view(dtypes.fp8_e8m0)
@@ -148,15 +154,17 @@ def test_gemm(
         x_scale = fp4_utils.e8m0_to_f32(x_scale_raw)
         w_scale = fp4_utils.e8m0_to_f32(w_scale_raw)
 
-    a, _ = run_torch(x, weight, x_scale, w_scale, dtype)
+    a, _ = run_torch(x, weight, x_scale, w_scale, dtype, scale_shape)
 
     x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
     gemm_weight = shuffle_weight(weight, layout=(16, 16)) if ck_preshuffle else weight
-    gemm_x_scale = x_scale_t if ck_preshuffle else x_scale
+    gemm_x_scale = x_scale_t if ck_preshuffle and block_shape_k == 128 else x_scale
     run_func = run_gemm_bpreshuffle if ck_preshuffle else run_gemm
     b, avg_b = run_func(x, gemm_weight, gemm_x_scale, w_scale, dtype)
 
     err_ck = checkAllclose(a, b, msg="ck", catastrophic_check=True)
+    if w_scale_block == "32x32":
+        assert err_ck <= 0.05, f"m={m} n={n} k={k}: 32x32 mismatch ratio {err_ck}"
     if ck_preshuffle and not use_flydsl_fp8_scale:
         x_scale_strided = x_scale.transpose(0, 1).contiguous().transpose(0, 1)
         b_strided = aiter.gemm_a8w8_blockscale_bpreshuffle(
@@ -214,6 +222,31 @@ def test_gemm(
             ret["triton err"] = err_triton
             ret["triton/ck"] = avg_d / avg_b
 
+        # FlyDSL blockscale runs on gfx950 with FP32 scales, on shapes its tile fits.
+        if get_gfx() == "gfx950":
+            from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
+                kernel_fits_shape,
+                kernelInstance,
+            )
+
+            flydsl_kernel = kernelInstance(ck_preshuffle)
+            if kernel_fits_shape(flydsl_kernel, m, n, k, get_gfx()):
+                f, avg_f = run_flydsl(
+                    x,
+                    gemm_weight,
+                    gemm_x_scale,
+                    w_scale,
+                    flydsl_kernel.name,
+                    ck_preshuffle,
+                    dtype,
+                )
+                ret["flydsl us"] = avg_f
+                ret["flydsl TFLOPS"] = m * n * k * 2 / avg_f / 1e6
+                ret["flydsl TB/s"] = (x.nbytes + weight.nbytes) / avg_f / 1e6
+                ret["flydsl err"] = checkAllclose(
+                    a, f, msg="flydsl", catastrophic_check=True
+                )
+
     return ret
 
 
@@ -243,6 +276,18 @@ def run_asm(x, weight, x_scale, w_scale, dtype=dtypes.bf16, kernel_name=None):
     n, _ = weight.shape
     out = torch.empty((m, n), dtype=dtype, device=x.device)
     return aiter.gemm_a8w8_blockscale_bpreshuffle_asm(x, weight, out, x_scale, w_scale)
+
+
+@perftest(num_iters=TEST_NUM_ITERS)
+def run_flydsl(
+    x, weight, x_scale, w_scale, kernel_name, preshuffle_b, dtype=dtypes.bf16
+):
+    m, _k = x.shape
+    n, _ = weight.shape
+    out = torch.empty((m, n), dtype=dtype, device=x.device)
+    return gemm_a8w8_blockscale_flydsl(
+        x, weight, x_scale, w_scale, out, {"kernelName": kernel_name}, preshuffle_b
+    )
 
 
 def test_splitk_correctness(m=4, n=2112, k=7168, dtype=dtypes.bf16, splitK=1):
@@ -418,6 +463,15 @@ parser.add_argument(
         or --apre True False""",
 )
 parser.add_argument(
+    "--w-scale-block",
+    dest="w_scale_block",
+    choices=["128x128", "32x32"],
+    default="128x128",
+    help="""Weight scale block. 32x32 runs native E8M0 group32 scales (1x32
+    row-major x_scale) on the preshuffled weight.
+    e.g.: --w-scale-block 32x32""",
+)
+parser.add_argument(
     "--csv",
     type=str,
     default=None,
@@ -462,11 +516,22 @@ if len(data_init_list) != len(scale_init_list):
 init_pairs = list(zip(data_init_list, scale_init_list))
 
 if args.ck_preshuffle is None:
-    args.ck_preshuffle = [True] if args.flydsl else [True, False]
+    args.ck_preshuffle = (
+        [True] if args.flydsl or args.w_scale_block == "32x32" else [True, False]
+    )
 l_preshuffle = (
     args.ck_preshuffle if isinstance(args.ck_preshuffle, list) else [args.ck_preshuffle]
 )
 l_apre = args.apre if isinstance(args.apre, list) else [args.apre]
+if args.w_scale_block == "32x32" and (False in l_preshuffle or True in l_apre):
+    parser.error("--w-scale-block 32x32 needs --ck_preshuffle True and no --apre")
+if args.w_scale_block == "32x32" and get_gfx() not in (
+    "gfx950",
+    "gfx1250",
+    "gfx1250-strict",
+):
+    print(f"skip: native 32x32 E8M0 preshuffle is unsupported on {get_gfx()}")
+    sys.exit(0)
 
 df = []
 if args.csv is not None:
@@ -490,6 +555,7 @@ if args.csv is not None:
                             scale_init=scale_init,
                             seed=args.seed,
                             apre=apre,
+                            w_scale_block=args.w_scale_block,
                         )
                         df.append(ret)
 else:
@@ -510,6 +576,7 @@ else:
                                 scale_init=scale_init,
                                 seed=args.seed,
                                 apre=apre,
+                                w_scale_block=args.w_scale_block,
                             )
                             df.append(ret)
 

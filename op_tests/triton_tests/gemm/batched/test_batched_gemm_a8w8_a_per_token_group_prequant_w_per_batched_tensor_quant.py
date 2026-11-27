@@ -10,6 +10,7 @@ from aiter.ops.triton.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 e5m2_type, e4m3_type = get_fp8_dtypes()
 
@@ -59,7 +60,7 @@ def generate_batched_gemm_a16w8_inputs(
 
     w_scale = torch.rand([1], dtype=torch.float32, device="cuda")[0]
     if has_bias:
-        bias = torch.rand([B, 1, N], dtype=dtype).cuda() * 10
+        bias = torch.rand([B, 1, N], dtype=dtype, device="cuda") * 10
     else:
         bias = None
 
@@ -98,6 +99,7 @@ def run_triton(
     transpose_bm=False,
     transpose_bm_in=False,
     backend=None,
+    y_scale_out=None,
 ):
     return batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
         x,
@@ -110,11 +112,12 @@ def run_triton(
         transpose_bm=transpose_bm,
         transpose_bm_in=transpose_bm_in,
         backend=backend,
+        y_scale_out=y_scale_out,
     )
 
 
 def skip_if_gluon_unavailable(backend):
-    if backend == "gluon" and arch_info.get_arch() != "gfx1250":
+    if backend == "gluon" and arch_info.get_arch() not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("gluon backend is gfx1250-only")
 
 
@@ -131,43 +134,7 @@ def skip_if_gluon_unsupported(backend, x, weight, bias):
         pytest.skip("gluon backend needs bf16/fp16 X and fp8 WQ, both K-contiguous")
 
 
-def get_x_vals():
-
-    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
-    x_vals += [
-        (1, 1280, 8192),
-        (32, 1280, 8192),
-        (64, 1280, 8192),
-        (128, 1280, 8192),
-        (192, 1280, 8192),
-        (256, 1280, 8192),
-        (320, 1280, 8192),
-        (512, 1280, 8192),
-        (1024, 1280, 8192),
-        (2048, 1280, 8192),
-        (4096, 1280, 8192),
-        (8192, 1280, 8192),
-        (16384, 1280, 8192),
-        (1, 8192, 1024),
-        (32, 8192, 1024),
-        (64, 8192, 1024),
-        (128, 8192, 1024),
-        (192, 8192, 1024),
-        (256, 8192, 1024),
-        (320, 8192, 1024),
-        (512, 8192, 1024),
-        (1024, 8192, 1024),
-        (2048, 8192, 1024),
-        (4096, 8192, 1024),
-        (8192, 8192, 1024),
-        (16384, 8192, 1024),
-    ]
-    x_vals += [(v**2, 128, 512) for v in range(7)]
-    x_vals += [(v**2, 512, 128) for v in range(7)]
-    x_vals += [(1, 128, 1)]  # minimal case
-    return x_vals
-
-
+@pytest.mark.parametrize("y_per_token_quant", [False, True])
 @pytest.mark.parametrize("backend", [None, "triton", "gluon"])
 @pytest.mark.parametrize(
     "dtype, b, m, n, k, group_size, has_bias, output, transpose_bm",
@@ -176,16 +143,30 @@ def get_x_vals():
         for output in [True, False]
         for dtype in ["bf16"]
         for b in [16]
-        for shape in get_x_vals()
+        for shape in get_shapes(k_mult=32, max_size=8192 * 8192 * 8192)
         for group_size in [128]
         for has_bias in [True, False]
         for transpose_bm in [True, False]
     ],
 )
 def test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
-    dtype, b, m, n, k, group_size, has_bias, output, transpose_bm, backend
+    dtype,
+    b,
+    m,
+    n,
+    k,
+    group_size,
+    has_bias,
+    output,
+    transpose_bm,
+    backend,
+    y_per_token_quant,
 ):
     skip_if_gluon_unavailable(backend)
+    if y_per_token_quant and (has_bias or not output or not transpose_bm):
+        pytest.skip("y_scale_out needs a pre-allocated YQ, transpose_bm and no bias")
+    if y_per_token_quant and backend == "gluon":
+        pytest.skip("gluon backend does not support y_scale_out")
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     dtype = str_to_torch_dtype[dtype]
@@ -193,6 +174,10 @@ def test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant
         b, m, n, k, dtype, has_bias, output, transpose_bm=transpose_bm
     )
     skip_if_gluon_unsupported(backend, x, weight, bias)
+    y_scale = None
+    if y_per_token_quant:
+        y = torch.empty((m, b, n), dtype=e4m3_type, device=x.device)
+        y_scale = torch.empty((m, 1), dtype=torch.float32, device=x.device)
     a = run_torch(x, weight, w_scale, bias, dtype, transpose_bm)
     b = run_triton(
         x,
@@ -204,7 +189,10 @@ def test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant
         y=y,
         transpose_bm=transpose_bm,
         backend=backend,
+        y_scale_out=y_scale,
     )
+    if y_per_token_quant:
+        b = b.float() * y_scale[:, :, None]
 
     triton.testing.assert_close(a, b, atol=0.1, rtol=0.1)
 

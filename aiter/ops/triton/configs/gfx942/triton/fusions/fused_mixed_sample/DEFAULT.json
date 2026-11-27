@@ -1,0 +1,32 @@
+{
+    "M_LEQ_4": {
+        "BLOCK_V": 1024,
+        "num_warps": 4,
+        "num_warps_pick": 4
+    },
+    "M_LEQ_16": {
+        "BLOCK_V": 2048,
+        "num_warps": 4,
+        "num_warps_pick": 1
+    },
+    "M_LEQ_64": {
+        "BLOCK_V": 2048,
+        "num_warps": 4,
+        "num_warps_pick": 4
+    },
+    "M_LEQ_128": {
+        "BLOCK_V": 4096,
+        "num_warps": 4,
+        "num_warps_pick": 1
+    },
+    "M_LEQ_256": {
+        "BLOCK_V": 2048,
+        "num_warps": 2,
+        "num_warps_pick": 1
+    },
+    "any": {
+        "BLOCK_V": 8192,
+        "num_warps": 4,
+        "num_warps_pick": 1
+    }
+}

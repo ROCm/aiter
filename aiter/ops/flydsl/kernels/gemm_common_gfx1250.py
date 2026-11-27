@@ -1,11 +1,11 @@
 """Shared utilities for gfx1250 GEMM kernels (fp16 / mxfp4 / mxfp8)."""
 
+import os
 from collections import namedtuple
 
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
-from flydsl.expr import as_ir_value, gpu, rocdl
+from flydsl.expr import as_ir_value, gpu, range_constexpr, rocdl
 from flydsl.expr.rocdl import cluster, tdm_ops
 from flydsl.expr.typing import T
 
@@ -43,6 +43,33 @@ def make_lds_copy_ops(bits):
     return load, store
 
 
+def make_gemm_grid(
+    M,
+    N,
+    tile_m,
+    tile_n,
+    cluster_m,
+    *,
+    split_k=1,
+    persistent_n_tiles=1,
+    fused_splitk=False,
+):
+    """Pad M to whole clusters and split long grids without duplicating tiles.
+
+    Fused split-K reserves grid.z for the K splits of one tile. Other grids
+    may put exact chunks of M there, keeping grid.x in whole cluster rows.
+    """
+    rows = fx.ceildiv(M, tile_m)
+    rows = fx.ceildiv(fx.max(rows, 1), cluster_m) * cluster_m
+    run = rows
+    if not fused_splitk:
+        divisor = rows & -rows
+        capped = fx.min(divisor, 32)
+        fits = (capped % cluster_m) == 0
+        run = ((rows > 32) & (divisor >= 8) & fits).select(capped, rows)
+    return run, fx.ceildiv(N, tile_n) // persistent_n_tiles, (rows // run) * split_k
+
+
 def make_sgpr_opaque(val_i32):
     """Return ``val_i32`` unchanged but hidden from constant folding.
 
@@ -56,7 +83,7 @@ def make_sgpr_opaque(val_i32):
     Emits no instruction.
     """
     op = llvm_dialect.InlineAsmOp(
-        res=ir.IntegerType.get_signless(32),
+        res=T.i32,
         operands_=[as_ir_value(val_i32)],
         asm_string="",
         constraints="=s,s",
@@ -66,31 +93,98 @@ def make_sgpr_opaque(val_i32):
     return op.res
 
 
-def _raw_lds_ptr(lds_base_idx, byte_offset):
-    """Materialize an LLVM LDS pointer from a pre-extracted byte base."""
-    lds_ptr_ty = ir.Type.parse("!llvm.ptr<3>")
-    total_byte = fx.Index(lds_base_idx) + fx.Index(byte_offset)
-    return llvm_dialect.inttoptr(lds_ptr_ty, fx.Int32(total_byte).ir_value())
+#: Kernels call prefetch_kernel_code at entry and add ``_ipf`` to their name.
+INST_PREFETCH = os.environ.get("AITER_FLYDSL_INST_PREFETCH", "1") == "1"
+# One s_prefetch_inst covers at most 32 lines of 128 B. The instruction cache is 64 KB, so only the head of a
+# kernel larger than the cap is prefetched.
+KERNEL_PREFETCH_MAX_BYTES = 56 * 1024
+_PREFETCH_CHUNK_SHIFT = 12
+_HWREG_MODE_SCALAR_PREFETCH_EN = 1 | (24 << 6)  # hwreg(HW_REG_MODE, 24, 1)
+
+
+def _kernel_code_span(func_index):
+    """(entry address, code bytes up to the end of the function).
+
+    FlyDSL has no s_getpc or code-size query; only the assembler knows where the function ends,
+    as .Lfunc_end<position of the function in its module>.
+    """
+
+    def asm(res, text, constraints="=s"):
+        return llvm_dialect.InlineAsmOp(
+            res=res,
+            operands_=[],
+            asm_string=text,
+            constraints=constraints,
+            has_side_effects=True,
+            is_align_stack=False,
+        ).res
+
+    label = f".Lkprefetch{func_index}"
+    pc = asm(T.i64, f"{label}:\ns_getpc_b64 $0")  # the address after the label
+    size = asm(T.i32, f"s_mov_b32 $0, .Lfunc_end{func_index}-{label}")
+    return fx.Int64(pc) - 4, fx.Int32(size)
+
+
+def prefetch_kernel_code(num_waves, func_index=0):
+    """Prefetch this kernel's code into the instruction cache; each wave takes every num_waves-th 4 KiB.
+
+    Code that another large kernel evicted from the CU is otherwise refetched line by line in the prologue and
+    epilogue. s_prefetch_inst is a no-op unless MODE.SCALAR_PREFETCH_EN is set, and a wave only starts with it set
+    if it is the first of its program on the WGP, so set it first.
+
+    ``func_index`` is the kernel's position among the functions of its module, in definition order.
+    """
+    # FlyDSL has no s_setreg or s_prefetch_inst wrapper, so these are the LLVM intrinsics.
+    mode_en = fx.Int32(_HWREG_MODE_SCALAR_PREFETCH_EN).ir_value()
+    llvm_dialect.call_intrinsic(
+        None, "llvm.amdgcn.s.setreg", [mode_en, fx.Int32(1).ir_value()], [], []
+    )
+    start, size = _kernel_code_span(func_index)
+    cap = fx.Int32(KERNEL_PREFETCH_MAX_BYTES)
+    span = (size < cap).select(size, cap)
+    last_line = ((span - 1) >> 7) << 7
+    wave = fx.Int32(rocdl.wave_id())
+    chunks = KERNEL_PREFETCH_MAX_BYTES >> _PREFETCH_CHUNK_SHIFT
+    for i in range_constexpr(-(-chunks // num_waves)):
+        off = (fx.Int32(i * num_waves) + wave) << _PREFETCH_CHUNK_SHIFT
+        off = (off < last_line).select(
+            off, last_line
+        )  # chunks past the end repeat the last line
+        lines = (span - off + 127) >> 7
+        lines = (lines < 32).select(lines, fx.Int32(32)) - 1
+        ptr = llvm_dialect.IntToPtrOp(
+            llvm_dialect.PointerType.get(address_space=1),
+            (start + fx.Int64(off)).ir_value(),
+        ).result
+        llvm_dialect.call_intrinsic(
+            None, "llvm.amdgcn.s.prefetch.inst.p1", [ptr, lines.ir_value()], [], []
+        )
+
+
+def _lds_ptr(lds_base_idx, byte_offset, element_type, alignment):
+    """Materialize an aligned LDS pointer from a pre-extracted byte base."""
+    lds_ptr_ty = fx.PointerType.get(element_type, fx.AddressSpace.Shared, alignment)
+    total_byte = fx.Int32(lds_base_idx) + fx.Int32(byte_offset)
+    return fx.inttoptr(lds_ptr_ty, total_byte)
 
 
 def lds_load_b128_raw(lds_base_idx, byte_offset):
-    """Load 16 bytes from LDS using a pre-extracted base index (raw LLVM)."""
-    ptr_val = _raw_lds_ptr(lds_base_idx, byte_offset)
-    return llvm_dialect.load(
-        ir.VectorType.get([4], ir.IntegerType.get_signless(32)), ptr_val
-    )
+    """Load 16 bytes from LDS using a pre-extracted byte base."""
+    vec_type = fx.Vector.make_type(4, fx.Int32)
+    ptr_val = _lds_ptr(lds_base_idx, byte_offset, fx.Int32.ir_type, 16)
+    return as_ir_value(fx.ptr_load(ptr_val, result_type=vec_type))
 
 
 def lds_load_b32_raw(lds_base_idx, byte_offset):
     """Load 4 bytes from LDS as ``i32`` using a pre-extracted base index."""
-    ptr_val = _raw_lds_ptr(lds_base_idx, byte_offset)
-    return llvm_dialect.load(ir.IntegerType.get_signless(32), ptr_val)
+    ptr_val = _lds_ptr(lds_base_idx, byte_offset, fx.Int32.ir_type, 4)
+    return as_ir_value(fx.ptr_load(ptr_val))
 
 
 def lds_store_b128_raw(lds_base_idx, byte_offset, data):
-    """Store 16 bytes to LDS using a pre-extracted base index (raw LLVM)."""
-    ptr_val = _raw_lds_ptr(lds_base_idx, byte_offset)
-    llvm_dialect.store(as_ir_value(data), ptr_val)
+    """Store 16 bytes to LDS using a pre-extracted byte base."""
+    ptr_val = _lds_ptr(lds_base_idx, byte_offset, fx.Int32.ir_type, 16)
+    fx.ptr_store(as_ir_value(data), ptr_val)
 
 
 def workgroup_barrier(use_cluster=False):
@@ -135,9 +229,7 @@ def pipeline_fence_wait(use_cluster=False):
 
 def fmin_f32(a, b):
     """Scalar f32 min (maps to v_min_num_f32)."""
-    from flydsl.expr import arith
-
-    return fx.Float32(arith.minnumf(as_ir_value(a), as_ir_value(b)))
+    return fx.minnumf(fx.Float32(a), fx.Float32(b))
 
 
 def fclamp_f32(x, lo, hi):
@@ -149,15 +241,7 @@ def fclamp_f32(x, lo, hi):
 
 def _fma_f32(a, b, c):
     """Evaluate ``a * b + c`` as one fused f32 operation."""
-    return fx.Float32(
-        llvm_dialect.call_intrinsic(
-            T.f32,
-            "llvm.fma.f32",
-            [as_ir_value(a), as_ir_value(b), as_ir_value(c)],
-            [],
-            [],
-        )
-    )
+    return fx.Float32(fx.fma(fx.Float32(a), fx.Float32(b), fx.Float32(c)))
 
 
 def fused_silu_swiglu_elem(g, u, *, swiglu, limit_f32, neg_limit_f32):

@@ -1,0 +1,55 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025 FlyDSL Project Contributors
+"""Buffer helpers of the MegaMoEV2 small- and large-input kernels' dispatch and combine code.
+
+Their launch configs live in mega_moe_config (select_fused_config); their GEMM
+tiles come from gemm_util, gemm1 and gemm2.
+"""
+
+from typing import NamedTuple
+
+import flydsl.expr as fx
+
+from ..tensor_shim import _fx_value_elem, buf_copy_load, buf_copy_store, ptr_buf_tensor
+
+
+class AddrBuffer(NamedTuple):
+    """A raw device address and an optional hardware OOB bound in bytes."""
+
+    addr: object
+    num_records_bytes: object = None
+
+
+def _addr_view(buf, elem, width):
+    # unit_stride=1: a wide access may start at any element offset.
+    return ptr_buf_tensor(
+        buf.addr,
+        elem,
+        unit_elems=width,
+        unit_stride=1,
+        num_records_bytes=buf.num_records_bytes,
+    )
+
+
+def load_at(buf, index, elem=fx.Int32, width=1, cache_modifier=0, mask=None):
+    """Load ``width`` x ``elem`` at element ``index`` of ``buf``.
+
+    A false ``mask`` moves the access past the buffer bound.
+    """
+    if mask is not None:
+        index = fx.Boolean(mask).select(
+            index, fx.Int32(0x7FFFFFFF // (elem.width // 8))
+        )
+    return buf_copy_load(
+        _addr_view(buf, elem, width), index, elem, width, cache_modifier
+    )
+
+
+def store_at(value, buf, index, cache_modifier=0, offset_is_bytes=False):
+    """Store ``value`` (scalar or vector) at element ``index`` of ``buf``."""
+    elem, width = _fx_value_elem(value)
+    if offset_is_bytes:
+        index = fx.Int32(index) // fx.Int32(elem.width // 8)
+    buf_copy_store(
+        _addr_view(buf, elem, width), index, value, elem, width, cache_modifier
+    )

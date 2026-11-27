@@ -115,15 +115,15 @@ def test_cross_entropy_tp_loss(world_size: int = 2):
     B, SQ, V = 2, 8, 512  # V must be divisible by world_size
     assert V % world_size == 0
     dtype = torch.bfloat16
+    device = torch.device("cuda:0")
 
-    logits = torch.randn(B, SQ, V, dtype=dtype)
-    target = torch.randint(0, V, (B, SQ))
+    logits = torch.randn(B, SQ, V, dtype=dtype, device=device)
+    target = torch.randint(0, V, (B, SQ), device=device)
 
     # Single-GPU reference on rank-0 GPU.
-    device = torch.device("cuda:0")
     ref_loss, _ = cross_entropy_forward(
-        logits.to(device),
-        target.to(device),
+        logits.clone(),
+        target,
         label_smoothing=0.0,
         reduce_loss=True,
         dist_group=None,
@@ -153,16 +153,16 @@ def test_cross_entropy_tp_grad(world_size: int = 2):
     B, SQ, V = 2, 8, 512
     assert V % world_size == 0
     dtype = torch.bfloat16
+    device = torch.device("cuda:0")
     V_local = V // world_size
 
-    logits = torch.randn(B, SQ, V, dtype=dtype)
-    target = torch.randint(0, V, (B, SQ))
+    logits = torch.randn(B, SQ, V, dtype=dtype, device=device)
+    target = torch.randint(0, V, (B, SQ), device=device)
 
     # Single-GPU reference gradient.
-    device = torch.device("cuda:0")
     _, ref_grad = cross_entropy_forward(
-        logits.to(device),
-        target.to(device),
+        logits.clone(),
+        target,
         label_smoothing=0.0,
         reduce_loss=True,
         dist_group=None,
@@ -191,17 +191,17 @@ def test_cross_entropy_tp_ignore_index(world_size: int = 2):
     B, SQ, V = 2, 8, 512
     assert V % world_size == 0
     dtype = torch.bfloat16
+    device = torch.device("cuda:0")
     ignore_idx = -100
 
-    logits = torch.randn(B, SQ, V, dtype=dtype)
-    target = torch.randint(0, V, (B, SQ))
+    logits = torch.randn(B, SQ, V, dtype=dtype, device=device)
+    target = torch.randint(0, V, (B, SQ), device=device)
     # Mask out half the rows.
     target.view(-1)[::2] = ignore_idx
 
-    device = torch.device("cuda:0")
     ref_loss, _ref_grad = cross_entropy_forward(
-        logits.to(device),
-        target.to(device),
+        logits.clone(),
+        target,
         label_smoothing=0.0,
         reduce_loss=True,
         dist_group=None,

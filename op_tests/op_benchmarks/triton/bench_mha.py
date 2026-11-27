@@ -1,5 +1,6 @@
 import argparse
 import dataclasses
+import functools
 import itertools
 import warnings
 from collections.abc import Callable
@@ -8,11 +9,14 @@ from dataclasses import dataclass
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
+from aiter.ops.triton._triton_kernels.attention.dao_ai.utils import (
+    get_arch,
+)
 from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
+    is_gluon_available,
     mha_set_impl,
     mha_set_use_fused_bwd_kernel,
 )
@@ -26,11 +30,19 @@ from aiter.test_mha_common import (
     generate_random_padding_mask,
     quantize_fp8_per_bh,
 )
-from op_tests.op_benchmarks.triton.utils.argparse import get_parser
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+    override_parser_action,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     get_model_configs,
     print_vgpr,
+)
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
 )
 
 
@@ -46,15 +58,30 @@ class BenchRun:
     profile_dir: str | None
     print_vgpr: bool
     bench_torch: bool
+    bencher: RotatingBufferBench
     backend: str = "triton"
 
 
 VALID_FUNCTIONS = {"fwd", "bwd", "fwd_varlen", "bwd_varlen", "fwd_kvcache"}
 
-# The (left, right) window variants the default sweep benches: dense + a representative
-# causal sliding window. A swept axis like the default function/dtype sets; override with
-# --window-size-left/right to bench one specific window instead.
-DEFAULT_WINDOWS = [(-1, -1), (1024, 0)]
+# Default sweep: dense (-1, -1) and a causal left window (1024, -1).
+# Native Triton rejects a right bound other than -1, so (1024, 0) never
+# runs on -impl default. With causal=True, (1024, -1) is that window.
+# Omit both window flags to run this sweep. Pass either flag to run one
+# window. An omitted side is unbounded (-1). For a dense only bench,
+# explicitly pass (-1, -1).
+DEFAULT_WINDOWS = [(-1, -1), (1024, -1)]
+
+
+def _resolve_windows(
+    window_size_left: int | None, window_size_right: int | None
+) -> list[tuple[int, int]]:
+    """Return the windows for this run."""
+    if window_size_left is None and window_size_right is None:
+        return DEFAULT_WINDOWS  # both unspecified, default windows sweep
+    left = -1 if window_size_left is None else window_size_left
+    right = -1 if window_size_right is None else window_size_right
+    return [(left, right)]
 
 
 @dataclass(frozen=True)
@@ -265,12 +292,10 @@ _MAKE_FN_FP8 = {
 
 # Gluon fp8 entry points
 # Unlike mha_v3's fp8 wrappers, which take high-precision inputs and quantize on
-# every call, the gluon kernel takes pre-quantized fp8 q/k/v plus descales.
-def _make_fp8_gluon_fn(q, k, v, **kw):
-    fp8_dtype = get_fp8_e4m3_dtype()
-    q_fp8, q_descale = quantize_fp8_per_bh(q, fp8_dtype)
-    k_fp8, k_descale = quantize_fp8_per_bh(k, fp8_dtype)
-    v_fp8, v_descale = quantize_fp8_per_bh(v, fp8_dtype)
+# every call, the gluon kernel takes pre-quantized fp8 q/k/v plus descales. The
+# caller (_make_pool_entry with quantize=True) quantizes q/k/v and passes the
+# descales in via kw["q_descale"] / kw["k_descale"] / kw["v_descale"].
+def _make_fp8_gluon_fn(q_fp8, k_fp8, v_fp8, **kw):
     return lambda: flash_attn_func(
         q_fp8,
         k_fp8,
@@ -278,18 +303,14 @@ def _make_fp8_gluon_fn(q, k, v, **kw):
         softmax_scale=kw["sm_scale"],
         causal=kw["causal"],
         window_size=kw.get("window_size", (-1, -1)),
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
+        q_descale=kw["q_descale"],
+        k_descale=kw["k_descale"],
+        v_descale=kw["v_descale"],
         backend="gluon",
     )
 
 
-def _make_fp8_varlen_gluon_fn(q, k, v, **kw):
-    fp8_dtype = get_fp8_e4m3_dtype()
-    q_fp8, q_descale = quantize_fp8_per_bh(q, fp8_dtype, kw["cu_seqlens_q"])
-    k_fp8, k_descale = quantize_fp8_per_bh(k, fp8_dtype, kw["cu_seqlens_k"])
-    v_fp8, v_descale = quantize_fp8_per_bh(v, fp8_dtype, kw["cu_seqlens_k"])
+def _make_fp8_varlen_gluon_fn(q_fp8, k_fp8, v_fp8, **kw):
     return lambda: flash_attn_varlen_func(
         q_fp8,
         k_fp8,
@@ -301,9 +322,9 @@ def _make_fp8_varlen_gluon_fn(q, k, v, **kw):
         softmax_scale=kw["sm_scale"],
         causal=kw["causal"],
         window_size=kw.get("window_size", (-1, -1)),
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
+        q_descale=kw["q_descale"],
+        k_descale=kw["k_descale"],
+        v_descale=kw["v_descale"],
         backend="gluon",
     )
 
@@ -434,7 +455,9 @@ def pad_rearrange_dropout_mask(
     batch_size = cu_seqlens_q.numel() - 1
 
     padded_dropout_mask = torch.ones(
-        (batch_size, num_q_heads, seqlen_q, seqlen_k), device="cuda"
+        (batch_size, num_q_heads, seqlen_q, seqlen_k),
+        device="cuda",
+        dtype=torch.float32,
     )
     for b in range(batch_size):
         start_q = cu_seqlens_q[b].item()
@@ -647,18 +670,24 @@ def run_benchmark(run: BenchRun):
         return_lse = True
         return_attn_probs = False
         has_pe = D_HEAD > D_HEAD_V
-        # Dense iff BOTH bounds are off (-1); either set = a window (matches the kernel's
-        # `LEFT < 0 and RIGHT < 0` dense test -- neither side is privileged).
-        has_sliding_window = window_size_left >= 0 or window_size_right >= 0
         window_size = (window_size_left, window_size_right)
-        if impl != "default":
-            mha_set_impl(impl)
-        # SWA runs on the dao_ai path (any dtype), the fp8 path (routes to FA3, which
-        # has it) and the Gluon backend; only native non-fp8 triton lacks it (left-only,
-        # right rejected). Skip that combo cleanly rather than hard-error mid-sweep.
-        if has_sliding_window and not is_gluon and impl != "dao_ai" and dtype != "fp8":
+        mha_set_impl(impl)
+        # Native Triton and Gluon support a left window (and a sink on the native
+        # one-kernel path). A right window needs dao_ai or the fp8/FA3 path.
+        # Skip that combo cleanly rather than hard-error mid-sweep.
+        if is_gluon and not is_gluon_available():
             warnings.warn(
-                "Skipping: sliding window needs -impl dao_ai (or an fp8 dtype)."
+                "Skipping: Gluon MHA backend is not available on this device."
+            )
+            return 0
+        if (
+            window_size_right >= 0
+            and not is_gluon
+            and impl != "dao_ai"
+            and dtype != "fp8"
+        ):
+            warnings.warn(
+                "Skipping: right sliding window needs -impl dao_ai (or an fp8 dtype)."
             )
             return 0
         if is_gluon and window_size_right >= 0:
@@ -672,6 +701,10 @@ def run_benchmark(run: BenchRun):
         if is_gluon and (is_bwd or is_decode):
             warnings.warn("Skipping: Gluon backend only supports fwd / fwd_varlen.")
             return 0
+        # Fused backward rejects a left window. dao_ai does not use that path.
+        if fused and is_bwd and window_size_left > 0 and impl != "dao_ai":
+            warnings.warn("Skipping: fused bwd does not support a sliding window.")
+            return 0
         mha_set_use_fused_bwd_kernel(fused)
         make_fn = get_make_fn(function, dtype, run.backend)
 
@@ -679,120 +712,23 @@ def run_benchmark(run: BenchRun):
         if sm_scale is None:
             sm_scale = 1.0 / (D_HEAD**0.5)
 
-        # Generate base inputs
-        q = torch.randn(
-            (BATCH, N_CTX_Q, HQ, D_HEAD),
-            device=device,
-            dtype=torch_dtype,
-            requires_grad=requires_grad,
-        )
-        k = torch.randn(
-            (BATCH, N_CTX_K, HK, D_HEAD),
-            device=device,
-            dtype=torch_dtype,
-            requires_grad=requires_grad,
-        )
-        v = torch.randn(
-            (BATCH, N_CTX_K, HK, D_HEAD_V),
-            device=device,
-            dtype=torch_dtype,
-            requires_grad=requires_grad,
-        )
-        sink = (
-            torch.randn(
-                (HQ,), device=device, dtype=torch_dtype, requires_grad=requires_grad
-            )
-            if run.sink
-            else None
-        )
-
         # FLOPS calculation variables
         total_flops = 0.0
-
-        # Input preparation
-        if is_decode:
-            # KV cache: q is (B, 1, Hq, D), k/v caches are (B, sk, Hk, D)
-            q_input = q[:, :N_CTX_Q, :, :]  # (B, sq, Hq, D)
-            k_cache = k[:, :N_CTX_K, :, :]  # (B, sk, Hk, D)
-            v_cache = v[:, :N_CTX_K, :, :D_HEAD_V]
-            cache_seqlens = torch.full(
-                (BATCH,), N_CTX_K, dtype=torch.int32, device=device
-            )
-            total_flops += 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
-
-            fn_kwargs = {
-                "sm_scale": sm_scale,
-                "causal": causal,
-                "cache_seqlens": cache_seqlens,
-            }
-            fn = make_fn(q_input, k_cache, v_cache, **fn_kwargs)
-            if fn is None:
-                return 0
-        elif is_varlen:
+        # Varlen's padding mask must be generated once per benchmark point (not per
+        # rotating-buffer pool entry): it fixes cu_seqlens/max_seqlen (and so every
+        # entry's unpadded tensor shapes) so a CUDA graph can capture across entries
+        # that only vary q/k/v content, not shape.
+        query_padding_mask = key_padding_mask = None
+        if is_varlen:
             query_padding_mask = generate_random_padding_mask(
                 N_CTX_Q, BATCH, device, mode="full" if run.equal_seqlens else "random"
             )
             key_padding_mask = generate_random_padding_mask(
                 N_CTX_K, BATCH, device, mode="full" if run.equal_seqlens else "random"
             )
-            (
-                q_unpad,
-                k_unpad,
-                v_unpad,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                max_seqlen_q,
-                max_seqlen_k,
-                q,
-                k,
-                v,
-                _,
-                _,
-                _,
-            ) = generate_qkv(
-                q, k, v, query_padding_mask, key_padding_mask, kvpacked=False
-            )
-            q_unpad.requires_grad = requires_grad
-            k_unpad.requires_grad = requires_grad
-            v_unpad.requires_grad = requires_grad
-
-            q_input, k_input, v_input = q_unpad, k_unpad, v_unpad
-
-            num_contexts = len(cu_seqlens_q) - 1
-            for i in range(num_contexts):
-                seqlen_q = (cu_seqlens_q[i + 1] - cu_seqlens_q[i]).item()
-                seqlen_k = (cu_seqlens_k[i + 1] - cu_seqlens_k[i]).item()
-                total_flops += (
-                    _count_valid_attention_elements(
-                        seqlen_q, seqlen_k, causal, window_size
-                    )
-                    * HQ
-                    * (D_HEAD + D_HEAD_V)
-                    * 2.0
-                )
-
-            fn_kwargs = {
-                "sm_scale": sm_scale,
-                "causal": causal,
-                "dropout": dropout,
-                "return_lse": return_lse,
-                "return_attn_probs": return_attn_probs,
-                "sink": sink,
-                "window_size": window_size,
-                "has_pe": has_pe,
-                "has_sink": run.sink,
-                "backend": run.backend,
-                "cu_seqlens_q": cu_seqlens_q,
-                "cu_seqlens_k": cu_seqlens_k,
-                "max_seqlen_q": max_seqlen_q,
-                "max_seqlen_k": max_seqlen_k,
-            }
-            fn = make_fn(q_input, k_input, v_input, **fn_kwargs)
-            if fn is None:
-                return 0
+        elif is_decode:
+            total_flops += 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
         else:
-            q_input, k_input, v_input = q, k, v
-
             total_flops += (
                 2.0
                 * BATCH
@@ -801,46 +737,172 @@ def run_benchmark(run: BenchRun):
                 * (D_HEAD + D_HEAD_V)
             )
 
-            fn_kwargs = {
-                "sm_scale": sm_scale,
-                "causal": causal,
-                "dropout": dropout,
-                "return_lse": return_lse,
-                "return_attn_probs": return_attn_probs,
-                "sink": sink,
-                "window_size": window_size,
-                "has_pe": has_pe,
-                "has_sink": run.sink,
-                "backend": run.backend,
-            }
-            fn = make_fn(q_input, k_input, v_input, **fn_kwargs)
-            if fn is None:
-                return 0
+        def _make_pool_entry(quantize: bool = False):
+            """Build one rotating-buffer pool entry.
 
-        if is_bwd:
-            with torch.enable_grad():
-                triton_out = fn()[0]
-                d_out = torch.randn_like(triton_out)
+            If ``quantize`` is set, q/k/v are quantized to fp8 (per batch/head)
+            here, outside the timed call; the returned q/k/v inputs are the fp8
+            tensors and the descales are forwarded to ``make_fn`` via fn_kwargs.
+            """
+            q = torch.randn(
+                (BATCH, N_CTX_Q, HQ, D_HEAD),
+                device=device,
+                dtype=torch_dtype,
+                requires_grad=requires_grad,
+            )
+            k = torch.randn(
+                (BATCH, N_CTX_K, HK, D_HEAD),
+                device=device,
+                dtype=torch_dtype,
+                requires_grad=requires_grad,
+            )
+            v = torch.randn(
+                (BATCH, N_CTX_K, HK, D_HEAD_V),
+                device=device,
+                dtype=torch_dtype,
+                requires_grad=requires_grad,
+            )
+            sink = (
+                torch.randn(
+                    (HQ,), device=device, dtype=torch_dtype, requires_grad=requires_grad
+                )
+                if run.sink
+                else None
+            )
 
-                grad_inputs = (q_input, k_input, v_input)
-                if sink is not None:
-                    grad_inputs += (sink,)
+            cu_seqlens_q = cu_seqlens_k = None
+            if is_decode:
+                # KV cache: q is (B, 1, Hq, D), k/v caches are (B, sk, Hk, D)
+                q_input = q[:, :N_CTX_Q, :, :]  # (B, sq, Hq, D)
+                k_input = k[:, :N_CTX_K, :, :]  # (B, sk, Hk, D)
+                v_input = v[:, :N_CTX_K, :, :D_HEAD_V]
+                cache_seqlens = torch.full(
+                    (BATCH,), N_CTX_K, dtype=torch.int32, device=device
+                )
+                fn_kwargs = {
+                    "sm_scale": sm_scale,
+                    "causal": causal,
+                    "cache_seqlens": cache_seqlens,
+                }
+                fwd_fn = make_fn(q_input, k_input, v_input, **fn_kwargs)
+            elif is_varlen:
+                (
+                    q_unpad,
+                    k_unpad,
+                    v_unpad,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    _,
+                    _,
+                    _,
+                    _,
+                    _,
+                    _,
+                ) = generate_qkv(
+                    q, k, v, query_padding_mask, key_padding_mask, kvpacked=False
+                )
+                q_unpad.requires_grad = requires_grad
+                k_unpad.requires_grad = requires_grad
+                v_unpad.requires_grad = requires_grad
 
-                def fn():
-                    grads = torch.autograd.grad(
-                        triton_out,
-                        grad_inputs,
-                        d_out,
-                        retain_graph=True,
-                    )
-                    return grads
+                q_input, k_input, v_input = q_unpad, k_unpad, v_unpad
+
+                fn_kwargs = {
+                    "sm_scale": sm_scale,
+                    "causal": causal,
+                    "dropout": dropout,
+                    "return_lse": return_lse,
+                    "return_attn_probs": return_attn_probs,
+                    "sink": sink,
+                    "window_size": window_size,
+                    "has_pe": has_pe,
+                    "has_sink": run.sink,
+                    "backend": run.backend,
+                    "cu_seqlens_q": cu_seqlens_q,
+                    "cu_seqlens_k": cu_seqlens_k,
+                    "max_seqlen_q": max_seqlen_q,
+                    "max_seqlen_k": max_seqlen_k,
+                }
+            else:
+                q_input, k_input, v_input = q, k, v
+                fn_kwargs = {
+                    "sm_scale": sm_scale,
+                    "causal": causal,
+                    "dropout": dropout,
+                    "return_lse": return_lse,
+                    "return_attn_probs": return_attn_probs,
+                    "sink": sink,
+                    "window_size": window_size,
+                    "has_pe": has_pe,
+                    "has_sink": run.sink,
+                    "backend": run.backend,
+                }
+
+            if quantize:
+                fp8_dtype = get_fp8_e4m3_dtype()
+                q_input, q_descale = quantize_fp8_per_bh(
+                    q_input, fp8_dtype, cu_seqlens_q
+                )
+                k_input, k_descale = quantize_fp8_per_bh(
+                    k_input, fp8_dtype, cu_seqlens_k
+                )
+                v_input, v_descale = quantize_fp8_per_bh(
+                    v_input, fp8_dtype, cu_seqlens_k
+                )
+                fn_kwargs.update(
+                    q_descale=q_descale, k_descale=k_descale, v_descale=v_descale
+                )
+
+            if not is_decode:
+                fwd_fn = make_fn(q_input, k_input, v_input, **fn_kwargs)
+
+            if is_bwd:
+                with torch.enable_grad():
+                    triton_out = fwd_fn()[0]
+                    d_out = torch.randn_like(triton_out)
+
+                    grad_inputs = (q_input, k_input, v_input)
+                    if sink is not None:
+                        grad_inputs += (sink,)
+
+                    def call():
+                        return torch.autograd.grad(
+                            triton_out,
+                            grad_inputs,
+                            d_out,
+                            retain_graph=True,
+                        )
+
+            else:
+                call = fwd_fn
+
+            return q_input, k_input, v_input, call, cu_seqlens_q, cu_seqlens_k
+
+        _out_val_keys = [
+            "q_input",
+            "k_input",
+            "v_input",
+            "call",
+            "cu_seqlens_q",
+            "cu_seqlens_k",
+        ]
+
+        # The gluon fp8 kernel takes pre-quantized fp8 q/k/v plus descales, so
+        # quantize once per pool entry, outside the timed call.
+        quantize_inputs = is_gluon and dtype == "fp8"
+        make_pool_entry = functools.partial(_make_pool_entry, quantize=quantize_inputs)
 
         if run.profile_dir is not None:
             import os
 
+            entry = dict(zip(_out_val_keys, make_pool_entry()))
+            call = entry["call"]
+
             # Warmup
             for _ in range(3):
-                fn()
+                call()
                 torch.cuda.synchronize()
 
             prof = torch.profiler.profile(
@@ -853,7 +915,7 @@ def run_benchmark(run: BenchRun):
             )
             prof.start()
             for _ in range(5):
-                fn()
+                call()
                 torch.cuda.synchronize()
             prof.stop()
 
@@ -872,21 +934,75 @@ def run_benchmark(run: BenchRun):
             prof.export_chrome_trace(os.path.join(trace_dir, "trace.json"))
             return 0
 
-        ms = triton.testing.do_bench(fn)
+        if is_bwd:
+            if not hasattr(torch.autograd.graph, "set_override_stale_capture_stream"):
+                raise RuntimeError(
+                    "torch.autograd.graph.set_override_stale_capture_stream is not available "
+                    f"(found torch {torch.__version__}); PyTorch >= 2.13 is required."
+                )
+            # autograd.grad's graph is built on the default stream; let CUDA graph
+            # capture (on its own side stream) adopt that stale reference.
+            torch.autograd.graph.set_override_stale_capture_stream(True)
+
+        # mha_v3's non-gluon fp8 wrappers (flash_attn_fp8_func / _varlen_fp8_func)
+        # quantize their high-precision inputs on every call, by design (see the
+        # module docstring). That quantization does a CPU->GPU copy, which CUDA
+        # graph capture disallows mid-capture, so this one combo can't use the
+        # rotating-buffer/capture path -- fall back to the original single-buffer
+        # plain do_bench. The gluon fp8 path pre-quantizes outside the returned
+        # call (see _make_pool_entry's quantize flag) and has no such restriction.
+        needs_plain_do_bench = dtype == "fp8" and not is_gluon
+
+        # Pool length floor is lowered to 2 in parse_args (--rot-bufs-min-pool-len).
+        if not needs_plain_do_bench:
+            rot_bufs = run.bencher.build_pool(
+                [make_pool_entry],
+                [_out_val_keys],
+            )
+            sample = rot_bufs[0]
+        else:
+            sample = dict(zip(_out_val_keys, make_pool_entry()))
+
+        base_elem = torch.tensor([], dtype=torch_dtype).element_size()
+        if is_varlen:
+            num_contexts = len(sample["cu_seqlens_q"]) - 1
+            for i in range(num_contexts):
+                seqlen_q = (
+                    sample["cu_seqlens_q"][i + 1] - sample["cu_seqlens_q"][i]
+                ).item()
+                seqlen_k = (
+                    sample["cu_seqlens_k"][i + 1] - sample["cu_seqlens_k"][i]
+                ).item()
+                total_flops += (
+                    _count_valid_attention_elements(
+                        seqlen_q, seqlen_k, causal, window_size
+                    )
+                    * HQ
+                    * (D_HEAD + D_HEAD_V)
+                    * 2.0
+                )
+            total_num_tokens_q = sample["cu_seqlens_q"][-1].item()
+            total_num_tokens_k = sample["cu_seqlens_k"][-1].item()
+        else:
+            total_num_tokens_q = BATCH * N_CTX_Q
+            total_num_tokens_k = BATCH * N_CTX_K
+
+        if needs_plain_do_bench:
+            ms = triton.testing.do_bench(sample["call"])
+        else:
+
+            def _run(call, **_):
+                call()
+
+            ms = run.bencher.bench(_run)
 
         if is_bwd:
             total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
 
-        if is_varlen:
-            total_num_tokens_q = cu_seqlens_q[-1].item()
-            total_num_tokens_k = cu_seqlens_k[-1].item()
-        else:
-            total_num_tokens_q = BATCH * N_CTX_Q
-            total_num_tokens_k = BATCH * N_CTX_K
-        q_size = total_num_tokens_q * HQ * D_HEAD * q.element_size()
-        k_size = total_num_tokens_k * HK * D_HEAD * k.element_size()
-        v_size = total_num_tokens_k * HK * D_HEAD_V * v.element_size()
-        o_size = total_num_tokens_q * HQ * D_HEAD_V * q.element_size()
+        q_size = total_num_tokens_q * HQ * D_HEAD * base_elem
+        k_size = total_num_tokens_k * HK * D_HEAD * base_elem
+        v_size = total_num_tokens_k * HK * D_HEAD_V * base_elem
+        o_size = total_num_tokens_q * HQ * D_HEAD_V * base_elem
         if is_bwd:
             # read q, k, v, do
             mem_read = q_size + k_size + v_size + o_size
@@ -937,6 +1053,14 @@ arg_to_torch_dtype = {
 
 def parse_args(args: list[str] | None = None) -> BenchRun:
     parser = get_parser(kernel_name="FlashAttention")
+    # Configs here range from tiny decode steps to multi-GB prefill shapes
+    # (estimated_memory / _filter_by_memory exist for exactly this reason), and
+    # the pool-size caps cannot push pool_len below min_pool_len, so the default
+    # floor of 4 entries could quadruple an already multi-GB config and OOM
+    # (backward retains even more per entry: out, d_out and the autograd graph).
+    # Large tensors already exceed L2 on their own and gain little from more
+    # rotation, so use a floor of 2.
+    override_parser_action(parser, action="--rot-bufs-min-pool-len", default=2)
     parser.add_argument(
         "-fn",
         type=str,
@@ -971,14 +1095,7 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
     parser.add_argument("-bench_torch", action="store_true", default=False)
     parser.add_argument("-fused_bwd", action="store_true", default=False)
     parser.add_argument("-print_vgpr", action="store_true", default=False)
-    parser.add_argument(
-        "-metric",
-        nargs="?",
-        const="throughput",
-        choices=["time", "throughput", "bandwidth"],
-        default=None,
-        help="Metrics for the kernel benchmark.",
-    )
+
     parser.add_argument(
         "-persistent",
         nargs="?",
@@ -1009,27 +1126,27 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
         type=str,
         default="default",
         choices=["default", "dao_ai"],
-        help="MHA forward implementation: default (_attn_fwd) or dao_ai (flash_attn_triton_amd)",
+        help="MHA forward implementation: default (_attn_fwd) or dao_ai (Dao-AI FlashAttention)",
     )
     parser.add_argument(
         "--window-size-left",
         type=int,
-        default=-1,
-        help="left sliding window size (-1 = no left bound; dense only when both -1)",
+        default=None,
+        help=(
+            "Left sliding window size. -1 means no left bound. "
+            f"Omit both window options to run the default sweep {DEFAULT_WINDOWS}. "
+            "Pass either flag to run one window. An omitted side is -1. "
+            "Dense only bench when both window sizes are -1."
+        ),
     )
     parser.add_argument(
         "--window-size-right",
         type=int,
-        default=-1,
-        help="right sliding window size (-1 = no right bound)",
-    )
-    parser.add_argument(
-        "-backend",
-        type=str,
-        default="triton",
-        choices=["triton", "gluon"],
-        help="Attention backend: 'triton' (default) or 'gluon' "
-        "(forward-only gfx950 kernel; only fwd / fwd_varlen).",
+        default=None,
+        help=(
+            "Right sliding window size. -1 means no right bound. "
+            "Please also check related help of --window-size-left option."
+        ),
     )
     parsed = parser.parse_args(args=args)
 
@@ -1069,11 +1186,7 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
     impl = parsed.impl
     fused = parsed.fused_bwd
     functions = [parsed.fn] if parsed.fn else sorted(VALID_FUNCTIONS)
-    windows = (
-        [(parsed.window_size_left, parsed.window_size_right)]
-        if parsed.window_size_left >= 0 or parsed.window_size_right >= 0
-        else DEFAULT_WINDOWS
-    )
+    windows = _resolve_windows(parsed.window_size_left, parsed.window_size_right)
     d_head = parsed.d if parsed.d else 128
     d_head_v = parsed.dv if parsed.dv else d_head
 
@@ -1133,6 +1246,9 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
         profile_dir=parsed.profile,
         print_vgpr=parsed.print_vgpr,
         bench_torch=parsed.bench_torch,
+        bencher=RotatingBufferBench.from_dict(
+            {**get_rot_bufs_kwargs(parsed), **get_do_bench_graph_kwargs(parsed)}
+        ),
         backend=parsed.backend,
     )
 

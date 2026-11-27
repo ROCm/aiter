@@ -89,7 +89,29 @@ def test_get_dtype_fp8_skips_runtime_detection_without_hip_device():
     subprocess.run([sys.executable, "-c", script], check=True, env=_test_env())
 
 
+def test_get_dtype_fp8_asks_the_aot_replay_target_without_a_device():
+    script = textwrap.dedent("""
+        import os
+        from unittest import mock
+
+        import torch
+        from aiter.jit.utils import chip_info
+        from aiter.utility import dtypes
+
+        with (
+            mock.patch.dict(os.environ, {"AITER_AOT_REPLAY": "1"}),
+            mock.patch.object(torch.version, "hip", "6.3"),
+            mock.patch.object(torch.cuda, "is_available", return_value=False),
+            mock.patch.object(chip_info, "get_gfx_runtime", return_value="gfx942") as get_gfx,
+        ):
+            assert dtypes.get_dtype_fp8() is torch.float8_e4m3fnuz
+        get_gfx.assert_called_once_with()
+    """)
+    subprocess.run([sys.executable, "-c", script], check=True, env=_test_env())
+
+
 if __name__ == "__main__":
     test_str2dtype_base_types_do_not_import_native_enum()
     test_get_dtype_fp8_delegates_to_shared_runtime_detector()
     test_get_dtype_fp8_skips_runtime_detection_without_hip_device()
+    test_get_dtype_fp8_asks_the_aot_replay_target_without_a_device()

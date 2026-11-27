@@ -134,6 +134,11 @@ def _gen_opus_moe_stage2_a8w4_decode_fake_tensors(
     sorted_expert_ids: Tensor,
     num_valid_ids: Tensor,
     out: Tensor,
+    token_num: int,
+    topk: int,
+    block_m: int,
+    kernel_id: int,
+    inter_dim_pad: int,
 ) -> Tensor:
     return out
 

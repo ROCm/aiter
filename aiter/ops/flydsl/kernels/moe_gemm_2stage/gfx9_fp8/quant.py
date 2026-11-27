@@ -8,16 +8,19 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir.dialects import llvm, vector
 from flydsl.expr import range_constexpr, rocdl
-from flydsl.expr.typing import T, as_ir_value
-from flydsl.expr.typing import Vector as Vec
+from flydsl.expr.typing import T
 from flydsl.expr.utils.arith import _to_raw as _raw
 
+from aiter.ops.flydsl.aot_cache import FlyDSLAotCache
+from aiter.ops.flydsl.aot_launch import bind_aot
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from . import common as fxh
 from .common import _ptr
+
+_ABSMAX_AOT_CACHE = FlyDSLAotCache("moe_gfx942_absmax")
+_QUANT_AOT_CACHE = FlyDSLAotCache("moe_gfx942_quant_per_tensor")
 
 
 @functools.cache
@@ -67,15 +70,7 @@ def flydsl_absmax():
 
         vmax = wave_reduce_max(vmax)
         if tid == 0:
-            llvm_ptr = fx.to_llvm_ptr(Amax)
-            llvm.AtomicRMWOp(
-                llvm.AtomicBinOp.fmax,
-                llvm_ptr,
-                as_ir_value(vmax),
-                llvm.AtomicOrdering.monotonic,
-                syncscope="agent",
-                alignment=4,
-            )
+            fx.atomic_max(Amax, vmax, syncscope="agent")
 
     @flyc.jit
     def launch(
@@ -88,6 +83,8 @@ def flydsl_absmax():
         absmax(A, Amax, num_elements).launch(
             grid=(wg_count, 1, 1), block=(num_threads, 1, 1), stream=stream
         )
+
+    bind_aot(launch, _ABSMAX_AOT_CACHE, ())
 
     def callable(A: torch.Tensor, Amax: torch.Tensor):
         stream = torch.cuda.current_stream()
@@ -117,7 +114,7 @@ def flydsl_quant_per_tensor(torch_dtype):
         num_workers = fx.grid_dim.x
 
         amax = fx.Float32(Amax[0])
-        inv_scale = (amax == fx.Float32(0.0)).select(
+        inv_scale = (amax == 0.0).select(
             fx.Float32(0.0),
             fx.Float32(rocdl.rcp(T.f32, amax) * fx.Float32(fmax)),
         )
@@ -169,8 +166,7 @@ def flydsl_quant_per_tensor(torch_dtype):
             w0 = rocdl.cvt_pk_fp8_f32(
                 T.i32, _raw(frag_f32[2]), _raw(frag_f32[3]), lo0, True
             )
-            vw0 = vector.broadcast(Vec.make_type((1,), fx.Int32), w0)
-            vi8x4_0 = vector.bitcast(Vec.make_type((4,), fx.Int8), vw0)
+            vi8x4_0 = fx.Vector.from_elements([w0], fx.Int32).bitcast(fx.Int8)
             frag2[0] = vi8x4_0[0]
             frag2[1] = vi8x4_0[1]
             frag2[2] = vi8x4_0[2]
@@ -182,8 +178,7 @@ def flydsl_quant_per_tensor(torch_dtype):
             w1 = rocdl.cvt_pk_fp8_f32(
                 T.i32, _raw(frag_f32[6]), _raw(frag_f32[7]), lo1, True
             )
-            vw1 = vector.broadcast(Vec.make_type((1,), fx.Int32), w1)
-            vi8x4_1 = vector.bitcast(Vec.make_type((4,), fx.Int8), vw1)
+            vi8x4_1 = fx.Vector.from_elements([w1], fx.Int32).bitcast(fx.Int8)
             frag2[4] = vi8x4_1[0]
             frag2[5] = vi8x4_1[1]
             frag2[6] = vi8x4_1[2]
@@ -203,6 +198,8 @@ def flydsl_quant_per_tensor(torch_dtype):
         quantize_per_tensor(A, Amax, B, num_elements).launch(
             grid=(wg_count, 1, 1), block=(num_threads, 1, 1), stream=stream
         )
+
+    bind_aot(launch, _QUANT_AOT_CACHE, (torch_dtype,))
 
     def callable(A: torch.Tensor, Amax: torch.Tensor, B: torch.Tensor):
         stream = torch.cuda.current_stream()

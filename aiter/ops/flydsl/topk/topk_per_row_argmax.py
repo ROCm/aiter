@@ -8,12 +8,14 @@ from functools import lru_cache
 import torch
 from flydsl.expr import BFloat16, Float16, Float32
 
-from ..kernels.tensor_shim import _run_compiled
+from ..kernels.topk.topk_launch import run_topk_launcher
 from ..kernels.topk.topk_per_row_argmax import (
     VEC_BY_ELEM,
     build_topk_per_row_argmax_module,
+    topk_per_row_argmax_rows_are_exact,
     topk_per_row_argmax_splits,
 )
+from .row_lens import row_len_slot
 
 __all__ = [
     "ARGMAX_DTYPES",
@@ -49,7 +51,7 @@ def topk_per_row_argmax_serves(k: int) -> str | None:
 
 
 def topk_per_row_argmax(
-    scores: torch.Tensor, row_lens: torch.Tensor, indices: torch.Tensor
+    scores: torch.Tensor, row_lens: torch.Tensor | None, indices: torch.Tensor
 ) -> None:
     """Write each row's argmax column.
 
@@ -57,7 +59,8 @@ def topk_per_row_argmax(
         scores: ``[rows, width]``, inner stride 1, dtype in `ARGMAX_DTYPES`
             (float32, bfloat16 or float16).
         row_lens: ``[rows]`` int32; columns at or past a row's length are
-            invisible to it. A row of length 0 yields -1.
+            invisible to it. A row of length 0 yields -1. None makes every
+            row full-width, and then no length tensor is read at all.
         indices: ``[rows, 1]`` int32, written in place.
 
     Ties go to the smallest column, as ``torch.argmax`` does. NaN outranks
@@ -80,22 +83,28 @@ def topk_per_row_argmax(
     splits = topk_per_row_argmax_splits(rows, width, vec)
     # The count goes in as an argument, not as a build parameter: it follows the
     # row count, so keying the build on it is keying it on the batch size.
-    slice_launch, fold_launch = build_topk_per_row_argmax_module(splits == 1, elem)
+    full_rows = row_lens is None
+    slice_launch, fold_launch = build_topk_per_row_argmax_module(
+        splits == 1,
+        elem,
+        full_rows=full_rows,
+        exact_rows=full_rows and topk_per_row_argmax_rows_are_exact(width, vec),
+    )
     stream = torch.cuda.current_stream(scores.device)
-    vectors = (width + vec - 1) // vec
+    len_slot = row_len_slot(row_lens, scores.device)
 
     if fold_launch is None:
         # One split writes the answer directly; the partials are unread, so pass
         # the output buffer in their place rather than allocating a pair to
         # ignore.
-        _run_compiled(
+        run_topk_launcher(
             slice_launch,
             scores,
-            row_lens,
+            len_slot,
             indices,
             indices,
             indices,
-            vectors,
+            width,
             splits,
             rows,
             stream,
@@ -107,26 +116,26 @@ def topk_per_row_argmax(
     # buffer would be shared across streams.
     part_key = torch.empty((rows, splits), dtype=torch.int32, device=scores.device)
     part_col = torch.empty_like(part_key)
-    _run_compiled(
+    run_topk_launcher(
         slice_launch,
         scores,
-        row_lens,
+        len_slot,
         indices,
         part_key,
         part_col,
-        vectors,
+        width,
         splits,
         rows,
         stream,
     )
-    _run_compiled(
+    run_topk_launcher(
         fold_launch,
         scores,
-        row_lens,
+        len_slot,
         indices,
         part_key,
         part_col,
-        vectors,
+        width,
         splits,
         rows,
         stream,

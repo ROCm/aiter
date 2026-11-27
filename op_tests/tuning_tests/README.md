@@ -8,8 +8,11 @@ Minimal test suite for validating the aiter tuning infrastructure.
 |------|-------|-----|---------------|
 | `test_csv_validation.py` | 0 | No | Tuned CSV integrity: duplicates (all families), invalid times, errRatio, git conflicts |
 | `test_tuner_infra.py` | 1 | No | `base_tuner` utilities: CSV I/O, merge, dedup, calculate, post_process topk, update_config_files |
-| `test_compare_logic.py` | 1 | No | Compare/update_improved: `_build_compare_update_plan`, `_merge_compare_filtered_results` |
-| `test_mp_tuner_logic.py` | 1 | No | `mp_tuner` polling: timeout, AcceleratorError, KeyError, pool restart |
+| `test_arch_resolution.py` | 1 | No | GPU SKU resolution: `get_device_name` (MI300X/MI300A/MI308X), `_get_pci_chip_id`, `gfx_from_cu_num`, `get_build_targets` CU-count handling, `normalize_fp8_dtype` |
+| `test_compare_logic.py` | 1 | No | Compare/update_improved: `_build_compare_update_plan`, `_merge_compare_filtered_results`, auto-select removal, stale rows retuned |
+| `test_mp_tuner_logic.py` | 1 | No | `mp_tuner` polling: timeout, AcceleratorError, KeyError, pool restart, resubmitting a faulted group's remaining candidates, fault detection by type or failing synchronize |
+| `test_mp_tuner_fault.py` | 2 | Yes | `mp_tuner` when a candidate faults, kills its worker, or fails preparing inputs: only that candidate fails, for untyped and `return_status` callers |
+| `test_dispatch_verification.py` | 1 | No | `dispatch_verification` against a stub family: verified, wrong selection, wrong output, unchecked, other-GPU rows; `TunerCommon.run_config` against the config file's row, unchecked-row warning, model_configs merge |
 | `test_online_tune.py` | 1 | No | `AITER_ONLINE_TUNE` decision logic, `mp_lock` synchronization, MainFunc CSV write, cfg_2stages reload |
 | `test_tune_pipeline.py` | 2 | Yes | End-to-end: run each tuner on small shapes (mp=1 + mp=default), verify output CSV; `--compare --update_improved`; `AITER_ONLINE_TUNE` e2e |
 | `test_asm_splitk_guard.py` | 1 | No | `GemmTuner.asm_gemm_all_solutions` SplitK semaphore grid guard |
@@ -19,7 +22,9 @@ Minimal test suite for validating the aiter tuning infrastructure.
 
 Fast deterministic tuning validation is part of the normal pull-request test
 sharding through `.github/scripts/split_tests.sh`. That gate includes CSV
-validation, shape-collision checks, and the mixed-MXFP tuner unit tests.
+validation, shape-collision checks, the mixed-MXFP tuner unit tests, the
+compare logic, the dispatch verification, and the one-GPU `mp_tuner` fault and
+worker-death tests.
 
 The full Level 0+1 workflow repeats the broader CPU suite on its daily/manual
 schedule. GPU tuner-pipeline and all-shape `--run_config` validation remain
@@ -64,6 +69,7 @@ If `AITER_CONFIGS` is unavailable (e.g. aiter not installed), the test falls bac
 python3 -m unittest op_tests.tuning_tests.test_csv_validation \
   op_tests.tuning_tests.test_tuner_infra \
   op_tests.tuning_tests.test_mp_tuner_logic \
+  op_tests.tuning_tests.test_arch_resolution \
   op_tests.tuning_tests.test_mixed_mxfp_tuning \
   op_tests.tuning_tests.test_online_tune -v
 python3 -m pytest op_tests/tuning_tests/test_fhmoe_tuner.py -v
@@ -74,7 +80,7 @@ python3 -m unittest op_tests.tuning_tests.test_tune_pipeline -v
 # Level 2: run_config validation (~20min, all tuned CSVs)
 python3 -m unittest op_tests.tuning_tests.test_run_config -v
 
-# Everything
+# Everything else
 python3 -m pytest op_tests/tuning_tests -v
 ```
 
@@ -143,6 +149,28 @@ python op_tests/tuners/tune_fhmoe.py \
 ```
 
 ### Running individual tuner tests
+
+The MXMOE CPU tests use a scoped host environment and run without visible GPUs:
+
+```bash
+HIP_VISIBLE_DEVICES='' ROCR_VISIBLE_DEVICES='' \
+python3 -m pytest -q op_tests/tuning_tests/test_mxfp4_flydsl_tuning.py \
+  op_tests/tuning_tests/test_mxfp4_cpu_test_isolation.py \
+  op_tests/tuning_tests/test_mxfp4_moe_aux_codegen.py \
+  op_tests/tuning_tests/test_public_a8w4_csv_lookup.py
+```
+
+Collection imports no aiter GPU modules for these tests. Execution
+uses the installed aiter host extension for enum types and the installed Python
+dependencies (torch, Triton, FlyDSL). The scoped environment supplies gfx950
+metadata, permits older system Triton only for these host checks, and rejects
+GPU initialization and extension builds. It restores environment overrides and
+the incoming default device on exit. Actual GPU CLI validation continues to use
+the real device detection, packages and compiled kernels.
+If torch changes its private default-device storage, the tests try the public
+query with GPU initialization blocked. If that query cannot read the setting
+safely, the tests report an unsupported environment before changing any device
+setting or environment variable.
 
 Most tuners in `test_tune_pipeline.py` have `_mp1` (single GPU) and
 `_mp_default` (all GPUs) variants. FHMoE is gfx950-only and defines `_mp1`

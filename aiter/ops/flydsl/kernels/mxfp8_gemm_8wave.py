@@ -13,6 +13,7 @@ scales, so the epilogue only converts. ``MxMfma`` issues one scaled atom per
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 
@@ -31,6 +32,23 @@ from aiter.ops.flydsl.kernels.mfma_preshuffle_pipeline import split_row_major_2d
 # closes for this shape, see ``compile_mxfp8_gemm_8w``.
 BLOCK_K = 128
 LDS_LIMIT_BYTES = 160 * 1024
+
+
+def barrier_if_zero(sgpr_value):
+    """``s_barrier`` only in waves whose (wave-uniform, SGPR) value is 0.
+
+    Inline asm rather than ``if``: a branch splits the block while every
+    accumulator is live, and the scalar ``scf.if`` alone raised the WKV
+    (K=6144) kernel's scratch spills 8 -> 20 and its time by ~2% (MI355X). The
+    branch skips the one 4-byte ``s_barrier``.
+    """
+    _llvm.inline_asm(
+        res=None,
+        operands_=[sgpr_value],
+        asm_string="s_cmp_lg_u32 $0, 0\ns_cbranch_scc1 1\ns_barrier",
+        constraints="s,~{scc}",
+        has_side_effects=True,
+    )
 
 
 class ScalePreshuffledS2R:
@@ -123,14 +141,18 @@ class ScaleRawLds:
         a_col_major=False,
         b_block128=False,
         c_m=None,
+        k_byte_off=None,
     ):
         """``a_row`` / ``b_row``: block-local first row of this wave's tiles; ``lds``: two chunk slots.
 
         ``b_rows_per`` N-rows share one B scale row: 1 for ``[N, K // 32]``, 32
         for a 32x32 ``[N // 32, K // 32]`` -- the staged chunk is the 1x32 one.
         ``a_col_major`` / ``b_block128`` select the 1x128 / 128x128 forms (``c_m``
-        is M, the column stride of the former).
+        is M, the column stride of the former). ``k_byte_off``: a split-K
+        segment's first scale byte of a row (row-major 1x32 / 32x32 forms only).
         """
+        assert k_byte_off is None or not (a_col_major or b_block128)
+        self.k_byte_off = k_byte_off
         self.row_bytes = K // 32
         self.k128 = K // 128
         self.a_col = a_col_major
@@ -195,6 +217,8 @@ class ScaleRawLds:
         if const_expr(op == 1 and self.b_blk):
             # The dword never runs past the row's end (K // 128 >= 4).
             return fx.Int32(min(chunk * self.CHUNK, self.k128 - 4))
+        if const_expr(self.k_byte_off is not None):
+            return fx.Int32(chunk * 16) + self.k_byte_off
         return fx.Int32(chunk * 16)
 
     def dma(self, chunk):
@@ -275,7 +299,7 @@ class MxMfma:
             for osa in range(4)
             for osb in range(4)
         }
-        self.zero_value = Vec.filled(4, 0.0, fx.Float32)
+        self.zero_value = fx.full(4, 0.0, fx.Float32)
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
 
@@ -320,40 +344,89 @@ class MxMfma:
 class StoreBf16:
     """Converts the already-scaled fp32 accumulators to bf16 and stores them."""
 
-    def __init__(self, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b):
+    def __init__(self, C, c_rows, c_cols, ldc, c_idx_fn, n_tiles_a, n_tiles_b):
+        # ldc: C's row stride in elements (>= c_cols), so C may be a column
+        # slice of a wider row-major matrix. Rows past c_rows land at or beyond
+        # c_rows * ldc, which the descriptor drops.
         self.c_rows = c_rows
         self.c_cols = c_cols
+        self.ldc = ldc
         self.lane_id = fx.thread_idx.x % 64
         self.c_idx_fn = c_idx_fn
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
         gC = fx.rocdl.make_buffer_tensor(
-            C, max_size=False, num_records_bytes=c_rows * c_cols * 2
+            C, max_size=False, num_records_bytes=c_rows * ldc * 2
         )
         self.c_div = fx.logical_divide(gC, fx.make_layout(1, 1))
         self.out_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16)
         self.reg_bf16_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.BFloat16)
 
     def store(self, c_frag, base_row, base_col):
+        # MFMA 16x16 C layout: lane l holds rows (l // 16) * 4 + i, column l % 16.
+        # The lane's element index is computed once; a row's offset
+        # (ti * 16 + i) * ldc is wave-uniform (SALU), so each element costs one
+        # add. A column past c_cols moves the lane's base to c_rows * ldc, which
+        # every row offset keeps out of the descriptor's range.
+        oob = fx.Int32(self.c_rows * self.ldc)
+        lane_col = base_col + self.lane_id % 16
+        lane_base = (base_row + (self.lane_id // 16) * 4) * self.ldc + lane_col
+        for tj in range_constexpr(self.n_tiles_b):
+            col_valid = (lane_col + tj * 16) < self.c_cols
+            base_tj = fx.Int32(col_valid.select(lane_base + tj * 16, oob))
+            for ti in range_constexpr(self.n_tiles_a):
+                # Four rows converted together: two packed cvts, not four.
+                acc = Vec(c_frag[self.c_idx_fn(ti, tj)]).to(fx.BFloat16)
+                for i in range_constexpr(4):
+                    fx.memref_store_vec(
+                        fx.full(1, acc[i], fx.BFloat16), self.reg_bf16_1
+                    )
+                    row_off = fx.Int32((ti * 16 + i) * self.ldc)
+                    fx.copy(
+                        self.out_atom_1,
+                        self.reg_bf16_1,
+                        fx.slice(self.c_div, (None, base_tj + row_off)),
+                    )
+
+
+class StoreF32Slab:
+    """Stores the fp32 accumulators of split-K segment ``seg`` into slab ``seg``
+    of a contiguous ``[k_split, c_rows, c_cols]`` fp32 workspace."""
+
+    def __init__(self, W, k_split, seg, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b):
+        self.c_rows = c_rows
+        self.c_cols = c_cols
+        self.slab_row0 = seg * c_rows
+        self.lane_id = fx.thread_idx.x % 64
+        self.c_idx_fn = c_idx_fn
+        self.n_tiles_a = n_tiles_a
+        self.n_tiles_b = n_tiles_b
+        self.n_elems = fx.Int32(k_split) * c_rows * c_cols
+        gW = fx.rocdl.make_buffer_tensor(
+            W, max_size=False, num_records_bytes=self.n_elems * 4
+        )
+        self.w_div = fx.logical_divide(gW, fx.make_layout(1, 1))
+        self.atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+        self.reg = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
+
+    def store(self, c_frag, base_row, base_col):
         for ti in range_constexpr(self.n_tiles_a):
             row = base_row + ti * 16 + (self.lane_id // 16) * 4
             for tj in range_constexpr(self.n_tiles_b):
                 col = base_col + tj * 16 + self.lane_id % 16
-                col_valid = col < self.c_cols
-                oob = fx.Int32(self.c_rows * self.c_cols)
                 vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
                 for i in range_constexpr(4):
-                    fx.memref_store_vec(
-                        Vec.filled(1, vec_f32[i].to(fx.BFloat16), fx.BFloat16),
-                        self.reg_bf16_1,
-                    )
-                    c_index = (row + i) * self.c_cols + col
+                    r = row + i
+                    # Rows past c_rows would land in the next slab: drop them
+                    # (and column overflow) out of bounds.
+                    ok = (r < self.c_rows) & (col < self.c_cols)
+                    idx = (self.slab_row0 + r) * self.c_cols + col
+                    fx.memref_store_vec(fx.full(1, vec_f32[i], fx.Float32), self.reg)
                     fx.copy(
-                        self.out_atom_1,
-                        self.reg_bf16_1,
+                        self.atom,
+                        self.reg,
                         fx.slice(
-                            self.c_div,
-                            (None, fx.Int32(col_valid.select(c_index, oob))),
+                            self.w_div, (None, fx.Int32(ok.select(idx, self.n_elems)))
                         ),
                     )
 
@@ -369,6 +442,7 @@ def compile_mxfp8_gemm_8w(
     xcd_swizzle: int = 0,
     b_scale_block: str = "1x32",
     a_scale_block: str = "1x32",
+    k_split: int = 1,
 ):
     """Build the MXFP8 launcher.
 
@@ -377,6 +451,11 @@ def compile_mxfp8_gemm_8w(
     ``b_scale_block="32x32"`` (row-major only) takes B's as ``[N // 32, K // 32]``,
     ``"128x128"`` as ``[N // 128, K // 128]``; ``a_scale_block="1x128"`` takes A's
     as the blockscale column-major ``[K // 128, M]`` (both unshuffled only).
+
+    ``k_split > 1`` builds the split-K tail kernel: workgroup ``t * k_split + s``
+    runs K-segment ``s`` (``K // k_split`` deep) of output tile ``t`` (row-major
+    tile order, no XCD swizzle) and writes its fp32 partial to slab ``s`` of
+    ``C``, a contiguous ``[k_split, c_m, c_n]`` fp32 workspace (ldc unused).
     """
     assert b_scale_block in (
         "1x32",
@@ -401,7 +480,14 @@ def compile_mxfp8_gemm_8w(
         K % 256 == 0
     ), f"K must be a multiple of 256 (MX scale chunk staging), got {K}"
 
-    K_ITERS = K // BLOCK_K
+    assert (
+        k_split >= 1 and K % (k_split * 256) == 0
+    ), f"k_split {k_split} must leave K-segments of whole 256-K scale chunks"
+    assert k_split == 1 or (
+        not scale_preshuffled and a_scale_block == "1x32" and b_scale_block != "128x128"
+    ), "a split-K segment takes row-major 1x32 A and 1x32 / 32x32 B scales"
+    assert k_split == 1 or xcd_swizzle == 0, "split-K tiles run in row-major order"
+    K_ITERS = K // BLOCK_K // k_split
     # Scale words are addressed by K-pair, so K must contain a whole number of
     # them (K % 256 above already guarantees it).
     assert K_ITERS % 2 == 0
@@ -438,6 +524,7 @@ def compile_mxfp8_gemm_8w(
     _kname = (
         f"flydsl_{_layout_tag}_mxfp8_8w_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_F8_F8_B16_"
         f"{waves_per_eu}x{xcd_swizzle}{_scale_tag}_k{K}"
+        f"{f'_ks{k_split}' if k_split > 1 else ''}"
     )
 
     @fx.struct
@@ -462,6 +549,7 @@ def compile_mxfp8_gemm_8w(
         B_scale: fx.Tensor,
         c_m: fx.Int32,
         c_n: fx.Int32,
+        ldc: fx.Int32,
     ):
         F8_IR_t = fx.Float8E4M3FN.ir_type
 
@@ -481,7 +569,16 @@ def compile_mxfp8_gemm_8w(
         wave_id = fx.thread_idx.x // 64
         wave_m = wave_id // 4
         wave_n = wave_id % 4
-        if const_expr(xcd_swizzle > 0):
+        B_K_STEP = (2 * 1024) if b_preshuffled else BLOCK_K
+        if const_expr(k_split > 1):
+            seg = fx.Int32(fx.block_idx.x) % k_split
+            block_m, block_n = split_row_major_2d(
+                fx.Int32(fx.block_idx.x) // k_split, n_blocks
+            )
+            k0 = seg * K_ITERS  # first K-step of this segment
+            a_k_off = k0 * BLOCK_K
+            b_k_off = k0 * B_K_STEP
+        elif const_expr(xcd_swizzle > 0):
             block_m, block_n = _xcd_swizzle_any(
                 ceildiv(c_m, BLOCK_M), n_blocks, wgm=xcd_swizzle
             )
@@ -490,9 +587,13 @@ def compile_mxfp8_gemm_8w(
 
         A0_gl_offset = (block_m * BLOCK_M) * K
         A1_gl_offset = (block_m * BLOCK_M + LDS_BLOCK_M) * K
-        B_K_STEP = (2 * 1024) if b_preshuffled else BLOCK_K
         B0_gl_offset = (block_n * BLOCK_N) * K
         B1_gl_offset = (block_n * BLOCK_N + LDS_BLOCK_N) * K
+        if const_expr(k_split > 1):
+            A0_gl_offset = A0_gl_offset + a_k_off
+            A1_gl_offset = A1_gl_offset + a_k_off
+            B0_gl_offset = B0_gl_offset + b_k_off
+            B1_gl_offset = B1_gl_offset + b_k_off
 
         gA = make_fp8_buffer_tensor(A, F8_IR_t)
         gB = make_fp8_buffer_tensor(B_T, F8_IR_t)
@@ -512,7 +613,12 @@ def compile_mxfp8_gemm_8w(
         b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
         a_s2r = S2RLoader(wave_m, N_TILES_A)
         b_s2r = S2RLoader(wave_n, N_TILES_B)
-        store_c = StoreBf16(C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
+        if const_expr(k_split > 1):
+            store_c = StoreF32Slab(
+                C, k_split, seg, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B
+            )
+        else:
+            store_c = StoreBf16(C, c_m, c_n, ldc, mfma.idx, N_TILES_A, N_TILES_B)
 
         if const_expr(scale_preshuffled):
             a_sc = ScalePreshuffledS2R(A_scale, c_m, K, N_TILES_A)
@@ -533,6 +639,8 @@ def compile_mxfp8_gemm_8w(
                 a_col_major=a_scale_block == "1x128",
                 b_block128=b_scale_block == "128x128",
                 c_m=c_m,
+                # A scale row holds K // 32 bytes: 4 per 128-K step.
+                k_byte_off=k0 * (BLOCK_K // 32) if k_split > 1 else None,
             )
             n_chunks = (K_ITERS + ScaleRawLds.CHUNK - 1) // ScaleRawLds.CHUNK
         # 16-row tile index of each wave's first row, per LDS half.
@@ -718,7 +826,11 @@ def compile_mxfp8_gemm_8w(
             a1_frag, b1_frag, c11_frag, sa1, sb1, k_pack=k % 2, set_prio=False
         )
         rocdl.s_setprio(0)
-        rocdl.s_barrier()
+        # The wave_m == 1 group took one extra barrier in the prologue, so this
+        # one would have no partner: it would hold that group until the other
+        # group's waves exit, serializing the two epilogues (ATT: ~5k cycles a
+        # tile). Only the leading group pairs it; no LDS access follows.
+        barrier_if_zero(rocdl.readfirstlane(fx.Int32.ir_type, wave_m))
 
         # Accumulators are already scaled by the MFMA: convert and store.
         wave_n_offset = wave_n * (N_TILES_B * 16)
@@ -740,9 +852,10 @@ def compile_mxfp8_gemm_8w(
         B_scale: fx.Tensor,
         c_m: fx.Int32,
         c_n: fx.Int32,
+        ldc: fx.Int32,
         stream: fx.Stream,
     ):
-        grid_x = ceildiv(c_m, BLOCK_M) * ceildiv(c_n, BLOCK_N)
+        grid_x = ceildiv(c_m, BLOCK_M) * ceildiv(c_n, BLOCK_N) * k_split
         kernel_gemm(
             A,
             B_T,
@@ -751,6 +864,7 @@ def compile_mxfp8_gemm_8w(
             B_scale,
             c_m,
             c_n,
+            ldc,
             value_attrs={
                 "rocdl.waves_per_eu": waves_per_eu,
                 "rocdl.flat_work_group_size": "512,512",

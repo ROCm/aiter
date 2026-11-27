@@ -152,6 +152,22 @@ def tensor_model_parallel_all_reduce(
     return get_tp_group().all_reduce(input_, use_new, open_fp8_quant, prefill_support)
 
 
+def tensor_model_parallel_all_reduce_add(
+    input_: torch.Tensor,
+    other: torch.Tensor,
+    use_new: bool = True,
+    open_fp8_quant: bool = False,
+    prefill_support: bool = False,
+) -> torch.Tensor:
+    """All-reduce input_ + other across the model parallel group: the sum over
+    ranks of each rank's input_ + other, with the add fused into the all-reduce
+    where the device communicator can."""
+    _assert_no_custom_group("tensor_model_parallel_all_reduce_add")
+    return get_tp_group().all_reduce_add(
+        input_, other, use_new, open_fp8_quant, prefill_support
+    )
+
+
 def tensor_model_parallel_fused_allreduce_rmsnorm(
     input_: torch.Tensor,
     residual_inp_: torch.Tensor,
@@ -184,6 +200,7 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
     emit_bf16: bool = False,
     transpose_scale: bool = False,
     gemma_norm: bool = False,
+    hadamard_rotate: bool = False,
 ):
     """Fused tensor-parallel all-reduce + RMSNorm + quantization.
 
@@ -199,12 +216,18 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
     matching what ``gemm_a8w8_blockscale_preshuffle`` expects.
 
     ``gemma_norm`` normalizes with ``x * (1 + w)`` from the raw ``weight_``.
+
+    ``hadamard_rotate`` (MXFP4 only) quantizes the normed output rotated per
+    32-element group, as ``per_1x32_f4_quant_hip(..., hadamard_rotate=True)``
+    does; the bf16 side output stays unrotated.
     """
     _assert_no_custom_group("tensor_model_parallel_fused_allreduce_rmsnorm_quant")
 
     # Enum -> string up front (trace-safe) so downstream string guards match
     # under torch.compile instead of falling to the untraced pybind path.
     quant_type = _canonical_fused_ar_rms_quant_type(quant_type)
+    if hadamard_rotate and quant_type != "mxfp4":
+        raise ValueError("hadamard_rotate is MXFP4-only")
 
     # Per-group has its own traceable torch.library method; the generic path would
     # hit raw pybind and graph-break.
@@ -232,6 +255,7 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
         emit_bf16=emit_bf16,
         transpose_scale=transpose_scale,
         gemma_norm=gemma_norm,
+        hadamard_rotate=hadamard_rotate,
     )
 
 
@@ -243,6 +267,7 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_mxfp4_quant(
     prefill_support: bool = False,
     emit_bf16: bool = False,
     gemma_norm: bool = False,
+    hadamard_rotate: bool = False,
 ):
     return tensor_model_parallel_fused_allreduce_rmsnorm_quant(
         input_,
@@ -253,6 +278,7 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_mxfp4_quant(
         quant_type="mxfp4",
         emit_bf16=emit_bf16,
         gemma_norm=gemma_norm,
+        hadamard_rotate=hadamard_rotate,
     )
 
 
@@ -293,6 +319,8 @@ def tensor_model_parallel_fused_qknorm_allreduce_rope(
 
 
 def tensor_model_parallel_custom_all_gather(input_: torch.Tensor) -> torch.Tensor:
+    """The TP group's custom all-gather; raises where it has no kernel (see
+    `GroupCoordinator.custom_all_gather`)."""
     _assert_no_custom_group("tensor_model_parallel_custom_all_gather")
     return get_tp_group().custom_all_gather(input_)
 
@@ -314,6 +342,24 @@ def tensor_model_parallel_all_gather(
     """All-gather the input tensor across model parallel group."""
     _assert_no_custom_group("tensor_model_parallel_all_gather")
     return get_tp_group().all_gather(input_, use_custom, dim)
+
+
+def tensor_model_parallel_all_to_all(
+    input_: torch.Tensor,
+    scatter_dim: int = 0,
+    gather_dim: int = -1,
+    scales: torch.Tensor | None = None,
+    use_custom: bool = True,
+    registered: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """All-to-all across the model parallel group: split `input_` into
+    world_size equal chunks along `scatter_dim`, send chunk j to rank j and
+    concatenate the chunks received from ranks 0..W-1 along `gather_dim`.
+    See `GroupCoordinator.all_to_all`."""
+    _assert_no_custom_group("tensor_model_parallel_all_to_all")
+    return get_tp_group().all_to_all(
+        input_, scatter_dim, gather_dim, scales, use_custom, registered
+    )
 
 
 def tensor_model_parallel_gather(
@@ -352,6 +398,22 @@ def expert_parallel_all_gather(
     """All-gather the input tensor across expert parallel group."""
     _assert_no_custom_group("expert_parallel_all_gather")
     return get_ep_group().all_gather(input_, use_custom, dim)
+
+
+def expert_parallel_all_to_all(
+    input_: torch.Tensor,
+    scatter_dim: int = 0,
+    gather_dim: int = -1,
+    scales: torch.Tensor | None = None,
+    use_custom: bool = True,
+    registered: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """All-to-all across the expert parallel group (tensor contract in
+    `GroupCoordinator.all_to_all`)."""
+    _assert_no_custom_group("expert_parallel_all_to_all")
+    return get_ep_group().all_to_all(
+        input_, scatter_dim, gather_dim, scales, use_custom, registered
+    )
 
 
 def expert_parallel_reduce_scatter(
@@ -546,3 +608,26 @@ def custom_reduce_scatter(
     """
     _assert_has_custom_group()
     return get_custom_group(group).reduce_scatter_tensor(input_, use_custom, dim)
+
+
+def custom_all_to_all(
+    input_: torch.Tensor,
+    scatter_dim: int = 0,
+    gather_dim: int = -1,
+    scales: torch.Tensor | None = None,
+    use_custom: bool = True,
+    registered: bool = False,
+    group: str | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """All-to-all across the user-specified custom group (tensor contract in
+    `GroupCoordinator.all_to_all`).
+
+    Args:
+        group: Name of the custom group. When only one custom group is
+            initialized this can be omitted. When multiple groups exist,
+            pass the group name to select which one to use.
+    """
+    _assert_has_custom_group()
+    return get_custom_group(group).all_to_all(
+        input_, scatter_dim, gather_dim, scales, use_custom, registered
+    )

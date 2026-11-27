@@ -85,7 +85,11 @@ def input_helper(
 def ref_preprocess(kv_cache, kv_lora_rank):
     latent_cache = kv_cache
     v_input = latent_cache[..., :kv_lora_rank]
-    v_input = v_input.contiguous().unsqueeze(1)
+    # .contiguous() is a no-op (returns the same storage) when a leading dim has
+    # size 1, since PyTorch ignores strides on size-1 dims when checking
+    # contiguity. That aliases v_input with latent_cache, which then breaks the
+    # in-place write into k_input below. clone() always allocates fresh memory.
+    v_input = v_input.clone(memory_format=torch.contiguous_format).unsqueeze(1)
     k_input = latent_cache.unsqueeze(1)
     k_input[..., :kv_lora_rank] = v_input
     return k_input, v_input
@@ -112,8 +116,8 @@ def ref_compute(
     qk_rope_head_dim = k_input.shape[-1] - kv_lora_rank
 
     if use_rope:
-        q_input = torch.empty(B, H, kv_lora_rank + qk_rope_head_dim, dtype=q.dtype).to(
-            device
+        q_input = torch.empty(
+            B, H, kv_lora_rank + qk_rope_head_dim, dtype=q.dtype, device=device
         )
         q_nope_out, q_pe = q.split([kv_lora_rank, qk_rope_head_dim], dim=-1)
 
@@ -189,8 +193,8 @@ def ref_compute_full_fwd(
 
     qk_rope_head_dim = k_input.shape[-1] - kv_lora_rank
 
-    q_input = torch.empty(B, H, kv_lora_rank + qk_rope_head_dim, dtype=q.dtype).to(
-        device
+    q_input = torch.empty(
+        B, H, kv_lora_rank + qk_rope_head_dim, dtype=q.dtype, device=device
     )
     q_nope_out, q_pe = q.split([kv_lora_rank, qk_rope_head_dim], dim=-1)
 

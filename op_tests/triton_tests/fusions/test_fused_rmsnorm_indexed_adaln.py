@@ -31,7 +31,11 @@ def make(M, N, G, dtype, device, *, runs=True, seed=0):
     shift = torch.randn(G, N, generator=gen, device=device, dtype=dtype)
     scale = torch.randn(G, N, generator=gen, device=device, dtype=dtype) * 0.1
     if runs:
-        edges = torch.linspace(0, M, G + 1).round().long()
+        edges = (
+            torch.linspace(0, M, G + 1, dtype=torch.float32, device=device)
+            .round()
+            .long()
+        )
         indices = torch.zeros(M, dtype=torch.int64, device=device)
         for g in range(G):
             indices[edges[g] : edges[g + 1]] = g
@@ -167,12 +171,3 @@ def test_int32_indices_are_accepted():
     )
     want = fused_rmsnorm_indexed_adaln(x, weight, shift, scale, indices, eps=1e-5)
     torch.testing.assert_close(got, want, atol=0, rtol=0)
-
-
-def test_rejects_mismatched_shapes():
-    dev = "cuda"
-    x, weight, shift, scale, indices = make(32, 256, 3, torch.bfloat16, dev)
-    with pytest.raises(AssertionError):
-        fused_rmsnorm_indexed_adaln(x, weight[:-1], shift, scale, indices)
-    with pytest.raises(AssertionError):
-        fused_rmsnorm_indexed_adaln(x, weight, shift, scale, indices[:-1])

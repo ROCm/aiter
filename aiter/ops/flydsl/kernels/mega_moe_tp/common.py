@@ -4,11 +4,16 @@
 
 from __future__ import annotations
 
+import csv
+import functools
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.expr import range_constexpr, rocdl
+from flydsl.expr import gpu, range_constexpr, rocdl
+from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
 from .. import buffer_ops
@@ -160,10 +165,6 @@ def g_or_agent(addr, v):
     fx.atomic_or(gptr(addr), i32(v), syncscope="agent")
 
 
-def g_ld_i32(addr):
-    return i32(fx.generic_load(gptr(addr), dtype=fx.Int32))
-
-
 def uni(v):
     return i32(rocdl.readfirstlane(T.i32, i32(v)))
 
@@ -171,8 +172,8 @@ def uni(v):
 def uni64(v):
     v = fx.Int64(v)
     lo = uni(fx.Int32(v & fx.Int64(0xFFFFFFFF)))
-    hi = uni(fx.Int32(v >> fx.Int64(32)))
-    return (fx.Int64(hi) << fx.Int64(32)) | (fx.Int64(lo) & fx.Int64(0xFFFFFFFF))
+    hi = uni(fx.Int32(v >> 32))
+    return (fx.Int64(hi) << 32) | (fx.Int64(lo) & fx.Int64(0xFFFFFFFF))
 
 
 # Buffer resources from raw (peer / arena) addresses plus per-lane byte offsets
@@ -212,8 +213,8 @@ def _dma(lds_addr, rs, voff, soff, nbytes, aux):
     )
 
 
-def dma16(lds_addr, rs, voff, soff, nt=False):
-    _dma(lds_addr, rs, voff, soff, 16, 2 if nt else 0)
+def dma16(lds_addr, rs, voff, soff, nt=False, aux=None):
+    _dma(lds_addr, rs, voff, soff, 16, aux if aux is not None else (2 if nt else 0))
 
 
 def dma4(lds_addr, rs, voff, soff, sys=False):
@@ -245,14 +246,14 @@ def fp4_pack(vals, qs):
 
 
 def fp8x4_pack(f, qs):
-    zero = fx.Vector.filled(2, 0, fx.Int16)
+    zero = fx.full(2, 0, fx.Int16)
     w = rocdl.cvt_scalef32_pk_fp8_f32(
         T.vec(2, T.i16), _u(zero), _u(f[0]), _u(f[1]), _u(qs), False
     )
     w = rocdl.cvt_scalef32_pk_fp8_f32(
         T.vec(2, T.i16), w, _u(f[2]), _u(f[3]), _u(qs), True
     )
-    return fx.Int32(fx.Vector(w).bitcast(fx.Int32)[0])
+    return fx.Vector(w).bitcast(fx.Int32)[0]
 
 
 def fp8x4_unpack(d, sc):
@@ -292,6 +293,7 @@ def scales4(e8i):
 
 
 def bf16_bits(f):
+    # Preserve the packed conversion's code generation on gfx950.
     return fx.Int32(
         fx.Vector.from_elements([fx.Float32(f).to(fx.BFloat16)], fx.BFloat16).bitcast(
             fx.Int16
@@ -332,7 +334,7 @@ def wave_red(v, lane, op):
 def wave_rank(hit):
     b = fx.Int64(rocdl.ballot(T.i64, hit))
     lo = i32(b & fx.Int64(0xFFFFFFFF))
-    hi = i32(b >> fx.Int64(32))
+    hi = i32(b >> 32)
     below = rocdl.mbcnt_lo(T.i32, _u(lo), _u(i32(0)))
     below = i32(rocdl.mbcnt_hi(T.i32, _u(hi), below))
     return below, _ctpop(lo) + _ctpop(hi)
@@ -356,17 +358,20 @@ def swap32(x, y):
 
 
 def widen(v4):
-    z = fx.Vector.filled(4, 0, fx.Int32)
+    z = fx.full(4, 0, fx.Int32)
     return fx.Vector(v4).shuffle(z, list(range(8)))
 
 
 # Scaled MFMA with per-lane E8M0 scales read from LDS: no MMA-atom form.
-def mfma(a4, b4, cacc, sa, sb, b8=False):
+def mfma(a4, b4, cacc, sa, sb, b8=False, opa=0, opb=0, a8=False):
+    """opa / opb: the byte of sa / sb that holds the scale (opsel); a8: the first (weight)
+    operand MXFP8 (8 dwords, e4m3) instead of MXFP4"""
+    ax = a4 if a8 else widen(a4)
     bx = b4 if b8 else widen(b4)
     return fx.Vector(
         rocdl.mfma_scale_f32_16x16x128_f8f6f4(
             _ty(V4F),
-            [widen(a4), bx, cacc, 4, 0 if b8 else 4, 0, i32(sa), 0, i32(sb)],
+            [ax, bx, cacc, 0 if a8 else 4, 0 if b8 else 4, opa, i32(sa), opb, i32(sb)],
         )
     )
 
@@ -393,17 +398,17 @@ def alive(t0):
 
 
 @flyc.jit
-def spin_lds_ge(L, off, target):
+def spin_lds_ge(L, off, target, nap=0):
     cur = lds_ld_acq(L, off)
     while cur < target:
-        rocdl.s_sleep(0)
+        rocdl.s_sleep(nap)
         cur = lds_ld_acq(L, off)
 
 
 @flyc.jit
-def spin0(L, lane, off, target):
+def spin0(L, lane, off, target, nap=0):
     if lane == i32(0):
-        spin_lds_ge(L, off, target)
+        spin_lds_ge(L, off, target, nap)
     rocdl.sched_barrier(0)
 
 
@@ -415,3 +420,117 @@ def poll_sys_ge(addr, target, nap=2):
         rocdl.s_sleep(nap)
         cur = g_ld_sys(addr)
     return cur
+
+
+def i8x4_pack(f, inv):
+    """4 f32 * inv -> int8 (round to even, clamped to +-127) packed in an i32"""
+    w = i32(0)
+    for k in range_constexpr(4):
+        q = fx.Int32(fmath.roundeven(f[k] * inv))
+        q = fx.max(fx.min(q, i32(127)), i32(-127))
+        w = w | ((q & i32(0xFF)) << i32(8 * k))
+    return w
+
+
+def i8x4_unpack(d, sc):
+    out = []
+    for k in range_constexpr(4):
+        b = (fx.Int32(d) << i32(24 - 8 * k)) >> i32(24)
+        out.append(b.to(fx.Float32) * sc)
+    return out
+
+
+def f32_bits_add(x, y):
+    """f32 add on i32 bit patterns (block reductions over i32 LDS words)"""
+    return (x.bitcast(fx.Float32) + y.bitcast(fx.Float32)).bitcast(fx.Int32)
+
+
+def f32_bits_max(x, y):
+    return x.bitcast(fx.Float32).maximumf(y.bitcast(fx.Float32)).bitcast(fx.Int32)
+
+
+def i4x8_pack(f, inv):
+    w = i32(0)
+    for k in range_constexpr(8):
+        q = fx.Int32(fmath.roundeven(f[k] * inv))
+        q = fx.max(fx.min(q, i32(7)), i32(-8))
+        w = w | ((q & i32(0xF)) << i32(4 * k))
+    return w
+
+
+def i4x8_unpack(d, sc):
+    out = []
+    for k in range_constexpr(8):
+        b = (fx.Int32(d) << i32(28 - 4 * k)) >> i32(28)
+        out.append(b.to(fx.Float32) * sc)
+    return out
+
+
+# ---- tuned-config CSVs ----
+@functools.cache
+def _read(path: str, mtime: float) -> tuple:
+    if not os.path.isfile(path):
+        return ()
+    with open(path) as f:
+        return tuple(csv.DictReader(f))
+
+
+def tuned_rows(path: str, key: dict, tokens_col: str) -> dict:
+    """{tokens: row} of the rows of path matching every key column (compared as str)."""
+    path = os.path.abspath(path)
+    mtime = os.path.getmtime(path) if os.path.isfile(path) else 0.0
+    want = {k: str(v) for k, v in key.items()}
+    return {
+        int(r[tokens_col]): r
+        for r in _read(path, mtime)
+        if all((r.get(k) or "") == v for k, v in want.items())
+    }
+
+
+def nearest(rows: dict, tokens: int, clamp: bool = False):
+    """The row of tokens, else of the nearest tuned count above it (a batch between two tuned
+    ones takes the larger one's config); beyond the largest: None, or (clamp) its row.
+    """
+    if not rows:
+        return None
+    above = [t for t in rows if t >= tokens]
+    if above:
+        return rows[min(above)]
+    return rows[max(rows)] if clamp else None
+
+
+def device_key(device=None) -> dict:
+    """gfx / cu_num of a device (the CSVs' leading key columns)."""
+    import torch
+
+    from aiter.jit.utils.chip_info import get_gfx
+
+    props = torch.cuda.get_device_properties(device or torch.cuda.current_device())
+    return {"gfx": get_gfx(), "cu_num": int(props.multi_processor_count)}
+
+
+# (debug) AITER_MEGAMOE_TP_TRACE_PTR: the address of a device int32 [grid, TRACE_SLOTS]
+# buffer (0: off, nothing compiled in); the small-engine kernel stores the low 32 bits of
+# s_memrealtime (100 MHz) at its phase points. The kernel name carries "_trace".
+TRACE_SLOTS = 32
+
+
+def trace_ptr() -> int:
+    return int(os.environ.get("AITER_MEGAMOE_TP_TRACE_PTR", "0"))
+
+
+def make_trace(who: int = 0):
+    """tr(tid, slot, who=who): thread who of every CTA stores now() into its trace slot"""
+    ptr = trace_ptr()
+
+    @flyc.jit
+    def _tr(tid, slot, w):
+        if tid == i32(w):
+            i = i32(gpu.block_id("x")) * i32(TRACE_SLOTS) + i32(slot)
+            g_st_sys(fx.Int64(ptr) + fx.Int64(i * i32(4)), fx.Int32(now()))
+
+    def tr(tid, slot, w=who):
+        if ptr:
+            _tr(tid, slot, w)
+
+    return tr

@@ -10,7 +10,10 @@ from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 
-from aiter.ops.flydsl.kernels.kernels_common import ceildiv
+from aiter.ops.flydsl.kernels.kernels_common import (
+    ceildiv,
+    set_slp_vectorize_once_used,
+)
 from aiter.ops.flydsl.kernels.mfma_preshuffle_pipeline import split_row_major_2d
 
 
@@ -189,7 +192,7 @@ class StoreC:
         return Vec(fx.memref_load_vec(self.reg_f32_1))[0]
 
     def _store_bf16(self, value_bf16, c_index):
-        fx.memref_store_vec(Vec.filled(1, value_bf16, fx.BFloat16), self.reg_bf16_1)
+        fx.memref_store_vec(fx.full(1, value_bf16, fx.BFloat16), self.reg_bf16_1)
         fx.copy(
             self.out_atom_1,
             self.reg_bf16_1,
@@ -225,7 +228,7 @@ class Mfma16x16x128:
         self.atom = fx.make_mma_atom(
             fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, fx.Float8E4M3FN)
         )
-        self.zero_value = Vec.filled(4, 0.0, fx.Float32)
+        self.zero_value = fx.full(4, 0.0, fx.Float32)
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
 
@@ -284,20 +287,31 @@ class Mfma16x16x128:
         return self._do_mma(a[i], b[j], c[self.idx(i, j)])
 
 
-def _xcd_swizzle_any(num_pid_m, num_pid_n, wgm):
-    """XCD-aware tile remap that works for any workgroup count. This function is used to swizzle the tile indices to improve the L2 reuse."""
-    NUM_XCDS = 8
+def _xcd_contiguous_index(wgid, num_wg, num_xcds):
+    """Map round-robin physical XCD dispatch to contiguous logical ranges."""
+    xcd = wgid % num_xcds
+    intra_xcd = wgid // num_xcds
+    base = num_wg // num_xcds
+    extra = num_wg % num_xcds
+    prefix_extra = min(xcd, extra) if isinstance(wgid, int) else fx.min(xcd, extra)
+    return xcd * base + prefix_extra + intra_xcd
 
-    wgid = fx.block_idx.x
+
+def _xcd_swizzle_any(num_pid_m, num_pid_n, wgm, wgid=None, num_xcds=8):
+    """XCD-aware tile remap that works for any workgroup count.
+
+    ``wgid`` defaults to the workgroup index; a persistent kernel passes its
+    tile index, which must lie on XCD ``wgid % num_xcds``.
+    """
+    assert num_xcds > 0
+
+    if wgid is None:
+        wgid = fx.block_idx.x
     num_wg = num_pid_m * num_pid_n
 
-    # Hardware dispatches workgroup i to XCD (i % NUM_XCDS). Invert that so
+    # Hardware dispatches workgroup i to XCD (i % num_xcds). Invert that so
     # logically adjacent tiles share an XCD, and thus its L2.
-    xcd = wgid % NUM_XCDS
-    intra_xcd = wgid // NUM_XCDS
-    base = num_wg // NUM_XCDS
-    extra = num_wg % NUM_XCDS
-    wgid_remap = xcd * base + fx.min(xcd, extra) + intra_xcd
+    wgid_remap = _xcd_contiguous_index(wgid, num_wg, num_xcds)
 
     # Group-of-WGM row swizzle for L2 reuse within one XCD.
     num_wgid_in_group = wgm * num_pid_n
@@ -446,6 +460,7 @@ def compile_fp8_gemm_8w(
             b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
             a0_frag = a_s2r.load(a_cur0)
             a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)
+            rocdl.s_waitcnt(lgkmcnt=0)
             rocdl.s_barrier()
 
             c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
@@ -477,7 +492,7 @@ def compile_fp8_gemm_8w(
         k = K_ITERS - 2
         b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
         a0_frag = a_s2r.load(a_cur0)
-        rocdl.s_barrier()
+        wait_barrier(0)
 
         c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
 
@@ -523,7 +538,8 @@ def compile_fp8_gemm_8w(
         c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, set_prio=False)
         c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, set_prio=False)
         rocdl.s_setprio(0)
-        rocdl.s_barrier()
+        if wave_m == 0:
+            rocdl.s_barrier()
 
         # Scale and store back to gmem
         wave_n_offset = wave_n * (N_TILES_B * 16)
@@ -562,4 +578,4 @@ def compile_fp8_gemm_8w(
             },
         ).launch(grid=(grid_x, 1, 1), block=(512, 1, 1), stream=stream)
 
-    return launch_gemm
+    return set_slp_vectorize_once_used(launch_gemm, False)

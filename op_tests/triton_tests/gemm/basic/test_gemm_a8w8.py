@@ -18,6 +18,7 @@ from aiter.ops.triton.utils.gemm_config_utils import (
     get_gemm_config,
 )
 from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 DEVICE_ARCH = arch_info.get_arch()
 
@@ -48,38 +49,6 @@ dtype_max = {
         torch.int8,
     ]
 }
-
-
-def get_x_vals():
-    x_vals = [(1, 1, 1)]  # minimal case
-    x_vals += [(3, 5, 2)]  # irregular shape
-    x_vals += [(1024 * v, 1024 * v, 1024 * v) for v in (1, 2, 4, 5, 8)]
-    x_vals += [(v, 106496, 16384) for v in (190, 256, 4096)]  # LL3 405B FC1
-    x_vals += [
-        (v, 10240, 8192) for v in (256, 4096, 8000)
-    ]  # LL3 70B QKV input projection
-    return x_vals
-
-
-def get_splitk_x_vals():
-    return [
-        (1, 1280, 8192),
-        (32, 1280, 8192),
-        (64, 1280, 8192),
-        (128, 1280, 8192),
-        (256, 1280, 8192),
-        (1, 8192, 1024),
-        (32, 8192, 1024),
-        (64, 8192, 1024),
-        (128, 8192, 1024),
-        (256, 8192, 1024),
-        (1024, 1024, 1000),
-        (1024, 1024, 1024),
-        (1024, 1024, 4096),
-        (1024, 4096, 4096),
-        (2048, 2048, 2048),
-        (4096, 4096, 4096),
-    ]
 
 
 def generate_gemm_a8w8_inputs(
@@ -137,20 +106,12 @@ def generate_gemm_a8w8_inputs(
     return x, weight, weight_shuffled, x_scale, w_scale, bias, y
 
 
-def get_fewer_x_vals():
-    x_vals = [(16, 1024, 1024)]
-    x_vals += [(128, 8192, 512)]
-    x_vals += [(256, 512, 8192)]
-    x_vals += [(1024 * v, 1024 * v, 1024 * v) for v in (1, 5, 8)]
-    return x_vals
-
-
 @pytest.mark.parametrize(
     "in_dtype, m, n, k",
     [
         (in_dtype, *shape)
         for in_dtype in ["fp8e4m3", "fp8e5m2"]
-        for shape in get_x_vals()
+        for shape in get_shapes()
     ],
 )
 @pytest.mark.parametrize(
@@ -159,6 +120,7 @@ def get_fewer_x_vals():
         "triton",
         "gluon",
         "gluon_shuffle",
+        "triton_shuffle",
     ],
 )
 def test_gemm_fp8(in_dtype, m, n, k, impl: str):
@@ -170,10 +132,12 @@ def test_gemm_fp8(in_dtype, m, n, k, impl: str):
             "Gluon implementation is not supported on this device (requires gfx950)."
         )
 
-    if impl == "gluon_shuffle" and (n % 16 != 0 or k % 32 != 0):
+    if "_shuffle" in impl and (n % 16 != 0 or k % 32 != 0):
         pytest.skip(
             "For preshuffle, N must be multiple of 16 and K must be multiple of 32."
         )
+    if impl == "gluon_shuffle" and k % 256 != 0:
+        pytest.skip("Gluon preshuffle needs K to be a multiple of BLOCK_SIZE_K (256).")
 
     in_dtype = str_to_torch_dtype[in_dtype]
     out_dtype = str_to_torch_dtype["bf16"]
@@ -193,8 +157,10 @@ def test_gemm_fp8(in_dtype, m, n, k, impl: str):
         impl = triton_gemm_a8w8
     elif impl == "gluon":
         impl = functools.partial(triton_gemm_a8w8, backend="gluon")
-    elif impl == "gluon_shuffle":
+    elif impl == "triton_shuffle":
         impl = gemm_a8w8_preshuffle
+    elif impl == "gluon_shuffle":
+        impl = functools.partial(gemm_a8w8_preshuffle, backend="gluon")
     else:
         raise ValueError(f"Unknown implementation: {impl}")
     b = run_triton(x, weight_triton, x_scale, w_scale, bias, out_dtype, y, impl)
@@ -207,7 +173,7 @@ def test_gemm_fp8(in_dtype, m, n, k, impl: str):
     [
         (out_dtype, *shape, layout, output)
         for out_dtype in ["fp16", "fp32", "int32"]
-        for shape in get_fewer_x_vals()
+        for shape in get_shapes(max_size=8192 * 8192 * 8192)
         for layout in ["TN", "TT", "NN", "NT"]
         for output in [True, False]
     ],
@@ -218,6 +184,7 @@ def test_gemm_fp8(in_dtype, m, n, k, impl: str):
         "triton",
         "gluon",
         "gluon_shuffle",
+        "triton_shuffle",
     ],
 )
 def test_gemm_int8(out_dtype, m, n, k, layout, output, impl: str):
@@ -231,10 +198,12 @@ def test_gemm_int8(out_dtype, m, n, k, layout, output, impl: str):
             "Gluon implementation is not supported on this device (requires gfx950)."
         )
 
-    if impl == "gluon_shuffle" and (n % 16 != 0 or k % 32 != 0):
+    if "_shuffle" in impl and (n % 16 != 0 or k % 32 != 0):
         pytest.skip(
             "For preshuffle, N must be multiple of 16 and K must be multiple of 32."
         )
+    if impl == "gluon_shuffle" and k % 256 != 0:
+        pytest.skip("Gluon preshuffle needs K to be a multiple of BLOCK_SIZE_K (256).")
 
     in_dtype = str_to_torch_dtype["int8"]
     out_dtype = str_to_torch_dtype[out_dtype]
@@ -254,8 +223,10 @@ def test_gemm_int8(out_dtype, m, n, k, layout, output, impl: str):
         impl = triton_gemm_a8w8
     elif impl == "gluon":
         impl = functools.partial(triton_gemm_a8w8, backend="gluon")
-    elif impl == "gluon_shuffle":
+    elif impl == "triton_shuffle":
         impl = gemm_a8w8_preshuffle
+    elif impl == "gluon_shuffle":
+        impl = functools.partial(gemm_a8w8_preshuffle, backend="gluon")
     else:
         raise ValueError(f"Unknown implementation: {impl}")
     b = run_triton(x, weight_triton, x_scale, w_scale, bias, out_dtype, y, impl)
@@ -272,18 +243,24 @@ def test_gemm_int8(out_dtype, m, n, k, layout, output, impl: str):
         (in_dtype, out_dtype, *shape)
         for in_dtype in ["fp8e4m3", "fp8e5m2", "int8"]
         for out_dtype in ["bf16", "fp32"]
-        for shape in get_splitk_x_vals()
+        for shape in get_shapes(max_size=4096 * 4096 * 4096)
     ],
 )
 @pytest.mark.parametrize("num_ksplit", [2, 4, 8])
 @pytest.mark.parametrize("has_bias", [True, False])
-def test_gemm_splitk(in_dtype, out_dtype, m, n, k, num_ksplit, has_bias):
+@pytest.mark.parametrize("preshuffle", [False, True])
+def test_gemm_splitk(in_dtype, out_dtype, m, n, k, num_ksplit, has_bias, preshuffle):
 
     torch.cuda.empty_cache()
 
     if out_dtype == "int32" and in_dtype in ["fp8e4m3", "fp8e5m2"]:
         pytest.skip(
             "This kernel is not supported for in_dtype of float and out_dtype of int."
+        )
+
+    if preshuffle and (n % 16 != 0 or k % 32 != 0):
+        pytest.skip(
+            "For preshuffle, N must be multiple of 16 and K must be multiple of 32."
         )
 
     in_dtype = str_to_torch_dtype[in_dtype]
@@ -296,17 +273,23 @@ def test_gemm_splitk(in_dtype, out_dtype, m, n, k, num_ksplit, has_bias):
         out_dtype=out_dtype,
         layout="TN",
         output=False,
+        shuffle=preshuffle,
     )
 
     if not has_bias:
         bias = None
 
-    config, _ = get_gemm_config("GEMM-A8W8", m, n, k)
+    if preshuffle:
+        config, _ = get_gemm_config("GEMM-A8W8_PRESHUFFLED", m, n, k)
+        fn = gemm_a8w8_preshuffle
+    else:
+        config, _ = get_gemm_config("GEMM-A8W8", m, n, k)
+        fn = triton_gemm_a8w8
     config["NUM_KSPLIT"] = num_ksplit
     compute_splitk_params(config, k)
 
     a = run_torch(x, weight, x_scale, w_scale, bias, out_dtype)
-    b = triton_gemm_a8w8(
+    b = fn(
         x,
         weight_triton,
         x_scale,
@@ -336,7 +319,8 @@ def test_gemm_splitk(in_dtype, out_dtype, m, n, k, num_ksplit, has_bias):
     ],
 )
 @pytest.mark.parametrize("num_ksplit", [2, 4])
-def test_gemm_splitk_skip_reduce(in_dtype, out_dtype, m, n, k, num_ksplit):
+@pytest.mark.parametrize("preshuffle", [False, True])
+def test_gemm_splitk_skip_reduce(in_dtype, out_dtype, m, n, k, num_ksplit, preshuffle):
 
     torch.cuda.empty_cache()
 
@@ -350,15 +334,21 @@ def test_gemm_splitk_skip_reduce(in_dtype, out_dtype, m, n, k, num_ksplit):
         out_dtype=out_dtype,
         layout="TN",
         output=False,
+        shuffle=preshuffle,
     )
 
-    config, _ = get_gemm_config("GEMM-A8W8", m, n, k)
+    if preshuffle:
+        config, _ = get_gemm_config("GEMM-A8W8_PRESHUFFLED", m, n, k)
+        fn = gemm_a8w8_preshuffle
+    else:
+        config, _ = get_gemm_config("GEMM-A8W8", m, n, k)
+        fn = triton_gemm_a8w8
     config["NUM_KSPLIT"] = num_ksplit
     compute_splitk_params(config, k)
 
     a = run_torch(x, weight, x_scale, w_scale, None, out_dtype)
 
-    y_pp = triton_gemm_a8w8(
+    y_pp = fn(
         x,
         weight_triton,
         x_scale,

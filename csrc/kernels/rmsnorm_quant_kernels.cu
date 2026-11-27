@@ -11,7 +11,9 @@
 #include "aiter_stream.h"
 #include "aiter_tensor.h"
 #include "mx_quant_utils.h"
+#include "quant_amax_floor.h"
 #include "rocprim/rocprim.hpp"
+#include <limits>
 
 namespace aiter {
 
@@ -217,7 +219,7 @@ __global__ void add_rmsnorm_quant_kernel(
 
             if constexpr(FUSE_QUANT)
             {
-                float thread_max = 1e-10f;
+                float thread_max = aiter::kAmaxFloor;
                 if constexpr(thread_data_size % 2 == 0)
                 {
                     for(int i = 0; i < thread_data_size; i += 2)
@@ -254,13 +256,8 @@ __global__ void add_rmsnorm_quant_kernel(
                     float max= multithread_reduce(thread_max, aiter::Max(), reduce_thread_size);
                     if(use_e8m0)
                     {
-                        constexpr aiter::MxDtype kMxDtype = is_fp4_out
-                            ? aiter::MxDtype::FP4_E2M1
-#if defined(__gfx942__)
-                            : aiter::MxDtype::FP8_E4M3_FNUZ;
-#else
-                            : aiter::MxDtype::FP8_E4M3;
-#endif
+                        constexpr aiter::MxDtype kMxDtype =
+                            is_fp4_out ? aiter::MxDtype::FP4_E2M1 : aiter::kHwFp8MxDtype;
                         quant_scale =
                             aiter::fp_f32_to_e8m0_scale<aiter::kDefaultMxScaleRoundMode, kMxDtype>(max);
                     }
@@ -458,6 +455,29 @@ __global__ void add_rmsnorm_quant_kernel(
                     n / 32, ") scale, got numel ", scale.numel());
     }
 
+    // add_rmsnorm_quant_kernel bounds every row with a buffer descriptor and moves it in
+    // 4-byte words, and the bound is rounded up to a whole word (ooba_i / ooba_o). A row
+    // whose byte length is not a multiple of 4 therefore has its last word reach past the
+    // row. With the 16-bit inputs an odd n reads element n of the input, the residual and
+    // the weight, and a 16-bit output gets it written; an 8-bit output gets up to 3 bytes
+    // written past the row. That is the start of the next row, or memory past the tensor.
+    // Refuse those widths. aiter/ops/rmsnorm.py keeps them off this kernel wherever another
+    // backend exists. fp4x2 rows are bounded to the packed row above and are left as they are.
+    // This check is the word bound that gfx942 and gfx950 need. gfx1250 needs more: there the
+    // bounds check drops a whole 16-byte vector, so a row with n % 8 != 0 loses its last
+    // n % 8 elements. That rule lives in _use_hip_common (aiter/ops/rmsnorm.py) and is not
+    // checked here.
+    static inline void check_row_words(const char* func, const aiter_tensor_t& input,
+                                       const aiter_tensor_t& out, int n)
+    {
+        const int64_t in_row_bytes  = static_cast<int64_t>(n) * input.element_size();
+        const int64_t out_row_bytes = static_cast<int64_t>(n) * out.element_size();
+        AITER_CHECK(in_row_bytes % 4 == 0 &&
+                        (out.dtype() == AITER_DTYPE_fp4x2 || out_row_bytes % 4 == 0),
+                    func, " needs rows of whole 4-byte words, got n = ", n, " (", in_row_bytes,
+                    " input bytes, ", out_row_bytes, " output bytes per row)");
+    }
+
     // A zero-element placeholder for optional operands (residual / scale) that a
     // given entry point does not use. The kernel never dereferences these when
     // the corresponding ADD_RESIDUAL / FUSE_QUANT path is disabled; only
@@ -489,8 +509,12 @@ __global__ void add_rmsnorm_quant_kernel(
         bool scale_layout_m32k4 = false
     )
     {
+        // A failed check has to reach Python as an exception, not abort() the
+        // interpreter: this is the binding boundary, so flip throw mode here.
+        aiter_detail::AiterThrowGuard throw_guard;
         int n = input.size(1);
         int m = input.numel() / n;
+        check_row_words(__func__, input, out, n);
         int input_stride = input.stride(0);
         int residual_in_stride = residual_in.stride(0);
         int residual_out_stride = residual_out.stride(0);
@@ -569,11 +593,15 @@ __global__ void add_rmsnorm_quant_kernel(
         bool scale_layout_m32k4 = false
     )
     {
+        // A failed check has to reach Python as an exception, not abort() the
+        // interpreter: this is the binding boundary, so flip throw mode here.
+        aiter_detail::AiterThrowGuard throw_guard;
         aiter_tensor_t residual_in = empty_placeholder(input.dtype(), input.device_id);
         aiter_tensor_t residual_out = empty_placeholder(input.dtype(), input.device_id);
 
         int n = input.size(1);
         int m = input.numel() / n;
+        check_row_words(__func__, input, out, n);
         int residual_in_stride = residual_in.stride(0);
         int residual_out_stride = residual_out.stride(0);
         int input_stride = input.stride(0);
@@ -643,10 +671,14 @@ __global__ void add_rmsnorm_quant_kernel(
         bool gemma_norm = false
     )
     {
+        // A failed check has to reach Python as an exception, not abort() the
+        // interpreter: this is the binding boundary, so flip throw mode here.
+        aiter_detail::AiterThrowGuard throw_guard;
         aiter_tensor_t scale = empty_placeholder(AITER_DTYPE_fp32, input.device_id);
 
         int n = input.size(1);
         int m = input.numel() / n;
+        check_row_words(__func__, input, out, n);
         int residual_in_stride = residual_in.stride(0);
         int residual_out_stride = residual_out.stride(0);
         int input_stride = input.stride(0);
@@ -698,12 +730,16 @@ __global__ void add_rmsnorm_quant_kernel(
         bool gemma_norm = false
     )
     {
+        // A failed check has to reach Python as an exception, not abort() the
+        // interpreter: this is the binding boundary, so flip throw mode here.
+        aiter_detail::AiterThrowGuard throw_guard;
         aiter_tensor_t scale = empty_placeholder(AITER_DTYPE_fp32, input.device_id);
         aiter_tensor_t residual_in = empty_placeholder(input.dtype(), input.device_id);
         aiter_tensor_t residual_out = empty_placeholder(input.dtype(), input.device_id);
 
         int n = input.size(1);
         int m = input.numel() / n;
+        check_row_words(__func__, input, out, n);
         int residual_in_stride = residual_in.stride(0);
         int residual_out_stride = residual_out.stride(0);
         int input_stride = input.stride(0);
@@ -729,4 +765,267 @@ __global__ void add_rmsnorm_quant_kernel(
             AITER_CHECK(false, __func__, " not support output type: ", AiterDtype_to_str(out.dtype()));
         }
     }
-}
+
+    // DeepSeek MLA q_a + kv_a RMSNorm in one launch. q leaves as MXFP4 (group 32, e8m0 RoundUp)
+    // with its scale in the m32k4 layout of dynamic_per_group_quant_m32k4; kv leaves as bf16.
+    // Bit-exact with rmsnorm() followed by per_1x32_mx_quant_hip(scale_layout_m32k4=True) for q,
+    // and with rmsnorm() for kv: the norm math is that of the 256 x 8 (q, 1024 < n <= 2048) and
+    // 64 x 8 (kv, n <= 512) instantiations of add_rmsnorm_quant_kernel, and q is rounded to bf16
+    // before its amax and convert, as the two-kernel path does.
+    // One 256-thread block per row: waves 0-5 carry the q row, waves 6-7 the kv row. The kv waves
+    // add zeros to the q block reduce, like the idle threads of the 256 x 8 kernel. A 64-thread
+    // reduce sums its two wave partials once, so the order of that sum does not matter.
+    // Blocks m..pad32(m) only write the 0x7F pad scales.
+    template <bool kWithKv>
+    __global__ void __launch_bounds__(256)
+        qkv_a_rmsnorm_fp4_kernel(uint8_t* __restrict__ q_out,
+                                 uint8_t* __restrict__ q_scale,
+                                 opus::bf16_t* __restrict__ kv_out,
+                                 opus::bf16_t* q_in,
+                                 opus::bf16_t* kv_in,
+                                 opus::bf16_t* q_weight,
+                                 opus::bf16_t* kv_weight,
+                                 double q_eps,
+                                 double kv_eps,
+                                 bool gemma_norm,
+                                 int m,
+                                 int qn,
+                                 int kvn,
+                                 int q_in_stride,
+                                 int kv_in_stride,
+                                 int q_out_stride,
+                                 int kv_out_stride)
+    {
+        using DTYPE_I                   = opus::bf16_t;
+        static constexpr int BlockSize  = 256;
+        static constexpr int tds        = 8;
+        static constexpr int kQThreads  = 192;
+        static constexpr int kKvWave0   = kQThreads / WARP_SIZE;
+        static constexpr int load_chunk = 16;
+        using vec_i                     = opus::vector_t<DTYPE_I, tds>;
+        using vec_f                     = opus::vector_t<float, tds>;
+
+        const int64_t row = blockIdx.x;
+        const int tid     = threadIdx.x;
+        if(row >= m)
+        {
+            for(int y = tid; y < qn / 32; y += BlockSize)
+                q_scale[(row / 32) * qn + (y / 4) * 128 + (row % 32) * 4 + y % 4] = 0x7F;
+            return;
+        }
+        const bool is_q = !kWithKv || tid < kQThreads; // wave-uniform
+        const int n     = is_q ? qn : kvn;
+        const int off   = (is_q ? tid : tid - kQThreads) * tds;
+        DTYPE_I* in_ptr = is_q ? q_in + row * static_cast<int64_t>(q_in_stride)
+                               : kv_in + row * static_cast<int64_t>(kv_in_stride);
+        const int oob_i = (n + 1) / 2 * 2;
+        auto buffer_i   = opus::make_gmem<DTYPE_I>(in_ptr, oob_i * sizeof(DTYPE_I));
+        auto buffer_w =
+            opus::make_gmem<DTYPE_I>(is_q ? q_weight : kv_weight, oob_i * sizeof(DTYPE_I));
+        vec_i data_i =
+            load_vector_nbytes<DTYPE_I, tds, load_chunk, GROUP_NT, true, WARP_SIZE>(buffer_i, off);
+        vec_i data_w =
+            load_vector_nbytes<DTYPE_I, tds, load_chunk, RT, true, WARP_SIZE>(buffer_w, off);
+
+        vec_f f;
+        for(int i = 0; i < tds; i++)
+            f[i] = static_cast<float>(data_i[i]);
+        float square_sum = 0.0f;
+        for(int i = 0; i < tds; i++)
+            square_sum += (f[i] * f[i]);
+
+        auto sum_f = [](float a, float b) { return a + b; };
+        __shared__ float kv_part[2];
+        if constexpr(kWithKv)
+        {
+            if(!is_q)
+            {
+                float part =
+                    wave_reduce<float, decltype(sum_f), WARP_SIZE, false>(square_sum, sum_f);
+                if(tid % WARP_SIZE == WARP_SIZE - 1)
+                    kv_part[tid / WARP_SIZE - kKvWave0] = part;
+            }
+        }
+        // The barrier inside block_reduce also publishes kv_part.
+        float total =
+            block_reduce<float, decltype(sum_f), BlockSize, true>(is_q ? square_sum : 0.0f, sum_f);
+        if constexpr(kWithKv)
+        {
+            if(!is_q)
+                total = kv_part[0] + kv_part[1];
+        }
+        const float rcp           = rsqrtf(total / n + (is_q ? q_eps : kv_eps));
+        const float weight_offset = gemma_norm ? 1.0f : 0.0f;
+        {
+            // -ffast-math compiles add_rmsnorm_quant_kernel's x * rcp * w as (x * w) * rcp; pin
+            // that order here, or about 1 in 2^18 outputs moves by one bf16 ulp.
+#pragma clang fp reassociate(off)
+            for(int i = 0; i < tds; i++)
+                f[i] = (f[i] * (static_cast<float>(data_w[i]) + weight_offset)) * rcp;
+        }
+
+        vec_i o;
+        for(int i = 0; i < tds; i++)
+            o[i] = opus::cast<DTYPE_I>(f[i]);
+
+        if(!is_q)
+        {
+            if(off < kvn)
+                *reinterpret_cast<vec_i*>(kv_out + row * static_cast<int64_t>(kv_out_stride) +
+                                          off) = o;
+            return;
+        }
+
+        // Back to fp32 from the rounded bf16 (exact). gfx1250 has no bf16 -> fp4 convert, so the
+        // fp4 convert takes fp32, as in dynamic_per_group_quant_m32k4.
+        for(int i = 0; i < tds; i++)
+            f[i] = static_cast<float>(o[i]);
+        float thread_max = aiter::kAmaxFloor;
+        for(int i = 0; i < tds; i++)
+            thread_max = max(thread_max, fabsf(f[i]));
+        const float amax = multithread_reduce(thread_max, aiter::Max(), 32 / tds);
+        const float row_scale =
+            aiter::fp_f32_to_e8m0_scale<aiter::kDefaultMxScaleRoundMode, aiter::MxDtype::FP4_E2M1>(
+                amax);
+        if(off >= qn)
+            return;
+        if(tid % (32 / tds) == 0)
+        {
+            const int y = tid / (32 / tds);
+            q_scale[(row / 32) * qn + (y / 4) * 128 + (row % 32) * 4 + y % 4] =
+                static_cast<uint8_t>((__builtin_bit_cast(uint32_t, row_scale) >> 23) & 0xFF);
+        }
+        using vec_q  = opus::vector_t<uint8_t, tds / 2>;
+        const auto q = scaled_cast<opus::fp4_t>(f, row_scale);
+        static_assert(sizeof(q) == sizeof(vec_q));
+        *reinterpret_cast<vec_q*>(q_out + row * static_cast<int64_t>(q_out_stride) + off / 2) =
+            __builtin_bit_cast(vec_q, q);
+    }
+
+    // q_out (m, qn / 2) fp4x2/u8, q_scale contiguous (pad32(m), qn / 32) e8m0/u8, q_in (m, qn) bf16
+    // with unit column stride. kv_in.numel() == 0 skips kv (kv_out / kv_weight unused).
+    void qkv_a_rmsnorm_fp4(aiter_tensor_t& q_out,
+                           aiter_tensor_t& q_scale,
+                           aiter_tensor_t& kv_out,
+                           aiter_tensor_t& q_in,
+                           aiter_tensor_t& kv_in,
+                           aiter_tensor_t& q_weight,
+                           aiter_tensor_t& kv_weight,
+                           double q_eps,
+                           double kv_eps,
+                           bool gemma_norm = false)
+    {
+        AITER_CHECK(q_in.dim() == 2, __func__, " needs a 2D q input");
+        AITER_CHECK(q_in.size(1) > 1024 && q_in.size(1) <= 1536 && q_in.size(1) % 128 == 0,
+                    __func__,
+                    " needs 1024 < q n <= 1536, n % 128 == 0, got ",
+                    q_in.size(1));
+        AITER_CHECK(q_in.size(0) <= std::numeric_limits<int>::max() - 31,
+                    __func__,
+                    " q row count exceeds the launch limit");
+        const int qn       = q_in.size(-1);
+        const int m        = q_in.size(0);
+        const bool with_kv = kv_in.numel() > 0;
+        AITER_CHECK(!with_kv || kv_in.dim() == 2, __func__, " needs a 2D kv input");
+        AITER_CHECK(!with_kv ||
+                        (kv_in.size(1) > 0 && kv_in.size(1) <= 512 && kv_in.size(1) % 8 == 0),
+                    __func__,
+                    " needs 0 < kv n <= 512, n % 8 == 0");
+        const int kvn       = with_kv ? kv_in.size(-1) : 0;
+        const int64_t m_pad = (static_cast<int64_t>(m) + 31) / 32 * 32;
+        AITER_CHECK(q_in.dtype() == AITER_DTYPE_bf16 && q_weight.dtype() == AITER_DTYPE_bf16,
+                    __func__,
+                    " needs bf16 q input and weight");
+        AITER_CHECK(q_weight.dim() == 1 && q_weight.numel() == qn && q_weight.is_contiguous(),
+                    __func__,
+                    " needs a contiguous q weight of length n");
+        AITER_CHECK(q_in.is_gpu() && q_weight.device_id == q_in.device_id &&
+                        q_out.device_id == q_in.device_id && q_scale.device_id == q_in.device_id,
+                    __func__,
+                    " q tensors must be on the same GPU");
+        AITER_CHECK(q_in.stride(-1) == 1 && q_in.stride(0) >= qn &&
+                        q_in.stride(0) <= std::numeric_limits<int>::max() &&
+                        q_in.stride(0) % 8 == 0 &&
+                        reinterpret_cast<uintptr_t>(q_in.data_ptr()) % 16 == 0 &&
+                        reinterpret_cast<uintptr_t>(q_weight.data_ptr()) % 16 == 0,
+                    __func__,
+                    " needs unit column stride and 16B-aligned q rows");
+        AITER_CHECK(q_out.dim() == 2 && q_out.size(0) == m && q_out.size(1) == qn / 2 &&
+                        q_out.element_size() == 1 && q_out.is_contiguous() &&
+                        reinterpret_cast<uintptr_t>(q_out.data_ptr()) % 4 == 0,
+                    __func__,
+                    " needs a contiguous (m, n / 2) fp4x2 q_out");
+        AITER_CHECK(q_scale.element_size() == 1 && q_scale.is_contiguous() &&
+                        q_scale.numel() >= m_pad * (qn / 32),
+                    __func__,
+                    " needs a contiguous (pad32(m), n / 32) = (",
+                    m_pad,
+                    ", ",
+                    qn / 32,
+                    ") byte scale, got numel ",
+                    q_scale.numel());
+        if(with_kv)
+        {
+            AITER_CHECK(kv_out.dim() == 2 && kv_out.size(0) == m && kv_in.size(0) == m &&
+                            kv_out.size(1) == kvn,
+                        __func__,
+                        " needs matching (m, kv n) input and output");
+            AITER_CHECK(kv_in.dtype() == AITER_DTYPE_bf16 &&
+                            kv_weight.dtype() == AITER_DTYPE_bf16 &&
+                            kv_out.dtype() == AITER_DTYPE_bf16,
+                        __func__,
+                        " needs bf16 kv input, weight and output");
+            AITER_CHECK(kv_weight.dim() == 1 && kv_weight.numel() == kvn &&
+                            kv_weight.is_contiguous(),
+                        __func__,
+                        " needs a contiguous kv weight of length kv n");
+            AITER_CHECK(kv_in.device_id == q_in.device_id &&
+                            kv_weight.device_id == q_in.device_id &&
+                            kv_out.device_id == q_in.device_id,
+                        __func__,
+                        " kv tensors must be on the same GPU as q");
+            AITER_CHECK(kv_in.stride(-1) == 1 && kv_in.stride(0) >= kvn &&
+                            kv_in.stride(0) <= std::numeric_limits<int>::max() &&
+                            kv_in.stride(0) % 8 == 0 && kv_out.stride(-1) == 1 &&
+                            kv_out.stride(0) >= kvn &&
+                            kv_out.stride(0) <= std::numeric_limits<int>::max() &&
+                            kv_out.stride(0) % 8 == 0 &&
+                            reinterpret_cast<uintptr_t>(kv_in.data_ptr()) % 16 == 0 &&
+                            reinterpret_cast<uintptr_t>(kv_out.data_ptr()) % 16 == 0 &&
+                            reinterpret_cast<uintptr_t>(kv_weight.data_ptr()) % 16 == 0,
+                        __func__,
+                        " needs unit column stride and 16B-aligned kv rows");
+        }
+        if(m == 0)
+            return;
+
+        const HipDeviceGuard device_guard(q_in.device_id);
+        AITER_CHECK(get_warp_size_func() == 32, __func__, " requires a wave32 GPU");
+        const hipStream_t stream = aiter::getCurrentHIPStream();
+        dim3 grid(m_pad), block(256);
+        auto launch = [&](auto kv_tag) {
+            qkv_a_rmsnorm_fp4_kernel<decltype(kv_tag)::value><<<grid, block, 0, stream>>>(
+                reinterpret_cast<uint8_t*>(q_out.data_ptr()),
+                reinterpret_cast<uint8_t*>(q_scale.data_ptr()),
+                with_kv ? reinterpret_cast<opus::bf16_t*>(kv_out.data_ptr()) : nullptr,
+                reinterpret_cast<opus::bf16_t*>(q_in.data_ptr()),
+                with_kv ? reinterpret_cast<opus::bf16_t*>(kv_in.data_ptr()) : nullptr,
+                reinterpret_cast<opus::bf16_t*>(q_weight.data_ptr()),
+                with_kv ? reinterpret_cast<opus::bf16_t*>(kv_weight.data_ptr()) : nullptr,
+                q_eps,
+                kv_eps,
+                gemma_norm,
+                m,
+                qn,
+                kvn,
+                static_cast<int>(q_in.stride(0)),
+                with_kv ? static_cast<int>(kv_in.stride(0)) : 0,
+                qn / 2,
+                with_kv ? static_cast<int>(kv_out.stride(0)) : 0);
+        };
+        if(with_kv)
+            launch(std::true_type{});
+        else
+            launch(std::false_type{});
+    }
+    } // namespace aiter

@@ -133,7 +133,7 @@ def prepare_chunk_indices(
     _ = num_decode_tokens  # in cache key only
     indices = torch.cat(
         [
-            torch.arange(n)
+            torch.arange(n, dtype=cu_seqlens.dtype, device=cu_seqlens.device)
             for n in triton.cdiv(
                 _prefill_lens(cu_seqlens, num_decodes), chunk_size
             ).tolist()

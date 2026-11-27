@@ -4,7 +4,9 @@
 """MoE topk-reduction kernel (FlyDSL, layout API).
 
 ``Y[t, d] = sum_k X[t, k, d]``, optionally gated by the EP validity mask
-(``valid[t,k] = expert_mask[topk_ids[t,k]] != 0``). Epilogue of stage2
+(``valid[t,k] = expert_mask[topk_ids[t,k]] != 0``) or by dropped routes
+(``valid[t,k] = topk_ids[t,k] >= 0``: the sort leaves dropped routes out, so
+their rows of X are never written). Epilogue of stage2
 ``mode="reduce"``, shared by every dtype's reduce path. Build a per-shape launcher
 with ``compile_moe_reduction`` (cached); the kernel's compile-time params are
 ``Constexpr`` so flyc specializes per shape/dtype.
@@ -23,8 +25,16 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr
 from flydsl.expr.typing import T
 
+from aiter.ops.flydsl.aot_launch import aot_factory
+
 from .kernels_common import ceildiv
-from .mxfp4_gemm_common import FP8OUT_PITCH_ALIGN, fp8out_row_bytes, fp8out_scale_blk
+from .mxfp4_gemm_common import (
+    FP8OUT_PITCH_ALIGN,
+    FP8OUT_SCALE_BLK,
+    fp4out_row_bytes,
+    fp8out_row_bytes,
+    fp8out_scale_blk,
+)
 
 BLOCK = 256
 FP8_VEC = 8  # fp8 values per 64b buffer load (also the store granularity)
@@ -43,23 +53,34 @@ def _moe_reduction_body(
     dtype_str: fx.Constexpr[str],
     use_mask: fx.Constexpr[bool],
     num_experts: fx.Constexpr[int],
+    skip_dropped: fx.Constexpr[bool],
     out_dtype_str: fx.Constexpr[str],
     use_weight: fx.Constexpr[bool],
     scale_blk: fx.Constexpr[int],
     fp8_row_stride: fx.Constexpr[int],
     NTHREADS: fx.Constexpr[int],
+    streaming_loads: fx.Constexpr[bool],
 ):
     # One tiled-copy reduce for every dtype. Dense (f16/bf16/f32) loads V elems
     # and extends to f32; fp8 route-out loads 8 fp8 bytes + their e8m0 microscale
     # and decodes to f32. Both then run the same masked f32 topk-accumulate
     # (uniform soffset = k*row_stride) and truncating store. row_stride differs:
     # an fp8 row is padded with its scale bytes ([N fp8 | N/scale_blk e8m0]).
-    is_fp8 = dtype_str == "fp8"
+    # fp4 route-out rows ([N/2 packed e2m1 | N/32 e8m0]) take the fp8 path with
+    # half the value bytes: 4 bytes = 8 values per thread.
+    is_fp4 = dtype_str == "fp4"
+    is_fp8 = dtype_str == "fp8" or is_fp4
+    pack = 2 if is_fp4 else 1
     if const_expr(is_fp8):
         in_elem, in_bytes, V = fx.Int8, 1, FP8_VEC
         row_stride = fp8_row_stride
         out_numeric = fx.Float16 if (out_dtype_str or "bf16") == "f16" else fx.BFloat16
-        load_atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.Int8)
+        load_atom = fx.make_copy_atom(
+            (fx.rocdl.BufferCopy32b if is_fp4 else fx.rocdl.BufferCopy64b)(
+                2 if streaming_loads else 0
+            ),
+            fx.Int8,
+        )
     else:
         in_elem = (
             fx.Float32
@@ -69,7 +90,9 @@ def _moe_reduction_body(
         in_bytes = 4 if dtype_str == "f32" else 2
         row_stride, out_numeric = model_dim, in_elem
         V = 128 // (8 * in_bytes)  # 4 (f32), 8 (16b)
-        load_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), in_elem)
+        load_atom = fx.make_copy_atom(
+            fx.rocdl.BufferCopy128b(2 if streaming_loads else 0), in_elem
+        )
     out_bytes = out_numeric.width // 8
     TILE = NTHREADS * V
     store_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), out_numeric)
@@ -92,7 +115,7 @@ def _moe_reduction_body(
     # for X > 4 GiB.
     x_row_bytes = topk * row_stride * in_bytes
     xbase = fx.Int64(ptrtoint(X)) + tok64 * fx.Int64(x_row_bytes)
-    xbuf = _view(in_elem, xbase, model_dim, x_row_bytes)
+    xbuf = _view(in_elem, xbase, model_dim // pack, x_row_bytes)
     ybuf = _view(
         out_numeric,
         fx.Int64(ptrtoint(Y)) + tok64 * fx.Int64(model_dim * out_bytes),
@@ -104,14 +127,15 @@ def _moe_reduction_body(
         i8pt = fx.PointerType.get(
             fx.Int8.ir_type, address_space=fx.AddressSpace.Global, alignment=1
         )
-        sc_ptr = fx.inttoptr(i8pt, xbase + fx.Int64(model_dim))
-    if const_expr(use_mask):
+        sc_ptr = fx.inttoptr(i8pt, xbase + fx.Int64(model_dim // pack))
+    if const_expr(use_mask or skip_dropped):
         i32pt = fx.PointerType.get(
             T.i32, address_space=fx.AddressSpace.Global, alignment=4
         )
         tk_ptr = fx.inttoptr(
             i32pt, fx.Int64(ptrtoint(topk_ids)) + tok64 * fx.Int64(topk * 4)
         )
+    if const_expr(use_mask):
         em_ptr = fx.inttoptr(i32pt, fx.Int64(ptrtoint(expert_mask)))
     if const_expr(use_weight):
         # Route weights deferred from the stage2 epilogue: scale each expert's
@@ -127,7 +151,11 @@ def _moe_reduction_body(
     tile_mn, tv_layout = fx.make_layout_tv(
         fx.make_layout((1, NTHREADS), (1, 1)), fx.make_layout((1, V), (1, 1))
     )
-    thr_load = fx.make_tiled_copy(load_atom, tv_layout, tile_mn).get_slice(tid)
+    # Loads tile packed bytes: V // pack per thread (the value tile for pack == 1).
+    tile_in, tv_in = fx.make_layout_tv(
+        fx.make_layout((1, NTHREADS), (1, 1)), fx.make_layout((1, V // pack), (1, 1))
+    )
+    thr_load = fx.make_tiled_copy(load_atom, tv_in, tile_in).get_slice(tid)
     thr_store = fx.make_tiled_copy(store_atom, tv_layout, tile_mn).get_slice(tid)
 
     def _decode_fp8(vfrag, scale):  # 8 fp8 bytes + its e8m0 scale -> Vector(8, f32)
@@ -140,9 +168,19 @@ def _moe_reduction_body(
             lanes.append(pair[1] * scale)
         return fx.Vector.from_elements(lanes, fx.Float32)
 
+    def _decode_fp4(vfrag, scale):
+        # 4 bytes of e2m1 pairs + their e8m0 scale -> Vector(8, f32)
+        w = fx.Vector(fx.memref_load_vec(vfrag)).bitcast(fx.Int32)[0]
+        lanes = []
+        for b in range_constexpr(4):
+            pair = fx.Vector(fx.rocdl.cvt_scalef32_pk_f32_fp4(T.f32x2, w, scale, b))
+            lanes.append(pair[0])
+            lanes.append(pair[1])
+        return fx.Vector.from_elements(lanes, fx.Float32)
+
     def _reduce_tile():
         p_src = thr_load.partition_S(
-            fx.slice(fx.zipped_divide(xbuf, tile_mn), (None, (0, tile)))
+            fx.slice(fx.zipped_divide(xbuf, tile_in), (None, (0, tile)))
         )
         p_dst = thr_store.partition_D(
             fx.slice(fx.zipped_divide(ybuf, tile_mn), (None, (0, tile)))
@@ -159,11 +197,13 @@ def _moe_reduction_body(
             scales = []
             for k in range_constexpr(topk):
                 e8m0 = fx.Uint32(fx.Uint8(sc_ptr[sc_col + fx.Int32(k * row_stride)]))
-                scales.append((e8m0 << fx.Uint32(23)).bitcast(fx.Float32))
+                scales.append((e8m0 << 23).bitcast(fx.Float32))
 
-        acc = fx.Vector.filled(V, 0.0, fx.Float32)
+        acc = fx.full(V, 0.0, fx.Float32)
         for k in range_constexpr(topk):
-            if const_expr(is_fp8):
+            if const_expr(is_fp4):
+                vk = _decode_fp4(frags[k], scales[k])
+            elif const_expr(is_fp8):
                 vk = _decode_fp8(frags[k], scales[k])
             else:
                 vk = fx.Vector(fx.memref_load_vec(frags[k])).to(fx.Float32)
@@ -173,9 +213,15 @@ def _moe_reduction_body(
                     [vk[i] * wk for i in range_constexpr(V)], fx.Float32
                 )
             if const_expr(use_mask):
-                vk = (em_ptr[tk_ptr[k]] != fx.Int32(0)).select(
-                    vk, fx.Vector.filled(V, 0.0, fx.Float32)
+                idx = tk_ptr[k]
+                idx_valid = idx >= fx.Int32(0)
+                safe_idx = idx_valid.select(idx, fx.Int32(0))
+                vk = (idx_valid & (em_ptr[safe_idx] != fx.Int32(0))).select(
+                    vk, fx.full(V, 0.0, fx.Float32)
                 )
+            if const_expr(skip_dropped):
+                # Select, not multiply: a never-written row may hold NaN.
+                vk = (tk_ptr[k] >= fx.Int32(0)).select(vk, fx.full(V, 0.0, fx.Float32))
             acc = acc + vk
         ofrag = fx.make_fragment_like(p_dst)
         fx.memref_store_vec(acc.to(out_numeric), ofrag)
@@ -199,6 +245,7 @@ def _pick_reduce_block(model_dim: int, V: int) -> int:
     return block
 
 
+@aot_factory("moe_reduction")
 @functools.lru_cache(maxsize=1024)
 def compile_moe_reduction(
     *,
@@ -207,19 +254,26 @@ def compile_moe_reduction(
     dtype_str: str = "f16",
     use_mask: bool = False,
     num_experts: int = 0,
+    skip_dropped: bool = False,
     out_dtype_str: str | None = None,
     use_weight: bool = False,
     scale_blk: int | None = None,
     pitch_align: int | None = None,
+    streaming_loads: bool = False,
 ):
     """Compile the topk-reduce launcher for one Constexpr set (cached per shape).
 
     Returns a ``@flyc.jit`` taking ``(X, Y, expert_mask, topk_ids, topk_weights,
     i32_m_tokens, stream)``; dispatch it through ``moe_kernels._run_compiled``. The
     launcher is a distinct object per shape, so the shim's per-exe ``_cf`` cache
-    stays correct.
+    stays correct. streaming_loads opts into nontemporal contribution loads
+    for buffers consumed once; the default retains the existing cache policy.
     """
-    V = FP8_VEC if dtype_str == "fp8" else 128 // (32 if dtype_str == "f32" else 16)
+    V = (
+        FP8_VEC
+        if dtype_str in ("fp8", "fp4")
+        else 128 // (32 if dtype_str == "f32" else 16)
+    )
     block = _pick_reduce_block(model_dim, V)
     gy = ceildiv(model_dim, block * V)
     out_tag = out_dtype_str or dtype_str
@@ -231,14 +285,21 @@ def compile_moe_reduction(
         fp8_row_stride = fp8out_row_bytes(
             model_dim, scale_blk=scale_blk, pitch_align=align
         )
+    elif dtype_str == "fp4":
+        scale_blk = FP8OUT_SCALE_BLK
+        align = FP8OUT_PITCH_ALIGN if pitch_align is None else int(pitch_align)
+        fp8_row_stride = fp4out_row_bytes(model_dim, pitch_align=align)
     else:
         scale_blk, fp8_row_stride = FP8_VEC, model_dim
 
     kernel_name = (
         f"moe_reduction_{dtype_str}_{out_tag}_t{topk}_n{model_dim}"
-        f"_m{int(use_mask)}e{num_experts if use_mask else 0}"
+        f"_m{int(use_mask)}e{num_experts if use_mask else 0}d{int(skip_dropped)}"
         f"_w{int(use_weight)}_s{scale_blk}_r{fp8_row_stride}_b{block}"
     )
+
+    if streaming_loads:
+        kernel_name += "_nt"
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
     def reduction_kernel(
@@ -261,11 +322,13 @@ def compile_moe_reduction(
             dtype_str,
             use_mask,
             num_experts,
+            skip_dropped,
             out_tag,
             use_weight,
             scale_blk,
             fp8_row_stride,
             block,
+            streaming_loads,
         )
 
     @flyc.jit

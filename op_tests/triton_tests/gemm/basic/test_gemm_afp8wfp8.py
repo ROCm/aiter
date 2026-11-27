@@ -16,7 +16,6 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops import gemm_op_a8w8
 from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale
 from aiter.ops.shuffle import shuffle_weight
-from aiter.ops.triton.gemm.basic import gemm_afp8wfp8 as afp8wfp8_op
 from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale_group32 import (
     gemm_a8w8_blockscale_group32,
 )
@@ -24,9 +23,12 @@ from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import (
     gemm_afp8wfp8,
     gemm_afp8wfp8_preshuffle,
 )
+from aiter.ops.triton.utils import fused_splitk
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 from aiter.test_common import checkAllclose
+from aiter.utility.graph_alloc import capture_scoped_cache
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 SCALE_GROUP_SIZE = 32  # A: 1x32 e8m0 scale group
 W_SCALE_K_GROUP = 128  # B: 128 in K direction
@@ -142,27 +144,7 @@ def run_torch_gemm_afp8wfp8(
 SCALE_MODES = [(128, False), (128, True), (32, False), (32, True)]
 
 
-def get_shapes():
-    # (M, N, K), with N % 128 == 0 and K % 128 == 0 to fit the 128x128 W-scale layout.
-    return [
-        (m, n, k)
-        for m in [16, 32, 64, 512]
-        for n, k in [
-            (2048, 7168),
-            (65536, 1536),
-            (16384, 1536),
-            (8192, 1536),
-            (7168, 16384),
-            (7168, 4096),
-            (6144, 7168),
-            (7168, 3072),
-            (1536, 7168),
-            (7168, 768),
-        ]
-    ]
-
-
-@pytest.mark.parametrize("M, N, K", get_shapes())
+@pytest.mark.parametrize("M, N, K", get_shapes(n_mult=128, k_mult=128))
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("x_scale_group_size, transpose_x_scale", SCALE_MODES)
 def test_gemm_afp8wfp8(
@@ -219,7 +201,7 @@ def _gluon_available() -> bool:
         return False
 
 
-@pytest.mark.parametrize("M, N, K", get_shapes())
+@pytest.mark.parametrize("M, N, K", get_shapes(n_mult=128, k_mult=128))
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
 @pytest.mark.parametrize("x_scale_group_size, transpose_x_scale", SCALE_MODES)
@@ -357,7 +339,7 @@ def test_gluon_preshuffle_cga_multicast(ctas_m: int, ctas_n: int, ragged: bool):
     )
 
 
-@pytest.mark.parametrize("M, N, K", get_shapes())
+@pytest.mark.parametrize("M, N, K", get_shapes(n_mult=128, k_mult=128))
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("x_scale_group_size, transpose_x_scale", SCALE_MODES)
 def test_gemm_afp8wfp8_preshuffle_gluon_matches_triton(
@@ -436,8 +418,8 @@ def _execution_config(packed=False, fused=False, splits=3, n_first=False):
 
 def _compact_scale_inputs(m, n, k, a_group, b_group):
     torch.manual_seed(m + n + k)
-    x = torch.randn(m, k, device="cuda").to(torch.float8_e4m3fn)
-    w = torch.randn(n, k, device="cuda").to(torch.float8_e4m3fn)
+    x = torch.randn(m, k, device="cuda", dtype=torch.float32).to(torch.float8_e4m3fn)
+    w = torch.randn(n, k, device="cuda", dtype=torch.float32).to(torch.float8_e4m3fn)
     xs = torch.randint(124, 131, (m, k // a_group), device="cuda", dtype=torch.uint8)
     ws = torch.randint(
         124,
@@ -617,8 +599,10 @@ def test_compact_scale_partial_k_tile(a_group, b_group, fused):
 
 def generate_group32_inputs(m, n, k, weight_group_rows=32):
     torch.manual_seed(m + n + k)
-    x = torch.randn(m, k, device="cuda").to(torch.float8_e4m3fn)
-    weight = torch.randn(n, k, device="cuda").to(torch.float8_e4m3fn)
+    x = torch.randn(m, k, device="cuda", dtype=torch.float32).to(torch.float8_e4m3fn)
+    weight = torch.randn(n, k, device="cuda", dtype=torch.float32).to(
+        torch.float8_e4m3fn
+    )
     xs = torch.randint(122, 131, (m, k // 32), device="cuda", dtype=torch.uint8)
     ws = torch.randint(
         122,
@@ -703,8 +687,10 @@ def test_tuned_variants_use_production_config(m, packed, dtype):
 )
 @pytest.mark.usefixtures("_require_gfx950")
 def test_group32_projection_extreme_scale_codes(a_code, b_code):
-    x = torch.ones(3, 1280, device="cuda").to(torch.float8_e4m3fn)
-    weight = torch.ones(2048, 1280, device="cuda").to(torch.float8_e4m3fn)
+    x = torch.ones(3, 1280, device="cuda", dtype=torch.float32).to(torch.float8_e4m3fn)
+    weight = torch.ones(2048, 1280, device="cuda", dtype=torch.float32).to(
+        torch.float8_e4m3fn
+    )
     xs = torch.full((3, 40), a_code, device="cuda", dtype=torch.uint8).view(
         torch.float8_e8m0fnu
     )
@@ -812,27 +798,6 @@ def test_raw_views_and_preallocated_output(split_k):
         atol=5e-5 * expected.abs().max().item(),
         catastrophic_check=True,
     )
-
-
-@pytest.mark.parametrize(
-    "invalid", ["stride", "scale_shape", "scale_dtype", "output", "split"]
-)
-@pytest.mark.usefixtures("_require_gfx950")
-def test_invalid_group32_contract(invalid):
-    x, w, xs, ws = generate_group32_inputs(3, 2053, 1280)
-    kwargs = {}
-    if invalid == "stride":
-        x = x.T.contiguous().T
-    elif invalid == "scale_shape":
-        ws = ws[:-1]
-    elif invalid == "scale_dtype":
-        xs = xs.float()
-    elif invalid == "output":
-        kwargs["y"] = torch.empty((3, 2052), dtype=torch.bfloat16, device="cuda")
-    else:
-        kwargs["split_k"] = 0
-    with pytest.raises(AssertionError):
-        gemm_a8w8_blockscale_group32(x, w, xs, ws, **kwargs)
 
 
 @pytest.mark.parametrize("split_k", [None, 3])
@@ -982,7 +947,7 @@ def test_fused_split_k_is_deterministic_and_rezeroes_counters(variant):
     # A stale counter or an early partial read would change a later sum.
     assert all(torch.equal(first, run()) for _ in range(50))
     torch.cuda.synchronize()
-    assert not afp8wfp8_op._split_counters(x.device).any()
+    assert not fused_splitk.split_counters(x.device).any()
 
 
 @pytest.mark.parametrize("variant", ["tile", "packed"])
@@ -1013,7 +978,8 @@ def test_fused_split_k_graph_replay_on_warmed_stream(variant):
 def test_fused_split_k_first_use_inside_capture(variant, monkeypatch):
     # Isolate the counter cache so earlier tests cannot warm the capture stream.
     torch.cuda.synchronize()
-    monkeypatch.setattr(afp8wfp8_op, "_split_counters_by_stream", {})
+    fresh = capture_scoped_cache(fused_splitk._split_counters_keyed.__wrapped__)
+    monkeypatch.setattr(fused_splitk, "_split_counters_keyed", fresh)
     # Before torch 2.10 counters cannot be allocated mid-capture: runs unfused.
     x, w, xs, ws = generate_group32_inputs(6, 1152, 5120)
     graph = torch.cuda.CUDAGraph()

@@ -3,7 +3,7 @@
 
 """Perf-only benchmark for the FlyDSL m32x8 MHA forward kernel on gfx1250.
 
-This is the performance companion to ``op_tests/test_mha_flydsl.py`` — it drives
+This is the performance companion to ``op_tests/test_flydsl_mha_fwd.py`` — it drives
 the same public interface (``flash_attn_func`` / ``flash_attn_varlen_func`` in
 ``aiter/ops/mha.py``) but computes NO reference and checks NO correctness. It only
 times the kernel and reports latency / TFLOPS / TB-s.
@@ -91,21 +91,35 @@ def _verify_dispatch(layout):
     """
     import aiter.ops.flydsl.fmha_kernels as fk
 
-    name = "flash_attn_varlen_m32x8" if layout == "thd" else "flash_attn_batch_m32x8"
-    orig = getattr(fk, name)
+    # fmha_kernels imports the entries under aliases, and there are two families now
+    # (a16w16 and the 8-bit a8w8 sibling), so watch whichever one this dtype routes to.
+    if layout == "paged":
+        names = [f"flash_attn_paged_{fam}_gfx1250" for fam in ("a16w16", "a8w8")]
+    else:
+        suffix = "varlen" if layout == "thd" else "batch"
+        names = [
+            f"flash_attn_{suffix}_a16w16_gfx1250",
+            f"flash_attn_{suffix}_a8w8_gfx1250",
+        ]
+    origs = {n: getattr(fk, n) for n in names}
     calls = {"n": 0}
 
-    def _spy(*a, **kw):
-        calls["n"] += 1
-        return orig(*a, **kw)
+    def _make_spy(fn):
+        def _spy(*a, **kw):
+            calls["n"] += 1
+            return fn(*a, **kw)
 
-    setattr(fk, name, _spy)
+        return _spy
+
+    for n, fn in origs.items():
+        setattr(fk, n, _make_spy(fn))
     try:
         yield calls
     finally:
-        setattr(fk, name, orig)
+        for n, fn in origs.items():
+            setattr(fk, n, fn)
     assert calls["n"] > 0, (
-        f"m32x8 kernel ({name}) never dispatched for layout={layout}; the call fell "
+        f"m32x8 kernel ({names}) never dispatched for layout={layout}; the call fell "
         f"through to another backend. Run with AITER_ENABLE_EXPERIMENTAL=1 and a "
         f"routed hdim (D_qk in 64/128/192/256, D_v in 64/128)."
     )
@@ -118,7 +132,7 @@ def _verify_dispatch(layout):
 
 def _attended_pairs(sq, sk, causal, window):
     """(query, key) pairs inside the bottom-right aligned band, matching
-    ``_local_mask``/``_effective_window`` in test_mha_flydsl.py: query ``s`` attends
+    ``_local_mask``/``_effective_window`` in test_flydsl_mha_fwd.py: query ``s`` attends
     ``s + (sk - sq) - left <= j <= s + (sk - sq) + right``, where ``-1`` is infinite
     on that side and ``causal`` pins ``right`` to 0."""
     left, right = window
@@ -140,17 +154,18 @@ def _fwd_flops(B, sq, sk, Hq, d_qk, d_v, causal, window=(-1, -1)):
     return B * Hq * 2 * _attended_pairs(sq, sk, causal, window) * (d_qk + d_v)
 
 
-def _fwd_bytes(B, sq, sk, Hq, Hkv, d_qk, d_v, lse):
-    """HBM traffic: read Q/K/V, write O (all bf16 = 2B); +LSE (fp32 = 4B) when returned."""
+def _fwd_bytes(B, sq, sk, Hq, Hkv, d_qk, d_v, lse, in_esize=2, out_esize=2):
+    """HBM traffic: read Q/K/V at ``in_esize`` B/elem, write O at ``out_esize``;
+    +LSE (fp32 = 4B) when returned. The 8-bit kernels read 1B inputs but still
+    write a 2B O, so the two sizes are tracked apart."""
     total_q = B * sq
     total_k = B * sk
-    elems = (
-        total_q * Hq * d_qk  # Q
-        + total_k * Hkv * d_qk  # K
-        + total_k * Hkv * d_v  # V
-        + total_q * Hq * d_v  # O
-    )
-    nbytes = elems * 2
+    q_elems = total_q * Hq * d_qk
+    k_elems = total_k * Hkv * d_qk
+    v_elems = total_k * Hkv * d_v
+    in_elems = q_elems + k_elems + v_elems
+    out_elems = total_q * Hq * d_v
+    nbytes = in_elems * in_esize + out_elems * out_esize
     if lse:
         nbytes += total_q * Hq * 4
     return nbytes
@@ -201,6 +216,8 @@ def run_perf(case, warmup, repeat, fix_init=None):
     sink = case.get("sink", False)
 
     assert Hq % Hkv == 0, f"nheads_q={Hq} must be a multiple of nheads_kv={Hkv}"
+    dtype_name = case.get("dtype", "bf16")
+    dtype = _DTYPES[dtype_name]
 
     # Always measure OUR m32x8 kernel, so experimental is always ON: the PR3039
     # gfx1250 varlen ASM gate in mha.py owns 128/128 and 192/128 unless experimental
@@ -212,13 +229,9 @@ def run_perf(case, warmup, repeat, fix_init=None):
 
     if layout == "thd":
         total_q, total_k = B * sq, B * sk
-        q = torch.randn(total_q, Hq, d_qk, dtype=torch.bfloat16, device=device)
-        k = torch.randn(total_k, Hkv, d_qk, dtype=torch.bfloat16, device=device)
-        v = torch.randn(total_k, Hkv, d_v, dtype=torch.bfloat16, device=device)
-        if fix_init is not None:
-            q.fill_(fix_init)
-            k.fill_(fix_init)
-            v.fill_(fix_init)
+        q = _randn((total_q, Hq, d_qk), dtype, device, fix_init)
+        k = _randn((total_k, Hkv, d_qk), dtype, device, fix_init)
+        v = _randn((total_k, Hkv, d_v), dtype, device, fix_init)
         cu_q = torch.arange(0, (B + 1) * sq, sq, dtype=torch.int32, device=device)
         cu_k = torch.arange(0, (B + 1) * sk, sk, dtype=torch.int32, device=device)
 
@@ -239,13 +252,9 @@ def run_perf(case, warmup, repeat, fix_init=None):
             )
 
     elif layout == "bshd":
-        q = torch.randn(B, sq, Hq, d_qk, dtype=torch.bfloat16, device=device)
-        k = torch.randn(B, sk, Hkv, d_qk, dtype=torch.bfloat16, device=device)
-        v = torch.randn(B, sk, Hkv, d_v, dtype=torch.bfloat16, device=device)
-        if fix_init is not None:
-            q.fill_(fix_init)
-            k.fill_(fix_init)
-            v.fill_(fix_init)
+        q = _randn((B, sq, Hq, d_qk), dtype, device, fix_init)
+        k = _randn((B, sk, Hkv, d_qk), dtype, device, fix_init)
+        v = _randn((B, sk, Hkv, d_v), dtype, device, fix_init)
 
         def _run():
             return flash_attn_func(
@@ -259,22 +268,69 @@ def run_perf(case, warmup, repeat, fix_init=None):
                 sink_ptr=sink_t,
             )
 
+    elif layout == "paged":
+        from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_paged_fwd
+
+        page = case["page"]
+        pages_per_seq = (sk + page - 1) // page
+        num_blocks = pages_per_seq * B + 8
+        q = _randn((B * sq, Hq, d_qk), dtype, device, fix_init)
+        k = _randn((num_blocks, page, Hkv, d_qk), dtype, device, fix_init)
+        v = _randn((num_blocks, page, Hkv, d_v), dtype, device, fix_init)
+        # permuted, so a kernel that assumes sequential pages shows up here
+        page_ids = (
+            torch.randperm(num_blocks, device=device)
+            .int()[: pages_per_seq * B]
+            .contiguous()
+        )
+        cu_q = torch.arange(0, (B + 1) * sq, sq, dtype=torch.int32, device=device)
+        kv_indptr = torch.arange(
+            0, (B + 1) * pages_per_seq, pages_per_seq, dtype=torch.int32, device=device
+        )
+        last_lens = torch.full(
+            (B,), sk - (pages_per_seq - 1) * page, dtype=torch.int32, device=device
+        )
+
+        def _run():
+            return flydsl_flash_attn_paged_fwd(
+                q,
+                k,
+                v,
+                cu_q,
+                kv_indptr,
+                page_ids,
+                kv_last_page_lens=last_lens,
+                max_seqlen_q=sq,
+                max_seqlen_k=sk,
+                softmax_scale=scale,
+                causal=causal,
+                window_size=window,
+                return_lse=lse,
+                sink=sink_t,
+            )
+
     else:
-        raise ValueError(f"unknown layout {layout!r} (expected 'thd' or 'bshd')")
+        raise ValueError(
+            f"unknown layout {layout!r} (expected 'thd', 'bshd' or 'paged')"
+        )
 
     with _verify_dispatch(layout):
         avg_ms = _time_fn(_run, warmup, repeat)
         _run()  # one more inside the spy to confirm dispatch
 
     flop = _fwd_flops(B, sq, sk, Hq, d_qk, d_v, causal, window)
-    nbytes = _fwd_bytes(B, sq, sk, Hq, Hkv, d_qk, d_v, lse)
+    _in_esize = torch.empty((), dtype=dtype).element_size()
+    _out_esize = 2 if dtype in _B8_DTYPES else _in_esize
+    nbytes = _fwd_bytes(B, sq, sk, Hq, Hkv, d_qk, d_v, lse, _in_esize, _out_esize)
     avg_us = avg_ms * 1000
     tflops = _tflops(flop, avg_ms)
     tbps = _tbps(nbytes, avg_ms)
 
+    _page = case.get("page")
     tag = (
         f"{layout} B={B} H={Hq}/{Hkv} d={d_qk}/{d_v} sq={sq} sk={sk} "
         f"causal={causal} lse={lse} window={window} sink={sink}"
+        + (f" page={_page}" if _page else "")
     )
     print(
         f"  [{tag}] avg: {avg_ms:.3f}ms ({avg_us:.1f} us)  "
@@ -291,6 +347,8 @@ def run_perf(case, warmup, repeat, fix_init=None):
         "d_v": d_v,
         "sq": sq,
         "sk": sk,
+        "dtype": dtype_name,
+        "page": case.get("page", ""),
         "causal": causal,
         "lse": lse,
         "window": str(window),
@@ -495,8 +553,159 @@ _HDIM_PAIRS = ((128, 128), (192, 128), (256, 128), (64, 64))
 CASES = [
     dict(_c, d_qk=_dqk, d_v=_dv) for _dqk, _dv in _HDIM_PAIRS for _c in _BASE_CASES
 ]
+# bf8 twins of every case, appended so the existing ids never move (case 10 is the
+# standing perf reference). Only the matched bf8+bf8 pair is listed; other dtypes
+# stay opt-in through -d.
+CASES += [dict(_c, dtype="bf8") for _c in CASES]
+
+# Paged KV, appended last so every id above keeps its number. pow2 hdim only (192 would
+# split K into two gather segments against a single-segment V, so the halves disagree on
+# tensorcnt).
+_PAGED_BASE = [
+    {
+        "layout": "paged",
+        "B": 1,
+        "sq": 4096,
+        "sk": 4096,
+        "Hq": 8,
+        "Hkv": 8,
+        "causal": True,
+        "desc": "4k causal, single batch",
+    },
+    {
+        "layout": "paged",
+        "B": 4,
+        "sq": 4096,
+        "sk": 4096,
+        "Hq": 8,
+        "Hkv": 8,
+        "causal": True,
+        "desc": "4k causal, multi-batch (paged analogue of case 10)",
+    },
+    {
+        "layout": "paged",
+        "B": 4,
+        "sq": 4096,
+        "sk": 4096,
+        "Hq": 16,
+        "Hkv": 2,
+        "causal": True,
+        "desc": "4k causal, GQA 8x",
+    },
+    {
+        "layout": "paged",
+        "B": 1,
+        "sq": 897,
+        "sk": 4097,
+        "Hq": 8,
+        "Hkv": 8,
+        "causal": True,
+        "desc": "odd sq!=sk, causal (chunked-prefill-like)",
+    },
+    {
+        "layout": "paged",
+        "B": 2,
+        "sq": 2048,
+        "sk": 2048,
+        "Hq": 8,
+        "Hkv": 8,
+        "causal": False,
+        "desc": "2k non-causal",
+    },
+]
+CASES += [
+    dict(_c, d_qk=_d, d_v=_d, page=_p)
+    for _p in (1, 16, 1024)
+    for _d in (128, 64)
+    for _c in _PAGED_BASE
+]
+
+# Long-context paged, appended after the block above so those ids do not move either.
+# d128 only and narrower heads on the longest shapes, to keep the pool affordable: at
+# page_size 1 a 2^17 sequence is ~131k blocks. The short-q/long-kv rows are the shape
+# prefix caching actually produces.
+_PAGED_LARGE = [
+    {
+        "layout": "paged",
+        "B": 4,
+        "sq": 16384,
+        "sk": 16384,
+        "Hq": 8,
+        "Hkv": 8,
+        "causal": True,
+        "desc": "16k causal, multi-batch (paged case 10)",
+    },
+    {
+        "layout": "paged",
+        "B": 1,
+        "sq": 65536,
+        "sk": 65536,
+        "Hq": 4,
+        "Hkv": 1,
+        "causal": True,
+        "desc": "64k causal, MQA long context",
+    },
+    {
+        "layout": "paged",
+        "B": 1,
+        "sq": 131071,
+        "sk": 131071,
+        "Hq": 4,
+        "Hkv": 1,
+        "causal": True,
+        "desc": "odd ~2^17 causal, MQA long context",
+    },
+    {
+        "layout": "paged",
+        "B": 1,
+        "sq": 897,
+        "sk": 65537,
+        "Hq": 8,
+        "Hkv": 8,
+        "causal": True,
+        "desc": "short q into a long cache (prefix caching)",
+    },
+    {
+        "layout": "paged",
+        "B": 8,
+        "sq": 1,
+        "sk": 32768,
+        "Hq": 8,
+        "Hkv": 1,
+        "causal": True,
+        "desc": "decode-shaped q=1 into a long cache",
+    },
+]
+CASES += [
+    dict(_c, d_qk=128, d_v=128, page=_p) for _p in (1, 16, 1024) for _c in _PAGED_LARGE
+]
+# 8-bit paged, appended last so every id above keeps its number. The bf8 duplication
+# above runs before the paged blocks exist, so these would otherwise be bf16 only.
+CASES += [dict(_c, dtype="bf8") for _c in CASES if _c["layout"] == "paged"]
+
 for _i, _c in enumerate(CASES):
     _c["id"] = _i
+
+
+# Q/K/V element type. 8-bit routes to the a8w8 sibling kernel; Q, K and V share one
+# type (softmax P is bf8 and the output stays bf16 regardless).
+_DTYPES = {
+    "bf16": torch.bfloat16,
+    "fp16": torch.float16,
+    "bf8": torch.float8_e5m2,
+    "fp8": torch.float8_e4m3fn,
+}
+_B8_DTYPES = (torch.float8_e5m2, torch.float8_e4m3fn)
+
+
+def _randn(shape, dtype, device, fix_init=None):
+    """``randn`` (or a constant fill) in ``dtype``; 8-bit draws in fp32 and rounds,
+    since neither randn nor fill_ is available for it. The 0.3 keeps the draw inside
+    the 8-bit range so the measurement is not dominated by saturated values."""
+    if fix_init is not None:
+        return torch.full(shape, fix_init, dtype=torch.float32, device=device).to(dtype)
+    t = torch.randn(*shape, dtype=torch.float32, device=device)
+    return (t * 0.3).to(dtype) if dtype in _B8_DTYPES else t.to(dtype)
 
 
 def _print_case_list():
@@ -511,10 +720,12 @@ def _print_case_list():
             "d_v": c.get("d_v", DEFAULT_HDIM_V),
             "sq": c["sq"],
             "sk": c["sk"],
+            "page": c.get("page", ""),
             "causal": c.get("causal", False),
             "lse": c.get("lse", False),
             "window": str(tuple(c.get("window", (-1, -1)))),
             "sink": c.get("sink", False),
+            "dtype": c.get("dtype", "bf16"),
             "desc": c.get("desc", ""),
         }
         for c in CASES
@@ -539,9 +750,28 @@ def main():
     )
     parser.add_argument(
         "--layout",
-        choices=["thd", "bshd"],
+        choices=["thd", "bshd", "paged"],
         default="thd",
         help="Layout for detailed-args mode (default thd).",
+    )
+    parser.add_argument(
+        "-p",
+        "--page-size",
+        type=int,
+        default=1,
+        help="KV cache page size for --layout paged (default 1).",
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=str,
+        choices=sorted(_DTYPES),
+        default=None,
+        help=(
+            "Q/K/V element type; 8-bit runs the a8w8 kernel. Overrides the\n"
+            "        dtype each selected case carries, which is bf16 unless the\n"
+            "        case says otherwise.\n        e.g.: -d bf8"
+        ),
     )
     parser.add_argument("-b", "--batch", type=int, default=1, help="Batch size.")
     parser.add_argument(
@@ -646,7 +876,8 @@ def main():
         selected = []
         for cid in args.case:
             assert 0 <= cid < len(CASES), f"--case {cid} out of range [0,{len(CASES)})"
-            selected.append(CASES[cid])
+            c = CASES[cid]
+            selected.append(dict(c, dtype=args.dtype) if args.dtype else c)
     elif args.seqlen_q is not None and args.seqlen_kv is not None:
         Hkv = args.nheads_kv if args.nheads_kv is not None else args.nheads
         selected = [
@@ -663,6 +894,8 @@ def main():
                 "lse": args.lse,
                 "window": _parse_window(args.window),
                 "sink": args.sink,
+                "dtype": args.dtype or "bf16",
+                "page": args.page_size,
             }
         ]
     else:
@@ -673,7 +906,8 @@ def main():
 
     init_desc = "random" if args.fix_init is None else f"fixed={args.fix_init}"
     print("=" * 70)
-    print(f"FlyDSL m32x8 MHA perf (gfx1250, bf16, init={init_desc})")
+    _dts = sorted({c.get("dtype", "bf16") for c in selected})
+    print(f"FlyDSL m32x8 MHA perf (gfx1250, {'/'.join(_dts)}, init={init_desc})")
     print("=" * 70)
 
     rows = []

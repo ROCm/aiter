@@ -5,7 +5,7 @@
 
 from .gemm1 import compile_moe_gemm1
 from .gemm2 import compile_moe_gemm2
-from .moe_reduce import invert_sorted_ids, sorted_sum
+from .moe_reduce import sorted_sum
 from .quant import (
     flydsl_absmax,
     flydsl_quant_per_tensor,
@@ -17,7 +17,6 @@ __all__ = [
     "compile_moe_gemm2",
     "flydsl_absmax",
     "flydsl_quant_per_tensor",
-    "invert_sorted_ids",
     "sorted_sum",
 ]
 
@@ -40,6 +39,8 @@ def compile_gemm(
     swiglu_limit=None,
     down_path="default",
     down_output_padding_bytes=0,
+    fused_down_clear=False,
+    has_num_local_tokens=False,
 ):
     if stage == "gateup":
         if down_path != "default" or down_output_padding_bytes != 0:
@@ -58,6 +59,8 @@ def compile_gemm(
             tile_k=tile_k,
             activation=activation,
             swiglu_limit=swiglu_limit,
+            fused_down_clear=fused_down_clear,
+            has_num_local_tokens=has_num_local_tokens,
         )
     return compile_moe_gemm2(
         N=N,
@@ -76,4 +79,5 @@ def compile_gemm(
         swiglu_limit=swiglu_limit,
         down_path=down_path,
         down_output_padding_bytes=down_output_padding_bytes,
+        has_num_local_tokens=has_num_local_tokens,
     )

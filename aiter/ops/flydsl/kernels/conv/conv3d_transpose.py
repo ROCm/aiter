@@ -11,6 +11,9 @@ import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, range_constexpr
 
+from aiter.ops.flydsl.aot_cache import FlyDSLAotCache
+from aiter.ops.flydsl.aot_launch import bind_aot
+
 from .conv3d_gfx950_utils import BF16_BYTES, CONV_COMPILE_HINTS, _as_stream
 
 TR_TILE = 64
@@ -22,6 +25,9 @@ _TR_PAD = 8
 _TR_LDS_S = TR_TILE + _TR_PAD
 
 TR_MAX_BIG_S = (0x7FFFFFFF - (TR_TILE - TR_VEC)) // (TR_TILE - 1)
+
+
+_TRANSPOSE_AOT_CACHE = FlyDSLAotCache("conv3d_transpose_ncdhw_ndhwc")
 
 
 @functools.lru_cache(maxsize=64)
@@ -123,8 +129,15 @@ def compile_transpose_ncdhw_ndhwc(n, c, s):
             v = fx.memref_load_vec(tr_reg)
             lds_store_vec8(rc * _TR_LDS_S + sv, v)
 
-        fx.rocdl.s_waitcnt(lgkmcnt=0)
-        fx.rocdl.s_barrier()
+        # gfx1250 rejects s_waitcnt(lgkmcnt=...); a workgroup barrier is enough
+        # for LDS visibility after the stores above. gfx950 keeps the waitcnt.
+        from flydsl.runtime.device import get_rocm_arch
+
+        if str(get_rocm_arch()).startswith("gfx1250"):
+            gpu.barrier()
+        else:
+            fx.rocdl.s_waitcnt(lgkmcnt=0)
+            fx.rocdl.s_barrier()
 
         for i in range_constexpr(_TR_ITERS):
             lin = tid + i * TR_THREADS
@@ -172,7 +185,11 @@ def compile_transpose_ncdhw_ndhwc(n, c, s):
             return flyc.compile(launch_transpose, out, inp, s, _as_stream(stream))
 
     _launch.compile = _compile
-    # Reachable from the object because the steady-state path calls the
-    # compiled function directly; see ``conv_kernels._dispatch``.
+    # Reachable from the object because the steady-state path launches the
+    # @flyc.jit launcher itself; see ``conv_kernels._dispatch``.
     _launch.extra_args = (s,)
+    _launch.launcher = launch_transpose
+    # ``s`` is a launch argument; the kernel bakes only whether n*c*s needs
+    # 64-bit offsets, so every resolution of one (n, c) shares an entry.
+    bind_aot(launch_transpose, _TRANSPOSE_AOT_CACHE, (n, c, BIG))
     return _launch

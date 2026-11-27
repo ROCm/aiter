@@ -214,9 +214,7 @@ def launch_mla_pagesize64_fp8_fp8(
         scale_log2 = score_scale * fx.Float32(LOG2E)
 
         page_begin = fx.Int32(buf_load_scalar(kv_indptr_rsrc, batch_i32, dwords=1))
-        page_end = fx.Int32(
-            buf_load_scalar(kv_indptr_rsrc, batch_i32 + fx.Int32(1), dwords=1)
-        )
+        page_end = fx.Int32(buf_load_scalar(kv_indptr_rsrc, batch_i32 + 1, dwords=1))
 
         split_page_begin = page_begin + split_id
         has_pages = split_page_begin < page_end
@@ -226,7 +224,7 @@ def launch_mla_pagesize64_fp8_fp8(
 
         token_begin = wave_id * HEADS_PER_WAVE
         negative_inf = fx.Float32(float("-inf"))
-        zero_out = Vec.filled(PV_ACC_DWORDS, 0.0, fx.Float32)
+        zero_out = fx.full(PV_ACC_DWORDS, 0.0, fx.Float32)
 
         @flyc.jit
         def issue_kv_page(physical_page, kv_stage):
@@ -242,8 +240,8 @@ def launch_mla_pagesize64_fp8_fp8(
                 fx.make_view(
                     kv_lds_ptr,
                     fx.make_layout(
-                        (HEADS_PER_WAVE, QK_NOPE_HEAD_DIM),
-                        (Q_LDS_ROW_BYTES, 1),
+                        ((HEADS_PER_WAVE, QK_NOPE_HEAD_DIM), 1),
+                        ((Q_LDS_ROW_BYTES, 1), HEADS_PER_WAVE * Q_LDS_ROW_BYTES),
                     ),
                 )
             )
@@ -259,16 +257,20 @@ def launch_mla_pagesize64_fp8_fp8(
                     ),
                 )
             )
-            kv_nope_tdm_atom = fx.rocdl.make_tdm_atom(
+            kv_tile = (HEADS_PER_WAVE, QK_NOPE_HEAD_DIM)
+            kv_nope_tdm_atom, kv_coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                fx.rocdl.TensorLoad(),
                 kv_nope_global,
-                [HEADS_PER_WAVE, None],
-                strides=[QK_NOPE_HEAD_DIM, None],
+                fx.make_layout(kv_tile, (Q_LDS_ROW_BYTES, 1)),
+                kv_tile,
                 num_warps=1,
-                pad_interval=QK_NOPE_HEAD_DIM,
-                pad_amount=Q_LDS_ROW_BYTES - QK_NOPE_HEAD_DIM,
+            )
+            kv_blk = fx.zipped_divide(kv_coord, kv_tile)[None, (0, None)]
+            tKs, tKg = fx.rocdl.cdna5.tdm_partition(
+                kv_nope_tdm_atom, 0, fx.make_layout(1, 1), kv_lds, kv_blk
             )
             rocdl.sched_barrier(0)
-            fx.copy(kv_nope_tdm_atom, kv_nope_global, kv_lds)
+            fx.copy(kv_nope_tdm_atom, tKg[None, 0], tKs[None, 0])
             kv_dwords = _dword_iter(ptr_kv)
             for rope_pass in range_constexpr(2):
                 src_row = token_begin + rope_pass * 8 + rope_row
@@ -422,8 +424,8 @@ def launch_mla_pagesize64_fp8_fp8(
                 updated_outs.append(finish_pv_tile(dv_tile, staged_v.pop(dv_tile)))
             return updated_outs
 
-        pending_meta_zero = Vec.filled(3, 0, fx.Int32)
-        pending_probability_zero = Vec.filled(PACKED_PROB_WORDS, 0, fx.Int32)
+        pending_meta_zero = fx.full(3, 0, fx.Int32)
+        pending_probability_zero = fx.full(PACKED_PROB_WORDS, 0, fx.Int32)
         init_state = (
             [negative_inf, fx.Float32(0.0)]
             + [zero_out for _ in range_constexpr(PV_D_TILES)]
@@ -450,7 +452,7 @@ def launch_mla_pagesize64_fp8_fp8(
 
             page_pos = fx.Int32(page_iter)
             if const_expr(mask_last):
-                is_last_page = page_pos == (page_end - fx.Int32(1))
+                is_last_page = page_pos == (page_end - 1)
                 page_valid_len = is_last_page.select(
                     last_page_len,
                     fx.Int32(PAGE_SIZE),
@@ -483,7 +485,7 @@ def launch_mla_pagesize64_fp8_fp8(
                     pending_probability_words,
                     False if pv_masked is None else pv_masked,
                 )
-            elif pending_valid != fx.Int32(0):
+            elif pending_valid != 0:
                 if const_expr(pv_masked is None):
                     if pending_valid_len == fx.Int32(PAGE_SIZE):
                         pv_ready_outs = compute_pending_pv(
@@ -631,7 +633,7 @@ def launch_mla_pagesize64_fp8_fp8(
 
             probabilities = []
             local_sum = fx.Float32(0.0)
-            sum_vector = Vec.filled(QK_ACC_DWORDS, 0.0, fx.Float32)
+            sum_vector = fx.full(QK_ACC_DWORDS, 0.0, fx.Float32)
             for n_tile in range_constexpr(QK_N_TILES):
                 with fx.fastmath(fm_no_inf):
                     if const_expr(mask_last):
@@ -677,7 +679,7 @@ def launch_mla_pagesize64_fp8_fp8(
                 issue_kv_page(_page_id(future_page), future_stage)
             gpu.barrier()
             pending_meta = Vec.from_elements(
-                [kv_stage, page_valid_len, fx.Int32(1)],
+                [kv_stage, page_valid_len, 1],
                 fx.Int32,
             )
             pending_probability = Vec.from_elements(
@@ -842,22 +844,24 @@ def launch_mla_pagesize64_fp8_fp8(
                     fx.make_view(
                         output_lds_ptr,
                         fx.make_layout(
-                            (HEADS_PER_WAVE, V_HEAD_DIM),
-                            (V_HEAD_DIM, 1),
+                            ((HEADS_PER_WAVE, V_HEAD_DIM), 1),
+                            ((V_HEAD_DIM, 1), HEADS_PER_WAVE * V_HEAD_DIM),
                         ),
                     )
                 )
-                output_tdm_atom = fx.rocdl.make_tdm_atom(
+                out_tile = (HEADS_PER_WAVE, V_HEAD_DIM)
+                output_tdm_atom, out_coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                    fx.rocdl.TensorStore(),
                     output_global,
-                    [HEADS_PER_WAVE, None],
-                    strides=[V_HEAD_DIM, None],
+                    fx.make_layout(out_tile, (V_HEAD_DIM, 1)),
+                    out_tile,
                     num_warps=1,
                 )
-                fx.copy(
-                    output_tdm_atom,
-                    output_lds,
-                    output_global,
+                out_blk = fx.zipped_divide(out_coord, out_tile)[None, (0, None)]
+                tOs, tOg = fx.rocdl.cdna5.tdm_partition(
+                    output_tdm_atom, 0, fx.make_layout(1, 1), output_lds, out_blk
                 )
+                fx.copy(output_tdm_atom, tOs[None, 0], tOg[None, 0])
                 tdm_ops.tensor_wait(0)
             else:
                 for dv_tile in range_constexpr(PV_D_TILES):

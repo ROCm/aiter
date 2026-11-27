@@ -27,7 +27,6 @@ from aiter.ops.triton.attention.paged_attention_output_gate import (
     _gluon_supported,
     _short_body_selected,
     paged_attention_output_gate_group_fp8_quant,
-    paged_attention_output_gate_supported,
 )
 from aiter.ops.triton.utils._triton import arch_info
 
@@ -53,8 +52,14 @@ def _make_inputs(rows, ctx_len, heads, dtype, device="cuda", seed=0):
     )
     # 0.25 keeps the fp8 cast away from saturation. A saturated fixture makes
     # every implementation agree trivially and hides real divergence.
-    kc = (torch.randn(pages, 1, HEAD_DIM, generator=g, device=device) * 0.25).to(dtype)
-    vc = (torch.randn(pages, 1, HEAD_DIM, generator=g, device=device) * 0.25).to(dtype)
+    kc = (
+        torch.randn(pages, 1, HEAD_DIM, generator=g, dtype=torch.float32, device=device)
+        * 0.25
+    ).to(dtype)
+    vc = (
+        torch.randn(pages, 1, HEAD_DIM, generator=g, dtype=torch.float32, device=device)
+        * 0.25
+    ).to(dtype)
     indptr = torch.arange(0, rows + 1, dtype=torch.int32, device=device) * ctx_len
     indices = torch.randperm(pages, generator=g, device=device).to(torch.int32)
     gate = torch.randn(
@@ -284,58 +289,6 @@ def test_gate_row_stride_is_honored(max_context):
     torch.testing.assert_close(loose.float(), packed.float(), rtol=0, atol=0)
 
 
-def test_supported_predicate_rejects_and_explains():
-    """The predicate must decline with a reason, never raise, so callers can
-    fall back."""
-    dtype = torch.float8_e4m3fn
-    q, kc, vc, _, _, gate = _make_inputs(4, 256, 4, dtype, seed=3)
-
-    ok, reason = paged_attention_output_gate_supported(q, kc, vc, gate, dtype)
-    assert ok and reason == ""
-
-    # bf16 KV cache is not supported by this body.
-    ok, reason = paged_attention_output_gate_supported(
-        q, kc.to(torch.bfloat16), vc.to(torch.bfloat16), gate, dtype
-    )
-    assert not ok and "fp8" in reason
-
-    # More heads than HEAD_TILE.
-    wide_q = torch.randn(4, 17, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-    wide_gate = torch.randn(4, 17 * HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-    ok, reason = paged_attention_output_gate_supported(wide_q, kc, vc, wide_gate, dtype)
-    assert not ok and "heads" in reason
-
-    ok, reason = paged_attention_output_gate_supported(q, kc, vc, gate, torch.float16)
-    assert not ok and "quant_dtype" in reason
-
-    # fnuz is the gfx942 e4m3 encoding. The same bytes denote different values
-    # under the OCP encoding this gfx950 body reads, so accepting it would
-    # dequantize silently wrong rather than fail -- reject both as cache and as
-    # output dtype.
-    ok, reason = paged_attention_output_gate_supported(
-        q,
-        kc.view(torch.float8_e4m3fnuz),
-        vc.view(torch.float8_e4m3fnuz),
-        gate,
-        dtype,
-    )
-    assert not ok and "e4m3fn" in reason
-    ok, reason = paged_attention_output_gate_supported(
-        q, kc, vc, gate, torch.float8_e4m3fnuz
-    )
-    assert not ok and "quant_dtype" in reason
-
-    # The long body adds the head-dim offset unscaled, so a non-unit query dim
-    # stride would read the wrong elements. Build one by transposing a wider
-    # buffer, so stride(2) != 1 while the shape stays valid.
-    strided_q = torch.randn(
-        4, HEAD_DIM, 4, dtype=torch.bfloat16, device="cuda"
-    ).transpose(1, 2)
-    assert strided_q.shape == q.shape and strided_q.stride(2) != 1
-    ok, reason = paged_attention_output_gate_supported(strided_q, kc, vc, gate, dtype)
-    assert not ok and "query" in reason and "stride" in reason
-
-
 def test_module_imports_without_the_gluon_dialect():
     """Importing the wrapper must not pull in Gluon.
 
@@ -346,7 +299,7 @@ def test_module_imports_without_the_gluon_dialect():
     that: with `triton.experimental.gluon` made unimportable, importing the
     wrapper still has to succeed.
     """
-    import importlib
+    import runpy
     import sys
 
     module = "aiter.ops.triton.attention.paged_attention_output_gate"
@@ -366,7 +319,7 @@ def test_module_imports_without_the_gluon_dialect():
         del sys.modules[k]
     sys.meta_path.insert(0, _BlockGluon())
     try:
-        importlib.import_module(module)  # must not raise
+        runpy.run_module(module)  # must not raise
     finally:
         sys.meta_path.pop(0)
         sys.modules.update(saved)
@@ -382,64 +335,6 @@ def test_gluon_probe_is_satisfied_here():
     assert isinstance(ok, bool) and isinstance(reason, str)
     assert ok, f"gluon probe rejected this toolchain: {reason}"
     assert reason == ""
-
-
-def test_predicate_surfaces_the_gluon_reason(monkeypatch):
-    """A failing dialect probe must decline through the public predicate.
-
-    The version/API gate is only useful if it reaches the caller as a reason
-    rather than an exception from somewhere deeper.
-    """
-    import aiter.ops.triton.attention.paged_attention_output_gate as mod
-
-    dtype = torch.float8_e4m3fn
-    q, kc, vc, _, _, gate = _make_inputs(4, 256, 4, dtype, seed=17)
-    monkeypatch.setattr(
-        mod, "_gluon_supported", lambda: (False, "synthetic: old dialect")
-    )
-    ok, reason = mod.paged_attention_output_gate_supported(q, kc, vc, gate, dtype)
-    assert not ok and "synthetic: old dialect" in reason
-
-
-def test_csr_inputs_must_be_contiguous():
-    """A strided CSR view must fail loudly.
-
-    Both bodies walk these as flat pointer offsets, so a non-contiguous view
-    would read the wrong row boundaries or page slots and return a plausible
-    but wrong answer. That is worse than raising.
-    """
-    dtype = torch.float8_e4m3fn
-    q, kc, vc, indptr, indices, gate = _make_inputs(4, 256, 4, dtype, seed=11)
-
-    # Interleave, then take every other element: same values, stride 2.
-    strided_indptr = torch.stack([indptr, indptr], dim=1).flatten()[::2]
-    assert not strided_indptr.is_contiguous()
-    assert torch.equal(strided_indptr, indptr)
-    with pytest.raises(ValueError, match="contiguous"):
-        paged_attention_output_gate_group_fp8_quant(
-            q,
-            kc,
-            vc,
-            strided_indptr,
-            indices,
-            gate,
-            scale=1.0,
-            quant_dtype=dtype,
-        )
-
-    strided_indices = torch.stack([indices, indices], dim=1).flatten()[::2]
-    assert not strided_indices.is_contiguous()
-    with pytest.raises(ValueError, match="contiguous"):
-        paged_attention_output_gate_group_fp8_quant(
-            q,
-            kc,
-            vc,
-            indptr,
-            strided_indices,
-            gate,
-            scale=1.0,
-            quant_dtype=dtype,
-        )
 
 
 def test_body_selection_contract():

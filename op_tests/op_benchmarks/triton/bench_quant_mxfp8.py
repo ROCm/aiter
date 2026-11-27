@@ -7,13 +7,33 @@
 (auto-selected: ASM on gfx950, portable path elsewhere).
 """
 
-import argparse
+import functools
 
 import torch
 import triton
 
 from aiter.ops.triton.quant.quant_mxfp8 import convert_from_mxfp8, convert_to_mxfp8
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+    override_parser_action,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
+
+
+def _generate_mxfp8_to_pool_inputs(M, N, in_dtype):
+    x = torch.randn(M, N, device="cuda", dtype=in_dtype)
+    return (x,)
+
+
+def _generate_mxfp8_from_pool_inputs(M, N, in_dtype, fp8_dtype):
+    x = torch.randn(M, N, device="cuda", dtype=in_dtype)
+    y, s = convert_to_mxfp8(x, fp8_dtype, quant_block_size=32)
+    return y, s
 
 
 def benchmark(args):
@@ -22,6 +42,9 @@ def benchmark(args):
     # M, N must tile to (block_m=64, block_n=64).
     x_vals = [(m, n) for m in [4096, 8192] for n in [4096, 8192, 16384]]
     unit = "ms" if args.metric == "time" else "GB/s"
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
 
     config = triton.testing.Benchmark(
         x_names=["M", "N"],
@@ -37,13 +60,24 @@ def benchmark(args):
 
     @triton.testing.perf_report([config])
     def _run(M, N, provider):
-        x = torch.randn(M, N, device="cuda", dtype=in_dtype)
         if provider == "to":
-            fn = lambda: convert_to_mxfp8(x, fp8_dtype, quant_block_size=32)
+            _p_gen = functools.partial(_generate_mxfp8_to_pool_inputs, M, N, in_dtype)
+            _out_val_keys = ["x"]
+
+            def kernel_fn(x):
+                convert_to_mxfp8(x, fp8_dtype, quant_block_size=32)
+
         else:
-            y, s = convert_to_mxfp8(x, fp8_dtype, quant_block_size=32)
-            fn = lambda: convert_from_mxfp8(y, s, in_dtype, quant_block_size=32)
-        ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+            _p_gen = functools.partial(
+                _generate_mxfp8_from_pool_inputs, M, N, in_dtype, fp8_dtype
+            )
+            _out_val_keys = ["y", "s"]
+
+            def kernel_fn(y, s):
+                convert_from_mxfp8(y, s, in_dtype, quant_block_size=32)
+
+        bencher.build_pool([_p_gen], [_out_val_keys])
+        ms = bencher.bench(kernel_fn)
         if args.metric == "time":
             return ms
         # bytes: high-precision payload + fp8 payload + one e8m0 scale byte per 32
@@ -54,14 +88,10 @@ def benchmark(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(prog="Benchmark MXFP8 convert", allow_abbrev=False)
+    parser = get_parser(kernel_name="MXFP8 convert")
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp32"])
-    parser.add_argument(
-        "-metric",
-        nargs="?",
-        const="time",
-        choices=["time", "bandwidth"],
-        default="time",
+    override_parser_action(
+        parser, action="--metric", choices=["time", "bandwidth"], default="time"
     )
     parser.add_argument("-o", action="store_true", default=False)
     return parser.parse_args()

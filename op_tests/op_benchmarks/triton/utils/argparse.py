@@ -1,4 +1,10 @@
 import argparse
+import itertools
+from collections.abc import Iterable
+from typing import TypeVar
+
+_T = TypeVar("_T")
+
 
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_available_models,
@@ -26,6 +32,22 @@ def pow2_int(value: str) -> int:
     return int_value
 
 
+def override_parser_action(
+    parser: argparse.ArgumentParser,
+    action: str,
+    choices: Iterable[_T] | None = None,
+    default: _T | None = None,
+    help: str | None = None,
+):
+    act = parser._option_string_actions[action]
+    if default is not None:
+        act.default = default
+    if choices is not None:
+        act.choices = choices
+    if help is not None:
+        act.help = help
+
+
 def get_parser(kernel_name: str) -> argparse.ArgumentParser:
     """
     Builds an argparser with default flags for Triton kernel benchmarking.
@@ -51,6 +73,22 @@ def get_parser(kernel_name: str) -> argparse.ArgumentParser:
         help="Model config json file.",
     )
     parser.add_argument("--model", type=str, help=model_help)
+
+    def to_backend_arg(s: str) -> str | None:
+        if s == "auto":
+            return None
+        else:
+            return s
+
+    parser.add_argument(
+        "--backend",
+        type=to_backend_arg,
+        choices=["triton", "gluon", None],
+        metavar="{triton,gluon,auto}",
+        default="auto",
+        help="kernel backend to use",
+    )
+
     parser.add_argument(
         "--metric",
         type=str,
@@ -58,7 +96,121 @@ def get_parser(kernel_name: str) -> argparse.ArgumentParser:
         default="throughput",
         help="metric to plot",
     )
+
+    parser.add_argument(
+        "--graph-warmup-iters",
+        type=positive_int,
+        default=3,
+        help="RotatingBufferBench: untimed iterations before the CUDA graph is captured",
+    )
+    parser.add_argument(
+        "--graph-warmup-replays",
+        type=positive_int,
+        default=3,
+        help="RotatingBufferBench: untimed graph replays before the timed ones",
+    )
+    parser.add_argument(
+        "--graph-kernels-per-graph",
+        type=positive_int,
+        default=1000,
+        help="RotatingBufferBench: kernel calls captured per CUDA graph",
+    )
+    parser.add_argument(
+        "--graph-num-replays",
+        type=positive_int,
+        default=10,
+        help="RotatingBufferBench: timed graph replays",
+    )
+    parser.add_argument(
+        "--rot-bufs-min-pool-len",
+        type=positive_int,
+        default=4,
+        help="rotating buffers minimum pool length",
+    )
+    parser.add_argument(
+        "--rot-bufs-target-mb",
+        type=positive_int,
+        default=None,
+        help="rotating buffers target size in MB (default: a fixed value per "
+        "device arch, see RotatingBufferBench._default_target_rot_pool_sz_mb)",
+    )
+    parser.add_argument(
+        "--rot-bufs-max-gpu-mem-mb",
+        type=positive_int,
+        default=None,
+        help="cap on the rotating pool's total real device-memory footprint, "
+        "in MB (default: 90%% of currently free device memory)",
+    )
+    parser.add_argument(
+        "--rot-bufs-print-info",
+        action="store_true",
+        default=False,
+        help="Print rotating buffers pool info (pool length, per-set and total bytes)",
+    )
+
     return parser
+
+
+def get_do_bench_graph_kwargs(args: argparse.Namespace) -> dict:
+    """RotatingBufferBench.bench/bench_synced kwargs from the --graph-* flags
+    added by get_parser()."""
+    return {
+        "warmup_iters": args.graph_warmup_iters,
+        "warmup_replays": args.graph_warmup_replays,
+        "kernels_per_graph": args.graph_kernels_per_graph,
+        "num_replays": args.graph_num_replays,
+    }
+
+
+def get_rot_bufs_kwargs(args: argparse.Namespace) -> dict:
+    """RotatingBufferBench.from_dict kwargs from the --rot-bufs-* flags added
+    by get_parser().
+    Note: max_pool_len is set to --graph-kernels-per-graph; the MB-valued
+    --rot-bufs-max-gpu-mem-mb flag is converted to GB here for
+    total_pool_sz_gb.
+    """
+    return {
+        "target_rot_pool_sz_mb": args.rot_bufs_target_mb,
+        "total_pool_sz_gb": (
+            args.rot_bufs_max_gpu_mem_mb / 1024
+            if args.rot_bufs_max_gpu_mem_mb is not None
+            else None
+        ),
+        "min_pool_len": args.rot_bufs_min_pool_len,
+        "print_info": args.rot_bufs_print_info,
+        # By default keep the rotating buffer pool length <= graph_kernels_per_graph
+        # Otherwise, in case per-set bytes are too small, then covering
+        # target_rot_pool_sz_mb might blow up the pool_len. This is not ideal
+        # for capturing graph
+        "max_pool_len": args.graph_kernels_per_graph,
+    }
+
+
+def add_sweep_argument(parser: argparse.ArgumentParser) -> None:
+    """Adds --sweep KEY=V1,V2 (repeat it for more keys): integer config values to
+    time, for a kernel that the tuning scripts cannot time."""
+    parser.add_argument(
+        "--sweep",
+        action="append",
+        metavar="KEY=V1,V2",
+        help="config values to time (repeat for more keys), for example BLOCKS=128,256",
+    )
+
+
+def get_sweep_configs(args: argparse.Namespace, default: str = "gluon") -> dict:
+    """The configs of --sweep as {line name: config values}: each combination of the
+    values. Without --sweep: {default: None}, the tuned config."""
+    if not args.sweep:
+        return {default: None}
+    keys, values = [], []
+    for item in args.sweep:
+        key, vals = item.split("=")
+        keys.append(key)
+        values.append([int(v) for v in vals.split(",")])
+    return {
+        ",".join(f"{k}={v}" for k, v in zip(keys, combo)): dict(zip(keys, combo))
+        for combo in itertools.product(*values)
+    }
 
 
 def get_ff_args(

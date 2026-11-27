@@ -177,13 +177,13 @@ def emit_service_tile(
     state_n_tile = (n_tile // fx.Int32(config.service_tile_group)) * fx.Int32(
         config.service_tile_group
     )
-    tile_byte_offset = fx.Int64(state_n_tile) * fx.Int64(8)
+    tile_byte_offset = fx.Int64(state_n_tile) * 8
     epoch_address = (
         local_workspace_base + fx.Int64(config.epoch_offset) + tile_byte_offset
     )
-    expected = fx.Int64(comm_ops.load_i64_global(epoch_address)) + fx.Int64(1)
+    expected = fx.Int64(comm_ops.load_i64_global(epoch_address)) + 1
     expected_i32 = fx.Int32(expected)
-    slot = expected & fx.Int64(1)
+    slot = expected & 1
     output_resource = buffer_tensor_from_addr(
         local_workspace_base + fx.Int64(config.output_offset),
         fx.BFloat16,
@@ -257,7 +257,7 @@ def emit_service_tile(
             spin_until_epoch_i32_system(
                 local_workspace_base
                 + fx.Int64(config.gather_done_offset)
-                + fx.Int64(gather_slot) * fx.Int64(4),
+                + fx.Int64(gather_slot) * 4,
                 expected_i32 - fx.Int32(SLOTS),
             )
         gpu.barrier()
@@ -400,7 +400,7 @@ def emit_service_tile(
                 ).to(fx.Float32)
             if const_expr(use_retained):
                 retained_packed, retained_e8m0 = retained_local_partial
-                scale = (fx.Uint32(retained_e8m0) << fx.Uint32(23)).bitcast(fx.Float32)
+                scale = (fx.Uint32(retained_e8m0) << 23).bitcast(fx.Float32)
                 return fx.Vector.from_elements(
                     decode_scaled_fp8_f32(retained_packed, scale),
                     fx.Float32,
@@ -607,7 +607,7 @@ def emit_service_tile(
                 comm_ops.store_i32_global_system_monotonic(
                     peer_base(workspace_flat_base, tid)
                     + fx.Int64(config.gather_done_offset)
-                    + fx.Int64(remote_slot) * fx.Int64(4),
+                    + fx.Int64(remote_slot) * 4,
                     expected_i32,
                 )
             if const_expr(barrier):
@@ -754,14 +754,14 @@ def emit_service_tile(
                 comm_ops.store_i32_global_system_monotonic(
                     peer_base(workspace_flat_base, tid)
                     + fx.Int64(config.owner_ready_offset)
-                    + fx.Int64(remote_slot) * fx.Int64(4),
+                    + fx.Int64(remote_slot) * 4,
                     expected_i32,
                 )
                 local_slot = state_n_tile * fx.Int32(tp_size) + tid
                 spin_until_epoch_i32_system(
                     local_workspace_base
                     + fx.Int64(config.owner_ready_offset)
-                    + fx.Int64(local_slot) * fx.Int64(4),
+                    + fx.Int64(local_slot) * 4,
                     expected_i32,
                 )
             gpu.barrier()
@@ -801,7 +801,7 @@ def emit_service_tile(
                     comm_ops.store_i32_global_agent_release(
                         local_workspace_base
                         + fx.Int64(config.reduced_collective_ready_offset)
-                        + fx.Int64(state_n_tile) * fx.Int64(4),
+                        + fx.Int64(state_n_tile) * 4,
                         expected_i32,
                     )
 
@@ -809,7 +809,7 @@ def emit_service_tile(
                 spin_until_epoch_i32_agent(
                     local_workspace_base
                     + fx.Int64(config.reduced_collective_ready_offset)
-                    + fx.Int64(state_n_tile) * fx.Int64(4),
+                    + fx.Int64(state_n_tile) * 4,
                     expected_i32,
                 )
                 comm_ops.fence_agent_acquire()
@@ -942,14 +942,14 @@ def emit_service_tile(
             comm_ops.store_i32_global_system_monotonic(
                 peer_base(workspace_flat_base, tid)
                 + fx.Int64(config.rank_ready_offset)
-                + fx.Int64(remote_slot) * fx.Int64(4),
+                + fx.Int64(remote_slot) * 4,
                 expected_i32,
             )
             local_slot = state_n_tile * fx.Int32(tp_size) + tid
             ready_address = (
                 local_workspace_base
                 + fx.Int64(config.rank_ready_offset)
-                + fx.Int64(local_slot) * fx.Int64(4)
+                + fx.Int64(local_slot) * 4
             )
             if const_expr(config.single_pass_direct):
                 spin_until_epoch_i32_system(
@@ -992,7 +992,7 @@ def emit_service_tile(
                     comm_ops.store_i32_global_system_release(
                         local_workspace_base
                         + fx.Int64(config.rank_ready_offset)
-                        + fx.Int64(local_ready_slot) * fx.Int64(4),
+                        + fx.Int64(local_ready_slot) * 4,
                         expected_i32,
                     )
                 gpu.barrier()
@@ -1002,7 +1002,7 @@ def emit_service_tile(
                     spin_until_epoch_i32_system(
                         peer_base(workspace_flat_base, tid)
                         + fx.Int64(config.rank_ready_offset)
-                        + fx.Int64(peer_ready_slot) * fx.Int64(4),
+                        + fx.Int64(peer_ready_slot) * 4,
                         expected_i32,
                     )
                 gpu.barrier()
@@ -1011,7 +1011,7 @@ def emit_service_tile(
                     comm_ops.store_i32_global_agent_release(
                         local_workspace_base
                         + fx.Int64(config.collective_ready_offset)
-                        + fx.Int64(state_n_tile) * fx.Int64(4),
+                        + fx.Int64(state_n_tile) * 4,
                         expected_i32,
                     )
 
@@ -1022,7 +1022,7 @@ def emit_service_tile(
                 spin_until_epoch_i32_agent(
                     local_workspace_base
                     + fx.Int64(config.collective_ready_offset)
-                    + fx.Int64(state_n_tile) * fx.Int64(4),
+                    + fx.Int64(state_n_tile) * 4,
                     expected_i32,
                 )
                 comm_ops.fence_agent_acquire()
@@ -1103,8 +1103,8 @@ def compile_megakernel(
                 )
             )
             tid = fx.Int32(gpu.thread_id("x"))
-            lane = tid % fx.Int32(64)
-            wave = rocdl.readfirstlane(T.i32, tid // fx.Int32(64))
+            lane = tid % 64
+            wave = rocdl.readfirstlane(T.i32, tid // 64)
             if const_expr(config.flat_producer_grid):
                 physical_block = fx.Int32(gpu.block_id("x"))
                 n_tile = physical_block % fx.Int32(config.n_tiles)
@@ -1182,7 +1182,7 @@ def compile_megakernel(
                         emit_gemm(m_block)
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
             gpu.barrier()
-            if tid == fx.Int32(0):
+            if tid == 0:
                 ticket = fx.Int32(
                     comm_ops.atomic_add_agent_one_as(
                         local_workspace_base
@@ -1194,7 +1194,7 @@ def compile_megakernel(
                 service_begin = fx.Int32(config.compute_groups - config.service_groups)
                 fx.ptr_store(
                     (ticket >= service_begin).select(
-                        ticket - service_begin + fx.Int32(1),
+                        ticket - service_begin + 1,
                         fx.Int32(0),
                     ),
                     service_marker_ptr,
@@ -1202,10 +1202,10 @@ def compile_megakernel(
             gpu.barrier()
 
             service_marker = fx.Int32(fx.ptr_load(service_marker_ptr))
-            if service_marker > fx.Int32(0):
-                service_group = service_marker - fx.Int32(1)
+            if service_marker > 0:
+                service_group = service_marker - 1
                 if config.service_groups > 1:
-                    if tid == fx.Int32(0):
+                    if tid == 0:
                         comm_ops.spin_until_ge_i32_agent(
                             local_workspace_base
                             + fx.Int64(config.producer_done_offset)
@@ -1214,7 +1214,7 @@ def compile_megakernel(
                         )
                         comm_ops.fence_agent_acquire()
                 else:
-                    if tid == fx.Int32(0):
+                    if tid == 0:
                         comm_ops.fence_agent_acquire()
                 gpu.barrier()
                 emit_service_tile(

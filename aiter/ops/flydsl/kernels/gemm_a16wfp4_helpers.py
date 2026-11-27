@@ -105,19 +105,6 @@ class DenseGemmTraits:
             f"_tn{self.tile_n}_tk{self.tile_k}_kw{self.k_wave}_wpe{wpe}"
         )
 
-    @property
-    def cache_key(self):
-        return (
-            self.n,
-            self.k,
-            self.block_m,
-            self.tile_n,
-            self.tile_k,
-            self.b_cache_mod,
-            self.k_wave,
-            self.waves_per_eu,
-        )
-
 
 def make_dense_operand_loaders(
     traits,
@@ -195,7 +182,7 @@ def make_dense_accumulators(traits):
         [fx.make_rmem_tensor(layout, fx.Float32) for _ in range(traits.n_repeats)]
         for _ in range(traits.m_repeats)
     ]
-    zero = Vec.filled(4, 0.0, fx.Float32)
+    zero = fx.full(4, 0.0, fx.Float32)
     for mi in range_constexpr(traits.m_repeats):
         for ni in range_constexpr(traits.n_repeats):
             accumulators[mi][ni].store(zero)
@@ -312,11 +299,9 @@ def reduce_dense_k_wave(traits, accumulators, lds, wave, wave_n_id, lane):
         ai_off = fx.Int32(ai * 64 * 4) + lane * fx.Int32(4)
         for g in range_constexpr(1, traits.k_wave):
             peer = fx.Int32(g * traits.num_n_waves) + wave_n_id
-            pv = Vec(
-                fx.ptr_load(
-                    peers + (peer * fx.Int32(grp_stride) + ai_off),
-                    result_type=T.vec(4, T.f32),
-                )
+            pv = fx.ptr_load(
+                peers + (peer * fx.Int32(grp_stride) + ai_off),
+                result_type=T.vec(4, T.f32),
             )
             s = Vec.from_elements(
                 [s[vv] + pv[vv] for vv in range_constexpr(4)], fx.Float32
@@ -350,5 +335,5 @@ def make_dense_store(arg_out, n):
 
 def store_dense_bf16(store, value, index):
     output, atom, fragment = store
-    fragment.store(Vec.filled(1, value.to(fx.BFloat16), fx.BFloat16))
+    fragment.store(fx.full(1, value.to(fx.BFloat16), fx.BFloat16))
     fx.copy(atom, fragment, fx.slice(output, (None, fx.Int32(index))))

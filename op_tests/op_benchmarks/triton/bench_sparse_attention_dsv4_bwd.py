@@ -19,8 +19,6 @@ Usage:
   python op_tests/op_benchmarks/triton/bench_sparse_attention_dsv4_bwd.py --cfgs 4096,128,512
 """
 
-import argparse
-
 import torch
 import triton
 
@@ -31,6 +29,7 @@ from aiter.ops.triton.attention.sparse_attention_dsv4_bwd import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.test_mha_common import sparse_mla_dsv4_ref
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 
 D = 512
 SWA = 128  # sliding-window width
@@ -70,7 +69,9 @@ def _build_topk_swa_pool(T, topk, num_pool, device, generator):
 
     # Pick n_pool visible blocks at random: score the visible ones in [0,1), push the rest to
     # 2.0, take the smallest.
-    score = torch.rand(T, num_pool, device=device, generator=generator)
+    score = torch.rand(
+        T, num_pool, device=device, dtype=torch.float32, generator=generator
+    )
     score = torch.where(visible, score, torch.full_like(score, 2.0))
     sel = score.argsort(dim=1)[:, :n_pool]
     pool = torch.where(torch.gather(visible, 1, sel), T + sel, torch.full_like(sel, -1))
@@ -231,7 +232,7 @@ def run_bwd_bench(args, device):
 
 
 def _parse_args():
-    p = argparse.ArgumentParser(description=__doc__)
+    p = get_parser(kernel_name="Sparse Attention DSV4 Backward")
     p.add_argument(
         "--cfgs",
         nargs="+",

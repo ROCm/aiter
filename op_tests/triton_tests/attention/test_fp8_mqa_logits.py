@@ -17,7 +17,7 @@ def calc_diff(x: torch.Tensor, y: torch.Tensor):
     return 1 - sim
 
 
-def check_logits(logits, ref_logits, where="", check_mask=True):
+def check_logits(logits, ref_logits, where="", check_mask=True, tol=1e-3):
     ref_neginf_mask = ref_logits == float("-inf")
     if check_mask:
         assert torch.equal(logits == float("-inf"), ref_neginf_mask), f"mask {where}"
@@ -27,7 +27,7 @@ def check_logits(logits, ref_logits, where="", check_mask=True):
         logits.masked_fill(ref_neginf_mask, 0),
         ref_logits.masked_fill(ref_neginf_mask, 0),
     )
-    assert diff < 1e-3, f"{where}{diff=}"
+    assert diff < tol, f"{where}{diff=}"
 
 
 def ceil_to_ue8m0(x: torch.Tensor):
@@ -127,9 +127,9 @@ def test_fp8_mqa_logits(
     q = torch.randn(s_q, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
     kv = torch.randn(s_k, head_dim, device="cuda", dtype=torch.bfloat16)
     kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
-    kv = (kv_fp8.to(torch.float32) * scales.reshape(-1, 1)).to(torch.bfloat16)
+    kv = kv_fp8.to(torch.float32) * scales.reshape(-1, 1)
     weights = torch.randn(s_q, num_heads, device="cuda", dtype=torch.float32)
-    # to respect the aseert in generate_cp_test_data
+    # to respect the assert in generate_cp_test_data
     if disable_cp or s_k % s_q != 0 or s_q % 2 != 0:
         ks = torch.zeros(s_q, dtype=torch.int, device="cuda")
         ke = torch.arange(s_q, dtype=torch.int, device="cuda") + (s_k - s_q)
@@ -137,7 +137,7 @@ def test_fp8_mqa_logits(
         ks, ke = generate_cp_test_data(s_q, s_k)
 
     q_fp8 = q.to(e4m3_type)
-    kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
+    q = q_fp8.to(torch.float32)
 
     ref_logits, _ref_cost = ref_fp8_mqa_logits(
         q=q, kv=kv, weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke
@@ -145,7 +145,7 @@ def test_fp8_mqa_logits(
 
     logits = fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke, clean_logits)
     assert logits.size() == (s_q, s_k)
-    check_logits(logits, ref_logits, check_mask=clean_logits)
+    check_logits(logits, ref_logits, check_mask=clean_logits, tol=1e-4)
 
 
 @pytest.mark.parametrize("s_q, s_k", [(8192, 65664), (8192, 98304)])
@@ -200,3 +200,183 @@ def test_fp8_mqa_logits_logits_past_2gib(
         check_logits(
             logits[a:b], ref_logits, where=f"rows {a}:{b}: ", check_mask=clean_logits
         )
+
+
+@pytest.mark.parametrize("cu_start", [1, 128, 2529])
+@pytest.mark.parametrize("num_heads", [32, 64])
+@pytest.mark.parametrize("head_dim", [64])
+@torch.inference_mode()
+def test_fp8_mqa_logits_nonzero_cu_start(
+    cu_start: int, num_heads: int, head_dim: int
+) -> None:
+    """Regression: rows whose kv window does not start at column 0 -- under
+    vLLM, every row of the 2nd+ prefill request packed into one indexer
+    chunk. The epilogue store masks scaled start_ind by BLOCK_KV."""
+    torch.manual_seed(0)
+    block_kv = 128  # BLOCK_KV on gfx1250
+    seg_lens = [
+        n * block_kv + tail
+        for n in range(6)
+        for tail in (0, 37)
+        if n * block_kv + tail > 0
+    ]
+    s_q = len(seg_lens)
+    s_k = cu_start + max(seg_lens)
+
+    q = torch.randn(s_q, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(s_k, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
+    kv = kv_fp8.to(torch.float32) * scales.reshape(-1, 1)
+    weights = torch.randn(s_q, num_heads, device="cuda", dtype=torch.float32)
+
+    ks = torch.full((s_q,), cu_start, dtype=torch.int, device="cuda")
+    ke = ks + torch.tensor(seg_lens, dtype=torch.int, device="cuda")
+
+    q_fp8 = q.to(e4m3_type)
+    q = q_fp8.to(torch.float32)
+
+    # kv_fp8/scales are the kernel's KV; kv is what they dequantize to, so the
+    # reference works from the same values. Re-quantizing kv here would rebind
+    # kv_fp8/scales and hand the kernel a slightly different KV.
+    ref_logits, _ref_cost = ref_fp8_mqa_logits(
+        q=q, kv=kv, weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke
+    )
+    logits = fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke, True)
+
+    ref_neginf_mask = ref_logits == float("-inf")
+    neginf_mask = logits == float("-inf")
+    assert torch.equal(neginf_mask, ref_neginf_mask)
+    ref_logits = ref_logits.masked_fill(ref_neginf_mask, 0)
+    logits = logits.masked_fill(neginf_mask, 0)
+    diff = calc_diff(logits, ref_logits)
+    assert diff < 1e-4, f"{diff=}"
+
+
+@pytest.mark.parametrize(
+    "s_q, s_k", [(1, 113), (61, 1024), (1024, 1560), (1019, 40000)]
+)
+@pytest.mark.parametrize("num_heads", [32, 64])
+@pytest.mark.parametrize("clean_logits", [True, False])
+@pytest.mark.parametrize("layout", ["aligned", "tight", "offset"])
+@torch.inference_mode()
+def test_fp8_mqa_logits_into_caller_buffer(
+    s_q: int, s_k: int, num_heads: int, clean_logits: bool, layout: str
+) -> None:
+    """`out=` gets the allocating path's scores in each row's range and writes
+    nothing past seq_len_kv columns or outside the view."""
+    torch.manual_seed(0)
+    head_dim = 128
+    q = torch.randn(s_q, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(s_k, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
+    weights = torch.randn(s_q, num_heads, device="cuda", dtype=torch.float32)
+    ks = torch.randint(0, s_k // 2 + 1, (s_q,), dtype=torch.int, device="cuda")
+    span = torch.randint(1, s_k + 1, (s_q,), dtype=torch.int, device="cuda")
+    ke = torch.minimum(ks + span, torch.full_like(ks, s_k))
+    q_fp8 = q.to(e4m3_type)
+    expected = fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke, True)
+
+    aligned = (s_k + 255) // 256 * 256
+    pitch, offset = {
+        "aligned": (aligned, 0),
+        "tight": (s_k, 0),
+        "offset": (aligned + 17, 37),
+    }[layout]
+    guard = 4096
+    plane = torch.full(
+        (offset + s_q * pitch + guard,),
+        float("nan"),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    rows = plane[offset : offset + s_q * pitch].view(s_q, pitch)
+    view = rows[:, :s_k]
+    logits = fp8_mqa_logits(
+        q_fp8, kv_fp8, scales, weights, ks, ke, clean_logits, out=view
+    )
+    assert logits.data_ptr() == view.data_ptr()
+    cols = torch.arange(s_k, device="cuda")
+    inside = (cols[None, :] >= ks[:, None]) & (cols[None, :] < ke[:, None])
+    assert torch.equal(logits[inside], expected[inside])
+    if clean_logits:
+        assert torch.isneginf(logits[~inside]).all()
+    assert torch.isnan(plane[:offset]).all()
+    assert torch.isnan(plane[offset + s_q * pitch :]).all()
+    assert torch.isnan(rows[:, s_k:]).all()
+
+
+@pytest.mark.parametrize(
+    "rows,keys", [(9, 1025), (4097, 1025), (9, 65539), (1019, 40000)]
+)
+@pytest.mark.parametrize("heads", [32, 64])
+@pytest.mark.parametrize("clean_logits", [False, True])
+@pytest.mark.parametrize("offset_dtype", [torch.int32, torch.int64])
+@torch.inference_mode()
+def test_fp8_mqa_logits_packed(rows, keys, heads, clean_logits, offset_dtype):
+    """Packed rows match the plane and leave gaps and guards untouched."""
+    torch.manual_seed(7517)
+    q = torch.randn(rows, heads, 128, device="cuda", dtype=torch.float32).to(e4m3_type)
+    kv = torch.randn(keys, 128, device="cuda", dtype=torch.float32).to(e4m3_type)
+    scales = torch.rand(keys, device="cuda", dtype=torch.float32) + 0.5
+    weights = torch.randn(rows, heads, device="cuda", dtype=torch.float32)
+    pattern = [0, 1, 63, 64, 65, 127, 128, 129, keys - 17]
+    lengths = [pattern[i % len(pattern)] for i in range(rows)]
+    visible = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+    starts = (
+        torch.arange(rows, device="cuda", dtype=torch.int32)
+        * 193
+        % (keys - visible + 1)
+    )
+    ends = starts + visible
+    # Reverse the storage order to cover negative distances between row bases.
+    locations, capacity = [0] * rows, 0
+    for row in reversed(range(rows)):
+        locations[row] = capacity
+        capacity += lengths[row] + 7
+    offsets = torch.tensor(locations, device="cuda", dtype=offset_dtype)
+    storage = torch.full(
+        (capacity + 34,), float("nan"), device="cuda", dtype=torch.float32
+    )
+    packed = storage[17:-17]
+    dense = fp8_mqa_logits(q, kv, scales, weights, starts, ends, clean_logits=False)
+    actual = fp8_mqa_logits(
+        q,
+        kv,
+        scales,
+        weights,
+        starts,
+        ends,
+        clean_logits=clean_logits,
+        out=packed,
+        out_offsets=offsets,
+    )
+    assert actual is packed
+    row_ids = torch.repeat_interleave(torch.arange(rows, device="cuda"), visible)
+    first = visible.to(torch.int64).cumsum(0) - visible
+    columns = torch.arange(sum(lengths), device="cuda") - first[row_ids]
+    destinations = offsets[row_ids] + columns
+    torch.testing.assert_close(
+        packed[destinations], dense[row_ids, starts[row_ids] + columns], rtol=0, atol=0
+    )
+    untouched = torch.ones(capacity, device="cuda", dtype=torch.bool)
+    untouched[destinations] = False
+    assert torch.isnan(packed[untouched]).all()
+    assert torch.isnan(storage[:17]).all() and torch.isnan(storage[-17:]).all()
+
+
+@pytest.mark.parametrize("rows", [0, 5])
+@torch.inference_mode()
+def test_fp8_mqa_logits_packed_empty_rows(rows):
+    q = torch.zeros(rows, 32, 128, device="cuda", dtype=e4m3_type)
+    kv = torch.zeros(73, 128, device="cuda", dtype=e4m3_type)
+    scales = torch.ones(73, device="cuda", dtype=torch.float32)
+    weights = torch.ones(rows, 32, device="cuda", dtype=torch.float32)
+    bounds = torch.zeros(rows, device="cuda", dtype=torch.int32)
+    packed = torch.full((19,), float("nan"), device="cuda", dtype=torch.float32)
+    assert (
+        fp8_mqa_logits(
+            q, kv, scales, weights, bounds, bounds, out=packed, out_offsets=bounds
+        )
+        is packed
+    )
+    assert torch.isnan(packed).all()

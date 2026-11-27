@@ -4,6 +4,7 @@
 import math
 
 import torch
+import triton
 
 from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla import (
     _sparse_mla as _sparse_mla_gfx950,
@@ -11,9 +12,13 @@ from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla import (
 from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla import (
     _sparse_mla_reduce as _sparse_mla_reduce_gfx950,
 )
+from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla_fp8 import (
+    _sparse_mla_fp8,
+)
 from aiter.ops.triton.attention.pa_decode_sparse import (
     _PREFILL_MIN_ROWS,
     _as_int32_contiguous_1d,
+    _check_epilogue,
     _launch_splits,
     _staged_block_m,
 )
@@ -73,37 +78,51 @@ def _cache_pointers(fmt, kv, d_qk, kv_scale):
 
 SUPPORTED_ARCHS = ("gfx942", "gfx950")
 
-# The kernel reads every fp8 byte, in q, the cache and the dot operands, as OCP
-# e4m3, which is gfx950's native fp8. gfx942's is fnuz, and the kernel does not
-# decode it yet, so gfx942 takes bf16 q and a bf16 cache only.
+# The kernel reads fp8 in the arch's native encoding: e4m3fnuz on gfx942,
+# OCP e4m3 on gfx950.
+FNUZ_ARCHS = ("gfx942",)
+
+# fp8 q is gfx950-only. gfx942 takes fp8_scalar (either dot precision) and
+# fp8_dsv32_mla (bf16 dots). Callers probe FNUZ_DSV32_ARCHS for the latter.
 FP8_ARCHS = ("gfx950",)
+FP8_SCALAR_ARCHS = ("gfx942", "gfx950")
+FNUZ_DSV32_ARCHS = ("gfx942",)
 
 # The packed caches (fp8_dsv4_mla, fp8_g64) and the SWA+top-k two-loop do not
-# reach the kernel below: they route to pa_decode_sparse, whose packed driver is
-# gfx950-only. Everywhere else they land in its fallback path, which reads a
-# plain grouped fp8 pool rather than these records, so it rejects them on dtype.
+# run outside PACKED_ARCHS. An fp8_scalar two-loop would launch the kernel below
+# rather than pa_decode_sparse, so sparse_mla_fwd rejects extra_kv first.
 PACKED_ARCHS = ("gfx950",)
 
 
-def _get_config(arch: str | None = None) -> dict:
+def _get_config(arch: str | None = None, fp8_dots: bool = False) -> dict:
     """The _sparse_mla launch config published for arch, the running one by default.
 
-    BLOCK_K is per arch because gfx950's tile does not fit gfx942's 64 KB of
-    LDS. num_warps is its own entry rather than BLOCK_K // 16, so the smaller
-    tile does not halve the warps too.
+    BLOCK_K and num_warps are per arch because gfx950's tile does not fit
+    gfx942's 64 KB of LDS. An arch may publish a separate _sparse_mla_fp8 entry
+    for fp8 dots, whose one-byte tiles fit twice the BLOCK_K.
     """
     cfg_dir = resolve_config_dir("attention", "SPARSE_MLA", backend="gluon", arch=arch)
-    return dict(load_config_json(f"{cfg_dir}/DEFAULT.json")["_sparse_mla"])
+    configs = load_config_json(f"{cfg_dir}/DEFAULT.json")
+    if fp8_dots and "_sparse_mla_fp8" in configs:
+        return dict(configs["_sparse_mla_fp8"])
+    return dict(configs["_sparse_mla"])
 
 
 def _check_packed_arch(arch: str) -> None:
     """Packed caches and the two-loop are gfx950-only, whatever SUPPORTED_ARCHS says.
 
-    Left alone these reach pa_decode_sparse and fail inside it on a cache dtype,
-    which says nothing about the arch being the reason.
+    An fp8_scalar two-loop never reaches pa_decode_sparse, so sparse_mla_fwd
+    calls this before launching the kernel below.
     """
     if arch not in PACKED_ARCHS:
-        flat = "bf16, fp8_scalar or fp8_dsv32_mla" if arch in FP8_ARCHS else "bf16"
+        if arch in FP8_ARCHS or (arch in FP8_SCALAR_ARCHS and arch in FNUZ_DSV32_ARCHS):
+            flat = "bf16, fp8_scalar or fp8_dsv32_mla"
+        elif arch in FP8_SCALAR_ARCHS:
+            flat = "bf16 or fp8_scalar"
+        elif arch in FNUZ_DSV32_ARCHS:
+            flat = "bf16 or fp8_dsv32_mla"
+        else:
+            flat = "bf16"
         raise ValueError(
             f"the fp8_dsv4_mla and fp8_g64 caches and the SWA+top-k two-loop are "
             f"{'/'.join(PACKED_ARCHS)}-only and have no implementation on {arch}. "
@@ -112,39 +131,45 @@ def _check_packed_arch(arch: str) -> None:
 
 
 def _check_fp8_arch(arch: str, fmt: str, q_dtype: torch.dtype) -> None:
-    """fp8 q and caches only where OCP e4m3 is the native fp8.
+    """fp8 q and caches only where the kernel decodes them.
 
-    A cache arrives as bytes, usually behind a uint8 view, so a gfx942 cache in
-    its native fnuz cannot be told apart from OCP here. Read as OCP it comes out
-    2x too large, and NaN wherever the quantizer saturated at 240.
+    A cache arrives as bytes, usually behind a uint8 view, so its encoding is
+    taken to be the arch's native one (see FNUZ_ARCHS).
     """
     if arch in FP8_ARCHS:
         return
+    caches = ["bf16"]
+    if arch in FP8_SCALAR_ARCHS:
+        caches.append("fp8_scalar")
+    if arch in FNUZ_DSV32_ARCHS:
+        caches.append("fp8_dsv32_mla")
     got = [
         what
         for what, is_fp8 in (
             (f"q is {q_dtype}", q_dtype.itemsize == 1),
-            (f"the cache is {fmt}", fmt != "bf16"),
+            (f"the cache is {fmt}", fmt not in caches),
         )
         if is_fp8
     ]
     if got:
         raise ValueError(
-            f"sparse_mla_fwd takes bf16 q and a bf16 cache on {arch}, but "
-            f"{' and '.join(got)}. The kernel reads fp8 as OCP e4m3, and {arch}'s "
-            "native fp8 is fnuz, which it does not decode yet."
+            f"sparse_mla_fwd takes bf16 q and a {' or '.join(caches)} cache on "
+            f"{arch}, but {' and '.join(got)}."
         )
 
 
-# Row pitch padding, and the scratch the kernel takes beyond the tiles. Both
-# hold only for bf16 tiles with the async path off, which is every gfx942
-# launch: fp8 dots are rejected there and its launch config keeps ASYNC_LDS off.
-# A nonzero KV_LDS_PAD replaces the pad on the KV tile alone.
+# Row pitch padding, and the scratch the kernel takes beyond the tiles, in tile
+# elements, with the async path off, which is every gfx942 launch. bf16 tiles
+# pad by 8; fp8 tiles (fp8 dots) are one byte per element and pad by 16. A
+# nonzero KV_LDS_PAD replaces the pad on the KV tile alone.
 _LDS_PAD = 8
-_LDS_SCRATCH_PER_BLOCK_K = 32
+_LDS_PAD_FP8 = 16
+_LDS_SCRATCH_PER_BLOCK_K = 16
 
 
-def _check_lds_budget(arch, block_k, kv_lora_rank, qk_rope_head_dim, kv_lds_pad):
+def _check_lds_budget(
+    arch, block_k, kv_lora_rank, qk_rope_head_dim, kv_lds_pad, fp8_dots=False
+):
     """Reject a geometry whose tiles cannot fit, naming what would.
 
     kv_lds_pad is the launch's KV_LDS_PAD, so prefill is checked at the wider
@@ -156,9 +181,10 @@ def _check_lds_budget(arch, block_k, kv_lora_rank, qk_rope_head_dim, kv_lds_pad)
     if arch != "gfx942":
         return
     budget = arch_info._LDS_CAP_BYTES[arch]
-    rope = block_k * (qk_rope_head_dim + _LDS_PAD) * 2 if qk_rope_head_dim else 0
-    need = (
-        block_k * (kv_lora_rank + (kv_lds_pad or _LDS_PAD)) * 2
+    elt, pad = (1, _LDS_PAD_FP8) if fp8_dots else (2, _LDS_PAD)
+    rope = block_k * (qk_rope_head_dim + pad) if qk_rope_head_dim else 0
+    need = elt * (
+        block_k * (kv_lora_rank + (kv_lds_pad or pad))
         + rope
         + _LDS_SCRATCH_PER_BLOCK_K * block_k
     )
@@ -233,10 +259,9 @@ def _resolve_dot_precision(dot_precision: str, fmt: str, arch: str) -> bool:
         )
     if dot_precision == "bf16":
         return False
-    if arch not in FP8_ARCHS:
+    if arch not in FP8_SCALAR_ARCHS:
         raise ValueError(
-            f"dot_precision='fp8' is not supported on {arch}: the kernel feeds the "
-            f"matrix core OCP e4m3, but {arch}'s native fp8 is fnuz. Use "
+            f"dot_precision='fp8' is not supported on {arch}. Use "
             "dot_precision='bf16'."
         )
     if fmt == "fp8_dsv32_mla":
@@ -260,12 +285,17 @@ def _classify_flat(kv, width, slots, kv_scale, what):
     """Flat pool rows are one QK row per slot; dtype and kv_scale pick the tag."""
     if kv.dtype == torch.bfloat16:
         return "bf16"  # kv_scale, if any, is ignored
-    if kv.dtype == torch.float8_e4m3fnuz:
+    arch = arch_info.get_arch()
+    native = torch.float8_e4m3fnuz if arch in FNUZ_ARCHS else torch.float8_e4m3fn
+    if kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz) and kv.dtype != native:
         raise ValueError(
-            f"{what}: float8_e4m3fnuz is the gfx942 encoding; gfx950 reads OCP e4m3"
+            f"{what}: {kv.dtype} is not {arch}'s fp8; the kernel reads {native}"
         )
-    if kv.element_size() != 1:
-        raise ValueError(f"{what}: unsupported cache dtype {kv.dtype}")
+    if kv.dtype not in (native, torch.uint8):
+        raise ValueError(
+            f"{what}: unsupported cache dtype {kv.dtype}; a flat fp8 cache is "
+            f"{native} or a uint8 view of it"
+        )
     if kv_scale is None:
         raise ValueError(
             f"{what}: a flat fp8 cache needs kv_scale, [1] f32 (fp8_scalar) or "
@@ -454,6 +484,240 @@ def _forward_paged(
     return res if isinstance(res, tuple) else (res, None)
 
 
+def _fp8_paged_map(cache, base_ptr, row):
+    """(row offset, block stride in rows, log2 block size) of a [nb, block, row]
+    fp8 cache read from base_ptr, slot s being row offset + (s // block) * stride
+    + s % block. None if _sparse_mla_fp8 cannot address it: an offset or page
+    pitch that is not whole rows, or a block size that is not a power of two."""
+    off = cache.data_ptr() - base_ptr
+    block = cache.shape[1]
+    if off % row or cache.stride(0) % row or block & (block - 1):
+        return None
+    return off // row, cache.stride(0) // row, block.bit_length() - 1
+
+
+def _fp8_plan(num_queries, num_heads, avg_topk, two_loops):
+    """(heads per program, split count) for _sparse_mla_fp8."""
+    num_cus = get_num_sms()
+    # 64 heads once that alone fills the CUs. Not for the two-loop kernel at 64
+    # heads: it spills there and 32 is faster.
+    if (
+        num_heads % 64 == 0
+        and num_queries * (num_heads // 64) >= num_cus
+        and not (two_loops and num_heads == 64)
+    ):
+        return 64, 1
+    # Short rows: fewer heads per program beats splitting, whose partials cost
+    # more than the extra gathers.
+    if math.ceil(avg_topk / 64) < 16:
+        for g in (32, 16, 8):
+            if num_heads % g == 0 and num_queries * (num_heads // g) >= num_cus // 2:
+                return g, 1
+    g = min(32, num_heads)
+    return g, _mla_num_splits(num_queries, num_heads // g, avg_topk)
+
+
+def _sparse_mla_fwd_gfx950_fp8(
+    q,
+    q_scale,
+    kv_buffer,
+    cache,
+    block_size,
+    kv_scale,
+    kv_indptr,
+    kv_indices,
+    softmax_scale,
+    out,
+    *,
+    kv_splits,
+    attn_sink,
+    return_lse,
+    extra_kv,
+    extra_kv_scale,
+    extra_indptr,
+    extra_indices,
+    inv_rope_positions,
+    inv_rope_cos_sin_cache,
+    out_mxfp8,
+):
+    """gfx950's kernel for a per-tensor fp8 cache with fp8 dots
+    (_gluon_kernels/gfx950/attention/sparse_mla_fp8.py) and, when split, the
+    generic merge. Returns (out, lse or None), or None if the kernel cannot
+    address the caches. cache and block_size come from _cache_pointers.
+
+    A flat pool is one list of row ids, a paged one maps slot ids to rows. With
+    extra_kv (SWA cache as kv_buffer, the compressed top-k cache as
+    extra_kv), both caches in one allocation under one scale are read as one list
+    in one loop, from the lower of the two; otherwise in two loops, each from its
+    own cache. Host metadata only (storage pointers, strides, scale identity):
+    safe under graph capture."""
+    C, H, row = q.shape
+    if cache.numel() == 0 or (extra_kv is not None and extra_kv.numel() == 0):
+        return None  # an empty key list still gathers row 0
+    kv, x_kv, x_ks = cache, None, None
+    main = extra = (None, None, 0)
+    if extra_kv is not None:
+        main_u8 = kv_buffer.view(torch.uint8)
+        x_u8 = extra_kv.view(torch.uint8)
+        one_alloc = (
+            main_u8.untyped_storage().data_ptr() == x_u8.untyped_storage().data_ptr()
+        )
+        one_scale = extra_kv_scale.data_ptr() == kv_scale.data_ptr()
+        # mapping tricks so both indices can read from the same kv pool, if it is shared
+        if one_alloc and one_scale:
+            # one u8 view over both caches, from the lower one: the base of both
+            lo = min(main_u8, x_u8, key=torch.Tensor.data_ptr)
+            end = max(t.data_ptr() + max_addressable_bytes(t) for t in (main_u8, x_u8))
+            kv = lo.new_empty(0).set_(
+                lo.untyped_storage(),
+                lo.data_ptr() - lo.untyped_storage().data_ptr(),
+                (end - lo.data_ptr(),),
+            )
+            main = _fp8_paged_map(main_u8, kv.data_ptr(), row)
+            extra = _fp8_paged_map(x_u8, kv.data_ptr(), row)
+        else:
+            kv, x_kv = main_u8, x_u8
+            main = _fp8_paged_map(main_u8, main_u8.data_ptr(), row)
+            extra = _fp8_paged_map(x_u8, x_u8.data_ptr(), row)
+            if not one_scale:
+                x_ks = extra_kv_scale
+    elif block_size > 1:
+        main = _fp8_paged_map(cache, cache.data_ptr(), row)
+    elif cache.stride(0) != row or cache.stride(1) != 1:
+        return None
+    if main is None or extra is None:
+        return None
+
+    _check_epilogue(q, out, inv_rope_positions, inv_rope_cos_sin_cache, out_mxfp8)
+    inv_rope = inv_rope_positions is not None
+    mxfp8 = out_mxfp8 is not None
+    # the output epilogue's arguments, shared with the merge
+    epilogue = {
+        "pos_ptr": inv_rope_positions,
+        "cos_sin_ptr": inv_rope_cos_sin_cache,
+        "cs_stride": inv_rope_cos_sin_cache.stride(0) if inv_rope else 0,
+        "out_scale_ptr": out_mxfp8[1] if mxfp8 else None,
+        "os_stride0": out_mxfp8[1].stride(0) if mxfp8 else 0,
+    }
+    if mxfp8:
+        out = out_mxfp8[0].view(C, H, 512)
+    else:
+        out = _check_out(out, q, 512)
+    lse = (
+        torch.empty((C, H), dtype=torch.float32, device=q.device)
+        if return_lse
+        else None
+    )
+
+    avg_topk = kv_indices.numel() / max(1, C)
+    if extra_kv is not None:
+        avg_topk += extra_indices.numel() / max(1, C)
+    block_h, num_splits = _fp8_plan(C, H, avg_topk, x_kv is not None)
+    if kv_splits is not None:
+        num_splits = max(1, int(kv_splits))
+    split = num_splits > 1
+    P = _launch_splits(num_splits)
+    if split:
+        part_m = torch.empty((C, P, H), dtype=torch.float32, device=q.device)
+        part_l = torch.empty_like(part_m)
+        part_acc = torch.empty((C, P, H, 512), dtype=torch.bfloat16, device=q.device)
+    else:
+        part_m = part_l = part_acc = None
+    # A row's head blocks run back to back on one XCD (Program.initialize), so
+    # the later blocks' gathers hit its L2.
+    head_blocks = H // block_h
+    xcds = get_num_xcds()
+    if head_blocks > 1:
+        grid = (triton.cdiv(C, xcds) * xcds * head_blocks, 1, P)
+    else:
+        grid = (C, 1, P)
+    # buffer loads take signed 32-bit offsets; a cache past them gathers in 64 bit
+    addr64 = any(
+        max_addressable_bytes(t) >= 2**31 - 1 for t in (kv, x_kv) if t is not None
+    )
+    q_bf16 = q.dtype == torch.bfloat16
+    rope = row - 512
+    _sparse_mla_fp8[grid](
+        q_ptr=q if q_bf16 else q.view(torch.uint8),
+        kv_ptr=kv,
+        out_ptr=None if split else out,
+        indptr_ptr=kv_indptr,
+        idx_ptr=kv_indices,
+        sink_ptr=attn_sink,
+        q_scale_ptr=None if q_bf16 else q_scale,
+        ks_ptr=kv_scale,
+        lse_ptr=None if split else lse,
+        part_m_ptr=part_m,
+        part_l_ptr=part_l,
+        part_acc_ptr=part_acc,
+        x_indptr_ptr=extra_indptr,
+        x_idx_ptr=extra_indices,
+        main_row0=main[0],
+        main_stride=main[1],
+        extra_row0=extra[0],
+        extra_stride=extra[1],
+        x_kv_ptr=x_kv,
+        x_ks_ptr=x_ks,
+        num_queries=C,
+        num_heads=H,
+        sm_scale=softmax_scale,
+        num_splits=num_splits,
+        q_stride0=q.stride(0),
+        q_stride1=q.stride(1),
+        out_stride0=out.stride(0),
+        out_stride1=out.stride(1),
+        BLOCK_H=block_h,
+        ROPE_TAIL=rope,
+        # how far (log2) a score may beat the running max before the max moves;
+        # most tiles then skip the accumulator rescale. 0 is the exact max.
+        LAZY_LOG2=8,
+        ADDR64=addr64,
+        MAIN_BLOCK_LOG2=main[2],
+        EXTRA_BLOCK_LOG2=extra[2],
+        HEAD_BLOCKS=head_blocks,
+        NUM_XCDS=xcds,
+        **epilogue,
+        # the RoPE tile needs key waves: 64 heads take 8 waves there
+        num_warps=8 if (rope and block_h == 64) else 4,
+        waves_per_eu=2,
+        # no AGPRs: Triton 3.9's LLVM infers it, 3.8's splits the budget in two
+        llvm_fn_attrs="amdgpu-agpr-alloc=0",
+        enable_fp_fusion=True,
+    )
+    if split:
+        _sparse_mla_reduce_gfx950[(C, H)](
+            part_m,
+            part_l,
+            part_acc,
+            attn_sink,
+            out,
+            out.stride(0),
+            out.stride(1),
+            part_m.stride(0),
+            part_m.stride(1),
+            part_acc.stride(0),
+            part_acc.stride(1),
+            part_acc.stride(2),
+            H,
+            HAS_SINK=attn_sink is not None,
+            HEAD_SIZE=512,
+            BLOCK_M=1,
+            NUM_SPLITS=P,
+            HEAD_ALIGNED=True,
+            ADAPTIVE_SPLITS=True,
+            lse_ptr=lse,
+            HAS_LSE=lse is not None,
+            **epilogue,
+            ROPE_DIM=64,
+            INV_ROPE=inv_rope,
+            OUT_MXFP8=mxfp8,
+            # a 2-split tile spans two warps; more would hold duplicate lanes
+            num_warps=min(4, P),
+            enable_fp_fusion=True,
+        )
+    return out, lse
+
+
 def sparse_mla_fwd(
     q: torch.Tensor,
     kv_buffer: torch.Tensor,
@@ -487,9 +751,10 @@ def sparse_mla_fwd(
 
     Supported KV cache formats. The format is inferred from kv_buffer's shape,
     dtype and kv_scale; each row gives what the caller has to pass. R is the
-    QK width, kv_lora_rank + qk_rope_head_dim. Every fp8 format, like fp8 q, is
-    gfx950-only: the kernel reads fp8 as OCP e4m3, and gfx942's native fp8 is
-    fnuz.
+    QK width, kv_lora_rank + qk_rope_head_dim. fp8 is read in the arch's native
+    encoding: e4m3fnuz on gfx942, OCP e4m3 on gfx950. gfx942 takes fp8_scalar
+    under either dot precision and fp8_dsv32_mla under bf16 dots. fp8 q and the
+    other fp8 formats are gfx950-only.
 
         format         kv_buffer                     kv_scale        geometry args
         bf16           [slots, R], [nb, block, R],   None            as the model
@@ -537,23 +802,26 @@ def sparse_mla_fwd(
             denominator (and the LSE) as a virtual key. None means no sink,
             which is not the same as a zero sink.
         extra_kv, extra_indptr, extra_indices: a second segment attended in the
-            same pass, for the SWA-window + top-k two-loop. All three together.
-            Either both segments are fp8_scalar block caches (each with its own
-            [1] f32 scale; either dot_precision) or both are fp8_dsv4_mla / bf16
-            block caches (bf16 dots).
+            same pass, for the SWA-window + top-k two-loop. All three together,
+            and gfx950-only, including when both segments are fp8_scalar. Either
+            both segments are fp8_scalar block caches (each with its own [1] f32
+            scale; either dot_precision) or both are fp8_dsv4_mla / bf16 block
+            caches (bf16 dots).
         extra_kv_scale: the extra segment's [1] f32 scale when it is
             fp8_scalar; defaults to kv_scale.
         dot_precision: what the QK and PV matrix-core ops run in.
 
             "bf16" (default): the KV tile is dequantized to bf16 on its way
                 into LDS and both dots are bf16. Works with every cache format
-                the arch takes: all of them on gfx950, bf16 alone on gfx942.
+                the arch takes: all of them on gfx950, and bf16, fp8_scalar and
+                fp8_dsv32_mla on gfx942.
             "fp8": the cache's own code points go to the fp8 matrix core with no
                 dequant, and the per-tensor scale folds outside the tile loop.
-                tensor scale fp8 kv cache only; gfx950 only.
+                tensor scale fp8 kv cache only; gfx942 and gfx950.
 
             q is adapted to the choice. bf16 q is quantized in the kernel
-            prologue, one scale per (query, head-block) tile; fp8 q is passed
+            prologue, one scale per (query, head-block) tile (per head on gfx950's
+            fp8_scalar kernel); fp8 q is passed
             straight through, and fp8 q under "bf16" dots is widened in-kernel.
 
         q_scale: scalar f32, required when q arrives already fp8 (the scale it
@@ -567,7 +835,7 @@ def sparse_mla_fwd(
             f32 (cos | sin). The trailing 64 lanes of each output row are
             rotated back (inverse GPT-J RoPE) before the store. DeepSeek-V4
             caches only (fp8_dsv4_mla, fp8_g64, the two-loop), whose rope lives
-            inside the row.
+            inside the row, and gfx950's 512-wide fp8_scalar with fp8 dots.
         out_mxfp8: (data [C, H * D] e4m3, scale [C, H * D // 32] uint8 E8M0) in
             place of out, for the same caches: the output is stored
             MXFP8-quantized, one scale per 32 lanes, and data viewed as
@@ -601,6 +869,10 @@ def sparse_mla_fwd(
     has_extra = all(a is not None for a in extra)
     if any(a is not None for a in extra) and not has_extra:
         raise ValueError("extra_kv, extra_indptr and extra_indices go together")
+    if has_extra and arch_info.get_arch() not in PACKED_ARCHS:
+        # fp8_scalar extra never reaches _forward_paged and would launch the
+        # kernel below. The two-loop stays gfx950-only for every cache format.
+        _check_packed_arch(arch_info.get_arch())
     if has_extra:
         # The SWA-window + top-k two-loop: both segments are block caches the
         # dsv4 decoder reads. A flat main pool would silently drop the extra one.
@@ -660,11 +932,6 @@ def sparse_mla_fwd(
             inv_rope_cos_sin_cache,
             out_mxfp8,
         )
-    if inv_rope_positions is not None or out_mxfp8 is not None:
-        raise ValueError(
-            "the inverse-RoPE / MXFP8 output epilogue needs a DeepSeek-V4 cache, "
-            f"got {fmt}"
-        )
     arch = arch_info.get_arch()
     assert arch in SUPPORTED_ARCHS, f"sparse_mla_fwd does not support {arch}"
     _check_fp8_arch(arch, fmt, q.dtype)
@@ -710,10 +977,58 @@ def sparse_mla_fwd(
         # The kernel still wants a live pointer for the compile-time-elided slot.
         attn_sink = torch.empty(1, device=q.device, dtype=torch.float32)
 
+    epilogue = inv_rope_positions is not None or out_mxfp8 is not None
+    # gfx950's fp8 kernel, where it can address the caches. -1 sentinels and
+    # skip_reduce run the generic one, and the epilogue needs the rope inside the
+    # row.
+
+    # Custom kernel for better performance
+    if (
+        arch == "gfx950"
+        and fmt == "fp8_scalar"
+        and fp8_dots
+        and not skip_reduce
+        and not has_invalid
+        and kv_lora_rank == 512
+        and qk_rope_head_dim in (0, 64)
+        and num_heads in (8, 16, 32, 64, 128)
+        and not (epilogue and qk_rope_head_dim)
+    ):
+        res = _sparse_mla_fwd_gfx950_fp8(
+            q,
+            q_scale,
+            kv_buffer,
+            cache,
+            block_size,
+            kv_scale,
+            kv_indptr,
+            kv_indices,
+            softmax_scale,
+            out,
+            kv_splits=kv_splits,
+            attn_sink=attn_sink if has_sink else None,
+            return_lse=return_lse,
+            extra_kv=extra_kv,
+            extra_kv_scale=extra_kv_scale,
+            extra_indptr=extra_indptr,
+            extra_indices=extra_indices,
+            inv_rope_positions=inv_rope_positions,
+            inv_rope_cos_sin_cache=inv_rope_cos_sin_cache,
+            out_mxfp8=out_mxfp8,
+        )
+        if res is not None:
+            return res
+    if epilogue:
+        raise ValueError(
+            "the inverse-RoPE / MXFP8 output epilogue needs a DeepSeek-V4 cache, "
+            "or a 512-wide fp8_scalar one with dot_precision='fp8' on gfx950, got "
+            f"{fmt}"
+        )
+
     # Tuned launch config (gfx950 / MI355). H < 16 runs natively at
     # BLOCK_M = next_pow2(H) instead of padding heads
     block_m = 16 if num_heads >= 16 else max(8, 1 << (num_heads - 1).bit_length())
-    cfg = _get_config()
+    cfg = _get_config(fp8_dots=fp8_dots)
     block_k = cfg["BLOCK_K"]
     num_warps = cfg["num_warps"]
 
@@ -815,7 +1130,9 @@ def sparse_mla_fwd(
     kv_lds_pad = (
         16 if num_queries >= _PREFILL_MIN_ROWS and not fp8_dots and not own_pad else 0
     )
-    _check_lds_budget(arch, block_k, kv_lora_rank, qk_rope_head_dim, kv_lds_pad)
+    _check_lds_budget(
+        arch, block_k, kv_lora_rank, qk_rope_head_dim, kv_lds_pad, fp8_dots
+    )
 
     # The 32/64-head programs and the decode XCD remap below are tuned on gfx950.
     staged = fmt == "fp8_scalar" or (fmt == "bf16" and qk_rope_head_dim == 0)
@@ -900,6 +1217,7 @@ def sparse_mla_fwd(
         IDX_BUFFER_LOAD=idx_use_buffer_load,
         HAS_INVALID=has_invalid,
         FP8_MFMA=fp8_dots,
+        FP8_FNUZ=arch in FNUZ_ARCHS,
         ASYNC_LDS=async_lds_on,
         GATHER_CACHE="",
         KV_LDS_PAD=kv_lds_pad,
@@ -909,6 +1227,7 @@ def sparse_mla_fwd(
         HAS_LSE=return_lse,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
+        enable_fp_fusion=True,
     )
 
     if num_splits == 1:
@@ -942,5 +1261,6 @@ def sparse_mla_fwd(
         HAS_LSE=return_lse,
         # A 2-split tile spans two warps; more warps would hold duplicate lanes.
         num_warps=min(4, grid_splits),
+        enable_fp_fusion=True,
     )
     return out, (lse if return_lse else None)

@@ -5,6 +5,7 @@
 import argparse
 import csv
 import json
+import os
 import statistics
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -17,7 +18,12 @@ from aiter.ops.triton.conv._prepack import (
     clear_conv3d_weight_pack_caches,
     prepack_ncdhw_to_cblocked,
 )
-from aiter.ops.triton.conv._utils import BLOCK_K, _out_dhw
+from aiter.ops.triton.conv._utils import (
+    BLOCK_K,
+    _out_dhw,
+    _padding_geometry,
+    _validate_padding_mode,
+)
 from aiter.ops.triton.conv.conv3d import (
     _resolve_route,
     conv3d,
@@ -28,6 +34,11 @@ from aiter.ops.triton.conv.conv3d import (
     conv3d_winograd_hw_f4x3,
     conv3d_winograd_hw_f4x3_cblocked,
 )
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_parser,
+    override_parser_action,
+)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import BASE_DIR
 from op_tests.triton_tests.conv._helpers import (
     _winograd_tolerances,
     apply_activation,
@@ -44,7 +55,6 @@ METHODS = (
     "winograd_cblocked",
 )
 _DEFAULT_MODEL = "wan22-a14b-vae"
-_MODEL_SHAPES_PATH = Path(__file__).with_name("conv_shapes.json")
 
 
 @dataclass(frozen=True)
@@ -104,8 +114,8 @@ def _torch_dtype(name: str) -> torch.dtype:
     return {"fp16": torch.float16, "bf16": torch.bfloat16}[name]
 
 
-def _load_model_cases(pattern: str) -> tuple[str, list[Conv3DCase]]:
-    with _MODEL_SHAPES_PATH.open() as file:
+def _load_model_cases(pattern: str, config_path: str) -> tuple[str, list[Conv3DCase]]:
+    with open(os.path.join(BASE_DIR, config_path)) as file:
         data = json.load(file)
     matches = [
         model
@@ -151,7 +161,7 @@ def _load_cases(args) -> tuple[str, list[Conv3DCase]]:
         ]
     if args.smoke:
         return "smoke", list(EDGE_CASES)
-    model, cases = _load_model_cases(args.model or _DEFAULT_MODEL)
+    model, cases = _load_model_cases(args.model or _DEFAULT_MODEL, args.model_configs)
     if args.batch_size is not None:
         cases = [
             replace(case, dims=(args.batch_size, *case.dims[1:])) for case in cases
@@ -159,10 +169,14 @@ def _load_cases(args) -> tuple[str, list[Conv3DCase]]:
     return model, cases
 
 
-def _selected_kernel(case: Conv3DCase, method: str, layout: str) -> str:
+def _selected_kernel(
+    case: Conv3DCase, method: str, layout: str, padding_mode: str = "zeros"
+) -> str:
+    N, C, D, H, W, K, T, R, S = case.dims
+    _validate_padding_mode(padding_mode, (D, H, W), case.padding)
     if method != "auto":
         return method
-    N, C, D, H, W, K, T, R, S = case.dims
+    (D, H, W), padding = _padding_geometry((D, H, W), case.padding, padding_mode)
     return _resolve_route(
         T,
         R,
@@ -176,17 +190,27 @@ def _selected_kernel(case: Conv3DCase, method: str, layout: str) -> str:
         W,
         K,
         layout,
-        padding=case.padding,
+        padding=padding,
     ).value
 
 
-def _run_triton(method, x, w, bias, case: Conv3DCase, layout: str, activation: str):
+def _run_triton(
+    method,
+    x,
+    w,
+    bias,
+    case: Conv3DCase,
+    layout: str,
+    activation: str,
+    padding_mode: str = "zeros",
+):
     kwargs = {
         "bias": bias,
         "stride": case.stride,
         "padding": case.padding,
         "dilation": case.dilation,
         "activation": activation,
+        "padding_mode": padding_mode,
     }
     if method == "auto":
         return conv3d(x, w, layout=layout, **kwargs)
@@ -265,7 +289,7 @@ def _effective_bytes(
     elements = N * C * D * H * W + K * C * T * R * S + N * K * OD * OH * OW
     if use_bias:
         elements += K
-    return elements * torch.empty((), dtype=dtype).element_size()
+    return elements * torch.empty((), device="cuda", dtype=dtype).element_size()
 
 
 def _metric_value(metric: str, milliseconds: float, flops: float, moved: int):
@@ -340,15 +364,28 @@ def _is_better(metric: str, triton_value: float, torch_value: float) -> bool:
 
 def _print_layer_table(layers, has_any_repack, metric):
     short_unit, _ = _metric_labels(metric)
+    end_to_end = layers[0]["timing_scope"] == "end_to_end"
+    primary_scope = "End-to-End" if end_to_end else "Kernel"
     print("\n" + "=" * 80)
     print("LAYER-BY-LAYER BENCHMARK")
     print("=" * 80)
 
-    headers = ["#", "Layer", "Type", "Shape", "Triton Kernel"]
-    headers.append(f"Tri Kernel {short_unit}")
+    headers = [
+        "#",
+        "Layer",
+        "Type",
+        "Shape",
+        "Padding",
+        "Triton Kernel",
+        "Torch Input Layout",
+    ]
+    headers.append(f"Tri {primary_scope} {short_unit}")
     if has_any_repack:
         headers.append(f"Tri Kernel+Repack {short_unit}")
-    headers.extend([f"Torch {short_unit}", "Winner"])
+    headers.append(
+        f"Torch End-to-End {short_unit}" if end_to_end else f"Torch {short_unit}"
+    )
+    headers.append("Winner")
 
     rows = []
     for index, layer in enumerate(layers):
@@ -357,7 +394,9 @@ def _print_layer_table(layers, has_any_repack, metric):
             layer["name"],
             layer["type"],
             layer["shape"],
+            layer["padding_mode"],
             layer["kernel_name"],
+            layer["torch_conv_layout"],
             f"{layer['values']['triton_kernel']:.2f}",
         ]
         if has_any_repack:
@@ -400,6 +439,9 @@ def _aggregate_value(layers, provider, metric):
 
 def _print_overall_perf_table(layers, has_any_repack, metric):
     _, long_unit = _metric_labels(metric)
+    primary_scope = (
+        "end-to-end" if layers[0]["timing_scope"] == "end_to_end" else "kernel"
+    )
     print("\n" + "=" * 80)
     print("OVERALL PERFORMANCE")
     print("=" * 80)
@@ -420,7 +462,7 @@ def _print_overall_perf_table(layers, has_any_repack, metric):
 
     rows = [
         [
-            f"Mean {long_unit} (kernel)",
+            f"Mean {long_unit} ({primary_scope})",
             f"{statistics.mean(tri_values):.2f}",
             f"{statistics.mean(torch_values):.2f}",
         ]
@@ -435,7 +477,7 @@ def _print_overall_perf_table(layers, has_any_repack, metric):
         )
     rows.append(
         [
-            f"Median {long_unit} (kernel)",
+            f"Median {long_unit} ({primary_scope})",
             f"{statistics.median(tri_values):.2f}",
             f"{statistics.median(torch_values):.2f}",
         ]
@@ -451,7 +493,7 @@ def _print_overall_perf_table(layers, has_any_repack, metric):
     if metric != "time":
         rows.append(
             [
-                f"Aggregate {long_unit} (kernel)",
+                f"Aggregate {long_unit} ({primary_scope})",
                 f"{_aggregate_value(layers, 'triton_kernel', metric):.2f}",
                 f"{_aggregate_value(layers, 'torch', metric):.2f}",
             ]
@@ -466,7 +508,7 @@ def _print_overall_perf_table(layers, has_any_repack, metric):
             )
     rows.append(
         [
-            "Total kernel time (ms)",
+            f"Total {primary_scope} time (ms)",
             f"{sum(layer['ms_tri'] for layer in layers):.2f}",
             f"{sum(layer['ms_torch'] for layer in layers):.2f}",
         ]
@@ -480,7 +522,11 @@ def _print_overall_perf_table(layers, has_any_repack, metric):
             ]
         )
     rows.append(
-        ["Layer wins (kernel)", f"{tri_wins}/{count}", f"{count - tri_wins}/{count}"]
+        [
+            f"Layer wins ({primary_scope})",
+            f"{tri_wins}/{count}",
+            f"{count - tri_wins}/{count}",
+        ]
     )
     if has_any_repack:
         rows.append(
@@ -521,7 +567,7 @@ def _print_weighted_totals(cases, timings, include_e2e):
         return
 
     print("\nCall-count-weighted model totals:")
-    print("workload calls triton_kernel_s triton_e2e_s torch_s speedup")
+    print("workload calls triton_primary_s triton_e2e_s torch_s speedup")
     for workload, calls, kernel_s, e2e_s, torch_s in rows:
         speedup = torch_s / e2e_s if e2e_s else float("nan")
         print(
@@ -536,9 +582,14 @@ def run_benchmark(args) -> None:
 
     source, cases = _load_cases(args)
     dtype = _torch_dtype(args.dtype)
-    kernel_names = [_selected_kernel(case, args.method, args.layout) for case in cases]
+    kernel_names = [
+        _selected_kernel(case, args.method, args.layout, args.padding_mode)
+        for case in cases
+    ]
+    end_to_end = args.end_to_end or args.padding_mode != "zeros"
+    timing_scope = "end_to_end" if end_to_end else "kernel"
     packs_input = ["cblocked" in name.lower() for name in kernel_names]
-    include_e2e = any(packs_input)
+    include_e2e = any(packs_input) and not end_to_end
     providers = ["triton_kernel"]
     if include_e2e:
         providers.append("triton_e2e")
@@ -549,6 +600,7 @@ def run_benchmark(args) -> None:
     values: dict[tuple[int, str], float] = {}
     moved_bytes: dict[tuple[int, str], int] = {}
     validated: set[int] = set()
+    torch_layouts: dict[int, str] = {}
     result_rows = []
 
     def benchmark_case(case_id, provider):
@@ -564,25 +616,54 @@ def run_benchmark(args) -> None:
 
         def run_triton():
             return _run_triton(
-                args.method, x, w, bias, case, args.layout, args.activation
+                args.method,
+                x,
+                w,
+                bias,
+                case,
+                args.layout,
+                args.activation,
+                padding_mode=args.padding_mode,
             )
 
-        def run_torch():
-            return _torch_reference(x, w, bias, case, args.activation)
+        def prepare_torch_input():
+            if args.padding_mode == "zeros":
+                return x
+            pad_depth, pad_height, pad_width = case.padding
+            return F.pad(
+                x,
+                (pad_width, pad_width, pad_height, pad_height, pad_depth, pad_depth),
+                mode=args.padding_mode,
+            )
+
+        torch_case = (
+            case if args.padding_mode == "zeros" else replace(case, padding=(0, 0, 0))
+        )
+
+        def run_torch(source=None):
+            if source is None:
+                source = prepare_torch_input()
+            return _torch_reference(source, w, bias, torch_case, args.activation)
 
         try:
             if case_id not in validated:
                 output = run_triton()
-                reference = run_torch()
+                torch_input = prepare_torch_input()
+                torch_layouts[case_id] = (
+                    "ndhwc"
+                    if torch_input.is_contiguous(memory_format=torch.channels_last_3d)
+                    else "ncdhw"
+                )
+                reference = run_torch(torch_input)
                 torch.cuda.synchronize()
                 _assert_correct(output, reference, case, dtype, kernel_name)
                 validated.add(case_id)
-                del output, reference
+                del output, reference, torch_input
                 torch.cuda.empty_cache()
 
             if provider == "torch":
                 function = run_torch
-            elif provider == "triton_e2e" or not needs_pack:
+            elif end_to_end or provider == "triton_e2e" or not needs_pack:
                 function = run_triton
             else:
                 x_blocked, _ = prepack_ncdhw_to_cblocked(x, BLOCK_K)
@@ -615,7 +696,8 @@ def run_benchmark(args) -> None:
 
     print(
         f"# source={source} shapes={len(cases)} dtype={args.dtype} "
-        f"layout={args.layout} method={args.method} metric={args.metric}"
+        f"layout={args.layout} method={args.method} metric={args.metric} "
+        f"padding_mode={args.padding_mode} timing_scope={timing_scope}"
     )
     for case_id, case in enumerate(cases):
         for provider in providers:
@@ -630,6 +712,9 @@ def run_benchmark(args) -> None:
                 "unit": unit,
                 "kernel": kernel_names[case_id],
                 "shape": _shape_label(case),
+                "padding_mode": args.padding_mode,
+                "timing_scope": timing_scope,
+                "torch_conv_layout": torch_layouts[case_id],
             }
             result_rows.append(row)
 
@@ -657,6 +742,9 @@ def run_benchmark(args) -> None:
                 "ms_tri_e2e": timings.get((case_id, "triton_e2e")),
                 "ms_torch": timings[(case_id, "torch")],
                 "flops": _flops(case),
+                "padding_mode": args.padding_mode,
+                "timing_scope": timing_scope,
+                "torch_conv_layout": torch_layouts[case_id],
             }
         )
 
@@ -669,7 +757,8 @@ def run_benchmark(args) -> None:
             for character in source
         )
         output_path = Path(
-            f"conv3d_{safe_source}_{args.dtype}_{args.layout}_{args.method}.csv"
+            f"conv3d_{safe_source}_{args.dtype}_{args.layout}_{args.method}"
+            f"_{args.padding_mode}_{timing_scope}.csv"
         )
         with output_path.open("w", newline="") as file:
             writer = csv.DictWriter(file, fieldnames=result_rows[0])
@@ -679,11 +768,12 @@ def run_benchmark(args) -> None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        prog="bench_conv3d",
-        description="Benchmark Triton Conv3D against PyTorch.",
-        allow_abbrev=False,
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    parser = get_parser(kernel_name="bench_conv3d")
+    override_parser_action(
+        parser,
+        action="--model-configs",
+        default="utils/conv_shapes.json",
+        help="Conv3D shapes JSON file (sweep mode).",
     )
     source = parser.add_mutually_exclusive_group()
     source.add_argument(
@@ -694,22 +784,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="benchmark one NCDHW/OIDHW shape",
     )
     source.add_argument(
-        "--model",
-        help="benchmark Conv3D shapes matching this model name",
-    )
-    source.add_argument(
         "--smoke",
         action="store_true",
         help="benchmark a compact edge-case sweep",
     )
     parser.add_argument("--dtype", choices=("fp16", "bf16"), default="fp16")
     parser.add_argument("--layout", choices=("ncdhw", "ndhwc"), default="ncdhw")
-    parser.add_argument("--method", choices=METHODS, default="auto")
     parser.add_argument(
-        "--metric",
-        choices=("time", "throughput", "bandwidth"),
-        default="throughput",
+        "--padding-mode",
+        choices=("zeros", "reflect", "replicate", "circular"),
+        default="zeros",
     )
+    parser.add_argument(
+        "--end-to-end",
+        action="store_true",
+        help="include input preparation in the primary timing; implied by nonzero padding modes",
+    )
+    parser.add_argument("--method", choices=METHODS, default="auto")
+    override_parser_action(parser, action="--metric", default="throughput")
     parser.add_argument(
         "--activation",
         choices=("none", "relu", "relu6", "gelu"),

@@ -161,4 +161,4 @@ def splitk_reduce_epilogue(
 
 def _semaphore_addr(semaphore, bid_x, bid_y, tiles_n):
     idx = fx.Int32(bid_x) * tiles_n + fx.Int32(bid_y)
-    return fx.Int64(fx.ptrtoint(fx.get_iter(semaphore))) + fx.Int64(idx) * fx.Int64(4)
+    return fx.Int64(fx.ptrtoint(fx.get_iter(semaphore))) + fx.Int64(idx) * 4

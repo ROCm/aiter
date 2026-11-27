@@ -26,9 +26,13 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <map>
+#include <memory>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -64,15 +68,34 @@
                 "unsupported world_size " + std::to_string(ws)); \
     }
 
+// Allgather (and the sync-only kernels) only move data, so they scale past the
+// all-reduce limit; multi-node symm_mem groups reach 64 ranks.
+#define DISPATCH_AG_NGPUS_1250(ws, CALL) \
+    switch(ws) {                         \
+        case 2:  CALL(2);  break;        \
+        case 4:  CALL(4);  break;        \
+        case 6:  CALL(6);  break;        \
+        case 8:  CALL(8);  break;        \
+        case 16: CALL(16); break;        \
+        case 32: CALL(32); break;        \
+        case 64: CALL(64); break;        \
+        default:                         \
+            throw std::runtime_error(    \
+                "unsupported world_size " + std::to_string(ws)); \
+    }
+
 namespace aiter {
 
 // ---------------------------------------------------------------------------
 // Constants & data structures
 // ---------------------------------------------------------------------------
-constexpr int kMaxBlocks = 512;
-// Matches DISPATCH_NGPUS_1250. Sizes Signal/RankData/RankSignals; the last two
-// are passed by value on every launch, so widening this costs all world sizes.
-constexpr int kMaxNgpus = 8;
+constexpr int kMaxBlocks  = 512;
+// kMaxNgpusAr matches DISPATCH_NGPUS_1250, kMaxNgpusAg DISPATCH_AG_NGPUS_1250.
+// kMaxNgpus sizes Signal/RankData/RankSignals; the last two are passed by value
+// on every launch, so widening it costs all world sizes.
+constexpr int kMaxNgpusAr = 8;
+constexpr int kMaxNgpusAg = 64;
+constexpr int kMaxNgpus   = kMaxNgpusAg;
 
 struct Signal
 {
@@ -91,15 +114,18 @@ struct __align__(16) RankSignals
     Signal* signals[kMaxNgpus];
 };
 
-// Construction-time counterpart to DISPATCH_NGPUS_1250, so an unsupported
+// Construction-time counterpart to DISPATCH_AG_NGPUS_1250, so an unsupported
 // world size fails at init instead of from a dispatch default arm on the first
 // collective. init_custom_ar* are public bindings called directly downstream.
+// World sizes above kMaxNgpusAr are allgather-only.
 inline void check_ngpus(int world_size)
 {
-    if(world_size < 2 || world_size > kMaxNgpus || world_size % 2 != 0)
+    bool ok = (world_size >= 2 && world_size <= kMaxNgpusAr && world_size % 2 == 0) ||
+              world_size == 16 || world_size == 32 || world_size == 64;
+    if(!ok)
         throw std::invalid_argument(
             "gfx1250 custom allreduce: unsupported world size " +
-            std::to_string(world_size) + " (supported: 2, 4, 6, 8)");
+            std::to_string(world_size) + " (supported: 2, 4, 6, 8, 16, 32, 64)");
 }
 
 // ---------------------------------------------------------------------------
@@ -132,9 +158,11 @@ DINLINE opus::fp32_t downcast_s<opus::fp32_t>(opus::fp32_t val)
 // shared Signal meta buffer (offset kLLScratchOffset), so no extra cross-rank
 // exchange is needed — peer scratch base = (char*)sg_.signals[i] + off.
 
-constexpr int    kLLMaxRanks       = kMaxNgpus;
+constexpr int    kLLMaxRanks       = kMaxNgpusAr;
 // Route to LL when bytes <= this (matches RCCL DDA_ALLREDUCE_LL_THRESHOLD).
 constexpr size_t kLLArMaxBytes     = 4194304;           // 4 MiB
+// Narrower rows do not amortize the extra launches of two-stage fused AR.
+constexpr int kArRmsTwoStageMinHidden = 6144;
 // Hard per-message payload cap (one slot). Comfortably above the routing
 // threshold so all dtypes at <=128 KiB fit.
 constexpr size_t kLLScratchCapBytes = 4194304;          // 4 MiB
@@ -166,14 +194,23 @@ constexpr size_t llScratchBytes(int ngpus)
 
 // Byte offset of the LL scratch within the shared meta buffer: right after the
 // Signal struct, 128-byte aligned. The meta buffer (see meta_size()) is sized
-// kLLScratchOffset + llScratchBytes(world_size) and zero-initialized, which
-// doubles as the LL flag reset (flag 0 == cleared line).
+// kLLScratchOffset + llScratchBytes(world_size) + kArRmsShardBytes and
+// zero-initialized, which doubles as the LL flag reset (flag 0 == cleared line).
 constexpr size_t kLLScratchOffset =
     ((sizeof(Signal) + 127) / 128) * 128;
 
+// Two-stage fused AR + RMSNorm stages each rank's reduced shard right after the
+// LL scratch, so LL never polls a line it did not write. 16 MiB covers the
+// communicator's 64 MiB fused limit at TP4.
+constexpr size_t kArRmsShardBytes = 16 * 1024 * 1024;
+constexpr size_t arRmsShardOffset(int ngpus)
+{
+    return kLLScratchOffset + llScratchBytes(ngpus);
+}
+
 // gfx1250 128-bit global load/store at *system* scope ("" == system). A single
 // 16B transaction keeps a line's data and flags atomic w.r.t. a peer reader.
-#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1250__) &&                   \
+#if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx1250__) || defined(__gfx1250_strict__)) &&                   \
     __has_builtin(__builtin_amdgcn_global_store_b128) &&                         \
     __has_builtin(__builtin_amdgcn_global_load_b128)
 #define AITER_GFX1250_HAVE_B128 1
@@ -228,33 +265,56 @@ DINLINE void ll_load_b128(
 #endif
 }
 
-// LL flat all-reduce. 1D grid over 8-byte packets.
+// LL all-reduce lines and roles (both kernels below).
 //
-// Phase 1 (publish): rank writes its full sendbuff into every peer's scratch at
-// slot[rank], as LL lines carrying the epoch flag.
-// Phase 2 (reduce): rank polls its own scratch slots for the other ranks
-// (waiting on the flag), sums them with its own sendbuff (fp32 accumulation),
-// and writes recvbuff. Self is read directly from sendbuff.
+// A 16-byte line carries 8 bytes of payload in words 0 and 2 and the call's
+// epoch in words 1 and 3 (LLPackedMsg). It is written with one ll_store_b128
+// and read with one ll_load_b128, and a reader takes it only once both flags
+// carry the epoch, so a line has to land atomically only per 8-byte half.
 //
-// Graph-safe device epoch: each block owns a persistent device flag
-// block_flags[blockIdx.x] that the kernel itself bumps (mirrors Signal::_flag).
-// A packet is always published+consumed by the same (blockIdx, threadIdx) on
-// every rank, so only the *same block across ranks* must agree on the flag; each
-// block runs once per launch, keeping per-block flags in lockstep. Scratch is
-// double-buffered (bank = epoch & 1); the per-epoch flag disambiguates stale
-// lines, so no clearing is needed and it survives CUDA-graph replay.
-template <typename T, int ngpus>
-__global__ void __launch_bounds__(512, 1) ar_ll_gfx1250(
+// On gfx1250 a load issued after a remote store in the same wave returns only
+// once that store has completed, about a fabric round trip, while a peer's line
+// lands about half a round trip after it was sent. So the waves that send never
+// poll, and a wave that does both polls before it sends: a poll sees a line as
+// soon as it lands. The bank bases are read once, before any store, and indexed
+// by k = 0..ngpus-1 (rank (rank + k) % ngpus) at compile time, so no table read
+// sits between two remote stores (it would wait for the store before it). A
+// poller polls every line it still needs in one batch.
+//
+// Every element is summed in fp32 in rank order 0..ngpus-1 with the local value
+// at its own rank and rounded to T once, by both kernels, so the result does
+// not depend on which kernel reduced it or on which rank.
+//
+// Both kernels may be called with recvbuff == sendbuff; each says why below.
+//
+// Graph-safe device epoch: a persistent device array block_flags[kMaxBlocks]
+// that the kernel itself bumps (mirrors Signal::_flag). The grid size and block
+// size follow the message size, so the block that owns a packet changes between
+// calls of different sizes. Every launch therefore writes its epoch to all
+// kMaxBlocks entries, including those of blocks it did not launch, so all
+// blocks always start the next call on one shared epoch. Scratch is
+// double-buffered (bank = epoch & 1) with a fixed per-rank slot stride; the
+// per-epoch flag disambiguates stale lines, so no clearing is needed and it
+// survives CUDA-graph replay.
+
+// LL one-shot all-reduce. Block = 2 x W threads: the first W send, the other W
+// poll. A sender takes U packets a round: all their loads, then their lines to
+// slot[rank] of every rank's scratch, this rank's own first. The poller of
+// packet i polls all ngpus slots of this rank's scratch in one batch, the own
+// slot included, and sums them. It takes the local value from the own line, not
+// from sendbuff: that line exists only once the sender has loaded the packet, so
+// with recvbuff == sendbuff no poller can overwrite a packet before it is sent.
+template <typename T, int ngpus, int U>
+__global__ void __launch_bounds__(1024, 1) ar_ll_gfx1250(
     T* const* __restrict__ peer_scratch, // ngpus scratch bases (device table)
     T* __restrict__ recvbuff,
     const T* __restrict__ sendbuff,
     size_t nPk,          // number of 8-byte packets = bytes / 8
     int rank,
-    uint32_t* __restrict__ block_flags) // device array[gridDim.x], persisted
+    uint32_t* __restrict__ block_flags) // device array[kMaxBlocks], persisted
 {
     constexpr int LP = 8 / sizeof(T); // elements per 8-byte payload
     using PL         = typename opus::vector_t<T, LP>;
-    using AL         = typename opus::vector_t<opus::fp32_t, LP>;
     constexpr size_t slot = kLLPackCapacity;
 
     __shared__ uint32_t s_flag;
@@ -262,77 +322,96 @@ __global__ void __launch_bounds__(512, 1) ar_ll_gfx1250(
     {
         uint32_t f = block_flags[blockIdx.x] + 1u;
         if(f == 0u)
-            f = 1u; // flag is never 0 (0 == cleared scratch)
+            f = 2u; // flag is never 0 (0 == cleared scratch); keep bank parity
         s_flag = f;
     }
     __syncthreads();
-    const uint32_t flag        = s_flag;
-    const size_t   bankOffPkts = (size_t)(flag & 1u) * (size_t)ngpus * slot;
+    const uint32_t flag = s_flag;
 
-    const size_t gtid   = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    const size_t stride = (size_t)gridDim.x * blockDim.x;
-
-    const uint32_t* in = reinterpret_cast<const uint32_t*>(sendbuff);
-
-    // Phase 1: publish my payload into every peer's slot[rank].
-    for(size_t pk = gtid; pk < nPk; pk += stride)
-    {
-        const uint32_t d0 = in[2 * pk];
-        const uint32_t d1 = in[2 * pk + 1];
+    LLPackedMsg* base[ngpus]; // base[k]: this call's bank of rank (rank + k) % ngpus
 #pragma unroll
-        for(int r = 1; r < ngpus; ++r)
+    for(int k = 0; k < ngpus; ++k)
+        base[k] = reinterpret_cast<LLPackedMsg*>(peer_scratch[(rank + k) % ngpus]) +
+                  (size_t)(flag & 1u) * ngpus * slot;
+
+    const size_t W      = blockDim.x / 2;
+    const size_t first  = (size_t)blockIdx.x * W + threadIdx.x % W;
+    const size_t stride = (size_t)gridDim.x * W;
+
+    if(threadIdx.x < W)
+    {
+        const uint2* in = reinterpret_cast<const uint2*>(sendbuff);
+        for(size_t b = first; b < nPk; b += stride * U)
         {
-            int          peer = (rank + r) % ngpus;
-            LLPackedMsg* dst  = reinterpret_cast<LLPackedMsg*>(peer_scratch[peer]) +
-                               bankOffPkts + (size_t)rank * slot;
-            ll_store_b128(reinterpret_cast<uint32_t*>(&dst[pk]), d0, flag, d1, flag);
+            uint2 d[U];
+#pragma unroll
+            for(int u = 0; u < U; ++u)
+                if(b + u * stride < nPk)
+                    d[u] = in[b + u * stride];
+#pragma unroll
+            for(int k = 0; k < ngpus; ++k)
+#pragma unroll
+                for(int u = 0; u < U; ++u)
+                    if(b + u * stride < nPk)
+                        ll_store_b128(
+                            reinterpret_cast<uint32_t*>(base[k] + (size_t)rank * slot + b + u * stride),
+                            d[u].x, flag, d[u].y, flag);
         }
     }
-
-    // Phase 2: poll my slots for the other ranks, reduce with my own data.
-    LLPackedMsg* myBase =
-        reinterpret_cast<LLPackedMsg*>(peer_scratch[rank]) + bankOffPkts;
-    for(size_t pk = gtid; pk < nPk; pk += stride)
+    else
     {
-        PL selfv = *reinterpret_cast<const PL*>(&in[2 * pk]);
-        AL acc;
-#pragma unroll
-        for(int j = 0; j < LP; ++j)
-            acc[j] = upcast_s(selfv[j]);
-
-        for(int r = 1; r < ngpus; ++r)
+        PL* out = reinterpret_cast<PL*>(recvbuff);
+        for(size_t i = first; i < nPk; i += stride)
         {
-            int                   peer = (rank + r) % ngpus;
-            volatile LLPackedMsg* src  = myBase + (size_t)peer * slot;
-            uint32_t d0, f0, d1, f1;
-            do
+            uint32_t w[ngpus][4];
+            uint32_t pending = (1u << ngpus) - 1u;
+            while(pending)
             {
-                ll_load_b128(
-                    reinterpret_cast<const uint32_t*>(const_cast<LLPackedMsg*>(&src[pk])),
-                    d0, f0, d1, f1);
-            } while(f0 != flag || f1 != flag);
-
-            const uint32_t w[2] = {d0, d1};
-            PL             pv   = *reinterpret_cast<const PL*>(w);
 #pragma unroll
-            for(int j = 0; j < LP; ++j)
-                acc[j] += upcast_s(pv[j]);
+                for(int r = 0; r < ngpus; ++r)
+                    if(pending & (1u << r))
+                        ll_load_b128(reinterpret_cast<const uint32_t*>(base[0] + (size_t)r * slot + i),
+                                     w[r][0], w[r][1], w[r][2], w[r][3]);
+#pragma unroll
+                for(int r = 0; r < ngpus; ++r)
+                    if((pending & (1u << r)) && w[r][1] == flag && w[r][3] == flag)
+                        pending &= ~(1u << r);
+            }
+            opus::fp32_t acc[LP];
+#pragma unroll
+            for(int r = 0; r < ngpus; ++r)
+            {
+                const uint32_t pw[2] = {w[r][0], w[r][2]};
+                const PL pv          = *reinterpret_cast<const PL*>(pw);
+#pragma unroll
+                for(int q = 0; q < LP; ++q)
+                    acc[q] = r == 0 ? upcast_s(pv[q]) : acc[q] + upcast_s(pv[q]);
+            }
+            PL ov;
+#pragma unroll
+            for(int q = 0; q < LP; ++q)
+                ov[q] = downcast_s<T>(acc[q]);
+            out[i] = ov;
         }
-
-        PL ov;
-#pragma unroll
-        for(int j = 0; j < LP; ++j)
-            ov[j] = downcast_s<T>(acc[j]);
-        reinterpret_cast<PL*>(recvbuff)[pk] = ov;
     }
 
-    if(threadIdx.x == 0)
-        block_flags[blockIdx.x] = flag;
+    for(int e = blockIdx.x + threadIdx.x * gridDim.x; e < kMaxBlocks;
+        e += gridDim.x * blockDim.x)
+        block_flags[e] = flag;
 }
 
 // ---------------------------------------------------------------------------
 // Synchronisation primitives (ROCm path only)
 // ---------------------------------------------------------------------------
+// Serial-number comparison of barrier epochs. A peer may already have stored
+// the next epoch (it can leave a barrier first), so the wait is "at or after
+// the target"; comparing the signed difference keeps that test right when a
+// slot's uint32 epoch wraps. Ranks are at most one barrier apart.
+DINLINE bool epoch_before(uint32_t observed, uint32_t target)
+{
+    return static_cast<int32_t>(observed - target) < 0;
+}
+
 template <int ngpus>
 DINLINE void start_sync(const RankSignals& sg, Signal* self_sg, int rank)
 {
@@ -343,9 +422,10 @@ DINLINE void start_sync(const RankSignals& sg, Signal* self_sg, int rank)
                                 flag,
                                 __ATOMIC_RELAXED,
                                 __MEMORY_SCOPE_SYSTEM);
-        while(__scoped_atomic_load_n(&self_sg->start[blockIdx.x][threadIdx.x],
-                                     __ATOMIC_RELAXED,
-                                     __MEMORY_SCOPE_DEVICE) < flag)
+        while(epoch_before(__scoped_atomic_load_n(&self_sg->start[blockIdx.x][threadIdx.x],
+                                                  __ATOMIC_RELAXED,
+                                                  __MEMORY_SCOPE_DEVICE),
+                           flag))
             ;
     }
     __syncthreads();
@@ -364,9 +444,11 @@ DINLINE void end_sync(const RankSignals& sg, Signal* self_sg, int rank)
                                 flag,
                                 final_sync ? __ATOMIC_RELAXED : __ATOMIC_RELEASE,
                                 __MEMORY_SCOPE_SYSTEM);
-        while(__scoped_atomic_load_n(&self_sg->end[blockIdx.x][threadIdx.x],
-                                     final_sync ? __ATOMIC_RELAXED : __ATOMIC_ACQUIRE,
-                                     __MEMORY_SCOPE_DEVICE) < flag)
+        while(epoch_before(
+            __scoped_atomic_load_n(&self_sg->end[blockIdx.x][threadIdx.x],
+                                   final_sync ? __ATOMIC_RELAXED : __ATOMIC_ACQUIRE,
+                                   __MEMORY_SCOPE_DEVICE),
+            flag))
             ;
     }
     __syncthreads();
@@ -397,8 +479,8 @@ __global__ void __launch_bounds__(256, 2) ar_gfx1250_naive_unroll4(
 #pragma unroll
     for(int i = 0; i < ngpus; i++)
     {
-        int target = (rank + i) % ngpus;
-        ptrs[i]    = (const P*)_input_dp->ptrs[target];
+        // Sum in rank order so every rank gets the same bits.
+        ptrs[i] = (const P*)_input_dp->ptrs[i];
     }
     start_sync<ngpus>(sg, self_sg, rank);
     int aligned_size = (size / unroll) * unroll;
@@ -458,6 +540,2147 @@ __global__ void __launch_bounds__(256, 2) ar_gfx1250_naive_unroll4(
     }
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
+
+// ---------------------------------------------------------------------------
+// gfx1250 fused allreduce + residual add + RMSNorm (+ per-token FP8 quant)
+// ---------------------------------------------------------------------------
+// Stage 1 of the large-message path. Each rank owns one contiguous hidden
+// shard, reduces that shard in fixed rank order, and writes it to its
+// peer-visible staging region. Stage 2 reads the reduced shards below.
+//
+// A two-stage call is four launches per rank, with no barrier in either stage:
+//  1. start_sync_kernel: every peer has written this call's input (its
+//     producer precedes the barrier on the peer's stream) and has finished the
+//     previous call's stage 2, so stage 1 may overwrite this rank's shard.
+//  2. Stage 1.
+//  3. start_sync_kernel again: every peer has finished stage 1, so its shard
+//     is complete and it no longer reads this rank's input, which may be
+//     rewritten once this call returns.
+//  4. Stage 2.
+// There is no end barrier. Peers may still read this rank's shard after this
+// call returns; its only writer is the next two-stage call's stage 1, which
+// waits behind barrier 1 of that call, and no peer reaches that barrier before
+// its stage 2 has completed. For the same reason a drained stream on this rank
+// does not mean the peers are done with its shard: free or unmap the meta
+// buffer only after every rank has synchronized. The shard, like the input, is
+// published by the completion of the kernel that wrote it, before the next
+// launch on the writer's stream signals the barrier, so both barriers stay
+// relaxed.
+// Barriers inside the stages cost more than these one-block launches: an
+// agent-scope release in every block is a cache writeback (global_wb) per
+// block, and a start_sync at the top of every stage-2 block costs as much as
+// the launches it would save.
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1) ar_rmsnorm_reduce_scatter_gfx1250(
+    RankData* _input_dp,
+    Signal* self_sg,
+    int rank,
+    int tokens,
+    int packs)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    using P                 = typename opus::vector_t<T, pack_size>;
+    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
+    const int shard_packs   = packs / ngpus;
+    const int shard_size    = tokens * shard_packs;
+    const P* ptrs[ngpus];
+#pragma unroll
+    for(int i = 0; i < ngpus; ++i)
+        ptrs[i] = reinterpret_cast<const P*>(_input_dp->ptrs[i]);
+    P* scratch =
+        reinterpret_cast<P*>(reinterpret_cast<char*>(self_sg) + arRmsShardOffset(ngpus));
+
+    const int tid    = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = gridDim.x * blockDim.x;
+    for(int out_idx = tid; out_idx < shard_size; out_idx += stride)
+    {
+        const int token = out_idx / shard_packs;
+        const int col   = out_idx - token * shard_packs;
+        const int idx   = token * packs + rank * shard_packs + col;
+        A acc;
+#pragma unroll
+        for(int j = 0; j < pack_size; ++j)
+            acc[j] = upcast_s(ptrs[0][idx][j]);
+#pragma unroll
+        for(int i = 1; i < ngpus; ++i)
+        {
+#pragma unroll
+            for(int j = 0; j < pack_size; ++j)
+                acc[j] += upcast_s(ptrs[i][idx][j]);
+        }
+        P reduced;
+#pragma unroll
+        for(int j = 0; j < pack_size; ++j)
+            reduced[j] = downcast_s<T>(acc[j]);
+        scratch[out_idx] = reduced;
+    }
+}
+
+// Sum or max over the block; every thread gets the result. Threads past the
+// row contribute 0, so the block size may exceed the row as long as it is a
+// whole number of waves.
+template <bool kMax, bool parallel_waves = false>
+DINLINE float block_allreduce_f32(float v)
+{
+    __shared__ float partial[32];
+    __shared__ float result;
+    for(int off = warpSize / 2; off > 0; off >>= 1)
+    {
+        const float o = __shfl_xor(v, off);
+        v             = kMax ? fmaxf(v, o) : v + o;
+    }
+    if(threadIdx.x % warpSize == 0)
+        partial[threadIdx.x / warpSize] = v;
+    __syncthreads();
+    // The two-stage FP8 epilogue reduces nonnegative amax values in parallel.
+    // Keep the sum's original order so normalization and split quantization
+    // retain their rounding. At most 32 wave32 partials fit in the first wave.
+    if constexpr(parallel_waves)
+    {
+        if(threadIdx.x < warpSize)
+        {
+            float r = threadIdx.x < blockDim.x / warpSize ? partial[threadIdx.x] : 0.f;
+            for(int off = warpSize / 2; off > 0; off >>= 1)
+            {
+                const float o = __shfl_xor(r, off);
+                r             = kMax ? fmaxf(r, o) : r + o;
+            }
+            if(threadIdx.x == 0)
+                result = r;
+        }
+    }
+    else if(threadIdx.x == 0)
+    {
+        float r = partial[0];
+        for(int w = 1; w < (int)(blockDim.x / warpSize); ++w)
+            r = kMax ? fmaxf(r, partial[w]) : r + partial[w];
+        result = r;
+    }
+    __syncthreads();
+    return result;
+}
+
+// One block per token, one thread per 16-byte pack of the row. Matches the
+// unfused path: the all-reduce result is rounded to T before the residual add,
+// and ranks are summed in rank order so every rank gets the same bits.
+template <typename T, typename OutT, int ngpus, bool GEMMA_NORM, bool TWO_STAGE = false>
+__global__ void __launch_bounds__(1024, 1) ar_rmsnorm_gfx1250(
+    RankData* _input_dp,
+    RankSignals sg,
+    Signal* self_sg,
+    int rank,
+    const T* __restrict__ residual_inp,
+    T* __restrict__ residual_out,
+    OutT* __restrict__ output,
+    const T* __restrict__ weight,
+    float* __restrict__ scale_out,
+    T* __restrict__ bf16_output,
+    int tokens,
+    int hidden,
+    float eps)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    using P                 = typename opus::vector_t<T, pack_size>;
+    const int packs         = hidden / pack_size;
+    const bool active       = (int)threadIdx.x < packs;
+    const P* ptrs[ngpus];
+#pragma unroll
+    for(int i = 0; i < ngpus; i++)
+    {
+        if constexpr(TWO_STAGE)
+            ptrs[i] = reinterpret_cast<const P*>(
+                reinterpret_cast<const char*>(sg.signals[i]) + arRmsShardOffset(ngpus));
+        else
+            ptrs[i] = reinterpret_cast<const P*>(_input_dp->ptrs[i]);
+    }
+    P w{};
+    if(active)
+        w = reinterpret_cast<const P*>(weight)[threadIdx.x];
+
+    if constexpr(!TWO_STAGE)
+        start_sync<ngpus>(sg, self_sg, rank);
+    for(int t = blockIdx.x; t < tokens; t += gridDim.x)
+    {
+        const int idx = t * packs + threadIdx.x;
+        float x[pack_size] = {};
+        float square_sum   = 0.f;
+        if(active)
+        {
+            if constexpr(TWO_STAGE)
+            {
+                const int shard_packs = packs / ngpus;
+                const int owner       = threadIdx.x / shard_packs;
+                const int col         = threadIdx.x - owner * shard_packs;
+                const P   v           = ptrs[owner][t * shard_packs + col];
+#pragma unroll
+                for(int j = 0; j < pack_size; ++j)
+                    x[j] = upcast_s(v[j]);
+            }
+            else
+            {
+#pragma unroll
+                for(int i = 0; i < ngpus; i++)
+                {
+                    const P v = ptrs[i][idx];
+#pragma unroll
+                    for(int j = 0; j < pack_size; j++)
+                        x[j] += upcast_s(v[j]);
+                }
+            }
+            const P res = reinterpret_cast<const P*>(residual_inp)[idx];
+            P sum;
+#pragma unroll
+            for(int j = 0; j < pack_size; j++)
+            {
+                x[j]   = upcast_s(downcast_s<T>(x[j])) + upcast_s(res[j]);
+                sum[j] = downcast_s<T>(x[j]);
+                square_sum += x[j] * x[j];
+            }
+            reinterpret_cast<P*>(residual_out)[idx] = sum;
+        }
+        const float inv_rms = rsqrtf(block_allreduce_f32<false>(square_sum) / hidden + eps);
+#pragma unroll
+        for(int j = 0; j < pack_size; j++)
+        {
+            const float wj = upcast_s(w[j]) + (GEMMA_NORM ? 1.f : 0.f);
+            x[j] *= inv_rms * wj;
+        }
+        if constexpr(std::is_same_v<T, OutT>)
+        {
+            if(active)
+            {
+                P o;
+#pragma unroll
+                for(int j = 0; j < pack_size; j++)
+                    o[j] = downcast_s<T>(x[j]);
+                reinterpret_cast<P*>(output)[idx] = o;
+            }
+        }
+        else
+        {
+            // Quantize the T-rounded output with the steps of the unfused
+            // dynamic_per_token_scaled_quant on gfx1250 (scale = amax / max,
+            // multiply by rcp(scale), clamp, cvt_pk), so both FP8 paths match
+            // bit for bit.
+            P o;
+            float amax = 0.f;
+#pragma unroll
+            for(int j = 0; j < pack_size; j++)
+            {
+                o[j] = downcast_s<T>(x[j]);
+                amax = fmaxf(amax, fabsf(upcast_s(o[j])));
+            }
+            if(active && bf16_output != nullptr)
+                reinterpret_cast<P*>(bf16_output)[idx] = o;
+            const float fp8_max = opus::cast<opus::fp32_t>(opus::numeric_limits<OutT>::max());
+            const float scale   = block_allreduce_f32<true, TWO_STAGE>(amax) * (float)(1. / fp8_max);
+            const float inv     = __builtin_amdgcn_rcpf(scale);
+            if(active)
+            {
+                opus::vector_t<OutT, pack_size> q;
+#pragma unroll
+                for(int j = 0; j < pack_size; j += 2)
+                {
+                    const float a = __builtin_amdgcn_fmed3f(upcast_s(o[j]) * inv, -fp8_max, fp8_max);
+                    const float b = __builtin_amdgcn_fmed3f(upcast_s(o[j + 1]) * inv, -fp8_max, fp8_max);
+                    reinterpret_cast<uint16_t*>(&q)[j / 2] =
+                        __builtin_amdgcn_cvt_pk_fp8_f32(a, b, 0, false);
+                }
+                reinterpret_cast<opus::vector_t<OutT, pack_size>*>(output)[idx] = q;
+            }
+            if(threadIdx.x == 0)
+                scale_out[t] = scale;
+        }
+    }
+    if constexpr(!TWO_STAGE)
+        end_sync<ngpus, true>(sg, self_sg, rank);
+}
+
+// LL all-gather. Every rank pushes its input into each peer's LL scratch as
+// 16-byte lines, then polls its own scratch for the peers' lines and writes
+// each to its place in the output. A line is one ll_store_b128 and is read
+// with one ll_load_b128, so a single flag guards all of it: words 0-2 carry 12
+// bytes of payload and word 3 the epoch, where ar_ll_gfx1250's lines carry 8
+// bytes and two flags. A rank sends 1.33 x (ngpus - 1) x its input instead of
+// 2 x. It shares the other LL kernels' epoch, banks and slot stride and
+// interleaves with them: a line another kernel wrote has an older epoch in
+// word 3.
+//
+// Word w of rank r, in row y = w / row32, lands at output word
+// (y * ngpus + r) * row32 + w % row32: row32 = n32 gathers along dim 0, the
+// last dim's words along the last dim. A thread takes U units of 12 bytes a
+// round: all their loads, then their (ngpus - 1) x U remote stores back to
+// back, then its own copies (on gfx1250 a load issued after a remote store
+// waits for that store's round trip), and its units' polls go out in one
+// batch. The launcher picks U so that one round covers the message. ALIGNED:
+// input and output 4-byte aligned; otherwise their words move byte by byte
+// (same lines).
+template <int ngpus, int U, bool ALIGNED>
+__global__ void __launch_bounds__(512, 1) ag_ll_gfx1250(
+    uint8_t* const* __restrict__ peer_scratch,
+    uint8_t* __restrict__ result,
+    const uint8_t* __restrict__ sendbuff,
+    uint32_t n32,   // 4-byte words a rank sends
+    uint32_t row32, // 4-byte words of a gathered row (n32 along dim 0)
+    int rank,
+    uint32_t* __restrict__ block_flags)
+{
+    constexpr size_t slot = kLLPackCapacity;
+
+    __shared__ uint32_t s_flag;
+    if(threadIdx.x == 0)
+    {
+        uint32_t f = block_flags[blockIdx.x] + 1u;
+        if(f == 0u)
+            f = 2u;
+        s_flag = f;
+    }
+    __syncthreads();
+    const uint32_t flag        = s_flag;
+    const size_t   bankOffPkts = (size_t)(flag & 1u) * (size_t)ngpus * slot;
+
+    const uint32_t nU     = (n32 + 2) / 3; // 12-byte units; the last may carry 4 or 8 bytes
+    const uint32_t gtid   = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t stride = gridDim.x * blockDim.x;
+    const auto load = [&](uint32_t w) {
+        uint32_t d = 0u;
+        if(w < n32)
+        {
+            if constexpr(ALIGNED)
+                d = reinterpret_cast<const uint32_t*>(sendbuff)[w];
+            else
+                __builtin_memcpy(&d, sendbuff + (size_t)w * 4, 4);
+        }
+        return d;
+    };
+    // unit i of rank r: its words 3i..3i+2 go to row w / row32 of rank r in
+    // the gathered tensor, which holds every rank's rows in rank order
+    const auto store_unit = [&](int r, uint32_t i, uint32_t a0, uint32_t a1, uint32_t a2) {
+        const uint32_t d[3] = {a0, a1, a2};
+        const uint32_t w0   = 3 * i;
+        uint32_t y          = w0 / row32;
+        uint32_t c          = w0 - y * row32;
+#pragma unroll
+        for(int q = 0; q < 3; ++q)
+        {
+            if(w0 + q < n32)
+            {
+                const size_t at = ((size_t)y * ngpus + r) * row32 + c;
+                if constexpr(ALIGNED)
+                    reinterpret_cast<uint32_t*>(result)[at] = d[q];
+                else
+                    __builtin_memcpy(result + at * 4, &d[q], 4);
+            }
+            if(++c == row32)
+            {
+                c = 0;
+                ++y;
+            }
+        }
+    };
+
+    for(uint32_t base = gtid; base < nU; base += stride * U)
+    {
+        uint32_t d[U][3];
+#pragma unroll
+        for(int u = 0; u < U; ++u)
+        {
+            const uint32_t i = base + u * stride;
+#pragma unroll
+            for(int q = 0; q < 3; ++q)
+                d[u][q] = i < nU ? load(3 * i + q) : 0u;
+        }
+#pragma unroll
+        for(int k = 1; k < ngpus; ++k)
+        {
+            LLPackedMsg* dst = reinterpret_cast<LLPackedMsg*>(peer_scratch[(rank + k) % ngpus]) +
+                               bankOffPkts + (size_t)rank * slot;
+#pragma unroll
+            for(int u = 0; u < U; ++u)
+            {
+                const uint32_t i = base + u * stride;
+                if(i < nU)
+                    ll_store_b128(reinterpret_cast<uint32_t*>(&dst[i]), d[u][0], d[u][1], d[u][2], flag);
+            }
+        }
+#pragma unroll
+        for(int u = 0; u < U; ++u)
+        {
+            const uint32_t i = base + u * stride;
+            if(i < nU)
+                store_unit(rank, i, d[u][0], d[u][1], d[u][2]);
+        }
+    }
+
+    const LLPackedMsg* myBase =
+        reinterpret_cast<const LLPackedMsg*>(peer_scratch[rank]) + bankOffPkts;
+    for(uint32_t base = gtid; base < nU; base += stride * U)
+    {
+        // bit u * ngpus + k: unit u's line from rank (rank + k) % ngpus
+        uint32_t pending = 0;
+#pragma unroll
+        for(int u = 0; u < U; ++u)
+            if(base + u * stride < nU)
+                pending |= (((1u << ngpus) - 1u) & ~1u) << (u * ngpus);
+        while(pending)
+        {
+            uint32_t line[U][ngpus][4];
+#pragma unroll
+            for(int u = 0; u < U; ++u)
+#pragma unroll
+                for(int k = 1; k < ngpus; ++k)
+                    if(pending & (1u << (u * ngpus + k)))
+                        ll_load_b128(reinterpret_cast<const uint32_t*>(
+                                         &myBase[(size_t)((rank + k) % ngpus) * slot + base + u * stride]),
+                                     line[u][k][0], line[u][k][1], line[u][k][2], line[u][k][3]);
+#pragma unroll
+            for(int u = 0; u < U; ++u)
+#pragma unroll
+                for(int k = 1; k < ngpus; ++k)
+                    if((pending & (1u << (u * ngpus + k))) && line[u][k][3] == flag)
+                    {
+                        store_unit((rank + k) % ngpus, base + u * stride, line[u][k][0], line[u][k][1],
+                                   line[u][k][2]);
+                        pending &= ~(1u << (u * ngpus + k));
+                    }
+        }
+    }
+
+    for(int e = blockIdx.x + threadIdx.x * gridDim.x; e < kMaxBlocks;
+        e += gridDim.x * blockDim.x)
+        block_flags[e] = flag;
+}
+
+// ---------------------------------------------------------------------------
+// DCP merge: the all-to-all and LSE combine of decode context parallelism
+// ---------------------------------------------------------------------------
+// Under DCP each of the ngpus ranks attends all H = ngpus * HL query heads over
+// its own shard of the KV cache. It holds a partial output o [B, H, 128] bf16
+// and its log-sum-exp lse [B, H] fp32. Rank r owns heads r * HL .. r * HL +
+// HL - 1 and needs their partials from every rank, merged by their LSE. This
+// kernel does the all-to-all and the merge in one launch over the LL scratch,
+// in place of a pack kernel, an all-to-all with its copy-in and a combine
+// kernel.
+//
+// A (b, h) row of 128 bf16 travels as 32 LL lines of 8 bytes, [d0, flag, d1,
+// flag], plus one line [lse, flag, 0, flag]. Rank s writes its rows for rank r
+// into slot s of rank r's LL scratch: data line (b * HL + hl) * 32 + j, LSE
+// line B * HL * 32 + b * HL + hl. It shares the LL kernels' epochs, banks and
+// slot stride and interleaves with them: a line another call wrote has an
+// older epoch.
+//
+// A block is 2 x W threads, in waves of 32:
+// - The first W send. A wave takes U rows (b, peer, hl) a round. It loads them
+//   all (a lane 8 bytes of the row, plus the row's LSE and the peer's scratch
+//   base), then issues their stores. On gfx1250 a load issued after a remote
+//   store waits for that store, about a fabric round trip.
+// - The other W merge. A wave takes one output row (b, hl) at a time. Lane j
+//   polls line j and the LSE line of every peer in one batch, reads the own
+//   shard's row from o, and combines. These waves issue no remote store.
+//
+// The combine matches ATOM's Triton combine. A non-finite LSE counts as -inf (a
+// shard with no KV for the row). m = max LSE, or 0 if all are -inf, and g =
+// log(sum exp(lse - m)) + m. out = sum over shards s = 0..ngpus-1 of
+// exp(lse_s - g) * o_s in fp32, rounded to bf16 once. A shard whose weight is 0
+// is skipped, since its o may be NaN. owned (optional, [B] int32): a row this
+// rank owns no KV slot of sends -inf.
+//
+// Epochs, as in ar_ll / ag_ll: a block takes its epoch from
+// block_flags[blockIdx.x] when it starts, and every block writes all kMaxBlocks
+// entries when it ends. A block that started only after another block of the
+// same launch had finished would read the advanced epoch and wait forever. So
+// every block of a launch must be resident at once: blocks <= CUs, one a CU,
+// with no other kernel holding CUs it needs. An LL kernel of the same
+// communicator running at the same time on another stream (decode two-batch
+// overlap, say) breaks that, and shares the scratch too: callers keep these
+// calls on one stream.
+template <int ngpus, int U>
+__global__ void __launch_bounds__(1024, 1) dcp_merge_ll_gfx1250(
+    uint8_t* const* __restrict__ peer_scratch,
+    const opus::bf16_t* __restrict__ o,
+    const float* __restrict__ lse,
+    const int* __restrict__ owned,
+    opus::bf16_t* __restrict__ out,
+    float* __restrict__ out_lse,
+    int B,
+    int HL,
+    int64_t o_sb,
+    int64_t o_sh,
+    int64_t l_sb,
+    int64_t l_sh,
+    int rank,
+    uint32_t* __restrict__ block_flags)
+{
+    using PL              = typename opus::vector_t<opus::bf16_t, 4>;
+    constexpr int    P    = 32; // lines a row: 128 bf16, 4 a line
+    constexpr size_t slot = kLLPackCapacity;
+
+    __shared__ uint32_t s_flag;
+    if(threadIdx.x == 0)
+    {
+        uint32_t f = block_flags[blockIdx.x] + 1u;
+        if(f == 0u)
+            f = 2u; // flag is never 0 (0 == cleared scratch); keep bank parity
+        s_flag = f;
+    }
+    __syncthreads();
+    const uint32_t flag    = s_flag;
+    const size_t   bankOff = (size_t)(flag & 1u) * ngpus * slot;
+    const size_t   lseOff  = (size_t)B * HL * P;
+    const int      W       = blockDim.x / 2;
+    const int      lane    = threadIdx.x % 32;
+    const int      wpb     = W / 32;
+    const int      wave    = blockIdx.x * wpb + (threadIdx.x % W) / 32;
+    const int      nwaves  = gridDim.x * wpb;
+
+    auto row_lse = [&](int b, int h) {
+        float v = lse[(int64_t)b * l_sb + (int64_t)h * l_sh];
+        if(owned != nullptr && owned[b] == 0)
+            v = -INFINITY;
+        return v;
+    };
+
+    if(threadIdx.x < W)
+    {
+        const int rows = B * (ngpus - 1) * HL;
+        for(int r0 = wave; r0 < rows; r0 += nwaves * U)
+        {
+            uint2        d[U];
+            float        lv[U];
+            LLPackedMsg* dst[U];
+            int          row[U];
+#pragma unroll
+            for(int u = 0; u < U; ++u)
+            {
+                const int r = r0 + u * nwaves;
+                if(r < rows)
+                {
+                    const int hl   = r % HL;
+                    const int k    = 1 + (r / HL) % (ngpus - 1);
+                    const int b    = r / (HL * (ngpus - 1));
+                    const int peer = (rank + k) % ngpus;
+                    const int h    = peer * HL + hl;
+                    d[u]   = *reinterpret_cast<const uint2*>(o + (int64_t)b * o_sb + (int64_t)h * o_sh + 4 * lane);
+                    lv[u]  = row_lse(b, h);
+                    dst[u] = reinterpret_cast<LLPackedMsg*>(peer_scratch[peer]) + bankOff + (size_t)rank * slot;
+                    row[u] = b * HL + hl;
+                }
+            }
+#pragma unroll
+            for(int u = 0; u < U; ++u)
+            {
+                if(r0 + u * nwaves < rows)
+                {
+                    ll_store_b128(reinterpret_cast<uint32_t*>(&dst[u][(size_t)row[u] * P + lane]),
+                                  d[u].x, flag, d[u].y, flag);
+                    if(lane == 0)
+                        ll_store_b128(reinterpret_cast<uint32_t*>(&dst[u][lseOff + row[u]]),
+                                      __float_as_uint(lv[u]), flag, 0u, flag);
+                }
+            }
+        }
+    }
+    else
+    {
+        const LLPackedMsg* own = reinterpret_cast<const LLPackedMsg*>(peer_scratch[rank]) + bankOff;
+        const int          rows = B * HL;
+        for(int q = wave; q < rows; q += nwaves)
+        {
+            const int hl = q % HL;
+            const int b  = q / HL;
+            const int h  = rank * HL + hl;
+            // the own shard's row, loaded before the polls so its latency overlaps them
+            const uint2 mine = *reinterpret_cast<const uint2*>(o + (int64_t)b * o_sb + (int64_t)h * o_sh + 4 * lane);
+            const float mlse = row_lse(b, h);
+            uint32_t    w[ngpus][4];
+            uint32_t    l[ngpus][4];
+            uint32_t    pending = ((1u << ngpus) - 1u) & ~(1u << rank);
+            while(pending)
+            {
+#pragma unroll
+                for(int s = 0; s < ngpus; ++s)
+                    if(pending & (1u << s))
+                    {
+                        const LLPackedMsg* src = own + (size_t)s * slot;
+                        ll_load_b128(reinterpret_cast<const uint32_t*>(&src[(size_t)q * P + lane]),
+                                     w[s][0], w[s][1], w[s][2], w[s][3]);
+                        ll_load_b128(reinterpret_cast<const uint32_t*>(&src[lseOff + q]),
+                                     l[s][0], l[s][1], l[s][2], l[s][3]);
+                    }
+#pragma unroll
+                for(int s = 0; s < ngpus; ++s)
+                    if((pending & (1u << s)) && w[s][1] == flag && w[s][3] == flag && l[s][1] == flag &&
+                       l[s][3] == flag)
+                        pending &= ~(1u << s);
+            }
+            float ls[ngpus];
+            float m = -INFINITY;
+#pragma unroll
+            for(int s = 0; s < ngpus; ++s)
+            {
+                float v = s == rank ? mlse : __uint_as_float(l[s][0]);
+                if(v != v || v == INFINITY)
+                    v = -INFINITY;
+                ls[s] = v;
+                m     = fmaxf(m, v);
+            }
+            if(m == -INFINITY)
+                m = 0.f;
+            float sum = 0.f;
+#pragma unroll
+            for(int s = 0; s < ngpus; ++s)
+                sum += expf(ls[s] - m);
+            const float g = logf(sum) + m;
+            float       acc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+            for(int s = 0; s < ngpus; ++s)
+            {
+                float f = expf(ls[s] - g);
+                if(f != f)
+                    f = 0.f;
+                if(f != 0.f)
+                {
+                    const uint32_t pw[2] = {s == rank ? mine.x : w[s][0], s == rank ? mine.y : w[s][2]};
+                    const PL       pv    = *reinterpret_cast<const PL*>(pw);
+#pragma unroll
+                    for(int j = 0; j < 4; ++j)
+                        acc[j] += upcast_s(pv[j]) * f;
+                }
+            }
+            PL ov;
+#pragma unroll
+            for(int j = 0; j < 4; ++j)
+                ov[j] = downcast_s<opus::bf16_t>(acc[j]);
+            *reinterpret_cast<PL*>(out + (size_t)q * 128 + 4 * lane) = ov;
+            if(out_lse != nullptr && lane == 0)
+                out_lse[q] = g;
+        }
+    }
+
+    for(int e = blockIdx.x + threadIdx.x * gridDim.x; e < kMaxBlocks;
+        e += gridDim.x * blockDim.x)
+        block_flags[e] = flag;
+}
+
+// ---------------------------------------------------------------------------
+// Lamport one-shot fused allreduce + residual add + RMSNorm (2-byte dtypes)
+// ---------------------------------------------------------------------------
+/*
+ * No barrier and no copy-in: every 16B pack of the input is pushed into
+ * slot[rank] of each peer's inbox, and its receiver polls its own inbox until
+ * no half-word is the 0xffff sentinel (a bf16/fp16 NaN; the sender rewrites
+ * its own 0xffff to 0x7fff). The epilogue then follows ar_rmsnorm_gfx1250 step
+ * by step (rank-order fp32 sum, round to T, add the residual, 32-lane butterfly
+ * then a serial sum over the wave groups of the row), so out and residual_out
+ * match it bit for bit, and so do the FP8 out and scale of its per-token quant.
+ *
+ * Inbox (one IPC buffer per rank, memset to 0xff at init):
+ *   inbox[kLamportBuffers][ngpus][slot] of 16B, slot = the most packs a call takes
+ * Each group of 32 packs has its own round counters (rank-local), which pick
+ * the buffer. Every rank runs the same calls, so the counter of a pack is the
+ * same on every rank whatever the row width and block shape of each call, and
+ * a pack that sits out a call keeps its counter and its inbox. A peer is at
+ * most one round ahead on a pack, so buffer (c+2)%3 is re-armed in round c and
+ * the kernel boundary orders that before my next round's sends.
+ *
+ * One block a row receives the row and reduces it on chip; thread t owns packs
+ * t + k * blockDim.x (k < PACKS) of its row. The packs are sent
+ *   - row mode: by that same block, before it polls;
+ *   - split mode: by sender blocks 0 .. senders - 1, ahead of the row blocks in
+ *     the grid. They spread the remote stores over more CUs and also re-arm.
+ *     Senders and receivers count rounds apart (tx and rx counters).
+ * LamportArRms::run picks the mode and PACKS.
+ */
+constexpr int kLamportBuffers       = 3;
+constexpr int kLamportWave          = 32;   // = gfx1250 warpSize
+constexpr int kLamportRowMaxThreads = 1024; // a row is one block: hidden <= 8192
+
+// slot: the most 16B packs a call takes, a multiple of kLamportWave
+inline constexpr int64_t lamport_ar_rms_buffer_bytes(int ngpus, int64_t slot)
+{
+    return (int64_t)kLamportBuffers * ngpus * slot * 16;
+}
+
+// The exact all-gather's escape inbox, one uint32 a pack, follows the data
+// inbox (see lamport_ag_gfx1250); armed with 0, the data inbox with 0xff.
+inline constexpr int64_t lamport_escape_bytes(int ngpus, int64_t slot)
+{
+    return (int64_t)kLamportBuffers * ngpus * slot * 4;
+}
+
+// The two-shot all-gather inbox, [ngpus][slot] of 16B, one buffer (no rounds),
+// follows the escape inbox; armed with 0xff. A two-shot call takes up to
+// ngpus x slot packs, so a rank's chunk, ceil(packs / ngpus), is up to slot
+// packs (see lamport_ar_2shot_gfx1250).
+inline constexpr int64_t lamport_two_shot_bytes(int ngpus, int64_t slot)
+{
+    return (int64_t)ngpus * slot * 16;
+}
+
+// Byte offset of the two-shot all-gather inbox in a rank's Lamport buffer.
+inline constexpr int64_t lamport_two_shot_offset(int ngpus, int64_t slot)
+{
+    return lamport_ar_rms_buffer_bytes(ngpus, slot) + lamport_escape_bytes(ngpus, slot);
+}
+
+// A rank's whole Lamport buffer: the data inbox, the escape inbox, then the
+// two-shot all-gather inbox.
+inline constexpr int64_t lamport_buffer_bytes(int ngpus, int64_t slot)
+{
+    return lamport_two_shot_offset(ngpus, slot) + lamport_two_shot_bytes(ngpus, slot);
+}
+
+struct __align__(16) LamportPeers
+{
+    void* ptrs[kMaxNgpusAr];
+};
+
+// one bit per half-word that is the 0xffff sentinel
+DINLINE uint32_t lamportSentinelMask(uint32_t w)
+{
+    uint32_t x   = ~w;
+    uint32_t tmp = ((x & 0x7fff7fff) + 0x7fff7fff) | x;
+    return (tmp & 0x80008000) ^ 0x80008000;
+}
+
+// 0xffff -> 0x7fff, both NaN, so sent data is never the sentinel
+DINLINE uint32_t lamportCanonicalize(uint32_t w) { return w ^ lamportSentinelMask(w); }
+
+using lamport_u32x4 = __attribute__((__vector_size__(4 * sizeof(uint32_t)))) uint32_t;
+
+DINLINE void lamport_store_b128(void* dst, lamport_u32x4 v)
+{
+#if AITER_GFX1250_HAVE_B128
+    __builtin_amdgcn_global_store_b128((llx_v4u_gptr)dst, v, "");
+#else
+    __builtin_nontemporal_store(v, reinterpret_cast<lamport_u32x4*>(dst));
+#endif
+}
+
+DINLINE lamport_u32x4 lamport_load_b128(const void* src)
+{
+#if AITER_GFX1250_HAVE_B128
+    return __builtin_amdgcn_global_load_b128((llx_v4u_gptr)src, "");
+#else
+    return __builtin_nontemporal_load(reinterpret_cast<const lamport_u32x4*>(src));
+#endif
+}
+
+// Slot (buf, sender) of an inbox, inbox[buf][sender][slot] of 16B packs. The
+// caller passes uniform values, so the result is in SGPRs.
+DINLINE char* lamport_slot(void* inbox, uint32_t buf, int sender, int ngpus, int slot)
+{
+    return static_cast<char*>(inbox) + (int64_t)(buf * ngpus + sender) * slot * 16;
+}
+
+// Pack `pack` of a slot, as a system-scope 16-byte store or load that bypasses
+// the caches (th:TH_*_BYPASS scope:SCOPE_SYS, cache policy 27), as the Gluon
+// all-reduce: a buffer instruction, the global ones take no temporal hint. The
+// byte offset is from the slot, so it fits an int (a slot is under 2 GiB, see
+// init_lamport_ar_rms; the whole inbox may not be).
+DINLINE void lamport_store_sys(char* slot_base, int pack, lamport_u32x4 v)
+{
+#if AITER_GFX1250_HAVE_B128
+    __builtin_amdgcn_raw_buffer_store_b128(
+        v, __builtin_amdgcn_make_buffer_rsrc(slot_base, 0, 0x7fffffff, 0), pack * 16, 0, 27);
+#else
+    lamport_store_b128(reinterpret_cast<lamport_u32x4*>(slot_base) + pack, v);
+#endif
+}
+
+DINLINE lamport_u32x4 lamport_load_sys(char* slot_base, int pack)
+{
+#if AITER_GFX1250_HAVE_B128
+    return __builtin_amdgcn_raw_buffer_load_b128(
+        __builtin_amdgcn_make_buffer_rsrc(slot_base, 0, 0x7fffffff, 0), pack * 16, 0, 27);
+#else
+    return lamport_load_b128(reinterpret_cast<lamport_u32x4*>(slot_base) + pack);
+#endif
+}
+
+// A block barrier that orders LDS only: __syncthreads() also waits for every
+// outstanding global store of the wave, here the remote sends, whose acks take
+// about one more fabric trip than the peers' data took to arrive.
+DINLINE void lamport_lds_barrier()
+{
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+}
+
+// Waits for a kernel argument past the preloaded ones (offset 128) to come
+// from memory. A block that sends a row and then polls the inbox gets the
+// peers' data sooner when its first poll waits for this load: TP4 bf16 row of
+// 6144, one block a row, 10.4 -> 7.6 us. An s_sleep of any length does not
+// give the same gain (the load seems to return after the sends left).
+//
+// ATTENTION: offset 128 is hard-coded against the argument list of
+// lamport_ar_rmsnorm_gfx1250 (152 bytes; the 30 preloaded dwords end at byte
+// 120 with send_packs, p5 sits at 128). Adding, removing or reordering its
+// arguments can move offset 128 back into the preloaded dwords (or past the
+// arguments): the wait then costs nothing and the gain above is lost, with no
+// error. Check this first if that kernel slows down after such a change.
+// TODO: derive the offset from the argument layout (a struct mirroring the
+// signature and a static_assert on offsetof(..., p5) == 128).
+DINLINE void lamport_kernarg_wait()
+{
+    const __attribute__((address_space(4))) volatile int* args =
+        (const __attribute__((address_space(4))) volatile int*)
+            __builtin_amdgcn_kernarg_segment_ptr();
+    const int v = args[128 / 4];
+    asm volatile("" ::"s"(v));
+}
+
+// i of lane ^ OFF (wave32) in registers: DPP row_xmask within a row of 16,
+// permlanex16 across the two rows. __shfl_xor goes through ds_bpermute, an
+// LDS round trip per step. A row_xmask lane always reads a lane of its row, so
+// bound_ctrl changes no value; it lets the compiler fold the move into the
+// add or max that uses it (v_add_f32_dpp, v_max_u32_dpp).
+template <int OFF>
+DINLINE int lamport_xor_lane_i(int i)
+{
+#if AITER_GFX1250_HAVE_B128
+    if constexpr(OFF == 16)
+        return __builtin_amdgcn_permlanex16(i, i, 0x76543210, 0xfedcba98, false, false);
+    else
+        return __builtin_amdgcn_update_dpp(i, i, 0x160 + OFF, 0xf, 0xf, true); // row_xmask:OFF
+#else
+    return __shfl_xor(i, OFF); // other archs only build the kernel, never run it
+#endif
+}
+
+template <int OFF>
+DINLINE float lamport_xor_lane(float v)
+{
+    return __builtin_bit_cast(float, lamport_xor_lane_i<OFF>(__builtin_bit_cast(int, v)));
+}
+
+// The 32-lane butterfly of block_allreduce_f32 (xor 16, 8, 4, 2, 1), the same
+// adds in the same order; every lane gets the sum.
+DINLINE float lamport_wave_sum(float p)
+{
+    p = p + lamport_xor_lane<16>(p);
+    p = p + lamport_xor_lane<8>(p);
+    p = p + lamport_xor_lane<4>(p);
+    p = p + lamport_xor_lane<2>(p);
+    p = p + lamport_xor_lane<1>(p);
+    return p;
+}
+
+// Max over the wave of non-negative, non-NaN floats as their bits: the bits of
+// such floats order as unsigned integers, and an integer max folds into DPP.
+DINLINE uint32_t lamport_wave_max_bits(uint32_t p)
+{
+#define LAMPORT_MAX_STEP(OFF)                                                     \
+    {                                                                             \
+        const uint32_t q = (uint32_t)lamport_xor_lane_i<OFF>((int)p);             \
+        p                = p > q ? p : q;                                         \
+    }
+    LAMPORT_MAX_STEP(16) LAMPORT_MAX_STEP(8) LAMPORT_MAX_STEP(4) LAMPORT_MAX_STEP(2)
+    LAMPORT_MAX_STEP(1)
+#undef LAMPORT_MAX_STEP
+    return p;
+}
+
+// Sum of the row's wave-group partials in group order, as block_allreduce_f32
+// folds its waves: thread k of the block owns group threadIdx.x / 32 + k *
+// waves of each of its PACKS packs (waves = blockDim.x / 32, passed in: blockDim
+// is a kernel argument load). One barrier: after it every wave adds the
+// partials itself, so no second barrier hands the result around.
+template <int PACKS>
+DINLINE float lamport_row_sum(const float (&v)[PACKS], int row_groups, int waves)
+{
+    __shared__ float partial[32];
+    const int lane = threadIdx.x % kLamportWave;
+#pragma unroll
+    for(int k = 0; k < PACKS; ++k)
+    {
+        const float p = lamport_wave_sum(v[k]);
+        if(lane == 0)
+            partial[threadIdx.x / kLamportWave + k * waves] = p;
+    }
+    lamport_lds_barrier();
+    // every lane reads the same address (an LDS broadcast) and adds on the
+    // VALU: a readlane loop would queue every wave of the CU on its SALU
+    float r = partial[0];
+    for(int g = 1; g < row_groups; ++g)
+        r += partial[g];
+    return r;
+}
+
+// OutT is T, or an FP8 type: then output gets the per-token quant of
+// ar_rmsnorm_gfx1250, scale_out a scale a row and bf16_output (unless null)
+// the T output. MAX_THREADS only bounds the block; blockDim.x = hidden / 8 /
+// PACKS. SPLIT: the first `senders` blocks send send_packs packs each (see the
+// comment on top); the row blocks follow.
+//
+// Scalar and pointer kernel arguments only, the inboxes one by one: the module
+// preloads the first 30 dwords of the kernel arguments into SGPRs (32 user
+// SGPRs less the kernel argument pointer). Up to 4 GPUs they hold every
+// argument the sends and the epilogue read (p4 .. p7 come after them); an
+// argument past them is a scalar load where it is used, on the critical path.
+template <typename T, typename OutT, int ngpus, int MAX_THREADS, int PACKS, bool SPLIT>
+__global__ void __launch_bounds__(MAX_THREADS, 1) lamport_ar_rmsnorm_gfx1250(
+    const T* __restrict__ input,
+    const T* __restrict__ residual_inp,
+    T* __restrict__ residual_out,
+    OutT* __restrict__ output,
+    const T* __restrict__ weight,
+    uint32_t* __restrict__ round_counter, // [2][slot / 32] tx, rx; one a group of 32 packs
+    int slot,                             // inbox packs per sender
+    int rank_gemma,                       // rank, and gemma_norm in bit 8
+    int hidden,
+    int senders, // SPLIT only
+    void* p0,
+    void* p1,
+    void* p2,
+    void* p3,
+    float* __restrict__ scale_out, // [rows], FP8 only
+    T* __restrict__ bf16_output,   // FP8 only, may be null
+    float eps,
+    int send_packs, // SPLIT only, divides the packs of a row
+    void* p4,       // not preloaded from here on
+    void* p5,
+    void* p6,
+    void* p7)
+{
+    // ar_rmsnorm_gfx1250 compiles each square to a rounded multiply and then an
+    // add; a contracted fma would change the sum of squares (and its bits)
+    // depending on how the compiler schedules the PACKS loops.
+#pragma clang fp contract(off)
+    static_assert(sizeof(T) == 2, "sentinel 0xffff is only defined for 2-byte dtypes");
+    static_assert(MAX_THREADS % kLamportWave == 0, "blocks are whole waves");
+    constexpr bool QUANT    = !std::is_same_v<T, OutT>;
+    constexpr int pack_size = 16 / sizeof(T);
+    using P                 = typename opus::vector_t<T, pack_size>;
+    union pack
+    {
+        P data;
+        lamport_u32x4 i;
+    };
+    const int rank        = rank_gemma & 0xff;
+    const bool gemma_norm = (rank_gemma >> 8) & 1;
+
+    // static indices only: a runtime index into the inboxes is a scalar load
+    // in series before each remote store
+    void* const all[8] = {p0, p1, p2, p3, p4, p5, p6, p7};
+    char* own          = static_cast<char*>(all[0]);
+#pragma unroll
+    for(int g = 1; g < ngpus; ++g)
+        own = g == rank ? static_cast<char*>(all[g]) : own;
+
+    const int row_packs        = hidden / pack_size;
+    uint32_t* const rx_counter = round_counter + slot / kLamportWave;
+    const lamport_u32x4 sentinel{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+
+    if constexpr(SPLIT)
+    {
+        if((int)blockIdx.x < senders)
+        {
+            // a sender block: send_packs packs, one a thread; the other waves
+            // of the block (it has the row blocks' size) exit
+            const int t =
+                __builtin_amdgcn_readfirstlane(threadIdx.x / kLamportWave) * kLamportWave;
+            if(t >= send_packs)
+                return;
+            const int p          = blockIdx.x * send_packs + threadIdx.x;
+            const int wave       = __builtin_amdgcn_readfirstlane(p / kLamportWave);
+            const uint32_t round = round_counter[wave];
+            pack v;
+            v.data = reinterpret_cast<const P*>(input)[p];
+#pragma unroll
+            for(int j = 0; j < 4; ++j)
+                v.i[j] = lamportCanonicalize(v.i[j]);
+#pragma unroll
+            for(int g = 0; g < ngpus; ++g)
+                if(g != rank)
+                    lamport_store_sys(lamport_slot(all[g], round, rank, ngpus, slot), p, v.i);
+            // re-arm buffer (round + 2) % 3 of this pack here, off the row
+            // blocks: it held the previous call's data, which the previous
+            // kernel consumed, and a peer is at most one round ahead
+            const uint32_t rearm = (round + 2) % kLamportBuffers;
+#pragma unroll
+            for(int g = 0; g < ngpus; ++g)
+                if(g != rank)
+                    lamport_store_sys(lamport_slot(own, rearm, g, ngpus, slot), p, sentinel);
+            if(threadIdx.x % kLamportWave == 0)
+                round_counter[wave] = (round + 1) % kLamportBuffers;
+            return;
+        }
+    }
+
+    // a row block: thread t owns packs t + k * block of the row
+    const int block = row_packs / PACKS; // = blockDim.x, without a kernel argument load
+    const int row   = SPLIT ? (int)blockIdx.x - senders : (int)blockIdx.x;
+    const int tid0  = row * row_packs + threadIdx.x;
+    int tid[PACKS];
+    uint32_t round[PACKS];
+#pragma unroll
+    for(int k = 0; k < PACKS; ++k)
+    {
+        tid[k] = tid0 + k * block;
+        // blocks are whole waves, so this is uniform over the wave
+        const int wave = __builtin_amdgcn_readfirstlane(tid[k] / kLamportWave);
+        round[k]       = SPLIT ? rx_counter[wave] : round_counter[wave];
+    }
+
+    pack local[PACKS];
+#pragma unroll
+    for(int k = 0; k < PACKS; ++k)
+    {
+        local[k].data = reinterpret_cast<const P*>(input)[tid[k]];
+#pragma unroll
+        for(int j = 0; j < 4; ++j)
+            local[k].i[j] = lamportCanonicalize(local[k].i[j]);
+    }
+
+    if constexpr(!SPLIT)
+    {
+#pragma unroll
+        for(int k = 0; k < PACKS; ++k)
+        {
+#pragma unroll
+            for(int g = 0; g < ngpus; ++g)
+                if(g != rank)
+                    lamport_store_sys(
+                        lamport_slot(all[g], round[k], rank, ngpus, slot), tid[k], local[k].i);
+        }
+        lamport_kernarg_wait();
+    }
+
+    // local operands of the epilogue, loaded before the wait
+    P res[PACKS], w[PACKS];
+#pragma unroll
+    for(int k = 0; k < PACKS; ++k)
+    {
+        res[k] = reinterpret_cast<const P*>(residual_inp)[tid[k]];
+        w[k]   = reinterpret_cast<const P*>(weight)[tid[k] - row * row_packs];
+    }
+
+    // the peers only, rank + 1 .. rank + ngpus - 1: the slot offsets are
+    // uniform (SGPR), so this costs no extra address math per load
+    pack scratch[PACKS][ngpus - 1];
+    bool pending;
+    do
+    {
+        // without the clobber the loads are hoisted out of the loop
+        asm volatile("" ::: "memory");
+#pragma unroll
+        for(int k = 0; k < PACKS; ++k)
+#pragma unroll
+            for(int i = 0; i < ngpus - 1; ++i)
+            {
+                const int g     = (rank + 1 + i) % ngpus;
+                scratch[k][i].i =
+                    lamport_load_sys(lamport_slot(own, round[k], g, ngpus, slot), tid[k]);
+            }
+        // issue all loads before any mask math
+        __builtin_amdgcn_sched_barrier(0);
+        uint32_t m = 0;
+#pragma unroll
+        for(int k = 0; k < PACKS; ++k)
+#pragma unroll
+            for(int i = 0; i < ngpus - 1; ++i)
+#pragma unroll
+                for(int j = 0; j < 4; ++j)
+                    m |= lamportSentinelMask(scratch[k][i].i[j]);
+        pending = m != 0;
+    } while(pending);
+
+    // same steps as ar_rmsnorm_gfx1250
+    float x[PACKS][pack_size];
+    float square_sum[PACKS];
+#pragma unroll
+    for(int k = 0; k < PACKS; ++k)
+    {
+#pragma unroll
+        for(int j = 0; j < pack_size; ++j)
+            x[k][j] = 0.f;
+        // rank order, as ar_rmsnorm_gfx1250: peer g sits at (g - rank - 1) mod ngpus
+#pragma unroll
+        for(int g = 0; g < ngpus; ++g)
+        {
+            const int at = (g - rank - 1 + ngpus) % ngpus; // ngpus - 1: this rank
+            P v          = local[k].data;
+#pragma unroll
+            for(int i = 0; i < ngpus - 1; ++i)
+                v = at == i ? scratch[k][i].data : v;
+#pragma unroll
+            for(int j = 0; j < pack_size; ++j)
+                x[k][j] += upcast_s(v[j]);
+        }
+        P sum;
+        square_sum[k] = 0.f;
+#pragma unroll
+        for(int j = 0; j < pack_size; ++j)
+        {
+            x[k][j] = upcast_s(downcast_s<T>(x[k][j])) + upcast_s(res[k][j]);
+            sum[j]  = downcast_s<T>(x[k][j]);
+            square_sum[k] += x[k][j] * x[k][j];
+        }
+        reinterpret_cast<P*>(residual_out)[tid[k]] = sum;
+    }
+
+    // FP8: the row amax, merged by an LDS atomic max after the sum barrier
+    __shared__ uint32_t amax_bits;
+    if constexpr(QUANT)
+        if(threadIdx.x == 0)
+            amax_bits = 0;
+    const int row_groups = row_packs / kLamportWave;
+    const float inv_rms =
+        rsqrtf(lamport_row_sum<PACKS>(square_sum, row_groups, block / kLamportWave) / hidden +
+               eps);
+
+    P o[PACKS];
+#pragma unroll
+    for(int k = 0; k < PACKS; ++k)
+    {
+#pragma unroll
+        for(int j = 0; j < pack_size; ++j)
+        {
+            const float wj = upcast_s(w[k][j]) + (gemma_norm ? 1.f : 0.f);
+            o[k][j]        = downcast_s<T>(x[k][j] * (inv_rms * wj));
+        }
+    }
+    if constexpr(!QUANT)
+    {
+#pragma unroll
+        for(int k = 0; k < PACKS; ++k)
+            reinterpret_cast<P*>(output)[tid[k]] = o[k];
+    }
+    else
+    {
+        // the steps of ar_rmsnorm_gfx1250 (amax of the T output, scale = amax /
+        // max, multiply by rcp(scale), clamp, cvt_pk), so the FP8 paths match bit
+        // for bit. amax starts at 0 and fmaxf drops NaNs: it is never negative
+        // nor NaN, so its bits order as unsigned integers (lamport_wave_max_bits)
+        // and the order of the row reduction does not change it.
+        uint32_t a = 0;
+#pragma unroll
+        for(int k = 0; k < PACKS; ++k)
+        {
+            float amax = 0.f;
+#pragma unroll
+            for(int j = 0; j < pack_size; ++j)
+                amax = fmaxf(amax, fabsf(upcast_s(o[k][j])));
+            const uint32_t b = __builtin_bit_cast(uint32_t, amax);
+            a                = a > b ? a : b;
+            if(bf16_output != nullptr)
+                reinterpret_cast<P*>(bf16_output)[tid[k]] = o[k];
+        }
+        a = lamport_wave_max_bits(a);
+        if(threadIdx.x % kLamportWave == 0)
+            __hip_atomic_fetch_max(
+                &amax_bits, a, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+        lamport_lds_barrier();
+        const float row_amax = __builtin_bit_cast(float, amax_bits);
+        const float fp8_max  = opus::cast<opus::fp32_t>(opus::numeric_limits<OutT>::max());
+        const float scale    = row_amax * (float)(1. / fp8_max);
+        const float inv      = __builtin_amdgcn_rcpf(scale);
+#pragma unroll
+        for(int k = 0; k < PACKS; ++k)
+        {
+            opus::vector_t<OutT, pack_size> q;
+#pragma unroll
+            for(int j = 0; j < pack_size; j += 2)
+            {
+                const float qa =
+                    __builtin_amdgcn_fmed3f(upcast_s(o[k][j]) * inv, -fp8_max, fp8_max);
+                const float qb =
+                    __builtin_amdgcn_fmed3f(upcast_s(o[k][j + 1]) * inv, -fp8_max, fp8_max);
+                reinterpret_cast<uint16_t*>(&q)[j / 2] =
+                    __builtin_amdgcn_cvt_pk_fp8_f32(qa, qb, 0, false);
+            }
+            reinterpret_cast<opus::vector_t<OutT, pack_size>*>(output)[tid[k]] = q;
+        }
+        if(threadIdx.x == 0)
+            scale_out[row] = scale;
+    }
+
+    if constexpr(!SPLIT)
+    {
+#pragma unroll
+        for(int k = 0; k < PACKS; ++k)
+        {
+            const uint32_t rearm = (round[k] + 2) % kLamportBuffers;
+#pragma unroll
+            for(int g = 0; g < ngpus; ++g)
+                if(g != rank)
+                    lamport_store_sys(lamport_slot(own, rearm, g, ngpus, slot), tid[k], sentinel);
+        }
+    }
+
+    if(threadIdx.x % kLamportWave == 0)
+    {
+#pragma unroll
+        for(int k = 0; k < PACKS; ++k)
+        {
+            const uint32_t next = (round[k] + 1) % kLamportBuffers;
+            if constexpr(!SPLIT)
+                round_counter[tid[k] / kLamportWave] = next;
+            rx_counter[tid[k] / kLamportWave] = next;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lamport one-shot all-reduce, of input or of input + other (2-byte dtypes)
+// ---------------------------------------------------------------------------
+/*
+ * output = the sum over ranks of each rank's input (ADD: input + other). With
+ * ADD the pair is added in fp32 and rounded to T first, as a T add rounds it,
+ * so the result has the bits of all-reducing the materialized sum (rank-order
+ * fp32 sum, one rounding).
+ *
+ * Same inbox, round counters and protocol as lamport_ar_rmsnorm_gfx1250: thread
+ * tid owns pack tid of the call. Waves past the input sit the call out; the
+ * lanes of the last wave past the input only re-arm, so that every pack of a
+ * wave that runs a round has its previous buffer re-armed, whatever the size
+ * of the next call on that wave.
+ */
+// Scalar and pointer kernel arguments only, the inboxes one by one: the
+// module preloads the kernel arguments into SGPRs up to the first aggregate,
+// and a LamportPeers argument would leave the rest to s_loads in series
+// before the first remote store (about 1 us of the call at decode sizes).
+template <typename T, int ngpus, int BLOCK, bool ADD>
+__global__ void __launch_bounds__(BLOCK, 1)
+    lamport_ar_1shot_gfx1250(const T* __restrict__ input,
+                             const T* __restrict__ other, // ADD only
+                             T* __restrict__ output,
+                             uint32_t* __restrict__ round_counter, // [2][slot / 32]: tx, rx
+                             int slot,                             // inbox packs per sender
+                             int rank,
+                             int packs, // packs of the call
+                             void* p0,
+                             void* p1,
+                             void* p2,
+                             void* p3,
+                             void* p4,
+                             void* p5,
+                             void* p6,
+                             void* p7)
+{
+    static_assert(sizeof(T) == 2, "sentinel 0xffff is only defined for 2-byte dtypes");
+    static_assert(BLOCK % kLamportWave == 0, "blocks are whole waves");
+    constexpr int pack_size = 16 / sizeof(T);
+    using P                 = typename opus::vector_t<T, pack_size>;
+    union pack
+    {
+        P data;
+        lamport_u32x4 i;
+    };
+
+    const int tid  = blockIdx.x * BLOCK + threadIdx.x;
+    const int wave = __builtin_amdgcn_readfirstlane(tid / kLamportWave);
+    // waves past the input sit the call out (no block-wide sync below)
+    if(wave * kLamportWave >= packs)
+        return;
+    const uint32_t round = round_counter[wave];
+    const uint32_t rearm = (round + 2) % kLamportBuffers;
+    // static indices only: a runtime index into the inboxes is a scalar load
+    // in series before each remote store
+    void* const all[8] = {p0, p1, p2, p3, p4, p5, p6, p7};
+    char* own          = static_cast<char*>(all[0]);
+#pragma unroll
+    for(int g = 1; g < ngpus; ++g)
+        own = g == rank ? static_cast<char*>(all[g]) : own;
+
+    if(tid < packs)
+    {
+        pack local;
+        local.data = reinterpret_cast<const P*>(input)[tid];
+        if constexpr(ADD)
+        {
+            const P b = reinterpret_cast<const P*>(other)[tid];
+#pragma unroll
+            for(int j = 0; j < pack_size; ++j)
+                local.data[j] = downcast_s<T>(upcast_s(local.data[j]) + upcast_s(b[j]));
+        }
+#pragma unroll
+        for(int j = 0; j < 4; ++j)
+            local.i[j] = lamportCanonicalize(local.i[j]);
+
+        const int64_t sent = (int64_t)(round * ngpus + rank) * slot + tid;
+#pragma unroll
+        for(int g = 0; g < ngpus; ++g)
+            if(g != rank)
+                lamport_store_b128(static_cast<P*>(all[g]) + sent, local.i);
+
+        // slot[rank] stays the sentinel; loaded and masked out, see the RMSNorm kernel
+        const P* inbox = reinterpret_cast<const P*>(own) + (int64_t)round * ngpus * slot + tid;
+        pack scratch[ngpus];
+        bool pending;
+        do
+        {
+            asm volatile("" ::: "memory");
+#pragma unroll
+            for(int g = 0; g < ngpus; ++g)
+                scratch[g].i = lamport_load_b128(inbox + (int64_t)g * slot);
+            __builtin_amdgcn_sched_barrier(0);
+            uint32_t m = 0;
+#pragma unroll
+            for(int g = 0; g < ngpus; ++g)
+            {
+                uint32_t gm = 0;
+#pragma unroll
+                for(int j = 0; j < 4; ++j)
+                    gm |= lamportSentinelMask(scratch[g].i[j]);
+                m |= g == rank ? 0u : gm;
+            }
+            pending = m != 0;
+        } while(pending);
+
+        float x[pack_size] = {};
+#pragma unroll
+        for(int g = 0; g < ngpus; ++g)
+        {
+            const P v = g == rank ? local.data : scratch[g].data;
+#pragma unroll
+            for(int j = 0; j < pack_size; ++j)
+                x[j] += upcast_s(v[j]);
+        }
+        P o;
+#pragma unroll
+        for(int j = 0; j < pack_size; ++j)
+            o[j] = downcast_s<T>(x[j]);
+        reinterpret_cast<P*>(output)[tid] = o;
+    }
+
+    const lamport_u32x4 sentinel{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+#pragma unroll
+    for(int g = 0; g < ngpus; ++g)
+        if(g != rank)
+            lamport_store_b128(reinterpret_cast<P*>(own) + (int64_t)(rearm * ngpus + g) * slot +
+                                   tid,
+                               sentinel);
+
+    if(threadIdx.x % kLamportWave == 0)
+    {
+        round_counter[wave]                       = (round + 1) % kLamportBuffers;
+        // and rx: a split lamport_ar_rmsnorm_gfx1250 call reads the rx counters
+        round_counter[slot / kLamportWave + wave] = (round + 1) % kLamportBuffers;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lamport two-shot all-reduce
+// ---------------------------------------------------------------------------
+// A pack's words against the inbox's sentinel, all bits set. 2-byte dtypes keep
+// the 16-bit sentinel of the other Lamport ops: a 0xffff half-word is sent as
+// 0x7fff, both NaN. fp32 needs a 32-bit one, as a value's low half-word can be
+// 0xffff: a word with all bits set is sent as 0x7fffffff, both NaN. pending()
+// is nonzero while a word still holds the sentinel.
+template <typename T>
+struct LamportArCodec
+{
+    static DINLINE uint32_t canonical(uint32_t w)
+    {
+        if constexpr(sizeof(T) == 4)
+            return w == 0xffffffffu ? 0x7fffffffu : w;
+        else
+            return lamportCanonicalize(w);
+    }
+    static DINLINE uint32_t pending(uint32_t w)
+    {
+        if constexpr(sizeof(T) == 4)
+            return w == 0xffffffffu ? 1u : 0u;
+        else
+            return lamportSentinelMask(w);
+    }
+};
+
+/*
+ * A reduce-scatter, then an all-gather, both pushed. The message is ngpus
+ * chunks of part packs (the last ones may be short or empty), and lane j of a
+ * role owns pack j of every chunk: it sends pack j of chunk g to rank g, sums
+ * pack j of its own chunk over the ranks (fp32 in rank order, rounded once:
+ * the bits of lamport_ar_1shot_gfx1250), sends that sum to every peer and
+ * collects theirs. A rank sends 2 (ngpus - 1) / ngpus of the message instead
+ * of ngpus - 1, in two hops instead of one.
+ *
+ * The reduce-scatter takes one round of the shared inbox on the pack's wave,
+ * as every Lamport op does, so the ops still interleave freely. The all-gather
+ * has an inbox of its own (lamport_two_shot_bytes) that no other op touches,
+ * and no rounds: it is re-armed as soon as it is read, and a peer writes that
+ * pack again only once it holds this rank's reduce-scatter data of a later
+ * call, which this rank sends after the kernel boundary.
+ *
+ * ROLES sets who takes the three steps of a pack:
+ * - 1, fused: one lane takes all three, BLOCK lanes a block. A wave's load
+ *   issued after its own remote store waits for that store, so its polls start
+ *   a fabric round trip late, and only once its pushes have landed.
+ * - 2 or 3, split: wave groups of W = blockDim.x / ROLES lanes, a group a step.
+ *   send loads the other chunks' packs, then pushes them. reduce re-arms, waits
+ *   `delay` x s_sleep(16) as nothing lands earlier, polls, sums and pushes.
+ *   gather waits twice that, then polls the peers' sums; with 2 roles it runs
+ *   in the send group after the pushes. No poll waits for a store of its own
+ *   wave, which saves a fabric round trip on a small message but keeps every
+ *   lane polling on a large one.
+ * The host picks the layout (run_2shot); a split block holds up to 1024 lanes,
+ * so BLOCK is only the bound there.
+ */
+template <typename T, int ngpus, int BLOCK, int ROLES>
+__global__ void __launch_bounds__(BLOCK, 1)
+    lamport_ar_2shot_gfx1250(const T* __restrict__ input,
+                             T* __restrict__ output,
+                             uint32_t* __restrict__ round_counter, // [2][slot / 32]: tx, rx
+                             int slot,                             // shared inbox packs per sender
+                             int rank,
+                             int packs, // packs of the message
+                             int part,  // packs a chunk, ceil(packs / ngpus)
+                             int delay, // split: s_sleep(16)s before reduce polls
+                             void* p0,
+                             void* p1,
+                             void* p2,
+                             void* p3,
+                             void* p4,
+                             void* p5,
+                             void* p6,
+                             void* p7)
+{
+    static_assert(sizeof(T) == 2 || sizeof(T) == 4, "2- and 4-byte dtypes");
+    static_assert(ROLES >= 1 && ROLES <= 3, "fused, or two or three wave groups");
+    static_assert(BLOCK % kLamportWave == 0, "blocks are whole waves");
+    using Codec             = LamportArCodec<T>;
+    constexpr int pack_size = 16 / sizeof(T);
+    using P                 = typename opus::vector_t<T, pack_size>;
+    union pack
+    {
+        P data;
+        lamport_u32x4 i;
+    };
+
+    // W is a whole number of waves, so a wave has one role and one round
+    const int W    = ROLES == 1 ? BLOCK : (int)blockDim.x / ROLES;
+    const int role = ROLES == 1 ? 0 : __builtin_amdgcn_readfirstlane((int)threadIdx.x / W);
+    const int j    = (int)blockIdx.x * W + (int)threadIdx.x - role * W;
+    const int wave = __builtin_amdgcn_readfirstlane(j / kLamportWave);
+    // a wave past the chunk sits the call out
+    const bool run = wave * kLamportWave < part;
+    if constexpr(ROLES == 1)
+        if(!run)
+            return; // no block-wide sync below
+    const uint32_t round = run ? round_counter[wave] : 0u;
+    const uint32_t rearm = (round + 2) % kLamportBuffers;
+    void* const all[8]   = {p0, p1, p2, p3, p4, p5, p6, p7};
+    char* own            = static_cast<char*>(all[0]);
+#pragma unroll
+    for(int g = 1; g < ngpus; ++g)
+        own = g == rank ? static_cast<char*>(all[g]) : own;
+    // the shared inbox, [kLamportBuffers][ngpus][slot], and a rank's all-gather
+    // inbox, [ngpus][slot]
+    const auto rs_inbox = [slot](void* base, uint32_t buf) {
+        return reinterpret_cast<P*>(base) + (int64_t)buf * ngpus * slot;
+    };
+    const int64_t ag_offset = lamport_two_shot_offset(ngpus, slot);
+    const auto ag_inbox     = [ag_offset](void* base) {
+        return reinterpret_cast<P*>(static_cast<char*>(base) + ag_offset);
+    };
+    const lamport_u32x4 sentinel{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+    const int64_t own_p = (int64_t)rank * part + j;
+
+    // v[g] = the line at base + g * slot, once every source in `wanted` landed
+    const auto poll = [&](pack(&v)[ngpus], const P* base, uint32_t wanted) {
+        bool pending;
+        do
+        {
+            asm volatile("" ::: "memory");
+#pragma unroll
+            for(int g = 0; g < ngpus; ++g)
+                v[g].i = lamport_load_b128(base + (int64_t)g * slot);
+            __builtin_amdgcn_sched_barrier(0);
+            uint32_t m = 0;
+#pragma unroll
+            for(int g = 0; g < ngpus; ++g)
+            {
+                uint32_t gm = 0;
+#pragma unroll
+                for(int q = 0; q < 4; ++q)
+                    gm |= Codec::pending(v[g].i[q]);
+                m |= (wanted >> g) & 1u ? gm : 0u;
+            }
+            pending = m != 0;
+        } while(pending);
+    };
+    // reduce-scatter: pack j of chunk g into slot[rank] of rank g's inbox, all
+    // loads first; mine is this rank's own pack j
+    const auto send = [&](pack& mine) {
+        pack v[ngpus];
+#pragma unroll
+        for(int g = 0; g < ngpus; ++g)
+        {
+            const int64_t p = (int64_t)g * part + j;
+            v[g].i          = sentinel;
+            if(p < packs)
+                v[g].data = reinterpret_cast<const P*>(input)[p];
+        }
+#pragma unroll
+        for(int g = 0; g < ngpus; ++g)
+        {
+            if((int64_t)g * part + j >= packs)
+                continue;
+#pragma unroll
+            for(int q = 0; q < 4; ++q)
+                v[g].i[q] = Codec::canonical(v[g].i[q]);
+            if(g == rank)
+                mine = v[g];
+            else
+                lamport_store_b128(rs_inbox(all[g], round) + (int64_t)rank * slot + j, v[g].i);
+        }
+    };
+    // this rank's chunk: the sum of pack j over the ranks, to every peer and to output
+    const auto reduce = [&](const pack& mine) {
+        // slot[rank] stays the sentinel; loaded and masked out, see the RMSNorm kernel
+        pack got[ngpus];
+        poll(got, rs_inbox(own, round) + j, ((1u << ngpus) - 1) & ~(1u << rank));
+        float x[pack_size] = {};
+#pragma unroll
+        for(int g = 0; g < ngpus; ++g)
+        {
+            const P v = g == rank ? mine.data : got[g].data;
+#pragma unroll
+            for(int e = 0; e < pack_size; ++e)
+                x[e] += upcast_s(v[e]);
+        }
+        pack sum;
+#pragma unroll
+        for(int e = 0; e < pack_size; ++e)
+        {
+            sum.data[e] = downcast_s<T>(x[e]);
+        }
+        // a peer would take the sentinel for "not arrived", and every rank
+        // writes the same bits
+#pragma unroll
+        for(int q = 0; q < 4; ++q)
+            sum.i[q] = Codec::canonical(sum.i[q]);
+#pragma unroll
+        for(int g = 0; g < ngpus; ++g)
+            if(g != rank)
+                lamport_store_b128(ag_inbox(all[g]) + (int64_t)rank * slot + j, sum.i);
+        reinterpret_cast<P*>(output)[own_p] = sum.data;
+    };
+    // all-gather: the peers' sums of pack j of their chunks, each re-armed once read
+    const auto gather = [&]() {
+        uint32_t live = 0;
+#pragma unroll
+        for(int g = 0; g < ngpus; ++g)
+            live |= g != rank && (int64_t)g * part + j < packs ? 1u << g : 0u;
+        P* const ag_own = ag_inbox(own) + j;
+        pack got[ngpus];
+        poll(got, ag_own, live);
+#pragma unroll
+        for(int g = 0; g < ngpus; ++g)
+            if((live >> g) & 1u)
+            {
+                reinterpret_cast<P*>(output)[(int64_t)g * part + j] = got[g].data;
+                lamport_store_b128(ag_own + (int64_t)g * slot, sentinel);
+            }
+    };
+    // the shared inbox: re-arm last round's buffer, on every lane of a wave that runs
+    const auto rearm_inbox = [&]() {
+#pragma unroll
+        for(int g = 0; g < ngpus; ++g)
+            if(g != rank)
+                lamport_store_b128(rs_inbox(own, rearm) + (int64_t)g * slot + j, sentinel);
+    };
+    // the tx and the rx counter alike: a split lamport_ar_rmsnorm_gfx1250 call
+    // reads the rx counters
+    const auto advance_round = [&]() {
+        round_counter[wave]                       = (round + 1) % kLamportBuffers;
+        round_counter[slot / kLamportWave + wave] = (round + 1) % kLamportBuffers;
+    };
+
+    if constexpr(ROLES == 1)
+    {
+        if(j < part)
+        {
+            pack mine;
+            mine.i = sentinel;
+            send(mine);
+            if(own_p < packs)
+                reduce(mine);
+            gather();
+        }
+        rearm_inbox();
+        if(threadIdx.x % kLamportWave == 0)
+            advance_round();
+    }
+    else
+    {
+        if(role == 0 && j < part)
+        {
+            pack mine;
+            send(mine);
+        }
+        if(role == 1)
+        {
+            if(run)
+                rearm_inbox();
+            for(int d = 0; d < delay; ++d)
+                __builtin_amdgcn_s_sleep(16);
+            if(j < part && own_p < packs)
+            {
+                pack mine;
+                mine.data = reinterpret_cast<const P*>(input)[own_p];
+#pragma unroll
+                for(int q = 0; q < 4; ++q)
+                    mine.i[q] = Codec::canonical(mine.i[q]);
+                reduce(mine);
+            }
+        }
+        if(role == (ROLES == 3 ? 2 : 0))
+        {
+            if constexpr(ROLES == 3)
+                for(int d = 0; d < 2 * delay; ++d)
+                    __builtin_amdgcn_s_sleep(16);
+            if(j < part)
+                gather();
+        }
+        // every wave of the block has read its round counter by now; a counter
+        // advances once
+        __syncthreads();
+        if(role == 0 && run && threadIdx.x % kLamportWave == 0)
+            advance_round();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lamport one-shot all-gather
+// ---------------------------------------------------------------------------
+/*
+ * Thread tid owns pack tid of this rank's input: it pushes the pack into
+ * slot[rank] of every peer's inbox, then polls slot[g] of its own inbox for the
+ * peers and writes each pack to its place in the output. Same inbox, round
+ * counters and re-arm as lamport_ar_1shot_gfx1250, so the Lamport ops interleave
+ * freely on the one inbox.
+ *
+ * Against ag_ll_gfx1250: a 16B line carries 16B of payload instead of 12B (no
+ * epoch word in the data), and there is no epoch fan-out over kMaxBlocks at the
+ * end.
+ *
+ * Rank g's pack p of row y = p / row_packs lands at output pack
+ * (y * ngpus + g) * row_packs + p % row_packs. DIM0 (row_packs == packs)
+ * gathers along dim 0 without the division.
+ *
+ * How a receiver tells an arrived word from the all-ones sentinel of an armed
+ * inbox is the Codec, below; the kernel moves raw words whatever the dtype.
+ *
+ * At most kMaxNgpusAr (8) ranks, unlike the other gfx1250 all-gathers (up to 64
+ * over multi-node symm_mem): the inboxes are the 8 scalar arguments p0..p7 (so
+ * that they are preloaded into SGPRs, see lamport_ar_1shot_gfx1250), and the
+ * inbox, 3 x ngpus x slot packs a rank, is only set up on the node-local IPC
+ * transport.
+ */
+
+// Codec of lamport_ag_gfx1250: the five points where the two encodings differ.
+// Each one is a static member; the kernel calls all five unconditionally, and
+// the ones a codec does not need are empty and inline away.
+//
+//   encode(v)                    make pack v sendable in place; returns its
+//                                escape mask, sent along with it
+//   publish_escape(peer, at, m)  send a nonzero escape mask m to peer's inbox
+//   load_escape(own, at)         this round's escape mask of a pack, polled
+//                                with the pack
+//   pending(v, esc)              nonzero while a word of v has not arrived
+//   release_escape(own, at, esc) re-arm an escape mask this rank consumed
+//
+// peer / own are the escape inboxes (uint32 a pack, see lamport_escape_bytes),
+// at the pack's index in them, the same as in the data inbox.
+
+// fp16/bf16: the 0xffff half-word sentinel of the other Lamport kernels. A
+// 0xffff half-word is sent as 0x7fff (both NaN), so the gather is bit for bit
+// except for it; every rank writes the canonical bits, its own slice too.
+struct LamportAgHalfSentinel
+{
+    static DINLINE uint32_t encode(lamport_u32x4& v)
+    {
+#pragma unroll
+        for(int j = 0; j < 4; ++j)
+            v[j] = lamportCanonicalize(v[j]);
+        return 0;
+    }
+    static DINLINE void publish_escape(uint32_t*, int64_t, uint32_t) {}
+    static DINLINE uint32_t load_escape(const uint32_t*, int64_t) { return 0; }
+    static DINLINE uint32_t pending(const lamport_u32x4& v, uint32_t)
+    {
+        uint32_t m = 0;
+#pragma unroll
+        for(int j = 0; j < 4; ++j)
+            m |= lamportSentinelMask(v[j]);
+        return m;
+    }
+    static DINLINE void release_escape(uint32_t*, int64_t, uint32_t) {}
+};
+
+// Any dtype, bit for bit: words are sent as is, and an all-ones word is also
+// flagged in the escape inbox (bit j: word j is 0xffffffff), armed with 0. A
+// word has arrived once it is not all ones or its escape bit is set, so only
+// 4-byte stores need to be single-copy atomic. The mask is written only for a
+// pack that holds an all-ones word, and the receiver then must have seen it to
+// resolve the pack, so it re-arms it right away, for the current round: the
+// other Lamport kernels never touch the escape inbox, so the delayed re-arm of
+// the data inbox would leave a stale mask behind them. The kernel boundary
+// orders that re-arm before this rank's next sends, and the sender's next
+// write to that mask is three rounds later.
+struct LamportAgEscape
+{
+    static constexpr uint32_t kOnes = 0xffffffffu;
+
+    static DINLINE uint32_t encode(lamport_u32x4& v)
+    {
+        uint32_t esc = 0;
+#pragma unroll
+        for(int j = 0; j < 4; ++j)
+            esc |= v[j] == kOnes ? 1u << j : 0u;
+        return esc;
+    }
+    static DINLINE void publish_escape(uint32_t* peer, int64_t at, uint32_t esc)
+    {
+        if(esc != 0)
+            __scoped_atomic_store_n(peer + at, esc, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+    }
+    static DINLINE uint32_t load_escape(const uint32_t* own, int64_t at)
+    {
+        return __scoped_atomic_load_n(own + at, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+    }
+    static DINLINE uint32_t pending(const lamport_u32x4& v, uint32_t esc)
+    {
+        uint32_t m = 0;
+#pragma unroll
+        for(int j = 0; j < 4; ++j)
+            m |= v[j] == kOnes && !((esc >> j) & 1u) ? 1u << j : 0u;
+        return m;
+    }
+    static DINLINE void release_escape(uint32_t* own, int64_t at, uint32_t esc)
+    {
+        if(esc != 0)
+            __scoped_atomic_store_n(own + at, 0u, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+    }
+};
+
+template <class Codec, int ngpus, int BLOCK, bool DIM0>
+__global__ void __launch_bounds__(BLOCK, 1)
+    lamport_ag_gfx1250(const lamport_u32x4* __restrict__ input,
+                       lamport_u32x4* __restrict__ output,
+                       uint32_t* __restrict__ round_counter, // [2][slot / 32]: tx, rx
+                       int slot,                             // inbox packs per sender
+                       int rank,
+                       int packs,     // 16B packs a rank sends
+                       int row_packs, // 16B packs of a gathered row (== packs for DIM0)
+                       void* p0,
+                       void* p1,
+                       void* p2,
+                       void* p3,
+                       void* p4,
+                       void* p5,
+                       void* p6,
+                       void* p7)
+{
+    static_assert(BLOCK % kLamportWave == 0, "blocks are whole waves");
+
+    const int tid  = blockIdx.x * BLOCK + threadIdx.x;
+    const int wave = __builtin_amdgcn_readfirstlane(tid / kLamportWave);
+    // waves past the input sit the call out, see lamport_ar_1shot_gfx1250
+    if(wave * kLamportWave >= packs)
+        return;
+    const uint32_t round = round_counter[wave];
+    const uint32_t rearm = (round + 2) % kLamportBuffers;
+    void* const all[8]   = {p0, p1, p2, p3, p4, p5, p6, p7};
+    char* own            = static_cast<char*>(all[0]);
+#pragma unroll
+    for(int g = 1; g < ngpus; ++g)
+        own = g == rank ? static_cast<char*>(all[g]) : own;
+    // the escape inbox follows the data inbox (unused by LamportAgHalfSentinel)
+    const auto escape = [slot](void* inbox) {
+        return reinterpret_cast<uint32_t*>(static_cast<char*>(inbox) +
+                                           lamport_ar_rms_buffer_bytes(ngpus, slot));
+    };
+
+    if(tid < packs)
+    {
+        lamport_u32x4 local     = input[tid];
+        const uint32_t esc_mask = Codec::encode(local);
+
+        const int64_t sent = (int64_t)(round * ngpus + rank) * slot + tid;
+#pragma unroll
+        for(int g = 0; g < ngpus; ++g)
+            if(g != rank)
+            {
+                lamport_store_b128(static_cast<lamport_u32x4*>(all[g]) + sent, local);
+                Codec::publish_escape(escape(all[g]), sent, esc_mask);
+            }
+
+        // output pack of rank g is out[g * step]
+        int64_t base, step;
+        if constexpr(DIM0)
+        {
+            base = tid;
+            step = packs;
+        }
+        else
+        {
+            const int y = tid / row_packs;
+            base        = (int64_t)y * ngpus * row_packs + (tid - y * row_packs);
+            step        = row_packs;
+        }
+        lamport_u32x4* out = output + base;
+        // own slice while the peers' packs are in flight
+        out[rank * step] = local;
+
+        // slot[rank] stays the sentinel; loaded and masked out, see the RMSNorm kernel
+        const int64_t mine         = (int64_t)round * ngpus * slot + tid;
+        const lamport_u32x4* inbox = reinterpret_cast<const lamport_u32x4*>(own) + mine;
+        uint32_t* own_escape       = escape(own);
+        lamport_u32x4 scratch[ngpus];
+        uint32_t esc[ngpus];
+        bool pending;
+        do
+        {
+            asm volatile("" ::: "memory");
+#pragma unroll
+            for(int g = 0; g < ngpus; ++g)
+            {
+                scratch[g] = lamport_load_b128(inbox + (int64_t)g * slot);
+                esc[g]     = Codec::load_escape(own_escape, mine + (int64_t)g * slot);
+            }
+            __builtin_amdgcn_sched_barrier(0);
+            uint32_t m = 0;
+#pragma unroll
+            for(int g = 0; g < ngpus; ++g)
+            {
+                // computed for every g, then selected: `g == rank ? 0 :
+                // pending(...)` turns into a branch that serializes the loads
+                const uint32_t gm = Codec::pending(scratch[g], esc[g]);
+                m |= g == rank ? 0u : gm;
+            }
+            pending = m != 0;
+        } while(pending);
+
+#pragma unroll
+        for(int g = 0; g < ngpus; ++g)
+            if(g != rank)
+            {
+                out[g * step] = scratch[g];
+                Codec::release_escape(own_escape, mine + (int64_t)g * slot, esc[g]);
+            }
+    }
+
+    const lamport_u32x4 sentinel{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+#pragma unroll
+    for(int g = 0; g < ngpus; ++g)
+        if(g != rank)
+            lamport_store_b128(reinterpret_cast<lamport_u32x4*>(own) +
+                                   (int64_t)(rearm * ngpus + g) * slot + tid,
+                               sentinel);
+
+    if(threadIdx.x % kLamportWave == 0)
+    {
+        round_counter[wave]                       = (round + 1) % kLamportBuffers;
+        // and rx: a split lamport_ar_rmsnorm_gfx1250 call reads the rx counters
+        round_counter[slot / kLamportWave + wave] = (round + 1) % kLamportBuffers;
+    }
+}
+
+// The Lamport inbox of a communicator: one per CustomAllreduce, any row width
+// and row count up to slot packs (see lamport_ar_rmsnorm_gfx1250).
+struct LamportArRms
+{
+    LamportPeers peers{};
+    uint32_t* d_round = nullptr; // [2][slot / 32]: tx, then rx counters; rank-local
+    int slot          = 0;       // the most packs a call takes
+    int rank          = 0;
+    int world_size    = 0;
+    int num_cus       = 0; // run_2shot's split layout: a block a CU
+
+    ~LamportArRms()
+    {
+        if(d_round)
+            (void)hipFree(d_round);
+    }
+
+    // Packs a thread of a row block: the fewest that keep the block at most 256
+    // threads (128 from 257 rows, 64 from 513: more, smaller blocks for big
+    // calls) and divide the row's groups of 32 packs (4x gfx1250, TP2/TP4,
+    // hidden 1024-8192, M 1-2048).
+    static int row_block_packs(int row_packs, int64_t rows)
+    {
+        const int most   = rows <= 256 ? 256 : rows <= 512 ? 128 : 64;
+        const int groups = row_packs / kLamportWave;
+        int packs        = 1;
+        for(int p : {1, 2, 4, 8})
+        {
+            if(groups % p != 0)
+                continue;
+            packs = p;
+            if(row_packs / p <= most)
+                break;
+        }
+        return packs;
+    }
+
+    // OutT: T, or an FP8 type with scale_out (and bf16_out unless null), see
+    // lamport_ar_rmsnorm_gfx1250
+    template <typename T, typename OutT>
+    void run(hipStream_t stream,
+             const T* input,
+             const T* residual_inp,
+             T* residual_out,
+             OutT* output,
+             const T* weight,
+             float* scale_out,
+             T* bf16_out,
+             float eps,
+             int64_t rows,
+             int hidden,
+             bool gemma_norm)
+    {
+        constexpr int pack_size = 16 / sizeof(T);
+        if(hidden <= 0 || hidden % (pack_size * kLamportWave) != 0 ||
+           hidden / pack_size > kLamportRowMaxThreads)
+            throw std::runtime_error("lamport allreduce rmsnorm: hidden must be a multiple of " +
+                                     std::to_string(pack_size * kLamportWave) + " and at most " +
+                                     std::to_string(pack_size * kLamportRowMaxThreads) +
+                                     ", got " + std::to_string(hidden));
+        const int row_packs = hidden / pack_size;
+        const int64_t packs = rows * row_packs;
+        if(packs > slot)
+            throw std::runtime_error("lamport allreduce rmsnorm: " + std::to_string(packs * 16) +
+                                     "B exceeds the inbox cap of " +
+                                     std::to_string((int64_t)slot * 16) + "B");
+        if(packs == 0)
+            return;
+        // Split (sender blocks, then a row block of one pack a thread) while the
+        // call is small: one CU sending and polling a whole row is the limit
+        // there. Rows of up to 1024 values stay in row mode. 4x gfx1250, bf16
+        // and FP8 out: TP4 up to 64 rows, TP2 up to 32K packs (rows x hidden / 8).
+        const bool split =
+            row_packs > 128 && (world_size >= 4 ? rows <= 64 : packs <= 32768);
+        const int packs_per_thread = split ? 1 : row_block_packs(row_packs, rows);
+        const int row_threads      = row_packs / packs_per_thread;
+        // sender blocks of 256 packs, a multiple of 32 that divides the row, so
+        // that no sender block runs past the call
+        int send_packs = std::min(256, row_packs);
+        while(row_packs % send_packs != 0)
+            send_packs -= kLamportWave;
+        const int senders = split ? (int)(packs / send_packs) : 0;
+
+#define LAMPORT_RMS_ARGS                                                                    \
+    input, residual_inp, residual_out, output, weight, d_round, slot,                       \
+        rank | (gemma_norm ? 0x100 : 0), hidden, senders, peers.ptrs[0], peers.ptrs[1],     \
+        peers.ptrs[2], peers.ptrs[3], scale_out, bf16_out, eps, send_packs, peers.ptrs[4],  \
+        peers.ptrs[5], peers.ptrs[6], peers.ptrs[7]
+#define LAUNCH_LAMPORT_RMS_PK(NG, PK, SPLIT)                                                \
+    lamport_ar_rmsnorm_gfx1250<T, OutT, NG, (kLamportRowMaxThreads / PK + 31) / 32 * 32, PK, \
+                               SPLIT>                                                       \
+        <<<senders + (int)rows, row_threads, 0, stream>>>(LAMPORT_RMS_ARGS)
+#define LAUNCH_LAMPORT_RMS(NG)                                                              \
+    if(split)                                                                               \
+        LAUNCH_LAMPORT_RMS_PK(NG, 1, true);                                                 \
+    else                                                                                    \
+        switch(packs_per_thread)                                                            \
+        {                                                                                   \
+        case 2: LAUNCH_LAMPORT_RMS_PK(NG, 2, false); break;                                 \
+        case 4: LAUNCH_LAMPORT_RMS_PK(NG, 4, false); break;                                 \
+        case 8: LAUNCH_LAMPORT_RMS_PK(NG, 8, false); break;                                 \
+        default: LAUNCH_LAMPORT_RMS_PK(NG, 1, false); break;                                \
+        }
+        DISPATCH_NGPUS_1250(world_size, LAUNCH_LAMPORT_RMS);
+#undef LAUNCH_LAMPORT_RMS
+#undef LAUNCH_LAMPORT_RMS_PK
+#undef LAMPORT_RMS_ARGS
+    }
+
+    // Block size of a call of packs: small blocks spread a decode-size call
+    // over more CUs, large ones cut the blocks of a big call (4x gfx1250, TP4,
+    // bf16 [M, 5120]: 64 best at M = 1, 256 at M = 8-288, 512 at M = 409).
+    static int add_threads(int64_t packs)
+    {
+        if(packs <= 2048)
+            return 64;
+        return packs <= 192 * 1024 ? 256 : 512;
+    }
+
+    // Packs of an all-reduce call, numel values: whole packs, at most max_packs
+    // (the one-shot slot, the two-shot world_size x slot).
+    template <typename T>
+    int64_t ar_packs(int64_t numel, int64_t max_packs) const
+    {
+        constexpr int pack_size = 16 / sizeof(T);
+        if(numel % pack_size != 0)
+            throw std::runtime_error("lamport all-reduce: numel must be a multiple of " +
+                                     std::to_string(pack_size));
+        const int64_t packs = numel / pack_size;
+        if(packs > max_packs)
+            throw std::runtime_error("lamport all-reduce: " + std::to_string(packs * 16) +
+                                     "B exceeds the inbox cap of " +
+                                     std::to_string(max_packs * 16) + "B");
+        return packs;
+    }
+
+    // output = all-reduce of input (ADD: of input + other), numel values, in
+    // one shot (see lamport_ar_1shot_gfx1250)
+    template <typename T, bool ADD>
+    void run_1shot(hipStream_t stream, const T* input, const T* other, T* output, int64_t numel)
+    {
+        const int64_t packs = ar_packs<T>(numel, slot);
+        if(packs == 0)
+            return;
+        const int threads = add_threads(packs);
+        const int blocks = (int)((packs + threads - 1) / threads);
+#define LAUNCH_LAMPORT_1SHOT_B(NG, B)                                                        \
+    lamport_ar_1shot_gfx1250<T, NG, B, ADD><<<blocks, B, 0, stream>>>(input,                 \
+                                                                    other,                 \
+                                                                    output,                \
+                                                                    d_round,               \
+                                                                    slot,                  \
+                                                                    rank,                  \
+                                                                    (int)packs,            \
+                                                                    peers.ptrs[0],         \
+                                                                    peers.ptrs[1],         \
+                                                                    peers.ptrs[2],         \
+                                                                    peers.ptrs[3],         \
+                                                                    peers.ptrs[4],         \
+                                                                    peers.ptrs[5],         \
+                                                                    peers.ptrs[6],         \
+                                                                    peers.ptrs[7])
+#define LAUNCH_LAMPORT_1SHOT(NG)                                                             \
+    switch(threads)                                                                          \
+    {                                                                                        \
+    case 64: LAUNCH_LAMPORT_1SHOT_B(NG, 64); break;                                          \
+    case 256: LAUNCH_LAMPORT_1SHOT_B(NG, 256); break;                                        \
+    default: LAUNCH_LAMPORT_1SHOT_B(NG, 512); break;                                         \
+    }
+        DISPATCH_NGPUS_1250(world_size, LAUNCH_LAMPORT_1SHOT);
+#undef LAUNCH_LAMPORT_1SHOT
+#undef LAUNCH_LAMPORT_1SHOT_B
+    }
+
+    // output = all-reduce of input, numel values, as a reduce-scatter and an
+    // all-gather (see lamport_ar_2shot_gfx1250). Up to world_size x slot packs:
+    // a chunk is then at most slot packs, all the reduce-scatter takes of a
+    // sender's slot of the shared inbox.
+    // - fused: a lane a pack of a chunk, add_threads(part) lanes a block.
+    // - split: W lanes a role, the fewest whole waves that take a chunk at one
+    //   block a CU, as a CU that runs two blocks finishes last (MI455X, TP8 over
+    //   symm_mem, 5 MiB bf16, on the split kernel merged here: 3 x 160 lanes on
+    //   256 blocks 21.2 us, 2 x 256 on 160 blocks 30.3 us, 3 x 128 on 320 blocks
+    //   33.6 us). Three wave groups up to W = 320, two above, W at most 512
+    //   (blocks of at most 1024 lanes). The pollers first sleep through the time
+    //   before anything can land.
+    template <typename T>
+    void run_2shot(hipStream_t stream, const T* input, T* output, int64_t numel, bool split)
+    {
+        const int64_t packs = ar_packs<T>(numel, (int64_t)world_size * slot);
+        if(packs == 0)
+            return;
+        const int part = (int)((packs + world_size - 1) / world_size);
+#define LAMPORT_2SHOT_ARGS                                                                     \
+    input, output, d_round, slot, rank, (int)packs, part, delay, peers.ptrs[0], peers.ptrs[1], \
+        peers.ptrs[2], peers.ptrs[3], peers.ptrs[4], peers.ptrs[5], peers.ptrs[6], peers.ptrs[7]
+        if(split)
+        {
+            const int64_t wave_cus = (int64_t)std::max(1, num_cus) * kLamportWave;
+            const int W =
+                (int)std::min<int64_t>(512, (part + wave_cus - 1) / wave_cus * kLamportWave);
+            const int roles  = W <= 320 ? 3 : 2;
+            const int blocks = (part + W - 1) / W;
+            const int delay  = W <= 64 ? 4 : 8;
+#define LAUNCH_LAMPORT_2SHOT_SPLIT_R(NG, R) \
+    lamport_ar_2shot_gfx1250<T, NG, 1024, R><<<blocks, R * W, 0, stream>>>(LAMPORT_2SHOT_ARGS)
+#define LAUNCH_LAMPORT_2SHOT_SPLIT(NG)       \
+    if(roles == 3)                           \
+    {                                        \
+        LAUNCH_LAMPORT_2SHOT_SPLIT_R(NG, 3); \
+    }                                        \
+    else                                     \
+    {                                        \
+        LAUNCH_LAMPORT_2SHOT_SPLIT_R(NG, 2); \
+    }
+            DISPATCH_NGPUS_1250(world_size, LAUNCH_LAMPORT_2SHOT_SPLIT);
+#undef LAUNCH_LAMPORT_2SHOT_SPLIT
+#undef LAUNCH_LAMPORT_2SHOT_SPLIT_R
+        }
+        else
+        {
+            const int threads = add_threads(part);
+            const int blocks  = (part + threads - 1) / threads;
+            const int delay   = 0;
+#define LAUNCH_LAMPORT_2SHOT_B(NG, B) \
+    lamport_ar_2shot_gfx1250<T, NG, B, 1><<<blocks, B, 0, stream>>>(LAMPORT_2SHOT_ARGS)
+#define LAUNCH_LAMPORT_2SHOT(NG)                      \
+    switch(threads)                                   \
+    {                                                 \
+    case 64: LAUNCH_LAMPORT_2SHOT_B(NG, 64); break;   \
+    case 256: LAUNCH_LAMPORT_2SHOT_B(NG, 256); break; \
+    default: LAUNCH_LAMPORT_2SHOT_B(NG, 512); break;  \
+    }
+            DISPATCH_NGPUS_1250(world_size, LAUNCH_LAMPORT_2SHOT);
+#undef LAUNCH_LAMPORT_2SHOT
+#undef LAUNCH_LAMPORT_2SHOT_B
+        }
+#undef LAMPORT_2SHOT_ARGS
+    }
+
+    // All-gather of bytes a rank (whole 16B packs) into output; row_bytes ==
+    // bytes gathers along dim 0, else along the last dim of row_bytes a row.
+    // Codec: LamportAgHalfSentinel or LamportAgEscape, see lamport_ag_gfx1250.
+    template <class Codec>
+    void run_ag(hipStream_t stream,
+                const void* input,
+                void* output,
+                int64_t bytes,
+                int64_t row_bytes)
+    {
+        if(bytes % 16 != 0 || row_bytes <= 0 || row_bytes % 16 != 0 || bytes % row_bytes != 0)
+            throw std::runtime_error("lamport all-gather: the input and its rows must be whole "
+                                     "16B packs");
+        const int64_t packs = bytes / 16;
+        if(packs > slot)
+            throw std::runtime_error("lamport all-gather: " + std::to_string(bytes) +
+                                     "B exceeds the inbox cap of " +
+                                     std::to_string((int64_t)slot * 16) + "B");
+        if(packs == 0)
+            return;
+        const int threads   = add_threads(packs);
+        const int blocks    = (int)((packs + threads - 1) / threads);
+        const int row_packs = (int)(row_bytes / 16);
+        const bool dim0     = row_packs == packs;
+        const auto* in      = static_cast<const lamport_u32x4*>(input);
+        auto* out           = static_cast<lamport_u32x4*>(output);
+#define LAUNCH_LAMPORT_AG_B(NG, B, D0)                                                        \
+    lamport_ag_gfx1250<Codec, NG, B, D0><<<blocks, B, 0, stream>>>(in,                        \
+                                                                   out,                       \
+                                                                   d_round,                   \
+                                                                   slot,                      \
+                                                                   rank,                      \
+                                                                   (int)packs,                \
+                                                                   row_packs,                 \
+                                                                   peers.ptrs[0],             \
+                                                                   peers.ptrs[1],             \
+                                                                   peers.ptrs[2],             \
+                                                                   peers.ptrs[3],             \
+                                                                   peers.ptrs[4],             \
+                                                                   peers.ptrs[5],             \
+                                                                   peers.ptrs[6],             \
+                                                                   peers.ptrs[7])
+#define LAUNCH_LAMPORT_AG_D(NG, B)                                                            \
+    if(dim0)                                                                                  \
+        LAUNCH_LAMPORT_AG_B(NG, B, true);                                                     \
+    else                                                                                      \
+        LAUNCH_LAMPORT_AG_B(NG, B, false)
+#define LAUNCH_LAMPORT_AG(NG)                                                                 \
+    switch(threads)                                                                           \
+    {                                                                                         \
+    case 64: LAUNCH_LAMPORT_AG_D(NG, 64); break;                                              \
+    case 256: LAUNCH_LAMPORT_AG_D(NG, 256); break;                                            \
+    default: LAUNCH_LAMPORT_AG_D(NG, 512); break;                                             \
+    }
+        DISPATCH_NGPUS_1250(world_size, LAUNCH_LAMPORT_AG);
+#undef LAUNCH_LAMPORT_AG
+#undef LAUNCH_LAMPORT_AG_D
+#undef LAUNCH_LAMPORT_AG_B
+    }
+};
 
 // ---------------------------------------------------------------------------
 // gfx1250 allgather kernel — scalar fallback (size not pack-aligned)
@@ -610,44 +2833,6 @@ __global__ void __launch_bounds__(512, 1) ag_gfx1250_lastdim(RankData* _dp,
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
-
-template <typename T, int ngpus>
-__global__ void __launch_bounds__(256, 2) ag_gfx1250_warpsplit_unroll4(
-    RankData* _input_dp,
-    RankSignals sg,
-    Signal* self_sg,
-    T* __restrict__ result,
-    int rank,
-    int size)
-{
-    constexpr int pack_size = 16 / sizeof(T);
-    constexpr int unroll    = 4;
-    constexpr int tnum_gpu = 256 / ngpus;
-    static_assert(256 % ngpus == 0, "tail threads would index ptrs[ngpus]");
-    using P                 = typename opus::vector_t<T, pack_size>;
-    int warp_id = threadIdx.x / tnum_gpu;
-    int lane_id = threadIdx.x % tnum_gpu;
-    int index    = blockIdx.x * tnum_gpu * unroll + lane_id;
-    int stride  = blockDim.x * tnum_gpu * unroll;
-    const P* ptrs[ngpus];
-#pragma unroll
-    for(int i = 0; i < ngpus; i++)
-    {
-        ptrs[i] = (const P*)_input_dp->ptrs[i];
-    }
-    start_sync<ngpus>(sg, self_sg, rank);
-    for (int idx = index; idx + tnum_gpu * (unroll - 1) < size; idx += stride)
-    {
-#pragma unroll
-      for (int i = 0; i < unroll; ++i)
-      {
-        P* rslt_addr = reinterpret_cast<P*>(result) + warp_id * size + idx + tnum_gpu * i;
-        *rslt_addr = ptrs[warp_id][idx + i * tnum_gpu];
-      }
-    }
-    end_sync<ngpus, true>(sg, self_sg, rank);
-}
-
 // ---------------------------------------------------------------------------
 // gfx1250 bandwidth test kernel
 // ---------------------------------------------------------------------------
@@ -710,8 +2895,8 @@ __global__ void __launch_bounds__(512, 1) rs_gfx1250_split_first_dim(
 #pragma unroll
     for(int i = 0; i < ngpus; i++)
     {
-        int target = (rank + i) % ngpus;
-        ptrs[i]    = (const P*)_dp->ptrs[target];
+        // Keep the sum order independent of the reduce-scatter owner.
+        ptrs[i] = (const P*)_dp->ptrs[i];
     }
     start_sync<ngpus>(sg, self_sg, rank);
     for(int idx = tid; idx < range; idx += stride)
@@ -752,8 +2937,8 @@ __global__ void __launch_bounds__(256, 1) rs_gfx1250_split_lastdim_naive(
 #pragma unroll
     for(int i = 0; i < ngpus; ++i)
     {
-        int target = (rank + i) % ngpus;
-        ptrs[i]    = (const T*)_dp->ptrs[target];
+        // Keep the sum order independent of the reduce-scatter owner.
+        ptrs[i] = (const T*)_dp->ptrs[i];
     }
     start_sync<ngpus>(sg, self_sg, rank);
     for(int i = index; i < size; i += blockDim.x * gridDim.x)
@@ -789,8 +2974,8 @@ __global__ void __launch_bounds__(256, 1) rs_gfx1250_split_lastdim(
 #pragma unroll
     for(int i = 0; i < ngpus; ++i)
     {
-        int target = (rank + i) % ngpus;
-        ptrs[i]    = (const P*)_dp->ptrs[target];
+        // Keep the sum order independent of the reduce-scatter owner.
+        ptrs[i] = (const P*)_dp->ptrs[i];
     }
     start_sync<ngpus>(sg, self_sg, rank);
     for(int i = index; i < size; i += blockDim.x * gridDim.x)
@@ -837,8 +3022,8 @@ __global__ void __launch_bounds__(256, 1) rs_gfx1250_split_middim_naive(
 #pragma unroll
     for(int i = 0; i < ngpus; ++i)
     {
-        int target = (rank + i) % ngpus;
-        ptrs[i]    = (const T*)_dp->ptrs[target];
+        // Keep the sum order independent of the reduce-scatter owner.
+        ptrs[i] = (const T*)_dp->ptrs[i];
     }
     start_sync<ngpus>(sg, self_sg, rank);
     for(int i = index; i < size; i += blockDim.x * gridDim.x)
@@ -875,8 +3060,8 @@ __global__ void __launch_bounds__(256, 1) rs_gfx1250_split_middim(
 #pragma unroll
     for(int i = 0; i < ngpus; ++i)
     {
-        int target = (rank + i) % ngpus;
-        ptrs[i]    = (const P*)_dp->ptrs[target];
+        // Keep the sum order independent of the reduce-scatter owner.
+        ptrs[i] = (const P*)_dp->ptrs[i];
     }
     start_sync<ngpus>(sg, self_sg, rank);
     for(int i = index; i < size; i += blockDim.x * gridDim.x)
@@ -913,19 +3098,19 @@ __global__ void __launch_bounds__(256, 1) rs_gfx1250_split_middim(
 // sync latency
 // ---------------------------------------------------------------------------
 template <int ngpus>
-__global__ void start_sync_latency(RankSignals sg, Signal* self_sg, int rank)
+__global__ void start_sync_kernel(RankSignals sg, Signal* self_sg, int rank)
 {
   start_sync<ngpus>(sg, self_sg, rank);
 }
 
 template <int ngpus>
-__global__ void end_sync_latency(RankSignals sg, Signal* self_sg, int rank)
+__global__ void end_sync_kernel(RankSignals sg, Signal* self_sg, int rank)
 {
   end_sync<ngpus>(sg, self_sg, rank);
 }
 
 template <int ngpus>
-__global__ void two_sync_latency(RankSignals sg, Signal* self_sg, int rank)
+__global__ void two_sync_kernel(RankSignals sg, Signal* self_sg, int rank)
 {
   start_sync<ngpus>(sg, self_sg, rank);
   end_sync<ngpus>(sg, self_sg, rank);
@@ -967,6 +3152,9 @@ public:
     void**    d_ll_peers_       = nullptr;
     uint32_t* d_ll_block_flags_ = nullptr;
 
+    // Lamport fused all-reduce + RMSNorm inbox (init_lamport_ar_rms), or null.
+    std::unique_ptr<LamportArRms> lamport_;
+
     // gfx1250: hipIpc is not available. Instead, each rank's Signal buffer
     // is a torch-shared tensor whose device pointer is exchanged via the
     // distributed store.  The constructor receives the remote pointers
@@ -995,7 +3183,9 @@ public:
         // before capture) those runtime calls are illegal mid-capture and abort.
         // sg_.signals[] is populated above, so the peer scratch bases are ready.
         if(ll_enabled())
+        {
             ensure_ll_tables_();
+        }
     }
 
     // IPC transport overload (ROCm >= 7.15): hipIpc works on gfx1250, so peer
@@ -1034,7 +3224,9 @@ public:
         // hipMalloc/hipMemcpy/hipMemset out of the first LL allreduce, which may
         // land inside a CUDA-graph capture and abort. sg_.signals[] is ready.
         if(ll_enabled())
+        {
             ensure_ll_tables_();
+        }
     }
 
     char* open_ipc_handle(const void* ipc_handle)
@@ -1064,6 +3256,34 @@ public:
         if(d_ll_block_flags_)
             (void)hipFree(d_ll_block_flags_);
     }
+
+    // Whether allreduce of this size takes the LL kernel, which reads the input
+    // in place and so needs no registered copy of it.
+    bool use_ll(size_t bytes) const
+    {
+        return ll_enabled() && bytes <= kLLArMaxBytes && world_size_ <= kLLMaxRanks;
+    }
+
+    // Whether allreduce of this size reads its input in place (no copy-in).
+    bool ar_reads_in_place(size_t bytes) const { return use_ll(bytes); }
+
+    static int cu_count()
+    {
+        static const int cus = []() {
+            int dev = 0, n = 0;
+            if(hipGetDevice(&dev) != hipSuccess ||
+               hipDeviceGetAttribute(&n, hipDeviceAttributeMultiprocessorCount, dev) != hipSuccess ||
+               n <= 0)
+                n = 256;
+            return n;
+        }();
+        return cus;
+    }
+
+    // Senders (and as many pollers) a block for the LL one-shot at `units`
+    // packets: 256 while one block a CU covers them, else 512. On MI455X a
+    // second block a CU costs more than the wider block.
+    static int ll_threads_for(size_t units) { return units <= (size_t)cu_count() * 256 ? 256 : 512; }
 
     // Whether the LL small-message fast path is enabled. On by default; set
     // AITER_CUSTOM_AR_DISABLE_LL=1 to force the naive kernel for all sizes.
@@ -1098,27 +3318,290 @@ public:
         HIP_CALL(hipMemset(d_ll_block_flags_, 0, sizeof(uint32_t) * kMaxBlocks));
     }
 
-    // LL small-message all-reduce. Reads `input` locally, pushes to peer scratch,
-    // reduces into `output`. numel is the element count; bytes must be a multiple
-    // of 16 and <= kLLScratchCapBytes (guaranteed by the routing threshold).
+    // LL one-shot all-reduce (see ar_ll_gfx1250). Reads `input` in place.
+    // numel is the element count; bytes must be a multiple of 16 and <=
+    // kLLScratchCapBytes (guaranteed by the routing threshold). W senders and W
+    // pollers a block (ll_threads_for); past one such block a CU, a sender takes
+    // 2 or 4 packets.
     template <typename T>
     void allreduce_ll(hipStream_t stream, const T* input, T* output, int numel)
     {
         ensure_ll_tables_();
         const size_t bytes = (size_t)numel * sizeof(T);
         const size_t nPk   = bytes >> 3; // 8 payload bytes per packet
-
-        const int threads = (bytes < 65536) ? 512 : 256;
-        int blocks = std::min<int>(kMaxBlocks, (int)((nPk + threads - 1) / threads));
-        if(blocks < 1)
-            blocks = 1;
+        const size_t cap   = std::min<size_t>(cu_count(), kMaxBlocks);
+        const int    W     = ll_threads_for(nPk);
+        int U = 1;
+        while(U < 4 && (nPk + (size_t)W * U - 1) / ((size_t)W * U) > cap)
+            U *= 2;
+        const int blocks = std::max(1, std::min<int>(kMaxBlocks,
+            (int)((nPk + (size_t)W * U - 1) / ((size_t)W * U))));
 
         T* const* peers = reinterpret_cast<T* const*>(d_ll_peers_);
-#define LAUNCH_LL(NG) \
-        ar_ll_gfx1250<T, NG><<<blocks, threads, 0, stream>>>( \
+#define LAUNCH_LL_U(NG, UU) \
+        ar_ll_gfx1250<T, NG, UU><<<blocks, 2 * W, 0, stream>>>( \
             peers, output, input, nPk, rank_, d_ll_block_flags_)
+#define LAUNCH_LL(NG)            \
+        if(U == 1)               \
+        {                        \
+            LAUNCH_LL_U(NG, 1);  \
+        }                        \
+        else if(U == 2)          \
+        {                        \
+            LAUNCH_LL_U(NG, 2);  \
+        }                        \
+        else                     \
+        {                        \
+            LAUNCH_LL_U(NG, 4);  \
+        }
         DISPATCH_NGPUS_1250(world_size_, LAUNCH_LL);
 #undef LAUNCH_LL
+#undef LAUNCH_LL_U
+    }
+
+    // -----------------------------------------------------------------------
+    // Lamport fused all-reduce + RMSNorm, see lamport_ar_rmsnorm_gfx1250.
+    //
+    // all_ptrs[i] is rank i's buffer of lamport_buffer_bytes(world_size_,
+    // max_bytes / 16) bytes, mapped into this process (all_ptrs[rank_] is this
+    // rank's own); max_bytes is the largest input a call takes. Once per
+    // communicator. The caller must barrier across ranks after this returns,
+    // otherwise a fast rank's first push can be wiped by a slow rank's 0xff
+    // memset.
+    // -----------------------------------------------------------------------
+    void init_lamport_ar_rms(const std::vector<int64_t>& all_ptrs, int64_t max_bytes)
+    {
+        if(lamport_)
+            throw std::runtime_error("init_lamport_ar_rms: already initialized");
+        if(world_size_ > kMaxNgpusAr || (int)all_ptrs.size() != world_size_)
+            throw std::invalid_argument(
+                "init_lamport_ar_rms: need one buffer per rank, at most 8 ranks");
+        // one round counter and one partial a wave, so whole waves of packs
+        if(max_bytes <= 0 || max_bytes % (16 * kLamportWave) != 0 ||
+           max_bytes / 16 > std::numeric_limits<int>::max() / (kLamportBuffers * kMaxNgpusAr))
+            throw std::invalid_argument("init_lamport_ar_rms: max_bytes must be a positive "
+                                        "multiple of 512");
+        const int64_t slot = max_bytes / 16;
+        auto state         = std::make_unique<LamportArRms>();
+        state->rank        = rank_;
+        state->world_size  = world_size_;
+        state->slot        = (int)slot;
+        int device;
+        HIP_CALL(hipGetDevice(&device));
+        HIP_CALL(
+            hipDeviceGetAttribute(&state->num_cus, hipDeviceAttributeMultiprocessorCount, device));
+        for(int i = 0; i < world_size_; i++)
+            state->peers.ptrs[i] = reinterpret_cast<void*>(all_ptrs[i]);
+        HIP_CALL(hipMemset(
+            state->peers.ptrs[rank_], 0xff, lamport_ar_rms_buffer_bytes(world_size_, slot)));
+        HIP_CALL(hipMemset(static_cast<char*>(state->peers.ptrs[rank_]) +
+                               lamport_ar_rms_buffer_bytes(world_size_, slot),
+                           0,
+                           lamport_escape_bytes(world_size_, slot)));
+        HIP_CALL(hipMemset(static_cast<char*>(state->peers.ptrs[rank_]) +
+                               lamport_two_shot_offset(world_size_, slot),
+                           0xff,
+                           lamport_two_shot_bytes(world_size_, slot)));
+        // tx counters, then rx counters (see lamport_ar_rmsnorm_gfx1250 SPLIT)
+        HIP_CALL(hipMalloc((void**)&state->d_round, sizeof(uint32_t) * 2 * (slot / kLamportWave)));
+        HIP_CALL(hipMemset(state->d_round, 0, sizeof(uint32_t) * 2 * (slot / kLamportWave)));
+        HIP_CALL(hipDeviceSynchronize());
+        lamport_ = std::move(state);
+    }
+
+    // OutT: T, or an FP8 type with scale_out (and bf16_out unless null), see
+    // lamport_ar_rmsnorm_gfx1250
+    template <typename T, typename OutT>
+    void fused_allreduce_rmsnorm_lamport(hipStream_t stream,
+                                         const T* input,
+                                         const T* residual_inp,
+                                         T* residual_out,
+                                         OutT* output,
+                                         const T* weight,
+                                         float* scale_out,
+                                         T* bf16_out,
+                                         int64_t tokens,
+                                         int hidden,
+                                         float eps,
+                                         bool gemma_norm)
+    {
+        if(!lamport_)
+            throw std::runtime_error("fused_allreduce_rmsnorm_lamport: call init_lamport_ar_rms "
+                                     "first");
+        lamport_->run<T, OutT>(stream, input, residual_inp, residual_out, output, weight,
+                               scale_out, bf16_out, eps, tokens, hidden, gemma_norm);
+    }
+
+    // Lamport all-reduce of input + other on the same inbox, see lamport_ar_1shot_gfx1250.
+    template <typename T>
+    void allreduce_add_lamport(hipStream_t stream,
+                               const T* input,
+                               const T* other,
+                               T* output,
+                               int64_t numel)
+    {
+        if(!lamport_)
+            throw std::runtime_error("allreduce_add_lamport: call init_lamport_ar_rms first");
+        lamport_->run_1shot<T, true>(stream, input, other, output, numel);
+    }
+
+    // Lamport all-reduce on the same inbox: one-shot (lamport_ar_1shot_gfx1250,
+    // 2-byte dtypes) or two-shot (lamport_ar_2shot_gfx1250), fused or split.
+    template <typename T>
+    void allreduce_lamport(
+        hipStream_t stream, const T* input, T* output, int64_t numel, bool two_shot, bool split)
+    {
+        if(!lamport_)
+            throw std::runtime_error("allreduce_lamport: call init_lamport_ar_rms first");
+        if(two_shot)
+            lamport_->run_2shot<T>(stream, input, output, numel, split);
+        else if constexpr(sizeof(T) == 2)
+            lamport_->run_1shot<T, false>(stream, input, nullptr, output, numel);
+        else
+            throw std::runtime_error("allreduce_lamport: the one-shot takes 2-byte dtypes");
+    }
+
+    // Lamport all-gather on the same inbox, see lamport_ag_gfx1250.
+    template <class Codec>
+    void allgather_lamport(
+        hipStream_t stream, const void* input, void* output, int64_t bytes, int64_t row_bytes)
+    {
+        if(!lamport_)
+            throw std::runtime_error("allgather_lamport: call init_lamport_ar_rms first");
+        lamport_->run_ag<Codec>(stream, input, output, bytes, row_bytes);
+    }
+
+    // Whether an all-gather of `bytes` a rank takes ag_ll_gfx1250: whole 8-byte
+    // packets, a row's too along the last dim. The shape alone decides, so
+    // every rank of the collective takes the same protocol.
+    bool use_ll_ag(size_t bytes, size_t row_bytes) const
+    {
+        return use_ll(bytes) && bytes % 8 == 0 && row_bytes % 8 == 0;
+    }
+
+    // Whether ag_ll_gfx1250 may read this rank's input in place: clear of the
+    // output it writes while still publishing the input, or a dim-0 gather into
+    // the output's own slice (that slice is rewritten with the same bytes).
+    bool ll_ag_reads_in_place(const void* input, const void* output, size_t bytes, size_t row_bytes) const
+    {
+        const auto in  = reinterpret_cast<uintptr_t>(input);
+        const auto out = reinterpret_cast<uintptr_t>(output);
+        return out >= in + bytes || in >= out + bytes * world_size_ ||
+               (row_bytes == bytes && in == out + bytes * rank_);
+    }
+
+    // LL all-gather (see ag_ll_gfx1250); row_bytes == bytes gathers along dim 0.
+    // use_ll_ag(bytes, row_bytes) holds, so both are whole 4-byte words, and a
+    // message is at most kLLArMaxBytes: 349526 units, under kLLPackCapacity
+    // lines a slot and under kMaxBlocks x 512 threads x 2 units. One unit a
+    // thread: 256-thread blocks while kMaxBlocks of them cover the message,
+    // then 512-thread blocks, then two units a thread past kMaxBlocks x 512.
+    template <typename T>
+    void allgather_ll(hipStream_t stream, const T* input, T* output, size_t bytes, size_t row_bytes)
+    {
+        ensure_ll_tables_();
+        const uint32_t n32   = bytes >> 2;
+        const size_t   units = ((size_t)n32 + 2) / 3;
+        const int threads    = units <= (size_t)kMaxBlocks * 256 ? 256 : 512;
+        const int unroll     = units <= (size_t)kMaxBlocks * threads ? 1 : 2;
+        const int blocks     = std::max(1, std::min<int>(kMaxBlocks,
+            (int)((units + (size_t)threads * unroll - 1) / ((size_t)threads * unroll))));
+
+        auto peers = reinterpret_cast<uint8_t* const*>(d_ll_peers_);
+        auto in    = reinterpret_cast<const uint8_t*>(input);
+        auto out   = reinterpret_cast<uint8_t*>(output);
+        // a rank-local choice of kernel, not of protocol: both move the same lines
+        const bool aligned = (reinterpret_cast<uintptr_t>(input) & 3) == 0 &&
+                             (reinterpret_cast<uintptr_t>(output) & 3) == 0;
+#define LAUNCH_AG_LL12_U(NG, U)                                                                    \
+        if(aligned)                                                                                \
+            ag_ll_gfx1250<NG, U, true><<<blocks, threads, 0, stream>>>(                          \
+                peers, out, in, n32, (uint32_t)(row_bytes >> 2), rank_, d_ll_block_flags_);        \
+        else                                                                                       \
+            ag_ll_gfx1250<NG, U, false><<<blocks, threads, 0, stream>>>(                         \
+                peers, out, in, n32, (uint32_t)(row_bytes >> 2), rank_, d_ll_block_flags_)
+#define LAUNCH_AG_LL12(NG)            \
+        if(unroll == 1)               \
+        {                             \
+            LAUNCH_AG_LL12_U(NG, 1);  \
+        }                             \
+        else                          \
+        {                             \
+            LAUNCH_AG_LL12_U(NG, 2);  \
+        }
+        DISPATCH_NGPUS_1250(world_size_, LAUNCH_AG_LL12);
+#undef LAUNCH_AG_LL12
+#undef LAUNCH_AG_LL12_U
+    }
+
+    // Rows of 128 bf16 a source that dcp_merge fits in an LL slot (32 data lines
+    // and one LSE line a row), or 0 where it does not run: LL off, or more than
+    // kLLMaxRanks ranks. dcp_merge takes B x H / world_size rows at most this.
+    int64_t dcp_merge_max_rows() const
+    {
+        return ll_enabled() && world_size_ <= kLLMaxRanks ? (int64_t)(kLLPackCapacity / 33) : 0;
+    }
+
+    // DCP merge (see dcp_merge_ll_gfx1250): o [B, H, 128] bf16 and lse [B, H]
+    // fp32 in, out [B, H / world_size, 128] bf16 and out_lse (optional) out.
+    // W = 256 threads a role. Blocks: one per 8 sender rows, up to one a CU; a
+    // sender wave then takes 1, 2, 4 or 8 rows a round, so that one round covers
+    // the message when it can.
+    void dcp_merge(hipStream_t stream,
+                   const void* o,
+                   const float* lse,
+                   const int* owned,
+                   void* out,
+                   float* out_lse,
+                   int B,
+                   int H,
+                   int64_t o_sb,
+                   int64_t o_sh,
+                   int64_t l_sb,
+                   int64_t l_sh)
+    {
+        ensure_ll_tables_();
+        static const int cus = []() {
+            int dev = 0, n = 0;
+            if(hipGetDevice(&dev) != hipSuccess ||
+               hipDeviceGetAttribute(&n, hipDeviceAttributeMultiprocessorCount, dev) != hipSuccess || n <= 0)
+                n = 256;
+            return n;
+        }();
+        constexpr int W   = 256;
+        constexpr int wpb = W / 32;
+        const int     HL  = H / world_size_;
+        const int     rows   = B * (world_size_ - 1) * HL;
+        const int     blocks = std::max(1, std::min({cus, kMaxBlocks, (rows + wpb - 1) / wpb}));
+        const int     per    = (rows + blocks * wpb - 1) / (blocks * wpb);
+        const int     U      = per <= 1 ? 1 : per <= 2 ? 2 : per <= 4 ? 4 : 8;
+
+        auto peers = reinterpret_cast<uint8_t* const*>(d_ll_peers_);
+        auto in    = reinterpret_cast<const opus::bf16_t*>(o);
+        auto res   = reinterpret_cast<opus::bf16_t*>(out);
+#define LAUNCH_DCP_U(NG, UU)                                                                      \
+        dcp_merge_ll_gfx1250<NG, UU><<<blocks, 2 * W, 0, stream>>>(                              \
+            peers, in, lse, owned, res, out_lse, B, HL, o_sb, o_sh, l_sb, l_sh, rank_, d_ll_block_flags_)
+#define LAUNCH_DCP(NG)            \
+        if(U == 1)                \
+        {                         \
+            LAUNCH_DCP_U(NG, 1);  \
+        }                         \
+        else if(U == 2)           \
+        {                         \
+            LAUNCH_DCP_U(NG, 2);  \
+        }                         \
+        else if(U == 4)           \
+        {                         \
+            LAUNCH_DCP_U(NG, 4);  \
+        }                         \
+        else                      \
+        {                         \
+            LAUNCH_DCP_U(NG, 8);  \
+        }
+        DISPATCH_NGPUS_1250(world_size_, LAUNCH_DCP);
+#undef LAUNCH_DCP
+#undef LAUNCH_DCP_U
     }
 
     // gfx1250: return raw device pointers (no hipIpc handles).
@@ -1133,6 +3616,28 @@ public:
         for(size_t i = 0; i < num_output_buffers; i++)
             ptrs[num_input_buffers + i] = (int64_t)graph_unreg_output_buffers_[i];
         return ptrs;
+    }
+
+    // IPC transport: the same buffers as hipIpc handles plus offsets. A handle
+    // covers the whole allocation that contains the pointer, so the offset
+    // into that allocation travels alongside.
+    std::pair<std::vector<uint8_t>, std::vector<int64_t>> get_graph_buffer_ipc_meta()
+    {
+        auto ptrs      = get_graph_buffer_ptrs();
+        auto handle_sz = sizeof(hipIpcMemHandle_t);
+        std::vector<uint8_t> handles(handle_sz * ptrs.size(), 0);
+        std::vector<int64_t> offsets(ptrs.size());
+        for(size_t i = 0; i < ptrs.size(); i++)
+        {
+            void* base_ptr;
+            if(hipPointerGetAttribute(&base_ptr,
+                                      HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR,
+                                      (hipDeviceptr_t)ptrs[i]) != hipSuccess)
+                throw std::runtime_error("failed to get the allocation of a graph buffer");
+            HIP_CALL(hipIpcGetMemHandle((hipIpcMemHandle_t*)&handles[i * handle_sz], base_ptr));
+            offsets[i] = ptrs[i] - (int64_t)base_ptr;
+        }
+        return {handles, offsets};
     }
 
     void check_rank_data_capacity(size_t num = 1)
@@ -1232,25 +3737,6 @@ public:
                                  " is not registered!");
     }
 
-    RankData* get_output_buffer_RD(hipStream_t stream, void* output)
-    {
-        auto it = output_buffers_.find(output);
-        if(it != output_buffers_.end())
-            return it->second;
-        hipStreamCaptureStatus status;
-        HIP_CALL(hipStreamIsCapturing(stream, &status));
-        if(status == hipStreamCaptureStatusActive)
-        {
-            auto ptrs = d_rank_data_base_ + graph_unreg_input_buffers_.size() +
-                        graph_unreg_output_buffers_.size();
-            graph_unreg_output_buffers_.push_back(output);
-            return ptrs;
-        }
-        throw std::runtime_error("output buffer address " +
-                                 std::to_string(reinterpret_cast<uint64_t>(output)) +
-                                 " is not registered!");
-    }
-
     // gfx1250: receive direct device pointers per rank per buffer.
     // ptrs_per_rank[rank_j] points to a flat array of int64_t device pointers,
     // one per buffer (inputs first, then outputs), in the same order as
@@ -1276,7 +3762,6 @@ public:
             for(int j = 0; j < world_size_; j++)
                 rd.ptrs[j] = (j != rank_) ? (void*)ptrs_per_rank[j][num_input_buffers + i]
                                           : self_ptr;
-            output_buffers_[self_ptr] = d_rank_data_base_ + num_input_buffers + i;
         }
         HIP_CALL(hipMemcpy(d_rank_data_base_,
                            rank_data.data(),
@@ -1287,12 +3772,70 @@ public:
         graph_unreg_output_buffers_.clear();
     }
 
+    // IPC transport overload: handles_per_rank[j] and offsets_per_rank[j] are
+    // rank j's get_graph_buffer_ipc_meta output. Each peer handle is opened
+    // once (open_ipc_handle caches it) and resolved to a pointer here.
+    void register_graph_buffers(const void* const* handles_per_rank,
+                                const int64_t* const* offsets_per_rank)
+    {
+        auto total_buffers =
+            graph_unreg_input_buffers_.size() + graph_unreg_output_buffers_.size();
+        check_rank_data_capacity(total_buffers);
+        std::vector<std::vector<int64_t>> ptrs(world_size_,
+                                               std::vector<int64_t>(total_buffers));
+        std::vector<const int64_t*> ptrs_per_rank(world_size_);
+        for(int j = 0; j < world_size_; j++)
+        {
+            for(size_t i = 0; j != rank_ && i < total_buffers; i++)
+            {
+                auto* handle = (const hipIpcMemHandle_t*)handles_per_rank[j] + i;
+                ptrs[j][i]   = (int64_t)(open_ipc_handle(handle) + offsets_per_rank[j][i]);
+            }
+            ptrs_per_rank[j] = ptrs[j].data();
+        }
+        register_graph_buffers(ptrs_per_rank.data());
+    }
+
+    // The allgather kernels index the output with int. allgather_scalar does it
+    // per element; vec, naive and lastdim do it per 16-byte pack. Each launcher
+    // takes the element count as int64_t and checks its own index range before
+    // narrowing, so the vectorized kernels take any output of up to INT_MAX
+    // packs (16 * INT_MAX bytes, about 32 GiB) whatever the dtype.
+    // _resolve_custom_sizes in custom_all_reduce.py caps
+    // AITER_CUSTOM_AG_MAX_SIZE at the same bound; keep the two in sync.
+    template <typename T>
+    int allgather_packs(int64_t numel, const char* who) const
+    {
+        constexpr int64_t d = 16 / sizeof(T);
+        if(numel % d != 0)
+            throw std::runtime_error(std::string(who) +
+                                     " requires input length to be multiple of " +
+                                     std::to_string(d));
+        const int64_t packs = numel / d;
+        if(packs * world_size_ > std::numeric_limits<int>::max())
+            throw std::runtime_error(
+                std::string(who) + ": output of " + std::to_string(packs * world_size_) +
+                " 16-byte packs (numel " + std::to_string(numel) + " x world_size " +
+                std::to_string(world_size_) + ") exceeds the int32 index range; "
+                "route this size through should_custom_ag / RCCL instead");
+        return static_cast<int>(packs);
+    }
+
     template <typename T>
     void allgather_scalar(hipStream_t stream,
                           T* input,
                           T* output,
-                          int size)
+                          int64_t numel)
     {
+        // Indexes the output per element, not per pack.
+        if(numel * world_size_ > std::numeric_limits<int>::max())
+            throw std::runtime_error(
+                "gfx1250 allgather_scalar: output element count " +
+                std::to_string(numel * world_size_) + " (numel " + std::to_string(numel) +
+                " x world_size " + std::to_string(world_size_) +
+                ") exceeds the int32 index range; route this size through "
+                "should_custom_ag / RCCL instead");
+        const int size       = static_cast<int>(numel);
         RankData* input_ptrs = get_buffer_RD(stream, input);
 
         constexpr int threads = 512;
@@ -1301,7 +3844,7 @@ public:
 #define LAUNCH_AG_SCALAR(NG) \
         ag_gfx1250_scalar<T, NG><<<blocks, threads, 0, stream>>>( \
             input_ptrs, sg_, self_sg_, output, rank_, size)
-        DISPATCH_NGPUS_1250(world_size_, LAUNCH_AG_SCALAR);
+        DISPATCH_AG_NGPUS_1250(world_size_, LAUNCH_AG_SCALAR);
 #undef LAUNCH_AG_SCALAR
     }
 
@@ -1309,15 +3852,10 @@ public:
     void allgather_vec(hipStream_t stream,
                        T* input,
                        T* output,
-                       int size)
+                       int64_t numel)
     {
-        auto d = 16 / sizeof(T);
-        if(size % d != 0)
-            throw std::runtime_error(
-                "allgather_vec requires input length to be multiple of " + std::to_string(d));
-
+        const int size       = allgather_packs<T>(numel, "allgather_vec");
         RankData* input_ptrs = get_buffer_RD(stream, input);
-        size /= d;
 
         constexpr int threads = 256;
         int blocks = std::min(kMaxBlocks,
@@ -1325,7 +3863,7 @@ public:
 #define LAUNCH_AG_VEC(NG) \
         ag_gfx1250_naive_vec<T, NG><<<blocks, threads, 0, stream>>>( \
             input_ptrs, sg_, self_sg_, output, rank_, size)
-        DISPATCH_NGPUS_1250(world_size_, LAUNCH_AG_VEC);
+        DISPATCH_AG_NGPUS_1250(world_size_, LAUNCH_AG_VEC);
 #undef LAUNCH_AG_VEC
     }
 
@@ -1333,15 +3871,10 @@ public:
     void allgather_naive(hipStream_t stream,
                          T* input,
                          T* output,
-                         int size)
+                         int64_t numel)
     {
-        auto d = 16 / sizeof(T);
-        if(size % d != 0)
-            throw std::runtime_error(
-                "allgather requires input length to be multiple of " + std::to_string(d));
-
+        const int size       = allgather_packs<T>(numel, "allgather");
         RankData* input_ptrs = get_buffer_RD(stream, input);
-        size /= d;
 
         constexpr int threads = 256;
         int blocks = std::min(kMaxBlocks,
@@ -1349,49 +3882,30 @@ public:
 #define LAUNCH_AG_NAIVE(NG) \
         ag_gfx1250_naive_unroll4<T, NG><<<blocks, threads, 0, stream>>>( \
             input_ptrs, sg_, self_sg_, output, rank_, size)
-        DISPATCH_NGPUS_1250(world_size_, LAUNCH_AG_NAIVE);
+        DISPATCH_AG_NGPUS_1250(world_size_, LAUNCH_AG_NAIVE);
 #undef LAUNCH_AG_NAIVE
-    }
-
-    template <typename T>
-    void allgather_warpsplit(hipStream_t stream,
-                             T* input,
-                             T* output,
-                             int size)
-    {
-        auto d = 16 / sizeof(T);
-        if(size % d != 0)
-            throw std::runtime_error(
-                "allgather requires input length to be multiple of " + std::to_string(d));
-
-        RankData* input_ptrs = get_buffer_RD(stream, input);
-        size /= d;
-
-        constexpr int threads = 256;
-        int blocks = std::min(kMaxBlocks,
-                              (size + threads * 4 - 1) / (threads * 4));
-#define LAUNCH_AG_WARP(NG) \
-        ag_gfx1250_warpsplit_unroll4<T, NG><<<blocks, threads, 0, stream>>>( \
-            input_ptrs, sg_, self_sg_, output, rank_, size)
-        DISPATCH_NGPUS_1250(world_size_, LAUNCH_AG_WARP);
-#undef LAUNCH_AG_WARP
     }
 
     template <typename T>
     void allgather_lastdim(hipStream_t stream,
                            T* input,
                            T* output,
-                           int size,
-                           int last_dim_size)
+                           int64_t numel,
+                           int64_t last_dim_size)
     {
         auto d = 16 / sizeof(T);
-        if(size % d != 0 || last_dim_size % d != 0)
+        if(last_dim_size % d != 0)
             throw std::runtime_error(
                 "allgather_lastdim requires input length and last_dim_size "
                 "to be multiples of " + std::to_string(d));
-
+        // The kernel takes the row length in elements and divides it by the
+        // pack size itself.
+        if(last_dim_size > std::numeric_limits<int>::max())
+            throw std::runtime_error("allgather_lastdim: last_dim_size " +
+                                     std::to_string(last_dim_size) +
+                                     " exceeds the int32 range");
+        const int size       = allgather_packs<T>(numel, "allgather_lastdim");
         RankData* input_ptrs = get_buffer_RD(stream, input);
-        size /= d;
 
         constexpr int threads = 512;
         constexpr int unroll  = 4;
@@ -1399,8 +3913,8 @@ public:
                               (size + threads * unroll - 1) / (threads * unroll));
 #define LAUNCH_AG_LAST(NG) \
         ag_gfx1250_lastdim<T, NG><<<blocks, threads, 0, stream>>>( \
-            input_ptrs, sg_, self_sg_, output, rank_, size, last_dim_size)
-        DISPATCH_NGPUS_1250(world_size_, LAUNCH_AG_LAST);
+            input_ptrs, sg_, self_sg_, output, rank_, size, static_cast<int>(last_dim_size))
+        DISPATCH_AG_NGPUS_1250(world_size_, LAUNCH_AG_LAST);
 #undef LAUNCH_AG_LAST
     }
 
@@ -1429,30 +3943,27 @@ public:
                    T* input,
                    T* output,
                    int size,
-                   bool use_new                 = true,
-                   bool is_broadcast_reg_outptr = false)
+                   bool use_new = true)
     {
         auto d = 16 / sizeof(T);
         if(size % d != 0)
             throw std::runtime_error(
                 "custom allreduce requires input length to be multiple of " + std::to_string(d));
 
-        // LL small-message fast lane: bytes <= kLLArMaxBytes (128 KiB) route to
-        // the flag-in-data kernel, which reads input locally and pushes to the
+        // LL small-message fast lane: bytes <= kLLArMaxBytes route to the
+        // flag-in-data kernel, which reads input locally and pushes to the
         // shared peer scratch — no registered peer-input table (_input_dp) is
         // needed, so branch before get_buffer_RD.
         const size_t bytes = (size_t)size * sizeof(T);
-        if(ll_enabled() && bytes <= kLLArMaxBytes &&
-           world_size_ <= kLLMaxRanks)
+        if(use_ll(bytes))
         {
             allreduce_ll<T>(stream, input, output, size);
             return;
         }
 
+        // The kernel reads the peers' inputs and writes only this rank's output,
+        // so a captured all-reduce registers its input alone.
         RankData* input_ptrs = get_buffer_RD(stream, input);
-        RankData* output_ptrs = nullptr;
-        if(is_broadcast_reg_outptr)
-            output_ptrs = get_output_buffer_RD(stream, output);
 
         size /= d;
 
@@ -1461,9 +3972,74 @@ public:
                               (size + threads * 4 - 1) / (threads * 4));
 #define LAUNCH_AR(NG) \
         ar_gfx1250_naive_unroll4<T, NG><<<blocks, threads, 0, stream>>>( \
-            input_ptrs, output_ptrs, sg_, self_sg_, output, rank_, size)
+            input_ptrs, nullptr, sg_, self_sg_, output, rank_, size)
         DISPATCH_NGPUS_1250(world_size_, LAUNCH_AR);
 #undef LAUNCH_AR
+    }
+
+    // Fused allreduce + residual add + RMSNorm over [tokens, hidden]. OutT is T,
+    // or fp8 for per-token quantized output with one scale per token.
+    template <typename T, typename OutT>
+    void fused_allreduce_rmsnorm(hipStream_t stream,
+                                 T* input,
+                                 const T* residual_inp,
+                                 T* residual_out,
+                                 OutT* output,
+                                 const T* weight,
+                                 float* scale_out,
+                                 T* bf16_output,
+                                 int tokens,
+                                 int hidden,
+                                 float eps,
+                                 bool gemma_norm,
+                                 bool use_1stage)
+    {
+        constexpr int pack_size = 16 / sizeof(T);
+        if(hidden % pack_size != 0 || hidden / pack_size > 1024)
+            throw std::runtime_error("gfx1250 fused allreduce rmsnorm: unsupported hidden size " +
+                                     std::to_string(hidden));
+        if(tokens == 0)
+            return;
+        RankData* input_ptrs = get_buffer_RD(stream, input);
+        const int threads    = (hidden / pack_size + 63) / 64 * 64;
+        const int blocks     = std::min(tokens, kMaxBlocks);
+        const size_t bytes   = (size_t)tokens * hidden * sizeof(T);
+        // At TP4+, two-stage halves or better the peer traffic of direct-read.
+        // Its extra launches and staging traffic do not amortize at TP2 or
+        // narrow rows.
+        // Each rank's reduced shard must fit its staging region.
+        const bool two_stage =
+            !use_1stage && world_size_ >= 4 && hidden >= kArRmsTwoStageMinHidden &&
+            hidden / pack_size % world_size_ == 0 &&
+            bytes / world_size_ <= kArRmsShardBytes && bytes > kLLArMaxBytes;
+#define LAUNCH_AR_RMS(NG)                                                                   \
+        if(two_stage)                                                                       \
+        {                                                                                   \
+            start_sync_kernel<NG><<<1, 64, 0, stream>>>(sg_, self_sg_, rank_);              \
+            ar_rmsnorm_reduce_scatter_gfx1250<T, NG><<<blocks, 512, 0, stream>>>(           \
+                input_ptrs, self_sg_, rank_, tokens, hidden / pack_size);                   \
+            start_sync_kernel<NG><<<1, 64, 0, stream>>>(sg_, self_sg_, rank_);              \
+            if(gemma_norm)                                                                  \
+                ar_rmsnorm_gfx1250<T, OutT, NG, true, true>                                 \
+                    <<<blocks, threads, 0, stream>>>(                                       \
+                        nullptr, sg_, self_sg_, rank_, residual_inp, residual_out, output,   \
+                        weight, scale_out, bf16_output, tokens, hidden, eps);                \
+            else                                                                            \
+                ar_rmsnorm_gfx1250<T, OutT, NG, false, true>                                \
+                    <<<blocks, threads, 0, stream>>>(                                       \
+                        nullptr, sg_, self_sg_, rank_, residual_inp, residual_out, output,   \
+                        weight, scale_out, bf16_output, tokens, hidden, eps);                \
+        }                                                                                   \
+        else if(gemma_norm)                                                                 \
+            ar_rmsnorm_gfx1250<T, OutT, NG, true><<<blocks, threads, 0, stream>>>(          \
+                input_ptrs, sg_, self_sg_, rank_, residual_inp, residual_out, output,       \
+                weight, scale_out, bf16_output, tokens, hidden, eps);                       \
+        else                                                                                \
+            ar_rmsnorm_gfx1250<T, OutT, NG, false><<<blocks, threads, 0, stream>>>(         \
+                input_ptrs, sg_, self_sg_, rank_, residual_inp, residual_out, output,       \
+                weight, scale_out, bf16_output, tokens, hidden, eps)
+        DISPATCH_NGPUS_1250(world_size_, LAUNCH_AR_RMS);
+#undef LAUNCH_AR_RMS
     }
 
     template <typename T>
