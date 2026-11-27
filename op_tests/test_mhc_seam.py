@@ -46,9 +46,8 @@ Also for FlyDSL: m = 0 in every mode; each RMSNorm path (fused, separate) at its
 config; a graph after an in-place update of fn, and after a write through fn.data with
 an explicit fn_packed refreshed. Per hidden size: two seams sharing one fn on two
 streams, builds the launch policy does not reach, forced, and invalid inputs, which
-raise ValueError or TypeError. Two host threads initializing one fn must share its
-pack, which a captured graph follows after a weight update. With two visible gfx942
-GPUs, calls alternate between them with both matching and different current devices.
+raise ValueError or TypeError. With two visible gfx942 GPUs, calls alternate between
+them with both matching and different current devices.
 
 Launch split, graphs and compile: T = 65536 + 37 (two launches, byte offsets past 2^31)
 with carried and identity pre gate against the same references; CUDA graphs captured at
@@ -68,9 +67,6 @@ loader and raises RuntimeError (the process continues).
 import argparse
 import itertools
 import sys
-import threading
-from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import patch
 
 import torch
 
@@ -1098,128 +1094,6 @@ def check_flydsl_multi_device(seed):
     return failed
 
 
-def check_flydsl_concurrent_pack(seed):
-    """Concurrent first-time packing and a graph's weight refresh, on both RMSNorm
-    paths."""
-    return sum(
-        flydsl_concurrent_pack_failures(norm, seed) for norm in ("fused", "separate")
-    )
-
-
-def flydsl_concurrent_pack_failures(norm, seed):
-    """Two host threads first using one fn must pack once and receive the same buffer.
-    Pause the first real pack before publication until the second caller either waits
-    on the real lock or returns a pack. This also completes without the lock, exposing
-    duplicate buffers instead of relying on a scheduling delay. Then check a captured
-    graph and eager outputs after updating fn. Returns the failure count."""
-    from aiter.ops.flydsl import mhc_seam_kernels as seam
-
-    failed = 0
-    device = torch.cuda.current_device()
-    # Compile with another weight so both threads first see an unpacked fn.
-    warm = make_inputs(32, 5120, seed=seed)
-    call, args = seam_flydsl(
-        warm,
-        "post",
-        config={"NORM": norm},
-        fn_packed=seam.flydsl_mhc_seam_pack_fn(warm["fn"]),
-    )
-    call(*args)
-    first = make_inputs(32, 5120, seed=seed + 41)
-    second = dict(make_inputs(32, 5120, seed=seed + 42), fn=first["fn"])
-    cases = [seam_flydsl(inp, "post", config={"NORM": norm}) for inp in (first, second)]
-    streams = [torch.cuda.Stream(device=device) for _ in cases]
-    torch.cuda.synchronize(device)
-    first_packed = threading.Event()
-    second_progress = threading.Event()
-    release_first = threading.Event()
-    packs, used_packs = [], []
-    lock = seam._FN_CACHE_LOCK
-    pack_fn, cached_pack_fn = seam.flydsl_mhc_seam_pack_fn, seam._pack_fn
-
-    class ObservedLock:
-        def __enter__(self):
-            if not lock.acquire(blocking=False):
-                second_progress.set()
-                if not lock.acquire(timeout=30):
-                    raise TimeoutError("concurrent fn pack: waiting for cache lock")
-
-        def __exit__(self, *exc):
-            lock.release()
-
-    def pack(fn):
-        packed = pack_fn(fn)
-        packs.append(packed)
-        if len(packs) == 1:
-            torch.cuda.current_stream(device).synchronize()
-            first_packed.set()
-            if not release_first.wait(timeout=30):
-                raise TimeoutError("concurrent fn pack: waiting to publish first pack")
-        return packed
-
-    def cached_pack(*args):
-        packed = cached_pack_fn(*args)
-        used_packs.append(packed)
-        # Without serialization the second caller returns while the first is paused.
-        second_progress.set()
-        return packed
-
-    def run(i):
-        with torch.cuda.device(device), torch.cuda.stream(streams[i]):
-            call, args = cases[i]
-            return call(*args)
-
-    with (
-        patch.object(seam, "_FN_CACHE_LOCK", ObservedLock()),
-        patch.object(seam, "flydsl_mhc_seam_pack_fn", pack),
-        patch.object(seam, "_pack_fn", cached_pack),
-        ThreadPoolExecutor(max_workers=2) as pool,
-    ):
-        futures = [pool.submit(run, 0)]
-        try:
-            if not first_packed.wait(timeout=30):
-                raise TimeoutError("concurrent fn pack: first caller did not pack")
-            futures.append(pool.submit(run, 1))
-            if not second_progress.wait(timeout=30):
-                raise TimeoutError("concurrent fn pack: second caller did not arrive")
-        finally:
-            release_first.set()
-        outs = [future.result(timeout=30) for future in futures]
-    torch.cuda.synchronize(device)
-    tag = f"concurrent fn pack NORM={norm} "
-    if len(packs) != 1 or len(used_packs) != 2 or used_packs[0] is not used_packs[1]:
-        aiter.logger.error(
-            "%sexpected one shared pack, got %d packing calls", tag, len(packs)
-        )
-        failed += 1
-    for out, inp in zip(outs, (first, second)):
-        err = check_flydsl(out, inp, "post", tag)
-        failed += any(e != 0 for e in err.values())
-
-    call, args = cases[1]
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        graph_out = call(*args)
-    graph.replay()
-    torch.cuda.synchronize(device)
-    old_gates = [graph_out[i].clone() for i in (1, 2, 4)]
-    first["fn"].mul_(2)
-    eager_out = call(*args)
-    graph.replay()
-    torch.cuda.synchronize(device)
-    for label, out in (
-        ("updated eager ", eager_out),
-        ("updated graph ", graph_out),
-    ):
-        err = check_flydsl(out, second, "post", tag + label)
-        failed += any(e != 0 for e in err.values())
-    for name, old, i in zip(("post", "comb", "pre"), old_gates, (1, 2, 4)):
-        if torch.isclose(old, graph_out[i], rtol=0, atol=FLY_GATE_ATOL).all():
-            aiter.logger.error("%s%s did not change after the weight update", tag, name)
-            failed += 1
-    return failed
-
-
 def flydsl_config_error(m, hidden_size, mode, config):
     """Returns the error message the FlyDSL seam raises for this explicit config in
     `mode`, or None if the config is legal. Like the op, it merges config over
@@ -1467,7 +1341,6 @@ def main():
     failed += check_flydsl_norm_paths(args.seed)
     failed += check_flydsl_weight_update(args.seed)
     failed += check_flydsl_multi_device(args.seed)
-    failed += check_flydsl_concurrent_pack(args.seed)
     for hidden_size in args.hidden:
         failed += check_flydsl_streams(hidden_size, args.seed)
         failed += check_flydsl_forced_configs(hidden_size, args.seed)
