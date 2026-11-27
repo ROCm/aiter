@@ -114,7 +114,7 @@ def check_score_plan_matches_direct(qls, seqs, heads, qdt, k_round):
 
 def check_lazy_exports():
     """Every lazy export is a (module, attribute) pair, and the new ones resolve."""
-    import aiter.ops.flydsl as flydsl
+    from aiter.ops import flydsl
 
     for name, target in flydsl._LAZY_IMPORTS.items():
         assert len(target) == 2, f"{name}: {target}"

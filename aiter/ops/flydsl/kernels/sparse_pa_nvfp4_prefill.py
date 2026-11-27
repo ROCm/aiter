@@ -573,7 +573,7 @@ class _BoundSparsePaPrefill:
     scales and every launch argument that does not change from one layer to the next.
     ``launch`` is None for an empty batch."""
 
-    __slots__ = ("launch", "out", "ks", "vs", "dev", "batch_ptrs", "tail")
+    __slots__ = ("batch_ptrs", "dev", "ks", "launch", "out", "tail", "vs")
 
     def __init__(self, launch, out, ks, vs, dev, batch_ptrs, tail):
         self.launch = launch
@@ -673,7 +673,7 @@ class SparsePaPrefillPlan:
     """`sparse_pa_nvfp4_prefill` with the validation done once. Built by
     `make_sparse_pa_prefill_plan`; see there for the per-layer call."""
 
-    __slots__ = ("_bound", "_layouts", "_batch")
+    __slots__ = ("_batch", "_bound", "_layouts")
 
     def __init__(self, bound, layouts, batch):
         self._bound = bound

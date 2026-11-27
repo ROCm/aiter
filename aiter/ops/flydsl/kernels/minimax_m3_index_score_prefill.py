@@ -2411,7 +2411,7 @@ class _BoundScorePrefill:
     """What `_bind_score_prefill` resolved: the launcher, the output and every launch
     argument that does not change from one layer to the next."""
 
-    __slots__ = ("launch", "out", "dev", "k_fp4", "arg_types", "tail")
+    __slots__ = ("arg_types", "dev", "k_fp4", "launch", "out", "tail")
 
     def __init__(self, launch, out, dev, k_fp4, arg_types, tail):
         self.launch = launch
@@ -2749,7 +2749,7 @@ class ScorePrefillPlan:
     `make_score_prefill_plan`; `plan(idx_q, cache, k_scale=None)` then scores one
     layer's operands into the plan's `out` and returns it."""
 
-    __slots__ = ("_bound", "_checks", "_batch")
+    __slots__ = ("_batch", "_bound", "_checks")
 
     def __init__(self, bound, checks, batch):
         self._bound = bound
