@@ -41,10 +41,10 @@ def ff_a16w16_fused_ungated(
     If it is given, the kernel adds the result to it, so it must hold zeros.
     - activation: Optional activation function to apply.
     One of ("gelu", "gelu_tanh", "silu", "silu_exp2", "relu", None)
-    - b_up: Optional bias of the up-projection, shape (N,). It is added in fp32
-    before the activation.
-    - b_down: Optional bias of the down-projection, shape (K,). It is added in
-    fp32 to the result.
+    - b_up: Optional contiguous bias of the up-projection, shape (N,). It is
+    added in fp32 before the activation.
+    - b_down: Optional contiguous bias of the down-projection, shape (K,). It is
+    added in fp32 to the result.
 
     When Y is not given and BLOCK_SIZE_N of the config covers N (one program
     along N), each program stores its rows of Y: Y is allocated without a
@@ -72,12 +72,20 @@ def ff_a16w16_fused_ungated(
 
     N, K = w_up.shape
     M = x.shape[0]
+    assert N > 0, f"w_up must have at least one row, got shape {tuple(w_up.shape)}"
+    # The kernel reads each bias with unit stride.
     if b_up is not None:
         assert b_up.shape == (N,), f"b_up must have shape ({N},), got {b_up.shape}"
+        assert (
+            b_up.is_contiguous()
+        ), f"b_up must be contiguous, got stride {b_up.stride()}"
     if b_down is not None:
         assert b_down.shape == (
             K,
         ), f"b_down must have shape ({K},), got {b_down.shape}"
+        assert (
+            b_down.is_contiguous()
+        ), f"b_down must be contiguous, got stride {b_down.stride()}"
     if M > 64:
         warnings.warn(
             "The fused FF kernel is slower than the unfused equivalent for large batch sizes (>64)."

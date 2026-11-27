@@ -301,3 +301,43 @@ def test_ff_a16w16_fused_ungated_bias_rejects_wrong_shape():
         ff_a16w16_fused_ungated(x, w1, w2, out_dtype, b_up=b)
     with pytest.raises(AssertionError):
         ff_a16w16_fused_ungated(x, w1, w2, out_dtype, b_down=b.new_zeros(256))
+
+
+def test_ff_a16w16_fused_ungated_bias_rejects_strided():
+    # The kernel reads each bias with unit stride, so a strided view is refused.
+    x, w1, w2, out_dtype, _, _ = generate_ff_inputs(
+        8, 32, 256, torch.bfloat16, output=False
+    )
+    base = torch.randn(512, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(AssertionError, match="b_up must be contiguous"):
+        ff_a16w16_fused_ungated(x, w1, w2, out_dtype, b_up=base[::2])
+    with pytest.raises(AssertionError, match="b_down must be contiguous"):
+        ff_a16w16_fused_ungated(x, w1, w2, out_dtype, b_down=base[:64:2])
+    # The same values as contiguous tensors are accepted.
+    b_up, b_down = base[::2].contiguous(), base[:64:2].contiguous()
+    out = ff_a16w16_fused_ungated(x, w1, w2, out_dtype, b_up=b_up, b_down=b_down)
+    ref = _ff_ungated_bias_ref(x, w1, w2, b_up, b_down, None)
+    torch.testing.assert_close(out, ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.parametrize("with_config", [False, True])
+def test_ff_a16w16_fused_ungated_rejects_empty_intermediate(with_config):
+    # N = 0 would launch no program, so y (and b_down) would never be written.
+    x = torch.randn(8, 32, dtype=torch.bfloat16, device="cuda")
+    w = torch.empty(0, 32, dtype=torch.bfloat16, device="cuda")
+    b_down = torch.randn(32, dtype=torch.bfloat16, device="cuda")
+    config = None
+    if with_config:
+        config = {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 16,
+            "BLOCK_SIZE_K": 32,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 1,
+            "waves_per_eu": 0,
+            "matrix_instr_nonkdim": 16,
+            "cache_modifier": ".cg",
+        }
+    with pytest.raises(AssertionError, match="w_up must have at least one row"):
+        ff_a16w16_fused_ungated(x, w, w, torch.bfloat16, config=config, b_down=b_down)
