@@ -562,6 +562,7 @@ def compile_gemm2_a4w4_port(
                     first=first,
                 )
                 run_unit(fx.Int32(0), mn_idx=(m_block, pc.n_block), es=es)
+                rocdl.sched_barrier(0)
 
             n_wg = fx.Int32(gpu.grid_dim.x)
             n_panels = n_act * num_n_blocks

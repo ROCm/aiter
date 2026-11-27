@@ -21,7 +21,6 @@ from flydsl.expr.typing import as_ir_value as _raw
 
 from .mxfp4_gemm_common import (
     _e8m0_from_amax,
-    _global_i32_buffer_tiles,
     _inline_dpp_pair_amax,
     _inline_dpp_quad_amax,
     _udiv,
@@ -992,7 +991,7 @@ def gemm2_body_v2(
             None,
             lds_ready=True,
             prefetched_ids=prefetched_ids,
-            uncond_stores=es is not None,
+            ids_ready=es is not None,
         )
     else:
         _epilog(
@@ -1036,8 +1035,8 @@ def atomic_bf16_epilog(
     output_width=None,
     reduce_store_cache_modifier=None,
     write_limit=None,
-    uncond_stores=False,
     route_w_lds=None,
+    ids_ready=False,
 ):
     if SBM is None:
         SBM = BM
@@ -1097,31 +1096,6 @@ def atomic_bf16_epilog(
     out_bf16 = flat_buffer(arg_out, T.bf16, 4)
     out_bf16_ptr = global_typed_ptr(arg_out, T.bf16, align=2)
     out_i8_ptr = global_typed_ptr(arg_out, T.i8, align=1)
-    if const_expr(uncond_stores):
-        assert use_reduce and not route_out_fp8 and not enable_bias
-        assert reduce_store_cache_modifier is None
-    if const_expr(uncond_stores and route_out_fp4):
-        u_pitch = val_width + _udiv(output_width, fx.Int32(g2_scale_blk))
-        if const_expr(g2_out_pitch_align > 0):
-            al = fx.Int32(g2_out_pitch_align)
-            u_pitch = ((u_pitch + al - fx.Int32(1)) // al) * al
-        u_end = fx.Int64(i32_M) * fx.Int64(topk) * fx.Int64(u_pitch)
-        out_8b = _global_i32_buffer_tiles(arg_out, u_end, 2)
-        out_1b = fx.logical_divide(
-            fx.rocdl.make_buffer_tensor(
-                fx.Tensor(
-                    fx.make_view(
-                        global_typed_ptr(arg_out, T.i8, align=1),
-                        fx.make_layout(u_end, 1),
-                    )
-                ),
-                max_size=False,
-                num_records_bytes=u_end,
-            ),
-            fx.make_layout(1, 1),
-        )
-        st_8b = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), Int32)
-        st_1b = fx.make_copy_atom(fx.rocdl.BufferCopy8b(), Int8)
 
     load_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), Int32)
     load_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), Float32)
@@ -1226,7 +1200,7 @@ def atomic_bf16_epilog(
             return
         gpu.barrier()
 
-    def store_one_mr(mr, valid=None):
+    def store_one_mr(mr):
         row_in_block = fx.Int32(mr * EPI_ROWS) + m_lane
         token_id = packed[mr] & fx.Int32(0x00FFFFFF)
         if const_expr(use_reduce):
@@ -1238,8 +1212,6 @@ def atomic_bf16_epilog(
                     al = fx.Int32(g2_out_pitch_align)
                     row_pitch = ((row_pitch + al - fx.Int32(1)) // al) * al
                 row_base_addr = out_row * fx.Int64(row_pitch)
-                if const_expr(uncond_stores):
-                    row_base_addr = valid.select(row_base_addr, u_end)
             else:
                 row_base_addr = out_row * fx.Int64(output_width) + fx.Int64(
                     n_block_idx * BN + col_start - output_n_base
@@ -1381,24 +1353,6 @@ def atomic_bf16_epilog(
                         if const_expr(route_out_fp4)
                         else output_col
                     )
-                    if const_expr(uncond_stores):
-                        assert len(words) == 2
-                        w8 = fx.make_rmem_tensor(2, Int32)
-                        w8.store(Vec.from_elements([Vec(w)[0] for w in words], Int32))
-                        fx.copy(
-                            st_8b,
-                            w8,
-                            fx.slice(
-                                out_8b, (None, fx.Int32(row_val_off >> fx.Int64(3)))
-                            ),
-                        )
-                        s_off = row_base_addr + fx.Int64(
-                            val_width + _udiv(output_col, fx.Int32(g2_scale_blk))
-                        )
-                        s1 = fx.make_rmem_tensor(1, Int8)
-                        s1.store(Vec.from_elements([e8m0.to(Int8)], Int8))
-                        fx.copy(st_1b, s1, fx.slice(out_1b, (None, fx.Int32(s_off))))
-                        return
                     for d in range_constexpr(len(words)):
                         fx.ptr_store(
                             Vec(words[d]).bitcast(Int8),
@@ -1416,11 +1370,7 @@ def atomic_bf16_epilog(
                     if col_lane8 < fx.Int32(BN):
                         store_route_group(col_lane8)
 
-                if const_expr(uncond_stores):
-                    assert n_rg * route_group_n == BN
-                    store_route_group(col_lane8)
-                else:
-                    store_route_group_if_valid(col_lane8)
+                store_route_group_if_valid(col_lane8)
         elif const_expr(reduce_store_cache_modifier is not None):
             for s in range_constexpr(BN // store_group_n):
                 idx0 = row_in_block * BN + col_start + s * store_group_n
@@ -1530,8 +1480,7 @@ def atomic_bf16_epilog(
         ]
 
     if const_expr(
-        (prefetched_ids is not None or (use_reduce and route_out_q))
-        and not uncond_stores
+        (prefetched_ids is not None or (use_reduce and route_out_q)) and not ids_ready
     ):
         rocdl.s_waitcnt(vmcnt=0)
 
@@ -1548,11 +1497,7 @@ def atomic_bf16_epilog(
             if valid:
                 store_one_mr(mr)
 
-        if const_expr(uncond_stores and route_out_fp4):
-            token_limit = i32_M if const_expr(write_limit is None) else write_limit
-            store_one_mr(mr, (token_id < token_limit) & (route_slot < fx.Int32(topk)))
-        else:
-            store_if_valid(token_id, route_slot, mr)
+        store_if_valid(token_id, route_slot, mr)
 
 
 def nonatomic_bf16_epilog(
