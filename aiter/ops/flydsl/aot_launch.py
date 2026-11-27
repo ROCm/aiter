@@ -7,7 +7,7 @@ changing their call sites.
 A launcher factory opts in once, and every ``_run_compiled(exe, ...)`` of the
 launcher it returns then goes through the cache::
 
-    @aot_factory("moe_gfx942_gemm", sources=["kernels/moe_gemm_2stage/gfx9_fp8"])
+    @aot_factory("moe_gfx942_gemm")
     @functools.cache
     def _get_compiled_kernel(N, K, ...):
         return compile_gemm(...)
@@ -16,7 +16,8 @@ launcher it returns then goes through the cache::
 it returns a handle that ``_run_compiled`` launches from the cache, so a hit
 never runs the factory (whose ``@flyc.kernel`` definitions alone take a few
 hundred ms in a fresh process). The factory runs only to build an entry or to
-fall back to the JIT. Pass the handle to ``_run_compiled`` only.
+fall back to the JIT. Pass the handle to ``tensor_shim``'s ``_run_compiled``,
+``_preload_compiled`` or ``_compile_and_keep`` only.
 
 A factory whose launcher is built inside a wrapper binds it where it is built::
 
@@ -61,11 +62,12 @@ from .aot_cache import (
     FlyDSLAotCache,
     _JitKernel,
     _normalize_key,
+    _prebuilding,
     _UsageError,
     aot_cache_mode,
 )
 
-__all__ = ["aot_factory", "bind_aot"]
+__all__ = ["aot_factory", "bind_aot", "preload_bound"]
 
 _ATTR = "_aiter_aot"
 
@@ -220,6 +222,45 @@ def bind_aot(exe, cache: FlyDSLAotCache, key, make_exe=None):
     return exe
 
 
+def preload_bound(exe, args, specialization_key=None):
+    """Load the entry of a bound launcher into this process without launching
+    it, for ``tensor_shim._preload_compiled`` and a caller that keeps the
+    function it gets and calls it directly.
+
+    Returns the loaded function, which takes the launcher's arguments (a
+    torch stream too); later launches of the key through ``_run_compiled``
+    use it as well. None if ``exe`` is not bound, in a prebuild (which builds
+    entries by launching: ``_run_compiled``), while ``COMPILE_ONLY`` is on
+    for another reason (a preload of another thread: nothing is loaded
+    then), or when the key has no entry: the cache then logs one error and
+    the key takes the JIT path, where the caller preloads or compiles it.
+    """
+    binding = getattr(exe, _ATTR, None)
+    if not binding or _prebuilding():
+        return None
+    # FlyDSLAotCache keys launch arguments by their FlyDSL type (see
+    # _AotBinding); the function it returns takes a torch stream as is.
+    if args and isinstance(args[-1], torch.cuda.Stream):
+        args = (*args[:-1], fx.Stream(args[-1]))
+    if specialization_key is None:
+        key = binding.key
+    elif specialization_key in binding.unkeyable:
+        return None
+    else:
+        key = (binding.key, specialization_key)
+    try:
+        return binding.cache.preload(key, binding.make_exe, *args)
+    except _UsageError as e:
+        if specialization_key is None:
+            raise
+        logger.error(
+            f"[FlyDSL AOT] {binding.cache.name}: {e} in specialization_key; "
+            f"launching it through the JIT path"
+        )
+        binding.unkeyable.add(specialization_key)
+        return None
+
+
 class _LazyLauncher:
     """A launcher not built yet, for ``_run_compiled`` only."""
 
@@ -229,14 +270,14 @@ class _LazyLauncher:
         setattr(self, _ATTR, binding)
 
 
-def aot_factory(name: str, *, sources=(), env=()):
+def aot_factory(name: str, *, sources=None, env=None):
     """Decorate a launcher factory so that the launchers it returns launch
     through a ``FlyDSLAotCache`` named ``name``, keyed by its arguments.
 
-    ``sources`` are the files those launchers are built from, besides the one
-    of the factory and the common ones, and ``env`` the environment variables
-    their code reads
-    (see ``FlyDSLAotCache``).
+    What the cache is built from (source files, environment variables) is
+    declared under ``name`` in ``aiter/aot/flydsl/sources.py``; ``sources``
+    and ``env`` are for a cache that is not in that table (see
+    ``FlyDSLAotCache``).
 
     Place it above ``functools.cache``. Under ``AITER_FLYDSL_AOT_CACHE=0`` it
     returns the factory itself, with ``lazy`` the factory.

@@ -96,6 +96,8 @@ class _StEngine:
         self._meta_ptr = None
         self._gpu_peer_ptrs = None
         self._colors = None
+        self.peer_ptrs = [0] * world_size
+        self._device_colors = None
         # Split-build exchange state inside the meta block; 0 when there is none.
         self._xchg = 0
         # Setup has two collectives, the handle exchange and a final agreement.
@@ -178,6 +180,22 @@ class _StEngine:
         )
         if xchg_bytes:
             self._xchg = self._meta_ptr + xchg_off
+        self.peer_ptrs = peer_ptrs
+        if self.spec.get("device_colors", False):
+            # Only this rank's kernel touches the colours, so they need not be
+            # uncached. Allocate eagerly (a lazy fill could be captured into a
+            # HIP graph) and synchronize before any launch on another stream.
+            dev = torch.cuda.current_device()
+            self._device_colors = torch.ones(self.grid, dtype=torch.int32, device=dev)
+            torch.cuda.synchronize(dev)
+
+    def colors_ptr(self) -> int:
+        if self._device_colors is not None:
+            return int(self._device_colors.data_ptr())
+        return int(self._colors)
+
+    def peer_args(self, world: int) -> list[int]:
+        return list(self.peer_ptrs) + [0] * (int(world) - len(self.peer_ptrs))
 
     def close(self):
         for b in self._peer_bases:
@@ -196,6 +214,7 @@ class _StEngine:
             self._gpu_peer_ptrs = None
             self._colors = None
             self._xchg = 0
+        self._device_colors = None
         if self._buf_ptr:
             try:
                 IpcHeap.free_device_mem(self._buf_ptr)

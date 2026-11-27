@@ -49,7 +49,13 @@ from .quant_utils import (
 from .tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
-    AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE,
+)
+
+# Toggle for the amdgpu-expert-scheduling-mode compile hint of this kernel
+# (its only user; it was read in tensor_shim.py, a source of every AOT cache).
+# On by default; set AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE=0 to disable it.
+AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE = bool(
+    int(os.environ.get("AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE", "1"))
 )
 
 # FlyDSL 0.5 moved the register-placement API into rocdl.experimental.
