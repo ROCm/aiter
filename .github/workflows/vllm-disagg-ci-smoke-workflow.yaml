@@ -18,7 +18,7 @@ on:
         description: "Comma-separated Spur node pool used to select idle nodes for each smoke job"
         required: false
         type: string
-        default: "ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16"
+        default: "ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16"
       image:
         description: "vLLM ROCm image (default: the nightly tag, pinned to its digest for the whole run)"
         required: false
@@ -66,7 +66,7 @@ env:
   # Use a dated tag (e.g. nightly-20260916-92d0bb9) to pin a run exactly.
   VLLM_ROUTER_IMAGE: vllm/vllm-router:nightly
   DISAGG_SCRIPTS_STAGE: ${{ inputs.disagg_scripts_stage || '/data/aiter-di-ci/vllm-disagg-logs/' }}
-  SPUR_NODE_POOL: ${{ inputs.spur_node_pool || 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' }}
+  SPUR_NODE_POOL: ${{ inputs.spur_node_pool || 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' }}
   # Every case shares SPUR_NODE_POOL, so 3- and 4-node cases queue behind each
   # other in Spur. Allow up to 3 h queued instead of the harness's 30-minute
   # default. SLURM_TIME_LIMIT is both the job walltime and the harness poller's

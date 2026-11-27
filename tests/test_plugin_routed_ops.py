@@ -10,8 +10,14 @@ they can gate every PR without a GPU runner (see tests/conftest.py).
 
 from __future__ import annotations
 
+import gc
+import json
+import subprocess
+import sys
+import time
 from dataclasses import dataclass
 from inspect import signature
+from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
@@ -157,6 +163,81 @@ def test_rmsnorm_provider_serves_through_either_public_spelling(monkeypatch):
         assert torch.equal(result, torch.full((2, 4), 7.0))
 
     assert provider.select_calls == 2
+
+
+def _sparse_prefill_args(tokens=2, heads=1, dim=512):
+    """Well-formed enough to reach the routed layer, which dispatches at once.
+
+    Shapes are not exercised here: a provider that serves means the native
+    never runs, and the point of this test is which callers reach the
+    provider at all.
+    """
+    return {
+        "q": torch.rand(tokens, heads, dim),
+        "unified_kv": torch.rand(4, dim),
+        "kv_indices_prefix": torch.zeros(4, dtype=torch.int32),
+        "kv_indptr_prefix": torch.tensor([0, 2, 4], dtype=torch.int32),
+        "kv": torch.rand(4, dim),
+        "kv_indices_extend": torch.zeros(4, dtype=torch.int32),
+        "kv_indptr_extend": torch.tensor([0, 2, 4], dtype=torch.int32),
+        "attn_sink": None,
+        "softmax_scale": 1.0,
+    }
+
+
+def test_sparse_prefill_serves_through_either_public_spelling(monkeypatch):
+    """`mla_sparse_prefill` and `pa_sparse_prefill_opus` are one op.
+
+    They take the same arguments and forward them unchanged to the same
+    implementation; the second name differs only by pinning the backend the
+    first one would have chosen anyway. Routing their convergence point is
+    what makes a provider reach the callers who use the backend-named
+    spelling -- which, on the DSV4.1 prefill path, is all of them.
+    """
+
+    from aiter.ops.mla_sparse_prefill import mla_sparse_prefill
+    from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_opus
+
+    served = torch.full((2, 1, 512), 7.0)
+    provider = _Provider("aklr", _candidate("aklr", served))
+    provider.op_versions = {"mla_sparse_prefill": {1}}
+    plugin.configure(enable=("aklr",), source="test")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+
+    for spelling in (mla_sparse_prefill, pa_sparse_prefill_opus):
+        result = spelling(**_sparse_prefill_args())
+        decision = plugin.last_decision()
+        assert (decision.route, decision.provider) == ("provider", "aklr")
+        assert torch.equal(result, served)
+
+    assert provider.select_calls == 2
+
+
+def test_the_backend_pin_is_not_part_of_the_sparse_prefill_contract(monkeypatch):
+    """`backend=` is answered above the routed layer, so it never reaches a provider.
+
+    A provider serving this contract has one kernel, not a choice of AITER's;
+    being handed a pin it cannot satisfy would leave it declining every call
+    from the spelling that pins. The dispatcher settles the native backend
+    first and the op begins below that.
+    """
+
+    from aiter.ops.mla_sparse_prefill import mla_sparse_prefill
+
+    served = torch.full((2, 1, 512), 7.0)
+    provider = _Provider("aklr", _candidate("aklr", served))
+    provider.op_versions = {"mla_sparse_prefill": {1}}
+    plugin.configure(enable=("aklr",), source="test")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+
+    result = mla_sparse_prefill(**_sparse_prefill_args(), backend="opus")
+
+    assert plugin.last_decision().route == "provider"
+    assert torch.equal(result, served)
 
 
 _REFERENCE_PROVIDER = '''
@@ -427,6 +508,150 @@ def test_the_capture_time_decision_is_what_every_replay_runs(tmp_path, monkeypat
 
 
 @requires_cuda
+def _capture_cold(fn):
+    """Capture ``fn`` with no warm-up, so its first call lands inside.
+
+    The opposite of ``_capture``. What a framework does to an op its warmup
+    pass does not reach -- a decode-only op under a prefill-only dummy batch is
+    the shape ATOM already hit, which is why ``capture_cudagraph()`` calls
+    ``warmup_exchange()`` before recording.
+    """
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = fn()
+    return graph, out
+
+
+@requires_cuda
+def test_a_provider_allocating_on_its_first_call_inside_a_capture_keeps_it(
+    tmp_path, monkeypatch
+):
+    """Lazy allocation under capture is safe, and the memory is the provider's.
+
+    Worth pinning because the intuition runs the other way: capture-time
+    allocations are widely assumed to land in the graph's private pool and die
+    with it. They do not when the provider holds the reference -- measured on
+    gfx950 at 16 MiB, same address after the graph is gone.
+
+    The consequence is what this says to a provider author: you do not have to
+    pre-allocate to be correct. What you must not do is read a result back,
+    which the next test covers.
+    """
+
+    _install_reference_provider(tmp_path, monkeypatch)
+    plugin.configure(enable=("refprov",), source="test")
+    weight = torch.rand(8, device="cuda")
+    value = torch.rand(2, 8, device="cuda")
+
+    scratch = {}
+
+    def allocate_then_call():
+        if "t" not in scratch:
+            # The provider's lazy init, standing in for a tuning table or a
+            # workspace: it happens on the first call, which is this one.
+            scratch["t"] = torch.empty(1 << 20, dtype=torch.float32, device="cuda")
+            scratch["ptr"] = scratch["t"].data_ptr()
+        return aiter.rmsnorm2d_fwd(value, weight, 1e-6)
+
+    graph, _ = _capture_cold(allocate_then_call)
+    assert plugin.last_decision().route == "provider"
+
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+
+    del graph
+    gc.collect()
+    torch.cuda.synchronize()
+
+    assert scratch["t"].data_ptr() == scratch["ptr"], (
+        "the allocation moved or was freed with the graph; a provider that "
+        "allocates lazily under capture would be left holding a dangling buffer"
+    )
+    scratch["t"][:4].fill_(1.0)
+    torch.cuda.synchronize()
+    assert scratch["t"][:4].tolist() == [1.0, 1.0, 1.0, 1.0]
+
+
+_CAPTURE_READBACK_PROBE = """
+import torch
+
+x = torch.rand(16, device="cuda")
+graph = torch.cuda.CUDAGraph()
+side = torch.cuda.Stream()
+side.wait_stream(torch.cuda.current_stream())
+with torch.cuda.stream(side):
+    x.mul(2)
+torch.cuda.current_stream().wait_stream(side)
+torch.cuda.synchronize()
+
+try:
+    with torch.cuda.graph(graph):
+        x[0].item()          # the readback a provider's logging or assert would do
+    print("NOT_REFUSED")
+except Exception as error:
+    print("REFUSED", type(error).__name__)
+
+# Whatever the error said, is anything still usable?
+try:
+    torch.rand(8, device="cuda")
+    print("CONTEXT_SURVIVED")
+except Exception as error:
+    print("CONTEXT_POISONED", type(error).__name__)
+"""
+
+
+@requires_cuda
+def test_a_readback_under_capture_is_refused_and_takes_the_context_with_it():
+    """Run in a subprocess, because proving this ruins the process that proves it.
+
+    A provider's first call can land inside a capture (see the test above), and
+    the ordinary contents of a lazy init -- a log line with `.item()`, an assert
+    on a checksum, a `synchronize()` after setup -- read a result back. A capture
+    records instructions without executing them, so there is nothing to read.
+
+    What makes this worth a test rather than a line of documentation is the
+    second assertion. The refusal is not recoverable: the CUDA context is left
+    unusable, and the next unrelated allocation fails with a message naming
+    neither capture nor the provider. A provider author sees the symptom
+    somewhere else entirely.
+
+    Subprocess isolation is not fastidiousness. Run this inline and every CUDA
+    test after it in this file fails, including ones that have nothing to do
+    with plugins -- which is exactly how the behaviour was found.
+
+    Measured on gfx950 / torch 2.10.0+rocm7.2.4. If a future ROCm or PyTorch
+    makes readback under capture legal, or recoverable, this goes red and the
+    obligation stated in #7240 should be revisited.
+
+    Both assertions were mutation-checked by swapping the `.item()` in the
+    probe for a `torch.empty` -- an operation capture permits. That reports
+    NOT_REFUSED and CONTEXT_SURVIVED, failing both, so neither assertion is
+    satisfied by something other than the behaviour it names.
+    """
+
+    result = subprocess.run(
+        [sys.executable, "-c", _CAPTURE_READBACK_PROBE],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,  # the probe reports through stdout; a non-zero exit is
+    )  # itself a result, not a reason to raise here
+    out = result.stdout
+
+    assert "REFUSED" in out, (
+        f"reading a result back inside a capture was accepted; "
+        f"#7240's provider obligation rests on it being refused. stdout={out!r} "
+        f"stderr={result.stderr[-400:]!r}"
+    )
+    assert "CONTEXT_POISONED" in out, (
+        "the capture failure was recoverable -- the context survived. That is "
+        "better than what #7240 documents, and the RFC should be corrected "
+        f"rather than this test relaxed. stdout={out!r}"
+    )
+
+
 def test_turning_a_provider_off_does_not_reach_an_already_captured_graph(
     tmp_path, monkeypatch
 ):
@@ -455,3 +680,1206 @@ def test_turning_a_provider_off_does_not_reach_an_already_captured_graph(
     expect = (value.float() * scale * weight.float()).to(out.dtype)
     torch.testing.assert_close(out, expect)
     assert plugin.last_decision() is None, "the switch is off for anything new"
+
+
+# ---------------------------------------------------------------------------
+# fused_dual_rmsnorm_mxfp8_quant: the out-buffer bypass
+#
+# This op's public name has two paths -- naming any of `yq`, `sq`, `yk`
+# bypasses routing, because the buffered form RETURNS the buffers it was
+# given while a custom op's schema declares its results do not alias its
+# inputs. The split is deliberate and documented; what it needs is proof
+# that each side is the side it claims to be.
+#
+# The risk is one-directional. Landing on the buffered path by naming a
+# buffer gets AITER's own kernel, which is what naming it asked for. The
+# failure that matters is the reverse: a call that looks routed quietly
+# not being routed. So every test below pins WHICH path ran, not just that
+# the call returned something.
+# ---------------------------------------------------------------------------
+
+
+def _dual_rmsnorm_args(device="cpu", dtype=torch.bfloat16):
+    """The seven parameters of the routed contract -- no output buffers."""
+
+    m, kq, kk = 4, 64, 32
+    return {
+        "q": torch.randn(m, kq, device=device, dtype=dtype),
+        "k": torch.randn(m, kk, device=device, dtype=dtype),
+        "q_weight": torch.randn(kq, device=device, dtype=dtype),
+        "k_weight": torch.randn(kk, device=device, dtype=dtype),
+        "eps_q": 1e-6,
+    }
+
+
+def _serve_dual_rmsnorm(monkeypatch, served):
+    """Enable a provider for this contract and hand back its spy object."""
+
+    provider = _Provider("aklr", _candidate("aklr", served))
+    provider.op_versions = {"fused_dual_rmsnorm_mxfp8_quant": {1}}
+    plugin.configure(enable=("aklr",), source="test")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+    return provider
+
+
+def test_the_allocating_form_is_what_a_provider_serves(monkeypatch):
+    """No buffers named, so the call is routed and a provider can take it."""
+
+    from aiter.ops.triton.quant.fused_mxfp8_quant import (
+        fused_dual_rmsnorm_mxfp8_quant,
+    )
+
+    served = (torch.zeros(4, 64), torch.zeros(4, 2), torch.zeros(4, 32))
+    provider = _serve_dual_rmsnorm(monkeypatch, served)
+
+    result = fused_dual_rmsnorm_mxfp8_quant(**_dual_rmsnorm_args())
+
+    decision = plugin.last_decision()
+    assert (decision.route, decision.provider) == ("provider", "aklr")
+    assert provider.select_calls == 1
+    assert all(torch.equal(a, b) for a, b in zip(result, served))
+
+
+@pytest.mark.parametrize("buffer_name", ["yq", "sq", "yk"])
+def test_naming_any_one_output_buffer_bypasses_routing(monkeypatch, buffer_name):
+    """Each buffer on its own is enough to leave the routed path.
+
+    Parametrised per buffer rather than testing them together: the branch
+    reads all three, so a test that passes them at once would still pass if
+    two of the three conditions were dropped.
+
+    The native body is replaced here so this runs without a device -- what is
+    under test is which branch the public name picks, not what the kernel
+    computes. The provider is enabled and must come out untouched.
+    """
+
+    from aiter.ops.triton.quant import fused_mxfp8_quant as module
+
+    provider = _serve_dual_rmsnorm(monkeypatch, (None, None, None))
+    sentinel = ("native-ran", None, None)
+    monkeypatch.setattr(
+        module,
+        "_fused_dual_rmsnorm_mxfp8_quant_native",
+        lambda *args, **kwargs: sentinel,
+    )
+
+    args = _dual_rmsnorm_args()
+    args[buffer_name] = torch.zeros(4, 64)
+    result = module.fused_dual_rmsnorm_mxfp8_quant(**args)
+
+    assert result is sentinel, f"naming {buffer_name} did not reach the native body"
+    assert provider.select_calls == 0, (
+        f"naming {buffer_name} still asked a provider to select; the buffered "
+        f"form must not reach routing at all"
+    )
+
+
+@requires_cuda
+def test_the_buffered_form_writes_and_returns_the_caller_s_buffers():
+    """Buffer identity, not just equal values.
+
+    A fake that allocates compiles fine and returns the right value while
+    leaving the caller's buffer unwritten -- correct return, stale buffer,
+    no error. Comparing values alone cannot see that. These assertions are
+    on `data_ptr`, so they fail if the returned tensor is a different
+    allocation that merely holds the right numbers.
+    """
+
+    from aiter.ops.triton.quant.fused_mxfp8_quant import (
+        fused_dual_rmsnorm_mxfp8_quant,
+    )
+
+    args = _dual_rmsnorm_args(device="cuda")
+    expected = fused_dual_rmsnorm_mxfp8_quant(**args)
+
+    buffers = {
+        "yq": torch.empty_like(expected[0]),
+        "sq": torch.empty_like(expected[1]),
+        "yk": torch.empty_like(expected[2]),
+    }
+    got = fused_dual_rmsnorm_mxfp8_quant(**args, **buffers)
+
+    for name, returned, want in zip(buffers, got, expected):
+        assert returned.data_ptr() == buffers[name].data_ptr(), (
+            f"{name}: the buffered form returned a different allocation, so a "
+            f"caller reading its own buffer afterwards would read stale data"
+        )
+        assert torch.equal(
+            returned, want
+        ), f"{name}: buffered value differs from routed"
+
+
+@requires_cuda
+def test_the_routed_form_runs_inside_a_compiled_region():
+    """The allocating form is the one a compiled caller reaches.
+
+    Registration exists so the dispatch stays out of the caller's graph; a
+    compiled call that returns something other than the eager one would mean
+    the fake's metadata disagrees with the kernel.
+    """
+
+    from aiter.ops.triton.quant.fused_mxfp8_quant import (
+        fused_dual_rmsnorm_mxfp8_quant,
+    )
+
+    args = _dual_rmsnorm_args(device="cuda")
+    eager = fused_dual_rmsnorm_mxfp8_quant(**args)
+
+    compiled = torch.compile(fused_dual_rmsnorm_mxfp8_quant, dynamic=False)
+    got = compiled(**args)
+
+    for i, (a, b) in enumerate(zip(got, eager)):
+        assert a.shape == b.shape and a.dtype == b.dtype, (
+            f"output {i}: compiled metadata {tuple(a.shape)}/{a.dtype} differs "
+            f"from eager {tuple(b.shape)}/{b.dtype} -- the fake is wrong"
+        )
+        assert torch.equal(a, b), f"output {i}: compiled value differs from eager"
+
+
+# ---------------------------------------------------------------------------
+# Measured selection, end to end: real kernels, measured here, no fixed numbers
+#
+# The unit tests for selection build candidates by hand. This one runs two real
+# implementations of one contract, times them on the machine the test is on,
+# reports those times, and checks that routing followed them. What it asserts
+# is the relationship -- the faster one serves, the one that reported losing
+# does not -- never a duration, because a duration is a property of the runner.
+# ---------------------------------------------------------------------------
+
+
+def _torch_rmsnorm(input, weight, epsilon, use_model_sensitive_rmsnorm=0):
+    scale = torch.rsqrt(input.float().pow(2).mean(-1, keepdim=True) + epsilon)
+    return (input.float() * scale * weight.float()).to(input.dtype)
+
+
+def _native_rmsnorm(input, weight, epsilon, use_model_sensitive_rmsnorm=0):
+    """AITER's kernel through the binding, NOT through the routed public name.
+
+    A provider's ``run`` must not call the spelling that routes to it: dispatch
+    would reach the provider again and recurse until the stack ends. Reaching
+    past the routed layer is what a real provider does anyway -- it has its own
+    kernel -- but a provider built by wrapping AITER, which is what a port
+    starts as, lands on this immediately.
+    """
+
+    from aiter.ops.rmsnorm import rms_norm_cu
+
+    out = torch.empty_like(input)
+    rms_norm_cu(out, input, weight, epsilon)
+    return out
+
+
+def _time_us(fn, rounds: int = 20) -> float:
+    for _ in range(3):
+        fn()
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    for _ in range(rounds):
+        fn()
+    torch.cuda.synchronize()
+    return (time.perf_counter() - start) / rounds * 1e6
+
+
+def _reporting(name, run, latency_us, baseline_us, baseline_path):
+    return plugin.KernelCandidate(
+        provider=name,
+        kernel_id=f"{name}-kernel",
+        artifact_digest="sha256:measured-in-test",
+        run=run,
+        latency_us=latency_us,
+        baseline_us=baseline_us,
+        baseline_path=baseline_path,
+        measured_under={"mode": "eager", "rounds": 20},
+        measurement_ref="tests/test_plugin_routed_ops.py",
+    )
+
+
+@requires_cuda
+def test_measured_selection_follows_real_timings(monkeypatch):
+    """Two real kernels, timed here, and the reports decide which one runs."""
+
+    big = torch.randn(2048, 4096, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(4096, device="cuda", dtype=torch.bfloat16)
+    native_us = _time_us(lambda: _native_rmsnorm(big, weight, 1e-6))
+    torch_us = _time_us(lambda: _torch_rmsnorm(big, weight, 1e-6))
+    assert native_us < torch_us, (
+        f"this test needs AITER's kernel to be the faster of the two on this "
+        f"machine; measured {native_us:.1f}us against {torch_us:.1f}us"
+    )
+
+    # "loser" reports the slow implementation against AITER's own: it measured
+    # itself and lost. "winner" reports AITER's kernel against the slow one.
+    loser = _Provider(
+        "loser",
+        _reporting("loser", _torch_rmsnorm, torch_us, native_us, "aiter native"),
+    )
+    loser.op_versions = {"rmsnorm": {2}}
+    winner = _Provider(
+        "winner",
+        _reporting("winner", _native_rmsnorm, native_us, torch_us, "torch rmsnorm"),
+    )
+    winner.op_versions = {"rmsnorm": {2}}
+
+    plugin.configure(enable=("loser", "winner"), source="test")
+    monkeypatch.setattr(
+        plugin,
+        "_entry_points",
+        lambda: (_EntryPoint("l", loser), _EntryPoint("w", winner)),
+    )
+
+    small = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
+    small_w = torch.randn(256, device="cuda", dtype=torch.bfloat16)
+    explained = plugin.explain("rmsnorm", small, small_w, 1e-6, 0)
+    # Both were asked by the dry run; the real call asks them again, because
+    # explain() must not leave state behind that dispatch then relies on.
+    assert loser.select_calls == 1 and winner.select_calls == 1
+    result = aiter.rms_norm(small, small_w, 1e-6)
+    decision = plugin.last_decision()
+
+    # Second in the enable list, and selected anyway: the report outranked the
+    # order, which is the whole change.
+    assert decision.provider == "winner"
+    assert decision.reason == plugin.PROVIDER_FASTER
+    # Both were asked again for the real call: comparing needs every offer, so
+    # there is no asking the first and stopping.
+    assert loser.select_calls == 2 and winner.select_calls == 2
+    assert explained.decision.provider == decision.provider
+    assert explained.decision.reason == decision.reason
+    assert torch.allclose(result, _torch_rmsnorm(small, small_w, 1e-6), atol=2e-2)
+
+
+@requires_cuda
+def test_a_reporting_provider_that_lost_leaves_the_call_native(monkeypatch):
+    """Alone and reporting a loss: AITER serves, rather than the slower kernel."""
+
+    big = torch.randn(2048, 4096, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(4096, device="cuda", dtype=torch.bfloat16)
+    native_us = _time_us(lambda: _native_rmsnorm(big, weight, 1e-6))
+    torch_us = _time_us(lambda: _torch_rmsnorm(big, weight, 1e-6))
+
+    loser = _Provider(
+        "loser",
+        _reporting("loser", _torch_rmsnorm, torch_us, native_us, "aiter native"),
+    )
+    loser.op_versions = {"rmsnorm": {2}}
+    plugin.configure(enable=("loser",), source="test")
+    monkeypatch.setattr(plugin, "_entry_points", lambda: (_EntryPoint("l", loser),))
+
+    small = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
+    small_w = torch.randn(256, device="cuda", dtype=torch.bfloat16)
+    aiter.rms_norm(small, small_w, 1e-6)
+
+    assert plugin.last_decision().route == "native"
+
+
+@requires_cuda
+def test_a_comparison_made_at_capture_is_the_one_every_replay_runs(monkeypatch):
+    """Replay executes no Python, so the comparison is made once, at capture.
+
+    `_choose` documents this; without a test it is a belief. The failure it
+    guards against is quiet by construction: a provider that retunes, or that
+    would report differently on later calls, cannot change a captured route,
+    and nothing in the replay says which call decided it.
+    """
+
+    slower = _Provider(
+        "slower", _reporting("slower", _torch_rmsnorm, 9.0, 10.0, "aiter native")
+    )
+    slower.op_versions = {"rmsnorm": {2}}
+    faster = _Provider(
+        "faster", _reporting("faster", _native_rmsnorm, 4.0, 10.0, "aiter native")
+    )
+    faster.op_versions = {"rmsnorm": {2}}
+
+    plugin.configure(enable=("slower", "faster"), source="test")
+    monkeypatch.setattr(
+        plugin,
+        "_entry_points",
+        lambda: (_EntryPoint("s", slower), _EntryPoint("f", faster)),
+    )
+
+    x = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(256, device="cuda", dtype=torch.bfloat16)
+    graph, captured = _capture(lambda: aiter.rms_norm(x, weight, 1e-6))
+
+    decision = plugin.last_decision()
+    assert decision.provider == "faster"
+    assert decision.reason == plugin.PROVIDER_FASTER
+    asked_at_capture = (slower.select_calls, faster.select_calls)
+
+    # The reports reverse: were the comparison live, "slower" would now win.
+    slower.selected = _reporting("slower", _torch_rmsnorm, 1.0, 10.0, "aiter native")
+    graph.replay()
+    torch.cuda.synchronize()
+
+    # Nobody was asked again, and the route did not move.
+    assert (slower.select_calls, faster.select_calls) == asked_at_capture
+    assert plugin.last_decision().provider == "faster"
+    assert torch.allclose(captured, _native_rmsnorm(x, weight, 1e-6), atol=2e-2)
+
+
+# --- The ten routes for out-of-tree providers --------------------------------
+#
+# What a provider depends on and the contract gate cannot see: the public name
+# a caller uses reaches the route, the provider is handed the whole contract in
+# its order, and a call that pins one of AITER's own implementations never
+# reaches a provider at all. A provider that serves means the native never
+# runs, and the bypass tests replace the native body, so none of this needs a
+# device.
+
+# The modules that route these ops, imported at collection: the first
+# _reset_for_testing() keeps the routes registered by then, and a module
+# imported later inside a test would leave its op out of plugin._routed_ops.
+import aiter.fused_moe
+import aiter.mla
+import aiter.ops.attention
+import aiter.ops.gemm_op_a8w8
+import aiter.ops.mha
+import aiter.ops.mhc
+import aiter.ops.mla_sparse_prefill
+import aiter.ops.pa_sparse_prefill_opus
+import aiter.ops.quant
+import aiter.ops.topk
+import aiter.ops.triton.attention.kda
+import aiter.ops.triton.attention.pa_mqa_logits
+import aiter.ops.triton.gated_delta_net.causal_conv1d_prefill
+import aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale
+import aiter.ops.triton.gemm.basic.gemm_a16w16
+import aiter.ops.triton.gluon.mla_gluon
+import aiter.tuned_gemm
+
+
+class _Recorder(_Provider):
+    """A provider that keeps what it was asked."""
+
+    def __init__(self, name, selected):
+        super().__init__(name, selected)
+        self.asked = []
+
+    def select(self, op, args, kwargs):
+        self.asked.append((args, kwargs))
+        return super().select(op, args, kwargs)
+
+
+def _serve(monkeypatch, op, candidate):
+    provider = _Recorder("aklr", candidate)
+    routed = plugin._routed_ops.get(op)
+    provider.op_versions = {op: {routed.op.version if routed else 1}}
+    plugin.configure(enable=("aklr",), source="test")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+    return provider
+
+
+def _z(*shape, dtype=torch.float32):
+    return torch.zeros(*shape, dtype=dtype)
+
+
+def _v4_args():
+    return {
+        "q_nope": _z(2, 4, 448, dtype=torch.bfloat16),
+        "q_rope": _z(2, 4, 64, dtype=torch.bfloat16),
+        "unified_kv_nope": _z(4, 448, dtype=torch.bfloat16),
+        "unified_kv_rope": _z(4, 64, dtype=torch.bfloat16),
+        "kv_indices_prefix": _z(4, dtype=torch.int32),
+        "kv_indptr_prefix": torch.tensor([0, 2, 4], dtype=torch.int32),
+        "kv_nope": _z(4, 448, dtype=torch.bfloat16),
+        "kv_rope": _z(4, 64, dtype=torch.bfloat16),
+        "kv_indices_extend": _z(4, dtype=torch.int32),
+        "kv_indptr_extend": torch.tensor([0, 2, 4], dtype=torch.int32),
+        "attn_sink": None,
+        "softmax_scale": 0.25,
+    }
+
+
+def _mhc_args():
+    m, hc, hidden = 2, 4, 64
+    return {
+        "layer_input": _z(m, hidden, dtype=torch.bfloat16),
+        "residual_in": _z(m, hc, hidden, dtype=torch.bfloat16),
+        "post_layer_mix": _z(m, hc, 1),
+        "comb_res_mix": _z(m, hc, hc),
+        "fn": _z(hc * (hc + 2), hc * hidden),
+        "hc_scale": _z(3),
+        "hc_base": _z(hc * (hc + 2)),
+    }
+
+
+def _mhc_result():
+    return (_z(2, 4, 1), _z(2, 4, 4), _z(2, 64, dtype=torch.bfloat16), _z(2, 4, 64))
+
+
+def _gluon_args():
+    return {
+        "q_nope": _z(2, 4, 512, dtype=torch.bfloat16),
+        "q_pe": _z(2, 4, 64, dtype=torch.bfloat16),
+        "kv_c": _z(8, 576, dtype=torch.bfloat16),
+        "o": _z(2, 4, 512, dtype=torch.bfloat16),
+        "page_table": _z(2, 4, dtype=torch.int32),
+        "seq_info": torch.tensor([4, 4], dtype=torch.int32),
+        "sm_scale": 0.5,
+    }
+
+
+def _route_cases():
+    """(call, a parameter the call sets, its value, what the provider returns).
+
+    The parameter is one the call sets away from its default, so the test sees
+    that the provider is handed the caller's value in the contract's position,
+    not just a tuple of the right length.
+    """
+
+    from aiter import dtypes
+    from aiter.fused_moe import fused_moe
+    from aiter.mla import mla_decode_fwd
+    from aiter.ops import mhc, mla_sparse_prefill, pa_sparse_prefill_opus, quant
+    from aiter.ops.topk import biased_grouped_topk
+    from aiter.ops.triton.attention import pa_mqa_logits
+    from aiter.ops.triton.attention.kda import (
+        fused_recurrent_kda,
+        fused_recurrent_kda_packed_decode,
+    )
+    from aiter.ops.triton.gated_delta_net.causal_conv1d_prefill import (
+        causal_conv1d_split_qkv_triton_tile_fn,
+    )
+    from aiter.ops.triton.gemm.basic import gemm_a8w8_blockscale as triton_blockscale
+    from aiter.ops.triton.gemm.basic import gemm_a16w16 as triton_a16w16
+    from aiter.ops.triton.gluon import mla_gluon
+    from aiter.tuned_gemm import gemm_a16w16
+
+    out = _z(2, 3, dtype=torch.bfloat16)
+    cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
+    ps_args = (
+        _z(4, 2, 192, dtype=torch.bfloat16),
+        _z(4, 2, 192, dtype=torch.bfloat16),
+        _z(4, 2, 128, dtype=torch.bfloat16),
+        cu_seqlens,
+        cu_seqlens,
+        _z(4, dtype=torch.int32),
+        None,
+        None,
+        4,
+        0.25,
+    )
+    kda_state = _z(2, 2, 8, 8)
+    logits_args = (_z(2, 1, 4, 128), _z(8, 1, 1, 132), _z(2, 4), _z(2, 64))
+    logits_args += (
+        torch.tensor([4, 4], dtype=torch.int32),
+        _z(2, 8, dtype=torch.int32),
+        64,
+    )
+    return {
+        "gemm_a16w16": (
+            lambda: gemm_a16w16(_z(2, 4), _z(3, 4), otype=torch.bfloat16),
+            "otype",
+            torch.bfloat16,
+            out,
+        ),
+        "gemm_a16w16_activation": (
+            lambda: triton_a16w16.gemm_a16w16(_z(2, 4), _z(3, 4), activation="silu"),
+            "activation",
+            "silu",
+            out,
+        ),
+        "gemm_a8w8_blockscale_out": (
+            lambda: triton_blockscale.gemm_a8w8_blockscale(
+                _z(2, 128), _z(3, 128), _z(2, 1), _z(1, 1), kernel_type="compute_bound"
+            ),
+            "kernel_type",
+            "compute_bound",
+            out,
+        ),
+        "fused_moe": (
+            lambda: fused_moe(
+                _z(2, 8, dtype=torch.bfloat16),
+                _z(2, 16, 8, dtype=torch.bfloat16),
+                _z(2, 8, 8, dtype=torch.bfloat16),
+                _z(2, 1),
+                _z(2, 1, dtype=torch.int32),
+                splitk=3,
+            ),
+            "splitk",
+            3,
+            _z(2, 8, dtype=torch.bfloat16),
+        ),
+        "biased_grouped_topk": (
+            lambda: biased_grouped_topk(
+                _z(2, 8),
+                _z(8),
+                _z(2, 2),
+                _z(2, 2, dtype=torch.int32),
+                1,
+                1,
+                True,
+                routed_scaling_factor=2.5,
+            ),
+            "routed_scaling_factor",
+            2.5,
+            None,
+        ),
+        "mla_decode_fwd": (
+            lambda: mla_decode_fwd(
+                _z(2, 4, 576),
+                _z(8, 1, 1, 576),
+                _z(2, 4, 512),
+                torch.tensor([0, 1, 2], dtype=torch.int32),
+                torch.tensor([0, 4, 8], dtype=torch.int32),
+                _z(8, dtype=torch.int32),
+                torch.ones(2, dtype=torch.int32),
+                1,
+                logit_cap=30.0,
+            ),
+            "logit_cap",
+            30.0,
+            (out, None),
+        ),
+        # The provider returns lse alone: an empty tensor when return_lse is False.
+        "mla_paged_decode": (
+            lambda: mla_gluon.mla_gluon(**_gluon_args(), kv_scale=2.0),
+            "kv_scale",
+            2.0,
+            _z(0),
+        ),
+        "fp8_paged_mqa_logits": (
+            lambda: pa_mqa_logits.deepgemm_fp8_paged_mqa_logits(
+                *logits_args, ChunkK=128
+            ),
+            "ChunkK",
+            128,
+            None,
+        ),
+        "mla_sparse_prefill_v4": (
+            lambda: mla_sparse_prefill.mla_sparse_prefill_v4(**_v4_args()),
+            "softmax_scale",
+            0.25,
+            _z(2, 4, 512, dtype=torch.bfloat16),
+        ),
+        "mhc_fused_post_pre": (
+            lambda: mhc.mhc_fused_post_pre(**_mhc_args(), sinkhorn_repeat=7),
+            "sinkhorn_repeat",
+            7,
+            _mhc_result(),
+        ),
+        "per_group_quant": (
+            lambda: quant.per_1x32_mx_quant_hip(
+                _z(2, 64), quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+            ),
+            "group_size",
+            32,
+            (_z(2, 64), _z(2, 2)),
+        ),
+        # The name SGLang imports, from before the Triton tree was reorganised.
+        "fp8_paged_mqa_logits (old path)": (
+            lambda: __import__(
+                "aiter.ops.triton.pa_mqa_logits", fromlist=["_"]
+            ).deepgemm_fp8_paged_mqa_logits(*logits_args, ChunkK=128),
+            "ChunkK",
+            128,
+            None,
+        ),
+        # The opus-pinned name enters the route where the default would pick
+        # opus anyway; the test pins that answer rather than read the device.
+        "mla_sparse_prefill_v4 (opus name)": (
+            lambda: pa_sparse_prefill_opus.pa_sparse_prefill_fp8_opus(**_v4_args()),
+            "softmax_scale",
+            0.25,
+            _z(2, 4, 512, dtype=torch.bfloat16),
+        ),
+        "flash_attn_varlen": (
+            lambda: aiter.flash_attn_varlen_func(
+                *ps_args[:3], cu_seqlens, cu_seqlens, 4, 4, causal=True
+            ),
+            "causal",
+            True,
+            _z(4, 2, 128, dtype=torch.bfloat16),
+        ),
+        "mla_prefill_ps": (
+            lambda: aiter.mla_prefill_ps_asm_fwd(
+                *ps_args,
+                True,
+                _z(2, 2, 128),
+                _z(2, 2),
+                _z(4, 2, 128, dtype=torch.bfloat16),
+            ),
+            "is_causal",
+            True,
+            None,
+        ),
+        "mla_reduce": (
+            lambda: aiter.mla_reduce_v1(
+                _z(2, 2, 128),
+                _z(2, 2),
+                torch.tensor([0, 2], dtype=torch.int32),
+                None,
+                torch.tensor([0, 1], dtype=torch.int32),
+                4,
+                0,
+                _z(1, 2, 128, dtype=torch.bfloat16),
+            ),
+            "max_seqlen_q",
+            4,
+            None,
+        ),
+        "gemm_a8w8_bpreshuffle": (
+            lambda: aiter.gemm_a8w8_bpreshuffle(
+                _z(2, 256, dtype=dtypes.fp8),
+                _z(16, 256, dtype=dtypes.fp8),
+                _z(2, 1),
+                _z(16, 1),
+                None,
+                torch.float16,
+            ),
+            "dtype",
+            torch.float16,
+            _z(2, 16, dtype=torch.float16),
+        ),
+        "causal_conv1d_split_qkv": (
+            lambda: causal_conv1d_split_qkv_triton_tile_fn(
+                _z(24, 4, dtype=torch.bfloat16),
+                _z(24, 4, dtype=torch.bfloat16),
+                None,
+                _z(1, 24, 3, dtype=torch.bfloat16),
+                cu_seqlens,
+                8,
+                8,
+            ),
+            "k_dim",
+            8,
+            tuple(_z(4, 8, dtype=torch.bfloat16) for _ in range(3)),
+        ),
+        "fused_recurrent_kda": (
+            lambda: fused_recurrent_kda(
+                *(_z(1, 1, 2, 8) for _ in range(4)), _z(1, 1, 2), scale=0.5
+            ),
+            "scale",
+            0.5,
+            (_z(1, 1, 2, 8), None),
+        ),
+        "fused_recurrent_kda_packed_decode": (
+            lambda: fused_recurrent_kda_packed_decode(
+                _z(1, 48),
+                _z(1, 2, 8),
+                _z(1, 2),
+                _z(2),
+                _z(2, 8),
+                None,
+                kda_state,
+                torch.tensor([1], dtype=torch.int32),
+                _z(2, 48, 3),
+                _z(3, 4, 16),
+                _z(1, 2, 8),
+                _z(8),
+                1e-6,
+                _z(1, 2, 8),
+            ),
+            "norm_eps",
+            1e-6,
+            _z(1, 2, 8),
+        ),
+    }
+
+
+_ROUTE_CASES = [
+    "gemm_a16w16",
+    "gemm_a16w16_activation",
+    "gemm_a8w8_blockscale_out",
+    "fused_moe",
+    "biased_grouped_topk",
+    "mla_decode_fwd",
+    "mla_paged_decode",
+    "fp8_paged_mqa_logits",
+    "fp8_paged_mqa_logits (old path)",
+    "mla_sparse_prefill_v4",
+    "mla_sparse_prefill_v4 (opus name)",
+    "mhc_fused_post_pre",
+    "per_group_quant",
+    "flash_attn_varlen",
+    "mla_prefill_ps",
+    "mla_reduce",
+    "gemm_a8w8_bpreshuffle",
+    "causal_conv1d_split_qkv",
+    "fused_recurrent_kda",
+    "fused_recurrent_kda_packed_decode",
+]
+
+
+@pytest.mark.parametrize("case", _ROUTE_CASES)
+def test_the_public_name_hands_a_provider_the_whole_contract(monkeypatch, case):
+    import warnings
+
+    from aiter.ops import pa_sparse_prefill_opus
+
+    monkeypatch.setattr(
+        pa_sparse_prefill_opus, "_v4_auto_tries_asm", lambda *args: False
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        call, name, value, served = _route_cases()[case]
+    op = case.split(" ")[0]
+    provider = _serve(monkeypatch, op, _candidate("aklr", served))
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        result = call()
+
+    decision = plugin.last_decision()
+    assert (decision.route, decision.provider) == ("provider", "aklr")
+    assert len(provider.asked) == 1
+    args, _ = provider.asked[0]
+    # The signature route() captured: the contract a provider implements.
+    positional = [
+        p.name
+        for p in plugin._routed_ops[op].contract.parameters.values()
+        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+    ]
+    assert len(args) == len(positional), (
+        f"{op}: the provider was handed {len(args)} arguments, the contract has "
+        f"{len(positional)}"
+    )
+    assert (
+        args[positional.index(name)] == value
+    ), f"{op}: {name} did not arrive in its place in the contract"
+    if case == "mla_paged_decode":
+        assert result[1] is None, "return_lse=False must give no lse"
+    elif isinstance(served, torch.Tensor):
+        assert torch.equal(result, served)
+
+
+def test_the_old_triton_path_is_the_module_at_the_new_one():
+    """Importing it runs no module code twice, so no route is registered twice."""
+
+    import importlib
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        old = importlib.import_module("aiter.ops.triton.pa_mqa_logits")
+    new = importlib.import_module("aiter.ops.triton.attention.pa_mqa_logits")
+    assert old is new
+
+
+def _pinned_cases():
+    """(op, call, the module and name of the native body it must reach, its result)."""
+
+    from aiter.ops import mhc, mla_sparse_prefill, pa_sparse_prefill_opus
+    from aiter.ops.triton.gemm.basic import gemm_a8w8_blockscale as triton_blockscale
+    from aiter.ops.triton.gemm.basic import gemm_a16w16 as triton_a16w16
+    from aiter.ops.triton.gluon import mla_gluon
+
+    out = _z(2, 3, dtype=torch.bfloat16)
+    v4 = _z(2, 4, 512, dtype=torch.bfloat16)
+    return {
+        "triton gemm_a16w16, backend=": (
+            "gemm_a16w16_activation",
+            lambda: triton_a16w16.gemm_a16w16(_z(2, 4), _z(3, 4), backend="triton"),
+            (triton_a16w16, "_gemm_a16w16_native"),
+            out,
+        ),
+        "triton gemm_a8w8_blockscale, backend=": (
+            "gemm_a8w8_blockscale_out",
+            lambda: triton_blockscale.gemm_a8w8_blockscale(
+                _z(2, 128), _z(3, 128), _z(2, 1), _z(1, 1), backend="triton"
+            ),
+            (triton_blockscale, "_gemm_a8w8_blockscale_native"),
+            out,
+        ),
+        "mla_sparse_prefill_v4, backend=": (
+            "mla_sparse_prefill_v4",
+            lambda: mla_sparse_prefill.mla_sparse_prefill_v4(
+                **_v4_args(), backend="opus"
+            ),
+            (mla_sparse_prefill, "_opus_sparse_prefill_v4"),
+            v4,
+        ),
+        "pa_sparse_prefill_fp8_opus where the default tries asm": (
+            "mla_sparse_prefill_v4",
+            lambda: pa_sparse_prefill_opus.pa_sparse_prefill_fp8_opus(**_v4_args()),
+            (pa_sparse_prefill_opus, "_opus_sparse_prefill_v4"),
+            v4,
+        ),
+        "mhc_fused_post_pre, force_fused=": (
+            "mhc_fused_post_pre",
+            lambda: mhc.mhc_fused_post_pre(**_mhc_args(), force_fused=True),
+            (mhc, "_mhc_fused_post_pre_native"),
+            _mhc_result(),
+        ),
+        "mhc_fused_post_pre, backend=": (
+            "mhc_fused_post_pre",
+            lambda: mhc.mhc_fused_post_pre(**_mhc_args(), backend="hip"),
+            (mhc, "_mhc_fused_post_pre_native"),
+            _mhc_result(),
+        ),
+        "mla_gluon prefill mode": (
+            "mla_paged_decode",
+            lambda: mla_gluon.mla_gluon(**_gluon_args(), has_pe=False),
+            (mla_gluon, "_mla_gluon_launch"),
+            (out, None),
+        ),
+        "mla_gluon with a sink": (
+            "mla_paged_decode",
+            lambda: mla_gluon.mla_gluon(**_gluon_args(), attn_sink=_z(4)),
+            (mla_gluon, "_mla_gluon_launch"),
+            (out, None),
+        ),
+        "mla_gluon with kv_split_info": (
+            "mla_paged_decode",
+            lambda: mla_gluon.mla_gluon(
+                **_gluon_args(),
+                kv_split_info=(_z(8, 8, dtype=torch.int32), _z(3, dtype=torch.int32)),
+            ),
+            (mla_gluon, "_mla_gluon_launch"),
+            (out, None),
+        ),
+    }
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "triton gemm_a16w16, backend=",
+        "triton gemm_a8w8_blockscale, backend=",
+        "mla_sparse_prefill_v4, backend=",
+        "pa_sparse_prefill_fp8_opus where the default tries asm",
+        "mhc_fused_post_pre, force_fused=",
+        "mhc_fused_post_pre, backend=",
+        "mla_gluon prefill mode",
+        "mla_gluon with a sink",
+        "mla_gluon with kv_split_info",
+    ],
+)
+def test_a_pinned_call_runs_aiter_s_own_and_asks_no_provider(monkeypatch, case):
+    """A pin names one of AITER's implementations; a provider has one kernel.
+
+    The provider is enabled and willing, so a pin that leaked into the route
+    would show up as a select call. Each condition is its own case, as for the
+    output buffers above: one test passing them together would still pass with
+    a condition dropped.
+    """
+
+    from aiter.ops import pa_sparse_prefill_opus
+
+    op, call, (module, native), result = _pinned_cases()[case]
+    monkeypatch.setattr(pa_sparse_prefill_opus, "_v4_auto_tries_asm", lambda *a: True)
+    monkeypatch.setattr(module, native, lambda *args, **kwargs: result)
+    provider = _serve(monkeypatch, op, _candidate("aklr", "provider-ran"))
+
+    got = call()
+
+    assert provider.asked == [], f"{case}: a provider was asked to select"
+    if isinstance(result, torch.Tensor):
+        assert torch.equal(got, result)
+
+
+def test_gemm_a16w16_out_refuses_a_result_that_is_not_out(monkeypatch):
+    """`gemm_a16w16_out` returns nothing, so its caller reads only `out`.
+
+    A provider that answers in a tensor of its own would leave `out` stale with
+    no error; the public function checks it instead.
+    """
+
+    from aiter.tuned_gemm import gemm_a16w16_out
+
+    _serve(monkeypatch, "gemm_a16w16", _candidate("aklr", _z(2, 3)))
+    with pytest.raises(RuntimeError, match="not written into out"):
+        gemm_a16w16_out(_z(2, 4), _z(3, 4), _z(2, 3))
+
+
+def test_gemm_a16w16_out_takes_a_result_written_into_out(monkeypatch):
+    from aiter.tuned_gemm import gemm_a16w16_out
+
+    in_place = plugin.KernelCandidate(
+        provider="aklr",
+        kernel_id="kernel-1",
+        artifact_digest="sha256:abc",
+        qualification="experimental",
+        run=lambda *args, **kwargs: args[7].fill_(1.0),
+    )
+    _serve(monkeypatch, "gemm_a16w16", in_place)
+    out = _z(2, 3)
+    gemm_a16w16_out(_z(2, 4), _z(3, 4), out)
+    assert torch.equal(out, torch.ones(2, 3))
+
+
+def test_mla_gluon_returns_the_lse_a_provider_computed(monkeypatch):
+    """The routed layer returns lse alone; mla_gluon puts o back in front."""
+
+    from aiter.ops.triton.gluon import mla_gluon
+
+    lse = torch.ones(2, 1, 4)
+    _serve(monkeypatch, "mla_paged_decode", _candidate("aklr", lse))
+    args = _gluon_args()
+    o, got = mla_gluon.mla_gluon(**args, return_lse=True)
+    assert o is args["o"]
+    assert torch.equal(got, lse)
+
+
+def test_fused_moe_leaves_no_presort_behind_a_served_call(monkeypatch):
+    """A served call returns before the native path consumes the registration.
+
+    Left in place, it would apply to the next native call on the same routing
+    buffers. The public fused_moe clears it when the call ends.
+    """
+
+    from aiter import presorted_moe
+    from aiter.fused_moe import fused_moe
+
+    _serve(monkeypatch, "fused_moe", _candidate("aklr", _z(2, 8, dtype=torch.bfloat16)))
+    presorted_moe.register_presorted_moe({"M": 2})
+    fused_moe(
+        _z(2, 8, dtype=torch.bfloat16),
+        _z(2, 16, 8, dtype=torch.bfloat16),
+        _z(2, 8, 8, dtype=torch.bfloat16),
+        _z(2, 1),
+        _z(2, 1, dtype=torch.int32),
+    )
+    assert plugin.last_decision().route == "provider"
+    assert presorted_moe.pop_presorted_moe() is None, "the presort survived the call"
+
+
+@pytest.mark.parametrize("op", ["gemm_a16w16_activation", "gemm_a8w8_blockscale_out"])
+def test_a_triton_gemm_refuses_a_result_that_is_not_y(monkeypatch, op):
+    """With y given, the caller may read only y, so the result must be y."""
+
+    from aiter.ops.triton.gemm.basic import gemm_a8w8_blockscale as triton_blockscale
+    from aiter.ops.triton.gemm.basic import gemm_a16w16 as triton_a16w16
+
+    if op == "gemm_a16w16_activation":
+        y_index, args = 4, (_z(2, 4), _z(3, 4))
+        call = triton_a16w16.gemm_a16w16
+    else:
+        y_index, args = 5, (_z(2, 128), _z(3, 128), _z(2, 1), _z(1, 1))
+        call = triton_blockscale.gemm_a8w8_blockscale
+
+    _serve(monkeypatch, op, _candidate("aklr", _z(2, 3, dtype=torch.bfloat16)))
+    with pytest.raises(RuntimeError, match="not written into y"):
+        call(*args, y=_z(2, 3, dtype=torch.bfloat16))
+
+    plugin._reset_for_testing()
+    in_place = plugin.KernelCandidate(
+        provider="aklr",
+        kernel_id="kernel-1",
+        artifact_digest="sha256:abc",
+        qualification="experimental",
+        run=lambda *a, **k: a[y_index].fill_(1.0),
+    )
+    _serve(monkeypatch, op, in_place)
+    y = _z(2, 3, dtype=torch.bfloat16)
+    assert call(*args, y=y) is y
+    assert torch.equal(y, torch.ones(2, 3, dtype=torch.bfloat16))
+
+
+# ---------------------------------------------------------------------------
+# Registration actually reaching torch, not just `fake=` being present
+#
+# `tests/test_plugin_contracts.py` reads the source and checks that a route
+# passes `fake=`; the registry check above reads the plugin's own dict. Neither
+# calls into torch. `_as_custom_op` returns None on any failure and logs at
+# debug level, so a torch change that broke `infer_schema` would un-register
+# every contract silently: the gate would stay green, the registry would still
+# list them, and the ops would be back to splitting a caller's graph with
+# nothing to say so.
+#
+# These names are the ones whose contract was changed to make registration
+# possible at all. If registration stops reaching torch, the change has no
+# remaining effect and this is where that shows up.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "op_name",
+    [
+        "gemm_a8w8_blockscale_bpreshuffle",
+        "mla_sparse_prefill",
+        "mla_sparse_prefill_v41",
+        "inverse_rope_group_quant",
+        "pa_decode_bf16",
+        "pa_fwd",
+    ],
+)
+def test_the_buffer_free_contracts_resolve_under_torch_ops(op_name):
+    """Each contract is reachable as a real custom op after import."""
+    import aiter.ops.attention
+    import aiter.ops.gemm_op_a8w8
+    import aiter.ops.inverse_rope_group_quant
+    import aiter.ops.mla_sparse_prefill  # noqa: F401
+
+    namespace = getattr(torch.ops, "aiter_routed", None)
+    assert namespace is not None, "no routed op registered at all"
+    assert hasattr(namespace, op_name), (
+        f"{op_name} passes fake= but did not reach torch.ops.aiter_routed; "
+        "_as_custom_op swallows the reason, so check its debug log"
+    )
+
+    # The registered schema must carry exactly the contract's parameters.
+    # Comparing against the recorded baseline rather than a list of likely
+    # buffer names: `x_scale` is an output buffer for one of these ops and an
+    # input for another, so a name-based check reads the wrong way round
+    # depending on which op it is applied to.
+    # Split on the arrow first: a tuple return is parenthesised too, so the
+    # last ")" in the string belongs to the result for some of these ops.
+    schema = str(getattr(namespace, op_name).default._schema)
+    head = schema.split("->")[0]
+    parameters = head[head.index("(") + 1 : head.rindex(")")]
+    registered = [
+        part.strip().split()[-1].split("=")[0]
+        for part in parameters.split(",")
+        if part.strip() and part.strip() != "*"
+    ]
+
+    baseline = json.loads(
+        (Path(__file__).with_name("plugin_contracts.json")).read_text()
+    )[op_name]["signature"]
+    expected = [
+        piece.split(":")[0].strip()
+        for piece in baseline.split(", ->")[0].split(",")
+        if piece.strip()
+    ]
+
+    assert registered == expected, (
+        f"{op_name}'s registered schema does not match the recorded contract.\n"
+        f"  registered: {registered}\n"
+        f"  contract:   {expected}"
+    )
+
+    # Dropping the buffer bumped the op version, so the version a provider may
+    # still serve has to be announced. `status()` is the only place a framework
+    # can read that from.
+    superseded = [
+        entry
+        for entry in plugin.status()["deprecations"]
+        if entry["kind"] == "op-version" and entry["subject"] == op_name
+    ]
+    assert len(superseded) == 1, f"{op_name} does not announce its superseded version"
+    assert (
+        superseded[0]["version"]
+        == plugin.status()["routed_ops"][op_name]["version"] - 1
+    )
+
+
+# ---------------------------------------------------------------------------
+# pa_fwd: the out-buffer bypass, and which spellings route
+#
+# `pa_fwd` has two public spellings and one of them is named `_asm`, which
+# looks like a backend pin and is not: `pa_fwd_asm` predates the neutral name,
+# so an ordinary call through it routes. Only `kernelName` pins a kernel no
+# provider has, and only that bypasses on its own.
+#
+# The other bypass is `out_`. The buffered form RETURNS the buffer it was
+# given, while a custom op's schema declares its results do not alias its
+# inputs; v2 leaves the buffer out of the contract rather than picking a side
+# of that contradiction.
+#
+# Five call sites in op_tests pass `out_`, so after this change they exercise
+# the bypass and nothing exercises the routed path. These tests are that
+# coverage: each pins WHICH path ran, not merely that the call returned.
+# ---------------------------------------------------------------------------
+
+
+def _pa_fwd_args(device="cpu"):
+    """The eleven parameters of the v2 contract -- no output buffer."""
+    heads, head_dim, batch, pages = 2, 16, 1, 1
+    return (
+        torch.randn(batch, heads, head_dim, device=device),
+        torch.randn(pages, heads, head_dim, device=device),
+        torch.randn(pages, heads, head_dim, device=device),
+        torch.zeros(batch, 1, dtype=torch.int32, device=device),
+        torch.ones(batch, dtype=torch.int32, device=device),
+        1,
+    )
+
+
+def _serve_pa_fwd(monkeypatch, served):
+    """Enable a provider for the pa_fwd contract and hand back its spy."""
+    provider = _Provider("aklr", _candidate("aklr", served))
+    provider.op_versions = {"pa_fwd": {2}}
+    plugin.configure(enable=("aklr",), source="test")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+    return provider
+
+
+@pytest.mark.parametrize("spelling", ["pa_fwd", "pa_fwd_asm"])
+def test_pa_fwd_both_spellings_route_when_no_buffer_is_named(monkeypatch, spelling):
+    """`pa_fwd_asm` is a historical name, not a backend pin, so it routes too.
+
+    Parametrised over both names rather than testing the neutral one alone:
+    the `_asm` suffix reads like a pin, and a reader who assumes it bypasses
+    would leave half this op's callers unrouted without noticing.
+    """
+    module = sys.modules["aiter.ops.attention"]
+    served = torch.zeros(1, 2, 16)
+    provider = _serve_pa_fwd(monkeypatch, served)
+
+    result = getattr(module, spelling)(*_pa_fwd_args())
+
+    decision = plugin.last_decision()
+    assert (decision.route, decision.provider) == ("provider", "aklr")
+    assert provider.select_calls == 1
+    assert torch.equal(result, served)
+
+
+@pytest.mark.parametrize("spelling", ["pa_fwd", "pa_fwd_asm"])
+def test_pa_fwd_naming_the_output_buffer_bypasses_routing(monkeypatch, spelling):
+    """A named `out_` must not reach a provider, from either spelling.
+
+    The native body is replaced so this runs without a device: what is under
+    test is which branch the public name picks, not what the kernel computes.
+    """
+    module = sys.modules["aiter.ops.attention"]
+    sentinel = object()
+    monkeypatch.setattr(module, "_pa_fwd_native", lambda *a, **k: sentinel)
+    provider = _serve_pa_fwd(monkeypatch, served=None)
+
+    args = _pa_fwd_args()
+    result = getattr(module, spelling)(*args, out_=torch.zeros(1, 2, 16))
+
+    assert result is sentinel, "naming out_ did not reach the native body"
+    assert provider.select_calls == 0, (
+        "a named buffer must not reach a provider: the buffered form returns "
+        "the tensor it was given, which the registered schema forbids"
+    )
+
+
+def test_pa_fwd_kernel_name_bypasses_routing(monkeypatch):
+    """`kernelName` pins one asm kernel, which no provider has.
+
+    This is the only argument that bypasses on its own; keeping it pinned
+    separately from `out_` stops the two reasons being merged into one.
+    """
+    module = sys.modules["aiter.ops.attention"]
+    sentinel = object()
+    monkeypatch.setattr(module, "_pa_fwd_native", lambda *a, **k: sentinel)
+    provider = _serve_pa_fwd(monkeypatch, served=None)
+
+    result = module.pa_fwd_asm(*_pa_fwd_args(), kernelName="pa_fwd_some_kernel")
+
+    assert result is sentinel
+    assert provider.select_calls == 0
+
+
+def test_pa_fwd_buffered_form_returns_the_caller_s_buffer(monkeypatch):
+    """Buffer identity through the dispatcher, not just a correct value.
+
+    A fake that allocates returns the right value while leaving the caller's
+    buffer unwritten -- correct return, stale buffer, no error. The assertion
+    is on `data_ptr`, so it fails if the dispatcher hands back a different
+    allocation that merely holds the right numbers.
+    """
+    module = sys.modules["aiter.ops.attention"]
+    buffer = torch.zeros(1, 2, 16)
+
+    def native(*args, **kwargs):
+        # `out_` sits after V_QScale in the native signature.
+        assert args[9] is buffer
+        args[9].fill_(1.0)
+        return args[9]
+
+    monkeypatch.setattr(module, "_pa_fwd_native", native)
+    result = module.pa_fwd(*_pa_fwd_args(), out_=buffer)
+
+    assert result.data_ptr() == buffer.data_ptr()
+    assert torch.equal(result, torch.ones(1, 2, 16))

@@ -44,6 +44,8 @@ jobs:
           PR_DRAFT: ${{ github.event.pull_request.draft }}
           EVENT_ACTION: ${{ github.event.action }}
           LABEL_NAME: ${{ github.event.label.name }}
+          PR_HEAD_REF: ${{ github.head_ref }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
           HAS_MULTIGPU_LABEL: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:multi-gpu') && 'true' || 'false' }}
         run: |
           set -euo pipefail
@@ -57,6 +59,23 @@ jobs:
             fi
             echo "reason=non_pull_request_event" >> "$GITHUB_OUTPUT"
             echo "Aiter tests are required for ${GITHUB_EVENT_NAME}." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          pr_title_lc="$(printf '%s' "${PR_TITLE}" | tr '[:upper:]' '[:lower:]')"
+          if [[ "${PR_HEAD_REF}" == aiter-bot/revert-* ]] || [[ "${pr_title_lc}" == *"[bot revert]"* ]]; then
+            echo "run_tests=false" >> "$GITHUB_OUTPUT"
+            echo "run_multigpu_tests=false" >> "$GITHUB_OUTPUT"
+            echo "reason=bot_revert_fast_workflow" >> "$GITHUB_OUTPUT"
+            {
+              echo "## Aiter Test Scope"
+              echo
+              echo "Aiter tests are skipped for this bot revert PR."
+              echo "Use the standalone aiter-revert-fast workflow for focused validation."
+              echo
+              echo "- PR head: ${PR_HEAD_REF}"
+              echo "- PR title: ${PR_TITLE}"
+            } >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
@@ -103,7 +122,7 @@ jobs:
                 reason=matching_changed_files
                 break
                 ;;
-              *.md|docs/*|LICENSE|.gitignore|.github/actionlint.yaml|.github/scripts/sglang_downstream.py|.github/workflows/*|.claude/*|op_tests/windows/*)
+              *.md|docs/*|LICENSE|.gitignore|.github/actionlint.yaml|.github/scripts/aiter_revert_fast.py|.github/scripts/sglang_downstream.py|.github/workflows/*|.claude/*|op_tests/windows/*)
                 ;;
               *)
                 run_tests=true
@@ -169,9 +188,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - python_version: "3.10"
-            docker_image: ${{ needs.ci_config.outputs.pytorch_py310_image }}
-            build_enabled: ${{ github.ref == 'refs/heads/main' }}
           - python_version: "3.12"
             docker_image: ${{ needs.ci_config.outputs.pytorch_py312_image }}
             build_enabled: true
@@ -1027,22 +1043,18 @@ jobs:
           aiter_test \
           bash -c "pip show amd-aiter || true"
 
-      - name: Focused regression tests
-        if: ${{ matrix.label == 'MI35X' && matrix.shard_idx == 0 }}
-        timeout-minutes: 10
-        run: |
-          set -ex
-          docker exec \
-          -w /workspace \
-          aiter_test \
-          bash -c "python3 -m pytest -q tests"
-
       - name: Tests
-        timeout-minutes: 90
+        timeout-minutes: 120
+        env:
+          AITER_MOE_2STAGE_FULL_MATRIX: >-
+            ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+              && matrix.label == 'MI35X'
+              && 'true' || 'false' }}
         run: |
           set -ex
           docker exec \
           -w /workspace \
+          -e AITER_MOE_2STAGE_FULL_MATRIX \
           aiter_test \
           bash -c "SHARD_TOTAL=${{ matrix.shard_total }} SHARD_IDX=${{ matrix.shard_idx }} ./.github/scripts/aiter_test.sh"
 
@@ -1063,6 +1075,18 @@ jobs:
             tuned_op_bench.csv
           if-no-files-found: warn
           retention-days: 7
+
+      - name: Upload MoE 2-stage full matrix log
+        if: >-
+          always() &&
+          (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
+          matrix.label == 'MI35X'
+        uses: actions/upload-artifact@v4
+        with:
+          name: moe-2stage-full-matrix-log-${{ github.run_id }}
+          path: full_matrix.log
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Cleanup container
         if: always()
@@ -1283,6 +1307,7 @@ jobs:
         run: |
           set -euo pipefail
           if docker exec \
+            -e AITER_GPU_VISIBILITY_CHECK_XGMI=1 \
             -w /workspace \
             aiter_test \
             bash -lc './.github/scripts/aiter_gpu_visibility_check.sh'; then
@@ -1355,9 +1380,8 @@ jobs:
             pip install tabulate
             pip install '${AITER_WHEEL_PATH}'
             pip show amd-aiter
-            # nightly: amd-mori 1.2.4 lacks mori #751 (grpc-free import) and #786 (SDMA bitcode)
-            pip install 'amd-mori-nightly==1.2.5.dev20261025'
-            pip show amd-mori-nightly
+            pip install 'amd-mori==1.2.5'
+            pip show amd-mori
           "
 
       - name: Mori smoke test

@@ -15,6 +15,8 @@ from __future__ import annotations
 import sys
 import textwrap
 import threading
+from dataclasses import dataclass
+from typing import Any, ClassVar
 
 import pytest
 
@@ -201,3 +203,48 @@ def test_a_broken_entry_point_scan_does_not_raise_into_the_call(monkeypatch):
     assert (
         plugin.status()["skipped_providers"][0]["entry_point"] == "<entry point scan>"
     )
+
+
+def test_an_entry_point_pointing_at_a_class_is_instantiated(monkeypatch):
+    """The spelling the README documents, and the one that was broken.
+
+    A class has a ``select`` attribute of its own -- the unbound function --
+    so deciding "instance or factory" by ``hasattr(loaded, "select")`` treats
+    the class as a ready instance. Dispatch then calls
+    ``Provider.select(op, args, kwargs)`` with ``op`` landing in ``self``, and
+    the provider is dropped with ``provider-select-error`` on every call.
+
+    Nothing caught it because every test and every example in this file hands
+    discovery an instance. The documented entry point -- ``mylib = "pkg:Cls"``
+    -- hands it a class.
+    """
+
+    seen = []
+
+    class Provider:
+        name = "classprov"
+        api_versions: ClassVar[set] = {plugin.API_VERSION}
+        op_versions: ClassVar[dict] = {"test.add": {1}}
+
+        def select(self, op, args, kwargs):
+            seen.append((op.name, args, dict(kwargs)))
+
+    @dataclass
+    class _EP:
+        name: str
+        target: Any
+
+        def load(self):
+            return self.target
+
+    monkeypatch.setattr(plugin, "_entry_points", lambda: (_EP("classprov", Provider),))
+
+    records = plugin._providers()
+    assert [record.name for record in records] == ["classprov"]
+    # An instance, not the class object: calling select on the class would put
+    # `op` into `self` and lose `kwargs`.
+    assert isinstance(records[0].provider, Provider)
+
+    plugin.configure(enable=("classprov",), source="test")
+    records[0].provider.select(plugin.Op("test.add", 1), (2, 3), {})
+    assert seen == [("test.add", (2, 3), {})]
