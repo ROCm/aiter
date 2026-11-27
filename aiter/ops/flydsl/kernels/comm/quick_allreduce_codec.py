@@ -4,7 +4,8 @@
 """INT4, INT5, INT6 and FP16 wire codecs for quick-allreduce.
 
 A rank-tile is ``block`` threads x one 16 B atom, quantized in packed fp16 with
-a group-16 signed 8-bit scale (E5M2, bias 12). INT4 is one nibble plane;
+a signed group-16 scale (a pair-shared-exponent float, see :func:`_pse_scale`).
+INT4 is one nibble plane;
 INT5/INT6 add a dense 1-bit or 2-bit plane on the same 64 B sector grid, which
 keeps the nibble plane byte-identical to INT4's. FP16 is a passthrough wire
 format -- the
@@ -21,12 +22,15 @@ every codec, and all in-kernel arithmetic is packed fp16. Two limits follow.
   :func:`_clamp_fp16_overflow`), and a magnitude below fp16's resolution loses
   mantissa bits that bf16 has. The FP16 wire format is therefore not lossless
   for bf16 data outside the fp16 range.
-* The group scale is a signed E5M2 byte with bias 12, spanning
-  ``[2**-12, 1.75 * 2**19]``, so every fp16 group extremum fits and nothing
-  clips below the fp16 limit above. It has 2 mantissa bits, so the scale
-  rounds to within 1/8 of the extremum. INT5 floors the scale at ``2**-11``
-  and INT6 at ``2**-10`` (see :attr:`Codec.scale_min_e5`). NaN and Inf are
-  not propagated: they become finite values.
+* The group scale spans ``[2**-12, 1.875 * 2**19]``, so every fp16 group
+  extremum fits and nothing clips below the fp16 limit above. INT4 rounds its
+  3-bit mantissa to nearest, within 1/16 of the extremum; INT5 and INT6 round
+  it up. Adjacent groups
+  share an exponent, within ``[-4, +3]`` of each other; past that the smaller
+  group's scale is raised and loses mantissa bits, though never clips. INT5
+  floors the scale at ``2**-11`` and INT6 at ``2**-10`` (see
+  :attr:`Codec.scale_min_e5`). NaN and Inf are not propagated: they become
+  finite values.
 
 ``block`` is a build parameter: it sets the tile width, and through it how
 many blocks a payload gets.
@@ -55,7 +59,7 @@ from .transport import (
     WAVE,
 )
 
-# Two threads (PAIR) share one scale byte; GROUP threads share the i32 slot.
+# Two threads (PAIR) share one group-16 scale; GROUP threads share the i32 slot.
 GROUP = 8
 PAIR = 2
 
@@ -101,14 +105,14 @@ _K_HALF2_1040 = 0xE410E410  # -1040.0 fp16x2 = -(1024 + 16)
 _K_HALF2_1056 = 0xE420E420  # -1056.0 fp16x2 = -(1024 + 32)
 
 # Largest finite fp16. The encode scale is materialised as fp16, so anything
-# above this becomes Inf there; see _codec_quant.
+# above this becomes Inf there; see Codec.scale_min_e5.
 _FP16_MAX = 65504.0
-# Exponent bias of the E5M2 group scale.
+# Exponent bias of the group scale.
 _SCALE_BIAS = 12
 # Names the group-scale codec in every mesh and ring launch name. FlyDSL 0.5.0
 # keys its cache on the traced IR, so a codec change rebuilds the kernels
 # without a new tag; the tag only labels the binaries.
-SCALE_CODEC_TAG = "s5m2b12"
+SCALE_CODEC_TAG = "pse3b12"
 
 
 @dataclass(frozen=True)
@@ -168,15 +172,15 @@ class Codec:
 
     @property
     def scale_rounds_up(self) -> bool:
-        """Round the group scale up to the next E5M2 value, not to nearest.
+        """Round the group scale up to the next representable value, not to
+        nearest.
 
         Rounding to nearest can round the scale below the extremum, which then
-        clips by up to 1/8. That is about one INT4 step, but two INT5 and four
-        INT6 steps, so INT5 and INT6 round up: no clip, at a step up to 1/4
-        coarser. On a normal
-        fill that keeps INT6 at E4M3's SQNR (33.5 vs 33.4 dB), where rounding
-        to nearest loses 2.4 dB; INT4 keeps rounding to nearest (21.9 dB, vs
-        21.5 dB rounding up).
+        clips by up to 1/16. That is half an INT4 step, but one INT5 and two
+        INT6 steps, so INT5 and INT6 round up: no clip, at a step up to 1/8
+        coarser. On a normal fill (fp64 model) INT6 gains 0.7 dB rounding up
+        (33.9 vs 33.3 dB), INT5 is within 0.1 dB either way, and INT4 keeps
+        rounding to nearest (22.2 dB, vs 21.8 dB rounding up).
         """
         return self.bits > 4
 
@@ -242,7 +246,7 @@ def codecs_for_block(block: int = BLOCK) -> dict[str, "Codec"]:
     block = validate_block(block)
     nibble = block  # one i32 of nibbles per thread
     hi2 = block // PAIR  # INT6's dense 2-bit plane, one i32 per lane pair
-    # One i32 per GROUP threads (4 packed scale bytes), padded to a sector.
+    # One i32 per GROUP threads (four group scales), padded to a sector.
     scale = _round_up_to_sector(block // GROUP)
     return {
         c.name: c
@@ -330,11 +334,11 @@ def thread_lane(tid, block: int = BLOCK):
 
 
 def scale_slot_of(tid, block: int = BLOCK):
-    """(scale_slot, pair_in_slot) -- this thread's group-16 scale slot,
-    and which half of the ``PAIR`` sharing that slot this thread is.
+    """(scale_slot, pair_in_slot) -- this thread's group-16 scale slot, and
+    which of the slot's four groups (each a ``PAIR`` of threads) is its own.
 
-    ``scale_slot`` addresses the i32 the byte lives in; ``pair_in_slot``
-    selects which of the two packed bytes within it, via
+    ``scale_slot`` addresses the i32 that holds the slot's scales;
+    ``pair_in_slot`` selects this group's scale within it, via
     :func:`_scale_from_word`.
     """
     scale_own_layout = fx.make_layout(
@@ -365,8 +369,7 @@ def _scale_from_word(codec, word, pair_in_slot):
     """
     if not codec.has_scale:
         return None
-    e = word.shrui(pair_in_slot * fx.Int32(8)) & fx.Int32(0xFF)
-    return _e4m3_decoding_scale(codec, e)
+    return _splat_f16x2(_pse_decoding_step(codec, word, pair_in_slot))
 
 
 def _f16x2(packed):
@@ -429,57 +432,111 @@ def _atom_f16_to_bf16(atom):
     return fx.Vector(atom).bitcast(fx.Float16).to(fx.BFloat16).bitcast(fx.Int32)
 
 
-def _f32_to_e4m3(x, min_e5=0, round_up=False):
-    """Pack f32 to a signed 8-bit scale: 1 sign, 5-bit exp (bias 12), 2-bit mantissa.
+def _atom_bf16_to_f16_scaled(atom, scale):
+    """:func:`_atom_bf16_to_f16`, multiplied by the f32 *scale* (an 8-wide splat)
+    before the fp16 narrowing, so a bf16 above 65504 survives a divisor."""
+    value = fx.Vector(atom).bitcast(fx.BFloat16).to(fx.Float32) * scale
+    return value.to(fx.Float16).bitcast(fx.Int32)
 
-    The scale was E4M3 with bias 7, which spans only ``[2**-7, 480]``: a
-    group whose extremum is above 480 clipped, and the ring, which requantizes
-    the running partial sum at every hop, clipped sums of a few values near
-    300. E5M2 with bias 12 spans ``[2**-12, 1.75 * 2**19]``, so every fp16
-    extremum fits. The byte, the layout and the instruction count are
-    unchanged; the function names keep "e4m3" for a small diff.
 
-    Decode is ``±(1 + m/4) * 2**(e - 12)`` for every ``e``, including 0
-    (no denorms). ``0x7F`` / ``0xFF`` are max finite, not NaN.
+def _atom_f16_to_bf16_scaled(atom, scale):
+    """:func:`_atom_f16_to_bf16`, multiplied by the f32 *scale* (an 8-wide splat)
+    after the fp16 widening, so the restored sum can exceed 65504."""
+    value = fx.Vector(atom).bitcast(fx.Float16).to(fx.Float32) * scale
+    return value.to(fx.BFloat16).bitcast(fx.Int32)
 
-    *min_e5* floors the exponent field (see :attr:`Codec.scale_min_e5`), and
-    *round_up* rounds the mantissa up instead of to nearest (see
-    :attr:`Codec.scale_rounds_up`).
-    ``0x00`` is +0 only. Any other value that would land there (positive
-    underflow, or exactly ``2**-12``) is stored as ``0x01``. Negative
-    underflow keeps ``0x80`` (``-2**-12``). Overflow clamps both exponent
-    and mantissa.
+
+# The group scale is a pair-shared-exponent (PSE) float. Each group-16 scale is
+# ``r = exponent * 8 + mantissa``: a 3-bit mantissa and a 5-bit exponent with
+# bias 12, so ``(r + _PSE_R_TO_F32) << 20`` is its f32 bit pattern. A scale
+# i32 holds the four groups of its slot (``pair_in_slot``) as two 16-bit
+# halves, groups 0 and 1 in the low half and 2 and 3 in the high one. In a
+# half, group A is the even one and B the odd one:
+#
+#   bits  0-7   r_A
+#   bits  8-13  r_B - (r_A & ~7) + 32: B's exponent relative to A's, plus 4,
+#               then B's mantissa
+#   bit  14/15  sign of A / sign of B
+#
+# B's exponent has to lie in [A - 4, A + 3]. When it does not, the smaller of
+# the two scales is raised to the nearest one that fits, which costs that group
+# mantissa bits but never clips it.
+_PSE_R_TO_F32 = (127 - _SCALE_BIAS) * 8
+# r of the largest scale the 5-bit exponent holds, 1.875 * 2**19.
+_PSE_R_MAX = 255
+
+
+def _pse_r_floor(codec):
+    return codec.scale_min_e5 * 8
+
+
+def _pse_scale(codec, ext, lane):
+    """``(scale_word, d)`` for this thread's group.
+
+    *ext* is the group's signed extremum (f32 of an fp16). ``scale_word`` is
+    the packed PSE i32 of the thread's whole ``GROUP`` -- every lane of it
+    computes the same word, and only the leader stores it -- and ``d`` is this
+    group's decoding step, ``scale * dec_step``, as f32.
+
+    The scale is rounded on the f32 bits directly: adding half an ulp of the
+    3-bit mantissa (or a whole one less one, to round up) and dropping the low
+    20 bits leaves ``r`` with any mantissa carry already in the exponent. The
+    exponent floor also catches an all-zero group, whose ``r`` is negative.
     """
-    is_z = x == fx.Float32(0.0)
-    sign = (x < fx.Float32(0.0)).select(fx.Int32(0x80), fx.Int32(0))
-    bits = abs(x).bitcast(fx.Int32)
-    e = (bits.shrui(fx.Int32(23)) & fx.Int32(255)) - fx.Int32(127)
-    mant = bits & fx.Int32(0x7FFFFF)
-    m2 = (mant + fx.Int32((1 << 21) - 1 if round_up else 1 << 20)).shrui(fx.Int32(21))
-    carry = m2 == fx.Int32(4)
-    e = e + carry.select(fx.Int32(1), fx.Int32(0))
-    m2 = carry.select(fx.Int32(0), m2)
-    e5 = e + fx.Int32(_SCALE_BIAS)
-    overflow = e5 > fx.Int32(31)
-    m2 = overflow.select(fx.Int32(3), m2)
-    e5 = (e5 < fx.Int32(min_e5)).select(
-        fx.Int32(min_e5), overflow.select(fx.Int32(31), e5)
+    rnd = (1 << 20) - 1 if codec.scale_rounds_up else 1 << 19
+    bits = ext.bitcast(fx.Int32)
+    mag = bits & fx.Int32(0x7FFFFFFF)
+    r = (mag + fx.Int32(rnd)).shrui(fx.Int32(20)) - fx.Int32(_PSE_R_TO_F32)
+    # The ceiling only binds on NaN or Inf: the largest fp16 rounds to r 224.
+    r = fx.min(fx.max(r, fx.Int32(_pse_r_floor(codec))), fx.Int32(_PSE_R_MAX))
+
+    # The partner group's lanes are xor-PAIR away, and the other half of the
+    # slot's word xor-2*PAIR away.
+    b = lane.shrui(fx.Int32(1)) & fx.Int32(1)
+    is_b = b != fx.Int32(0)
+    sign_bit = bits.shrui(fx.Int32(31)) << (fx.Int32(14) + b)
+    own = r | sign_bit
+    other = own.shuffle_xor(PAIR, WAVE)
+    r_other = other & fx.Int32(0xFF)
+    r_a = is_b.select(r_other, r)
+    r_b = is_b.select(r, r_other)
+    r_a = fx.max(r_a, (r_b & fx.Int32(~7)) - fx.Int32(3 * 8))
+    base = (r_a & fx.Int32(~7)) - fx.Int32(4 * 8)
+    r_b = fx.max(r_b, base)
+    half = r_a | ((r_b - base) << fx.Int32(8)) | ((own | other) & fx.Int32(0xC000))
+    other_half = half.shuffle_xor(2 * PAIR, WAVE)
+    is_lo = (lane & fx.Int32(2 * PAIR)) == fx.Int32(0)
+    word = is_lo.select(
+        half | (other_half << fx.Int32(16)), other_half | (half << fx.Int32(16))
     )
-    byte = sign | (e5 << fx.Int32(2)) | (m2 & fx.Int32(3))
-    return is_z.select(fx.Int32(0), (byte == fx.Int32(0)).select(fx.Int32(1), byte))
+    return word, _pse_step(codec, is_b.select(r_b, r_a), bits)
 
 
-def _e4m3_to_f32(b):
-    is_z = b == fx.Int32(0)
-    sign = (b & fx.Int32(0x80)) != fx.Int32(0)
-    e5 = b.shrui(fx.Int32(2)) & fx.Int32(31)
-    m2 = b & fx.Int32(3)
-    mag_bits = ((e5 + fx.Int32(127 - _SCALE_BIAS)) << fx.Int32(23)) | (
-        m2 << fx.Int32(21)
+def _pse_step(codec, r, sign_src):
+    """``scale * dec_step`` for scale *r*, with the sign of *sign_src*'s top bit.
+
+    ``dec_step`` is ``-2**-log2(bias)``, so the product is exact and is built
+    as bits: the exponent drops by ``log2(bias)`` and the sign flips.
+    """
+    shift = int(math.log2(codec.bias)) * 8
+    mag = (r + fx.Int32(_PSE_R_TO_F32 - shift)) << fx.Int32(20)
+    sign = (sign_src & fx.Int32(-0x80000000)) ^ fx.Int32(-0x80000000)
+    return (mag | sign).bitcast(fx.Float32)
+
+
+def _pse_decoding_step(codec, word, pair_in_slot):
+    """This thread's ``scale * dec_step`` (f32) out of its slot's PSE word."""
+    b = pair_in_slot & fx.Int32(1)
+    half = word.shrui((pair_in_slot & fx.Int32(2)) << fx.Int32(3))
+    r_a = half & fx.Int32(0xFF)
+    r_b = (
+        (half & fx.Int32(0xF8))
+        + (half.shrui(fx.Int32(8)) & fx.Int32(0x3F))
+        - fx.Int32(4 * 8)
     )
-    mag = mag_bits.bitcast(fx.Float32)
-    signed = sign.select(-mag, mag)
-    return is_z.select(fx.Float32(0.0), signed)
+    r = (b != fx.Int32(0)).select(r_b, r_a)
+    sign = half.shrui(fx.Int32(14) + b) << fx.Int32(31)
+    return _pse_step(codec, r, sign)
 
 
 def _pack_fields(fields, width, mask=None):
@@ -489,23 +546,6 @@ def _pack_fields(fields, width, mask=None):
         f = fields[i] if mask is None else fields[i] & mask
         out = out | (f << fx.Int32(i * width))
     return out
-
-
-def _pack_e4m3_word(e, lane):
-    """Four pair-scale bytes into the i32 scale slot (lanes 0,2,4,6 of GROUP)."""
-    base = (lane // GROUP) * GROUP
-    src = [base] + [base + fx.Int32(k) for k in range_constexpr(PAIR, GROUP, PAIR)]
-    e_pair = [fx.Int32(gpu.shuffle_idx(e, s, WAVE)) for s in src]
-    return _pack_fields(e_pair, 8, mask=fx.Int32(0xFF))
-
-
-def _e4m3_decoding_scale(codec, e):
-    return _splat_f16x2(_e4m3_to_f32(e) * fx.Float32(codec.dec_step))
-
-
-def _clamp_f32(x, lo, hi):
-    x = (x < fx.Float32(lo)).select(fx.Float32(lo), x)
-    return (x > fx.Float32(hi)).select(fx.Float32(hi), x)
 
 
 def _quant_atom_fp16(codec, atom, enc_pk):
@@ -601,19 +641,16 @@ def _codec_quant(codec, atom, lane, tid):
     if not codec.has_scale:
         return tuple(atom[i] for i in range_constexpr(4)), None, False
     ext = _pair_signed_ext_f16(atom)
-    e = _f32_to_e4m3(ext, codec.scale_min_e5, codec.scale_rounds_up)
-    d = _e4m3_to_f32(e) * fx.Float32(codec.dec_step)
-    # Clamp before the fp16 splat. An all-zero group gives d == 0, so the
-    # reciprocal is 1e7 -- Inf once narrowed to fp16, and 0 * Inf is NaN. Only
-    # MODE.FP16_OVFL saturation has been keeping that from poisoning a tile,
-    # and INT6 cuts the headroom fourfold: |d| is four times smaller for a
-    # given extremum, so 1/|d| peaks near 4096 rather than 1024.
-    enc = _clamp_f32(fx.Float32(1.0) / (d + fx.Float32(1e-7)), -_FP16_MAX, _FP16_MAX)
+    scale_word, d = _pse_scale(codec, ext, lane)
+    # The scale floor keeps d away from zero: 1/|d| peaks at 2**15 for every
+    # codec (see Codec.scale_min_e5), so the fp16 splat cannot overflow and an
+    # all-zero group needs no special case.
+    enc = fx.Float32(1.0) / d
     words = _quant_atom_fp16(codec, atom, _splat_f16x2(enc))
     if codec.hi2_i32_off is not None:
         words = (words[0], _compact_hi(words[1], lane, codec.hi_bits))
     is_leader = (tid % GROUP) == 0
-    return words, _pack_e4m3_word(e, lane), is_leader
+    return words, scale_word, is_leader
 
 
 def _codec_dequant(codec, words, scale, tid, acc=None):
@@ -659,9 +696,9 @@ def _codec_dequant(codec, words, scale, tid, acc=None):
 def _codec_load(codec, get, tid, scale_slot):
     """Read one packet through ``get(i32_off_in_tile) -> i32``.
 
-    Returns ``(words, e4m3_word)`` exactly as they sit on the wire -- the
+    Returns ``(words, scale_word)`` exactly as they sit on the wire -- the
     extra-bit plane stays compacted -- so a forwarding path can restage them
-    byte for byte without decoding. ``e4m3_word`` is ``None`` for a codec with
+    byte for byte without decoding. ``scale_word`` is ``None`` for a codec with
     no scale plane (fp16 passthrough).
     """
     words = tuple(get(off) for off, _pred in codec.plane_slots(tid))

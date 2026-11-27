@@ -14,13 +14,21 @@ Two properties are load-bearing:
   dequantizer produces. Relocation cannot change a value, so any disagreement
   about where the 2-bit plane or the scale word lives shows up here -- and
   nowhere else, since both sides of the real kernel would be wrong together.
-* **The analytic error bound.** The E5M2 scale carries 2 mantissa bits, so the
-  decoded extremum is within 1/8 of the true one (INT6 rounds the scale up, so
-  it never clips, at a step up to 1/4 coarser); on top of that a value can
-  miss by half a step, and one near the extreme can land a whole code short.
-  That gives ``|err| <= |ext| * (1/8 + 1.05/bias)`` with no free parameters.
+* **The analytic error bound.** The group scale carries 3 mantissa bits. INT4
+  rounds it to nearest, so the decoded extremum is within 1/16 of the true one;
+  INT5 and INT6 round it up, so it never clips, at a step up to 1/8 coarser.
+  On top of that a value can miss by half a step, and one near the extreme can
+  land a whole code short. That gives ``|err| <= |ext| * (1/16 + 1.05/bias)``
+  for INT4 and ``|ext| * 1.05/bias`` for INT5 and INT6, with no free
+  parameters, as long as the two groups that share an exponent are within
+  ``2**3`` of each other.
 
-Both are also checked at every workgroup width the codec supports, since the
+A third pins the scale format itself: the codec must agree bit for bit with an
+fp32/fp16 model of the pair-shared-exponent scale on payloads whose adjacent
+groups span the whole fp16 range, where the shared exponent coarsens the
+smaller group.
+
+All are also checked at every workgroup width the codec supports, since the
 plane and scale offsets scale with it and block 64 pads its scale region.
 """
 
@@ -250,17 +258,23 @@ def codec_roundtrip(
     return out
 
 
-# A quantization group is one scale byte's worth of values: PAIR=2 threads x 8
+# A quantization group is one scale's worth of values: PAIR=2 threads x 8
 # values per atom. Thread t owns elements [8t, 8t+8) of an atom row and pairs
 # with its xor-1 neighbour, so groups are contiguous 16-element runs -- and an
-# atom row is 2048 elements, a multiple of 16, so a flat reshape lines up.
+# atom row is 2048 elements, a multiple of 16, so a flat reshape lines up. Two
+# adjacent groups share a scale exponent.
 GROUP_ELEMS = 16
 
-# Half-ulp of the scale's 2-bit mantissa: the decoded extremum is within this
-# fraction of the true one.
-SCALE_REL_SLACK = 1.0 / 8.0
+# Half-ulp of the scale's 3-bit mantissa: a scale rounded to nearest is within
+# this fraction of the extremum, and no decoded value exceeds the extremum by
+# more.
+SCALE_REL_SLACK = 1.0 / 16.0
 
 CODEC_NAMES = ("int4", "int5", "int6")
+
+# fp16's largest finite value: the kernels saturate to it on load, so it is the
+# largest group extremum the scale ever sees.
+FP16_MAX = 65504.0
 
 
 def _payload(
@@ -281,14 +295,85 @@ def _signed_extremum(g: torch.Tensor) -> torch.Tensor:
     return torch.where(mx.abs() > mn.abs(), mx, mn)
 
 
-def _err_bound(bias: int) -> float:
+def _err_bound(codec_name: str) -> float:
     """Largest ``|y-x| / |ext|`` the codec may produce, from its definition.
 
-    ``1/8`` for the E5M2 scale, ``0.5/bias`` for rounding, and up to another
-    ``0.5/bias`` because the positive end of the range stops one code short of
-    the negative end. Rounded up to ``1.05/bias`` for fp16 arithmetic.
+    ``1/16`` for a scale rounded to nearest (INT4), which can clip the
+    extremum by that much; nothing for one rounded up (INT5, INT6). Then
+    ``0.5/bias`` for rounding, and up to another ``0.5/bias`` because the
+    positive end of the range stops one code short of the negative end.
+    Rounded up to ``1.05/bias`` for fp16 arithmetic. Holds for any group whose
+    exponent its pair partner did not raise.
     """
-    return SCALE_REL_SLACK + 1.05 / bias
+    codec = CODECS[codec_name]
+    slack = 0.0 if codec.scale_rounds_up else SCALE_REL_SLACK
+    return slack + 1.05 / codec.bias
+
+
+# Bit-trick constants of the pair-shared-exponent scale: ``r`` is the scale's
+# exponent (bias 12) times 8 plus its 3-bit mantissa, and ``(r + 920) << 20``
+# its f32 bit pattern.
+_PSE_R_TO_F32 = (127 - 12) * 8
+_PSE_R_MAX = 255
+
+
+def _lane_signed_ext(v: torch.Tensor) -> torch.Tensor:
+    mx, mn = v.max(-1).values, v.min(-1).values
+    return torch.where(mx.abs() > mn.abs(), mx, mn)
+
+
+def _pse_reference(x: torch.Tensor, codec_name: str) -> torch.Tensor:
+    """What the codec should return for *x*, modelled in fp32/fp16 on the CPU.
+
+    Each group's signed extremum is taken the kernel's way, per fp16 lane of
+    the packed pair first. Its scale ``r`` is rounded on the f32 bits, floored
+    and capped; the even group of a pair is raised to within 3 exponents below
+    the odd one, and the odd one to within 4 below the even one. The values
+    are quantized with the fp16 reciprocal of ``scale * dec_step`` and
+    dequantized with its fp16 value, as the kernel does.
+    """
+    c = CODECS[codec_name]
+    h = x.float().cpu().clamp(-FP16_MAX, FP16_MAX).to(torch.float16).float()
+    pairs = h.reshape(-1, 2, GROUP_ELEMS)
+    lo = _lane_signed_ext(pairs[..., 0::2])
+    hi = _lane_signed_ext(pairs[..., 1::2])
+    ext = torch.where(lo.abs() > hi.abs(), lo, hi)
+
+    bits = ext.view(torch.int32)
+    rnd = (1 << 20) - 1 if c.scale_rounds_up else 1 << 19
+    r = (((bits & 0x7FFFFFFF) + rnd) >> 20) - _PSE_R_TO_F32
+    r = r.clamp(8 * c.scale_min_e5, _PSE_R_MAX)
+    r_a, r_b = r[:, 0], r[:, 1]
+    r_a = torch.maximum(r_a, (r_b & ~7) - 3 * 8)
+    r_b = torch.maximum(r_b, (r_a & ~7) - 4 * 8)
+    r = torch.stack((r_a, r_b), -1)
+
+    scale = ((r + _PSE_R_TO_F32) << 20).view(torch.float32)
+    d = torch.where(bits < 0, scale, -scale) / c.bias
+    enc = (1.0 / d).to(torch.float16).float()
+    w = (pairs * enc[..., None]).to(torch.float16).float()
+    q = torch.round(w.clamp(c.qmin, c.qmax))
+    y = q * d.to(torch.float16).float()[..., None]
+    y = y.clamp(-FP16_MAX, FP16_MAX).to(torch.float16)
+    return y.to(torch.bfloat16).reshape(x.shape)
+
+
+def _wide_payload(*, n_tiles: int, seed: int, block: int = BLOCK) -> torch.Tensor:
+    """Groups with independent magnitudes over ``[2**-24, 2**17]``.
+
+    Adjacent groups are usually more than ``2**3`` apart, so most pairs share
+    a coarsened exponent; the range also reaches fp16 subnormals, the scale
+    floor and, past 65504, the fp16 saturation on load. Every 11th group is
+    zero and every 7th constant.
+    """
+    g = torch.Generator().manual_seed(seed)
+    n_groups = n_tiles * tile_elems(block) // GROUP_ELEMS
+    x = torch.randn(n_groups, GROUP_ELEMS, generator=g)
+    mag = torch.empty(n_groups, 1).uniform_(-24.0, 17.0, generator=g).exp2()
+    x = x * mag
+    x[0::11] = 0.0
+    x[3::7] = x[3::7, :1]
+    return x.reshape(-1).to(device="cuda:0", dtype=torch.bfloat16)
 
 
 @pytest.mark.parametrize("block", BLOCK_WIDTHS)
@@ -306,7 +391,7 @@ def test_memory_path_matches_register_path(codec_name, block):
     pins the mapping is the accuracy set below, which grades against a group
     extremum computed in torch.
     """
-    x = _payload(n_tiles=2, seed=17, block=block)
+    x = _wide_payload(n_tiles=2, seed=17, block=block)
     through_lds = codec_roundtrip(x, codec_name, via_memory=True, block=block)
     in_regs = codec_roundtrip(x, codec_name, via_memory=False, block=block)
     mismatch = int((through_lds != in_regs).sum())
@@ -314,6 +399,61 @@ def test_memory_path_matches_register_path(codec_name, block):
         f"{mismatch}/{x.numel()} elements differ between the staged and "
         "register paths: the wire layout is not round-tripping"
     )
+
+
+@pytest.mark.parametrize("block", BLOCK_WIDTHS)
+@pytest.mark.parametrize("codec_name", CODEC_NAMES)
+def test_matches_pair_shared_exponent_model(codec_name, block):
+    """Equal to :func:`_pse_reference` on groups that span the fp16 range.
+
+    This pins which two groups share an exponent, the scale's rounding, floor
+    and sign, and the coarsening of the smaller group of a pair -- none of
+    which a randn payload reaches. Values, not bits, are compared: the kernel
+    decodes code 0 as +0 where the model's ``round`` can give -0.
+    """
+    x = _wide_payload(n_tiles=4, seed=37, block=block)
+    y = codec_roundtrip(x, codec_name, block=block).cpu().float()
+    ref = _pse_reference(x, codec_name).float()
+    bad = (y != ref).nonzero().flatten()
+    assert bad.numel() == 0, (
+        f"{bad.numel()}/{x.numel()} elements differ from the model, first at "
+        f"{int(bad[0])}: x={float(x[bad[0]])} y={float(y[bad[0]])} "
+        f"ref={float(ref[bad[0]])}"
+    )
+
+
+@pytest.mark.parametrize("codec_name", CODEC_NAMES)
+@pytest.mark.parametrize("gap", (2, 5, 12))
+def test_shared_exponent_coarsens_only_the_smaller_group(codec_name, gap):
+    """Pairs of groups ``2**gap`` apart, the smaller one first and then second.
+
+    Each group is ``k/8`` for ``k`` in ``[-8, 8)``, so its scale is exactly 1
+    and the larger one's ``2**gap``. The even group of a pair may sit at most
+    3 exponents below the odd one and the odd one at most 4 below the even
+    one; past that the smaller group's scale is raised to exactly that floor.
+    The larger group must decode exactly as it does alone, and the smaller one
+    must stay within half of its (raised) step -- it is coarsened, not clipped.
+    """
+    c = CODECS[codec_name]
+    p = torch.arange(-8, 8, dtype=torch.float32) / 8
+    n_pairs = tile_elems(BLOCK) // (2 * GROUP_ELEMS)
+    big = p * 2.0**gap
+    pairs = torch.empty(n_pairs, 2, GROUP_ELEMS)
+    pairs[0::2, 0], pairs[0::2, 1] = p, big
+    pairs[1::2, 0], pairs[1::2, 1] = big, p
+    x = pairs.reshape(-1).to(device="cuda:0", dtype=torch.bfloat16)
+    y = codec_roundtrip(x, codec_name).cpu().float().reshape(n_pairs, 2, -1)
+
+    alone = torch.empty_like(pairs).copy_(big)
+    alone = alone.reshape(-1).to(device="cuda:0", dtype=torch.bfloat16)
+    y_alone = codec_roundtrip(alone, codec_name).cpu().float()[:GROUP_ELEMS]
+    assert torch.equal(y[0::2, 1], y_alone.expand(n_pairs // 2, -1))
+    assert torch.equal(y[1::2, 0], y_alone.expand(n_pairs // 2, -1))
+
+    for small, raised_to in ((y[0::2, 0], gap - 3), (y[1::2, 1], gap - 4)):
+        half_step = 2.0 ** max(0, raised_to) / c.bias / 2
+        err = float((small - p).abs().max())
+        assert err <= half_step, (raised_to, err, half_step)
 
 
 @pytest.mark.parametrize("block", BLOCK_WIDTHS)
@@ -326,7 +466,7 @@ def test_error_within_analytic_bound(codec_name, block):
     xg, yg = _groups(x), _groups(y)
     ext = _signed_extremum(xg).abs().clamp_min(1e-20)
     worst = float(((yg - xg).abs().max(-1).values / ext).max())
-    bound = _err_bound(CODECS[codec_name].bias)
+    bound = _err_bound(codec_name)
     assert worst <= bound, f"max |err|/|ext| {worst:.4f} > {bound:.4f}"
 
 
@@ -360,7 +500,7 @@ def test_group_extremum_keeps_its_sign(codec_name, block):
         (torch.sign(x_ext[live]) == torch.sign(y_ext[live])).all()
     ), "Sign changed"
     rel = float(((y_ext[live] - x_ext[live]).abs() / x_ext[live].abs()).max())
-    bound = _err_bound(CODECS[codec_name].bias)
+    bound = _err_bound(codec_name)
     assert rel <= bound, f"extremum moved {rel:.4f} > {bound:.4f}"
 
 
@@ -395,9 +535,10 @@ def test_int5_sits_between_int4_and_int6():
 def test_degenerate_groups_stay_finite(codec_name):
     """Zero and sub-floor groups drive the encode reciprocal to its ceiling.
 
-    ``1/d`` is materialised as fp16, so without the clamp in ``_codec_quant`` a
-    zero-extremum group reaches the codec as Inf and ``0 * Inf`` poisons the
-    tile. INT6 has a quarter of INT4's headroom here; INT5 is in between.
+    ``1/d`` is materialised as fp16, so a zero-extremum group would reach the
+    codec as Inf, and ``0 * Inf`` would poison the tile. The scale floor keeps
+    ``1/|d|`` at or below ``2**15`` for every codec, INT6 included, whose
+    ``|d|`` is a quarter of INT4's for the same scale.
     """
     x = _payload(n_tiles=2, seed=43).reshape(-1, GROUP_ELEMS)
     x[0::4] = 0.0
@@ -407,11 +548,6 @@ def test_degenerate_groups_stay_finite(codec_name):
     assert bool(torch.isfinite(y.float()).all()), "codec produced NaN or Inf"
     zeros = y.reshape(-1, GROUP_ELEMS)[0::4]
     assert bool((zeros == 0).all()), "an all-zero group did not stay zero"
-
-
-# fp16's largest finite value: the kernels saturate to it on load, so it is the
-# largest group extremum the scale ever sees.
-FP16_MAX = 65504.0
 
 
 def _spike_group(
@@ -436,11 +572,12 @@ def test_large_extremum_does_not_clip(codec_name, ext):
 
     The E4M3 scale clipped every group above 480 to about 480, and the ring,
     which requantizes its running sum at every hop, clipped sums of a few
-    values near 300. E5M2 reaches ``1.75 * 2**19``, beyond fp16, so the only
-    error left is the scale's rounding.
+    values near 300. The scale now reaches ``1.875 * 2**19``, beyond fp16, so
+    the only error left is the scale's rounding -- here with a partner group
+    far smaller, which the shared exponent coarsens instead.
     """
     decoded = float(codec_roundtrip(_spike_group(ext), codec_name)[0])
-    bound = _err_bound(CODECS[codec_name].bias)
+    bound = _err_bound(codec_name)
     assert (
         abs(decoded - ext) <= abs(ext) * bound
     ), f"{ext} decoded to {decoded}: off by more than {bound:.3f} relative"
@@ -453,7 +590,7 @@ def test_extremum_past_fp16_stays_finite(codec_name):
     The bf16 output can hold the scale's rounding of 65504 (65536), so the
     decoded value is checked against fp16's maximum with the codec's bound.
     """
-    bound = _err_bound(CODECS[codec_name].bias)
+    bound = _err_bound(codec_name)
     for ext in (FP16_MAX, 1.0e6):
         decoded = float(codec_roundtrip(_spike_group(ext), codec_name)[0])
         assert math.isfinite(decoded), decoded
@@ -465,13 +602,13 @@ def test_extremum_past_fp16_stays_finite(codec_name):
 def test_small_extremum_survives_instead_of_zeroing(codec_name, ext):
     """A small extremum keeps its value; it does not lose the whole group.
 
-    ``0x00`` is the byte reserved for exact zero. A positive extremum small
-    enough to encode there used to collide with that sentinel, so the decoder
-    read a scale of 0 and every value in the group came back as 0. The encoder
-    bumps such a value to ``0x01``, the smallest non-zero magnitude. 1e-4 is
-    below E4M3's old floor of ``2**-7`` and below this codec's scale floor
-    (``2**-12`` for INT4, ``2**-11`` for INT5, ``2**-10`` for INT6), so it is
-    quantized against the floor scale and still lands within a step.
+    The byte scales reserved ``0x00`` for exact zero, and a positive extremum
+    small enough to encode there once read back as a scale of 0, zeroing the
+    group. The pair-shared-exponent scale has no such sentinel: a group below
+    the codec's scale floor (``2**-12`` for INT4, ``2**-11`` for INT5,
+    ``2**-10`` for INT6) is quantized against the floor, and an all-zero
+    group decodes to zero codes. 1e-4 is below E4M3's old floor of ``2**-7``
+    and below every floor here, so it still lands within a step.
     """
     decoded = codec_roundtrip(_spike_group(ext, fill=0.0), codec_name)
     assert torch.isfinite(decoded.float()).all()
@@ -626,7 +763,7 @@ def _resolve(algorithm, world_size, rs=None, ag=None):
     ((2, ("int4", "int4")), (4, ("int6", "int4")), (8, ("int6", "int4"))),
 )
 def test_ring_codec_defaults_widen_from_tp4(world_size, expected):
-    """From TP4 an all-INT4 ring misses the floor (17.9 dB at TP4 with E5M2).
+    """From TP4 an all-INT4 ring misses the floor (17.9 dB at TP4, former E5M2).
 
     Production dispatch passes ``None`` for both laps precisely to land here --
     see ``_FLY_REGIMES`` in ``quick_all_reduce.py``.

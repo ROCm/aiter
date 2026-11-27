@@ -15,8 +15,8 @@ they are named for the topology of each lap instead:
   (``pull_allreduce_rmsnorm``).
 
 Super-tile ST∈{1,8} on the mesh, ST∈{1,8,16,32} on the ring. INT4 nibble,
-INT5 nibble+1-bit plane, or INT6 bit-plane pair, all with group-16 E5M2
-scales. INT5 is mesh-only. Payload HBM is bf16.
+INT5 nibble+1-bit plane, or INT6 bit-plane pair, all with group-16
+pair-shared-exponent scales. INT5 is mesh-only. Payload HBM is bf16.
 
 The kernel configuration comes from a tuning ladder of ``TwoShotRung``, keyed
 on ``(arch, link, world_size)`` in ``allreduce_policy``.
@@ -107,14 +107,12 @@ from .kernels.tensor_shim import _run_compiled
 
 logger = logging.getLogger("aiter")
 
-# The sum is restored in fp16 before the bf16 store, by scaling each group's
-# dequant step (group scale * 1/bias) by the divisor. With the E5M2 group
-# scale every fp16 extremum fits at divisor 1, so the divisor is opt-in and the
-# scale range no longer sets these bounds. The smallest step is 2**-15 (INT4
-# and INT6 alike, see Codec.scale_min_e5); at DIVISOR_MIN it is restored as
-# 2**-19, an fp16 subnormal that still holds the 2-bit mantissa exactly
-# (subnormal spacing 2**-24). Inputs are divided by the divisor before the
-# first pack, so restored values keep the input's magnitude at DIVISOR_MAX.
+# The divisor divides every bf16 load in f32 before the fp16 narrowing and
+# multiplies every bf16 store back in f32, so a payload or sum up to
+# ``65504 * divisor`` survives the packed-fp16 math that saturates at 65504.
+# The bounds limit what the fp16 intermediate loses at the other end: a
+# divisor of 128 pushes magnitudes below ``2**-7`` into fp16 subnormals, and
+# one of ``2**-4`` saturates inputs above 4094.
 DIVISOR_MIN = 2.0**-4
 DIVISOR_MAX = 128.0
 
@@ -228,6 +226,7 @@ ALGORITHMS = {
         ag_codecs=AG_CODECS,
         st_ladder=ring_st_ladder,
         fused_st_ladder=fused_ring_st_ladder,
+        has_divisor=True,
     ),
     "pull": _Algorithm(
         name="pull",
@@ -667,26 +666,23 @@ class FlyQuickAllReduce:
         return int(nbytes) >= self.min_bytes
 
     def _check_divisor_supported(self, divisor: float) -> None:
-        """A divisor other than 1 needs the mesh schedule's INT4 wire format."""
-        if divisor != DEFAULT_DIVISOR and (
-            not self._algo.has_divisor or "int4" not in (self.rs_codec, self.ag_codec)
-        ):
+        """A divisor other than 1 needs a schedule whose plain kernel takes one."""
+        if divisor != DEFAULT_DIVISOR and not self._algo.has_divisor:
             raise ValueError(
-                "FlyQuickAllReduce divisor is only supported by the mesh "
-                f"algorithm with the int4 codec, got algorithm={self.algorithm!r}, "
-                f"rs_codec={self.rs_codec!r}, ag_codec={self.ag_codec!r}"
+                "FlyQuickAllReduce divisor is only supported by the mesh and "
+                f"ring algorithms, got algorithm={self.algorithm!r}"
             )
 
     def allreduce(self, inp, out, stream=None, divisor: float = DEFAULT_DIVISOR):
         """Two-shot INT4 all-reduce into ``out``.
 
         ``stream=None`` uses the current PyTorch stream on this device.
-        ``divisor`` defaults to 1, which keeps the previous INT4 result.
-        Loaded values are divided by it before the first pack, and the
-        finished sum is multiplied by it once. Every rank must pass the same
-        divisor; this is not checked, and a mismatch silently gives each rank
-        a different result. Only the mesh schedule with the INT4 codec takes
-        a divisor other than 1.
+        ``divisor`` defaults to 1, which leaves the values unscaled.
+        Loaded bf16 values are divided by it in f32 before narrowing to fp16,
+        and the finished sum is multiplied back in f32 before the bf16 store,
+        so magnitudes up to ``65504 * divisor`` survive. Every rank must pass
+        the same divisor; this is not checked, and a mismatch silently gives
+        each rank a different result.
         """
         divisor = _check_divisor(divisor)
         self._check_divisor_supported(divisor)

@@ -58,9 +58,10 @@ sentinel until the data of a peer arrives. The reader polls its slot until no
 
 The mesh is a two-shot all-reduce: a reduce-scatter lap, then an all-gather
 lap. In each lap, each rank pushes to all `N-1` peers. Both laps use the same
-wire format. The default is INT4 with one E5M2 scale for each group of 16
-values. INT5 and INT6 use the same scale and add more bits for each value. FP16
-sends the values without quantization and is used in testing.
+wire format. The default is INT4 with one scale for each group of 16 values;
+two adjacent groups share the scale's exponent (see Accuracy limits). INT5 and
+INT6 use the same scale and add more bits for each value. FP16 sends the
+values without quantization and is used in testing.
 
 ### Ring
 
@@ -92,10 +93,23 @@ The kernels convert the bf16 payload to fp16 and do all arithmetic in packed
 fp16, for every wire format.
 
 * A magnitude above 65504 saturates to 65504. The `fp16` wire format is not
-  lossless for bf16 values outside the fp16 range.
-* The group scale is an E5M2 byte (bias 12) spanning `[2**-12, 1.75 * 2**19]`,
-  so every fp16 extremum fits and no group clips below the fp16 limit above,
-  including the ring's requantized partial sums. NaN and Inf become finite
+  lossless for bf16 values outside the fp16 range. The opt-in `divisor` of the
+  plain all-reduce (mesh and ring, every wire format) divides in fp32 before
+  the fp16 narrowing and multiplies back in fp32 before the bf16 store, so
+  magnitudes up to `65504 * divisor` survive. Every rank must pass the same
+  divisor.
+* The group scale is a pair-shared-exponent float. Each 16-bit word holds the
+  scales of two adjacent groups: the first is a 5-bit exponent (bias 12) and
+  a 3-bit mantissa, the second a 6-bit offset from the first's exponent, and
+  the last two bits are their signs. A scale spans
+  `[2**-12, 1.875 * 2**19]`, so every fp16 extremum fits and no group clips
+  below the fp16 limit above, including the ring's requantized partial sums.
+  INT5 floors the scale at `2**-11` and INT6 at `2**-10`.
+* INT4 rounds the scale to nearest, within 1/16 of the group extremum. INT5
+  and INT6 round it up. When the two groups' exponents differ by more than the
+  offset covers (4 binades below the first, 3 above), the smaller group's
+  scale is raised and loses mantissa bits; the larger keeps its own. A scale
+  still takes one byte for each group on the wire. NaN and Inf become finite
   values.
 
 ## Inbox memory

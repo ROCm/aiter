@@ -37,10 +37,16 @@ their own -- those belong to the kernel body or a ``@flyc.jit`` helper, the only
 code the AST rewriter sees.
 """
 
+import flydsl.expr as fx
 from flydsl.expr import range_constexpr
 
 from ...allreduce_policy import SUPPORTED_BLOCKS
-from .quick_allreduce_codec import _atom_bf16_to_f16, _atom_f16_to_bf16
+from .quick_allreduce_codec import (
+    _atom_bf16_to_f16,
+    _atom_bf16_to_f16_scaled,
+    _atom_f16_to_bf16,
+    _atom_f16_to_bf16_scaled,
+)
 from .transport import ATOMS, _payload_io
 
 
@@ -74,7 +80,24 @@ class QuickReducePlainEpilogue:
             "rows_per_tile": self.rows_per_tile,
         }
 
-    def bind(self, *, tid, nbytes, num_tiles, inp_ptr, out_ptr, **_unused):
+    def bind(
+        self, *, tid, nbytes, num_tiles, inp_ptr, out_ptr, divisor=None, **_unused
+    ):
+        """*divisor* (f32, runtime) divides every load and multiplies every
+        store, both in f32 on the far side of the fp16 narrowing, so magnitudes
+        up to ``65504 * divisor`` survive the fp16 math. ``None`` builds the
+        unscaled conversions."""
+        decode, encode = _atom_bf16_to_f16, _atom_f16_to_bf16
+        if divisor is not None:
+            inv_div = fx.full(8, fx.Float32(1.0) / divisor, fx.Float32)
+            div = fx.full(8, divisor, fx.Float32)
+
+            def decode(atom):
+                return _atom_bf16_to_f16_scaled(atom, inv_div)
+
+            def encode(atom):
+                return _atom_f16_to_bf16_scaled(atom, div)
+
         return _BoundPlain(
             *_payload_io(
                 inp_ptr,
@@ -84,8 +107,8 @@ class QuickReducePlainEpilogue:
                 ATOMS,
                 self.block,
                 tid,
-                decode=_atom_bf16_to_f16,
-                encode=_atom_f16_to_bf16,
+                decode=decode,
+                encode=encode,
             )
         )
 
