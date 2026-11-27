@@ -147,6 +147,9 @@ class TunerCommon:
         self.keys = key
         self.tunedf = None
         self.untunedf = None
+        # Set by _run_selected for `--run_config <tuned_csv>`: shapes come from that
+        # file, so a missing untuned CSV reads as empty instead of aborting pre_process.
+        self._untuned_file_optional = False
         self.name = name
         self.topk = 1
         self.success = pd.DataFrame(columns=self.columns)
@@ -623,6 +626,8 @@ class TunerCommon:
         return untunedf
 
     def get_untuned_gemm_list(self, untuned_gemm_file):
+        if self._untuned_file_optional and not os.path.exists(untuned_gemm_file):
+            return pd.DataFrame(columns=self.keys)
         assert os.path.exists(
             untuned_gemm_file
         ), f"Not exist untuned file: {untuned_gemm_file}"
@@ -1990,6 +1995,14 @@ class TunerCommon:
             return self._run_selected(args, fast_mode)
 
     def _run_selected(self, args, fast_mode=False):
+        # --run_config <tuned_csv> reads its shapes from that file; only --compare and
+        # --all need the untuned file. pre_process still runs (subclasses set up their
+        # state there); only the read of a missing untuned CSV is skipped.
+        self._untuned_file_optional = (
+            isinstance(args.run_config, str)
+            and not getattr(args, "compare", False)
+            and not getattr(args, "all", False)
+        )
         self.pre_process(args)
 
         # Resolve --run_config: can be False, True (no file), or a file path string.
@@ -2248,7 +2261,7 @@ class GemmCommonTuner(TunerCommon):
 
             untunedf_cols = self.untunedf.columns
             current = self.current_rows(self.tunedf)
-            if len(current) != 0:
+            if len(current) != 0 and not self.untunedf.empty:
                 mask = self.untunedf.apply(tuple, axis=1).isin(
                     current[untunedf_cols].apply(tuple, axis=1)
                 )
