@@ -288,10 +288,8 @@ __all__ = [
     "FP8_DTYPE",
     "FP8_MAX",
     "qsa_cache_row_layout",
-    *(["qsa_decode_indexer"] if _HAS_FLYDSL else []),
     "qsa_expand_block_indices",
     "qsa_paged_mqa_logits",
-    *(["qsa_prefill_indexer"] if _HAS_FLYDSL else []),
     "qsa_select_paged_tokens",
     "qsa_sparse_paged_gqa",
     "qsa_sparse_prefill",
@@ -299,6 +297,9 @@ __all__ = [
     "qsa_sparse_prefill_widths",
     "qsa_store_quantized_rows",
 ]
+
+if _HAS_FLYDSL:
+    __all__ += ["qsa_decode_indexer", "qsa_prefill_indexer"]
 
 
 def __getattr__(name):
