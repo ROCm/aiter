@@ -538,6 +538,43 @@ class OpusGemmInstance:
         return _opus_sf_shuf_sub()
 
 
+# gfx950 a16w16 tags whose pipelines zero the K tail (k >= K) of the A and B
+# register fragments in the last K tile (opus_gemm_k_tail_mask_gfx950.cuh), so a
+# partial last K tile is correct for them: the split-barrier, persistent,
+# mono_tile (each with a 4g_safe form) and flatmm_splitk pipelines (ROCm/aiter#5954).
+A16W16_K_TAIL_MASKED_TAGS = frozenset(
+    {"a16w16", "a16w16_persistent", "a16w16_mono_tile", "a16w16_flatmm_splitk"}
+)
+
+# gfx950 a16w16 tags whose hand-scheduled pipelines consume K tiles in pairs
+# (main loop of two tiles plus two epilogue tiles), so ceil(K / B_K) must be
+# even and at least 2. This is independent of K % B_K.
+A16W16_PAIRED_K_TILE_TAGS = frozenset(
+    {"a16w16", "a16w16_persistent", "a16w16_mono_tile"}
+)
+
+
+def a16w16_requires_k_aligned(instance: OpusGemmInstance) -> bool:
+    """Whether a gfx950 kid is only correct when K is a multiple of its B_K.
+
+    True for every gfx950 kid (empty ``arch_prefix``) whose pipeline does not
+    mask the K tail, so a new kernel family is alignment-required until its tag
+    is added to ``A16W16_K_TAIL_MASKED_TAGS``. gfx942 and gfx1250 kids carry
+    their own prefix and are not covered by this rule.
+    """
+    return (
+        instance.arch_prefix == ""
+        and instance.kernel_tag not in A16W16_K_TAIL_MASKED_TAGS
+    )
+
+
+def a16w16_requires_even_k_tiles(instance: OpusGemmInstance) -> bool:
+    """Whether a gfx950 kid needs an even ceil(K / B_K) of at least 2."""
+    return (
+        instance.arch_prefix == "" and instance.kernel_tag in A16W16_PAIRED_K_TILE_TAGS
+    )
+
+
 def a16w16_flatmm_prefetch_k_iter(instance: OpusGemmInstance) -> int:
     """Mirror gfx950 ``Traits::prefetch_k_iter`` for host-side planning.
 

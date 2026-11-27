@@ -18,6 +18,8 @@ from csrc.opus_gemm.opus_gemm_common import (
     OpusGemmInstance,
     a8w8_mxscale_flatmm_prefetch_k_iter,
     a16w16_flatmm_prefetch_k_iter,
+    a16w16_requires_even_k_tiles,
+    a16w16_requires_k_aligned,
     get_kernel_instance,
     group_kids,
 )
@@ -75,9 +77,18 @@ def _supports_a16w16_shape(
             return False
         return split_k <= (K + instance.B_K - 1) // instance.B_K
 
-    # gfx950 a16w16 pipelines zero the K tail of the A and B register fragments
-    # in the last K tile (opus_gemm_k_tail_mask_gfx950.cuh), so a partial last
-    # K tile is correct for every kid and K % B_K is not part of the contract.
+    # gfx950 a16w16 pipelines in A16W16_K_TAIL_MASKED_TAGS zero the K tail of the
+    # A and B register fragments in the last K tile
+    # (opus_gemm_k_tail_mask_gfx950.cuh), so a partial last K tile is correct for
+    # them. Any other gfx950 tag still requires K % B_K == 0.
+    if a16w16_requires_k_aligned(instance) and K % instance.B_K != 0:
+        return False
+    # The split-barrier, persistent and mono_tile pipelines consume K tiles in
+    # pairs: ceil(K / B_K) must be even and at least 2.
+    if a16w16_requires_even_k_tiles(instance):
+        k_tiles = (K + instance.B_K - 1) // instance.B_K
+        if k_tiles < 2 or k_tiles % 2 != 0:
+            return False
     if instance.kernel_tag == "a16w16_mono_tile":
         return N % instance.B_N == 0
 
@@ -354,6 +365,19 @@ def _build_a16w16_launch_plan(
             "opus_gemm_a16w16_launch: gfx1250 workspace kids require "
             f"batch=1; got batch={batch}"
         )
+    if a16w16_requires_k_aligned(instance) and K % instance.B_K != 0:
+        raise ValueError(
+            f"OPUS kid {resolved_kid} ({instance.kernel_tag}) does not mask the "
+            f"K tail and requires K % {instance.B_K} == 0; got K={K}"
+        )
+    if a16w16_requires_even_k_tiles(instance):
+        k_tiles = (K + instance.B_K - 1) // instance.B_K
+        if k_tiles < 2 or k_tiles % 2 != 0:
+            raise ValueError(
+                f"OPUS kid {resolved_kid} ({instance.kernel_tag}) consumes K "
+                f"tiles in pairs and requires an even ceil(K / {instance.B_K}) "
+                f">= 2; got K={K} ({k_tiles} tiles)"
+            )
     if not _supports_a16w16_shape(instance, M=M, N=N, K=K):
         raise ValueError(
             f"OPUS kid {resolved_kid} is incompatible with "

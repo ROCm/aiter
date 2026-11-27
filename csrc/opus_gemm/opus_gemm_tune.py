@@ -65,6 +65,8 @@ from opus_gemm_common import (
     GFX1250_SPLITK_FUSE_KIDS,
     _opus_sidecar_path,
     a16w16_flatmm_prefetch_k_iter,
+    a16w16_requires_even_k_tiles,
+    a16w16_requires_k_aligned,
     get_registry,
     group_kids,
 )
@@ -574,6 +576,13 @@ def kid_rejects_shape(k_inst, M, N, K, cu_num):
 
     B_K = k_inst.B_K
     loops = _ceil_div(K, B_K)
+
+    # gfx950 tags outside A16W16_K_TAIL_MASKED_TAGS do not mask the K tail.
+    if a16w16_requires_k_aligned(k_inst) and K % B_K != 0:
+        return True
+    # split-barrier / persistent / mono_tile consume K tiles in pairs.
+    if a16w16_requires_even_k_tiles(k_inst) and (loops < 2 or loops % 2 != 0):
+        return True
 
     # The exact-N bf16-workspace restriction belongs only to the gfx942
     # reducer. gfx1250 #4246 has a different bf16 reducer and accepts padded N.

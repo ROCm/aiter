@@ -1236,6 +1236,11 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     int loops_ = (K + {k.B_K} - 1) / {k.B_K};
     AITER_CHECK(loops_ >= 2,
         "K=", K, " too small for B_K={k.B_K}, need K >= {min_k}");
+    // The pipeline runs two MMAs per main-loop iteration plus two epilogue
+    // MMAs, so an odd tile count would re-read tile loops-2 and consume a stale
+    // buffer (this also held for odd aligned K before the K-tail mask).
+    AITER_CHECK(loops_ % 2 == 0,
+        "ceil_div(K, {k.B_K})=", loops_, " must be even (prefetch constraint)");
     AITER_CHECK(K % 2 == 0,
         "K=", K, " must be even (a16w16 family rejects odd K)");
     AITER_CHECK(M >= 1 && N >= 1, "M and N must be >= 1");

@@ -955,9 +955,17 @@ def test_gfx950_heuristic_does_not_try_secondary_kids(monkeypatch):
 
 
 # ---- partial-K contract (ROCm/aiter#5954) --------------------------------
-# Every gfx950 a16w16 pipeline zeroes the K tail (k >= K) of the A and B
-# register fragments in the last K tile, so a partial K must give the same
-# result whatever bytes (including NaN/Inf) sit past logical K in each row.
+# The gfx950 split-barrier, persistent, mono_tile (each with a 4g_safe form) and
+# flatmm_splitk pipelines zero the K tail (k >= K) of the A and B register
+# fragments in the last K tile, so a partial K must give the same result
+# whatever bytes (including NaN/Inf) sit past logical K in each row. Any other
+# gfx950 tag stays alignment-required (a16w16_requires_k_aligned).
+#
+# GPU coverage depends on the build: a default build compiles kids
+# 6, 12, 14, 30, 52, 58, 60, 76 (DEFAULT_COMPILED_KIDS_GFX950) plus the kids named
+# by tuned rows, so the cases that name other kids (split-barrier 2, 4g_safe
+# 117/121, mono_tile 92) skip with a reason on a default build and run when
+# those kids are compiled (for example a build with the full registry).
 
 _PARTIAL_K_PADS = (0.0, 1.0, -3.0, float("nan"), float("inf"))
 
@@ -968,17 +976,132 @@ def _gfx950_a16_registry():
     return KERNEL_REGISTRY["a16w16"]["gfx950"][256]
 
 
-@pytest.mark.parametrize("kid", sorted(_gfx950_a16_registry()))
-def test_gfx950_partial_k_is_accepted_by_launch_plan(kid):
-    """No gfx950 a16w16 kid is rejected on the host for K % B_K != 0."""
-    block_k = _gfx950_a16_registry()[kid].B_K
-    # 1536 is a multiple of every gfx950 a16w16 B_M/B_N, so only K could reject.
-    # 15 * B_K + 2 keeps ceil(K / B_K) even and is not a multiple of B_K.
-    K = 15 * block_k + 2
-    plan = _get_cached_a16w16_launch_plan(
-        **_a16_policy_args("gfx950", 1536, 1536, K), kid=kid, split_k=0
+def _gfx950_masked_pipelines():
+    """(tag, is_4g_safe) forms present in the registry, e.g. ("a16w16", True)."""
+    return sorted(
+        {(i.kernel_tag, i.is_4g_safe) for i in _gfx950_a16_registry().values()}
     )
-    assert plan.resolved_kid == kid
+
+
+def _launch_or_skip_uncompiled(kid, A, B, Y):
+    try:
+        return opus_bmm(A, B, Y, family="a16w16", kid=kid, split_k=0)
+    except RuntimeError as exc:
+        if "is not compiled in the current OPUS module" in str(exc):
+            pytest.skip(f"kid {kid} is not compiled in this build")
+        raise
+
+
+@pytest.mark.parametrize(("tag", "is_4g_safe"), _gfx950_masked_pipelines())
+def test_gfx950_partial_k_is_accepted_by_launch_plan(tag, is_4g_safe):
+    """No kid of a masked pipeline is rejected on the host for K % B_K != 0."""
+    from csrc.opus_gemm.opus_gemm_common import A16W16_K_TAIL_MASKED_TAGS
+
+    assert tag in A16W16_K_TAIL_MASKED_TAGS
+    kids = [
+        kid
+        for kid, inst in _gfx950_a16_registry().items()
+        if (inst.kernel_tag, inst.is_4g_safe) == (tag, is_4g_safe)
+    ]
+    assert kids
+    for kid in kids:
+        block_k = _gfx950_a16_registry()[kid].B_K
+        # 1536 is a multiple of every gfx950 a16w16 B_M/B_N; 15 * B_K + 2 is not a
+        # multiple of B_K and keeps ceil(K / B_K) = 16 even.
+        plan = _get_cached_a16w16_launch_plan(
+            **_a16_policy_args("gfx950", 1536, 1536, 15 * block_k + 2),
+            kid=kid,
+            split_k=0,
+        )
+        assert plan.resolved_kid == kid
+
+
+def test_gfx950_unmasked_tag_still_requires_aligned_k():
+    """Tags outside the masked set keep a K % B_K == 0 rejection path."""
+    import dataclasses
+
+    from aiter.ops.opus.launch_plan import _supports_a16w16_shape
+    from csrc.opus_gemm.opus_gemm_common import (
+        a16w16_requires_k_aligned,
+        get_registry,
+    )
+
+    kid6 = _gfx950_a16_registry()[6]
+    unmasked = dataclasses.replace(kid6, kernel_tag="a16w16_flatmm")
+    assert a16w16_requires_k_aligned(unmasked)
+    assert _supports_a16w16_shape(unmasked, M=1536, N=1536, K=16 * kid6.B_K)
+    assert not _supports_a16w16_shape(unmasked, M=1536, N=1536, K=16 * kid6.B_K + 2)
+    # Masked tags and other architectures are not covered by the rule.
+    assert not a16w16_requires_k_aligned(kid6)
+    for gfx, cu in (("gfx942", 304), ("gfx1250", 256)):
+        assert not any(
+            a16w16_requires_k_aligned(inst)
+            for inst in get_registry("a16w16", gfx, cu).values()
+        )
+
+
+# ceil(K / 64) = 3 and 5. These are partial-K shapes too, so they also cover the
+# case that K-tail masking alone cannot fix: an odd K-tile count.
+_ODD_TILE_KS = (130, 258)
+_PAIRED_KIDS = (2, 30, 76, 92, 117, 121)
+
+
+@pytest.mark.parametrize("K", _ODD_TILE_KS)
+@pytest.mark.parametrize("kid", _PAIRED_KIDS)
+def test_gfx950_odd_k_tile_count_is_rejected_by_launch_plan(kid, K):
+    """Pair-consuming pipelines reject an odd ceil(K / B_K) instead of mis-computing.
+
+    mono_tile used to accept it (also for aligned K, e.g. K=192) and returned a
+    wrong result: the main loop plus two epilogue MMAs re-read tile loops-2.
+    """
+    inst = _gfx950_a16_registry()[kid]
+    assert inst.B_K == 64 and (K + 63) // 64 % 2 == 1
+    with pytest.raises(ValueError, match="even ceil"):
+        _get_cached_a16w16_launch_plan(
+            **_a16_policy_args("gfx950", 1536, 1536, K), kid=kid, split_k=0
+        )
+
+
+@pytest.mark.parametrize("K", _ODD_TILE_KS)
+@pytest.mark.parametrize("kid", _PAIRED_KIDS)
+@pytest.mark.parametrize("pad", ("contiguous", float("nan")))
+def test_gfx950_odd_k_tile_count_never_launches_a_paired_kid(kid, K, pad):
+    """On hardware: NaN padding or stride == K, odd tile count -> rejected, Y untouched."""
+    if _runtime_arch() != "gfx950":
+        pytest.skip("requires gfx950 hardware")
+    gen = torch.Generator(device="cuda").manual_seed(0x130 + K)
+    if pad == "contiguous":
+        A = torch.randn((1, 512, K), device="cuda", dtype=torch.bfloat16, generator=gen)
+        B = torch.randn((1, 512, K), device="cuda", dtype=torch.bfloat16, generator=gen)
+    else:
+        A = _padded_k_operand(512, K, (K + 63) // 64 * 64 + 64, pad, gen)
+        B = _padded_k_operand(512, K, (K + 63) // 64 * 64 + 64, pad, gen)
+    Y = torch.full((1, 512, 512), 7.0, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="even ceil"):
+        opus_bmm(A, B, Y, family="a16w16", kid=kid, split_k=0)
+    torch.cuda.synchronize()
+    assert bool((Y == 7.0).all()), "a rejected kid must not launch"
+
+
+# ceil(K / 64) = 5 and 7; kids 6 and 52 need at least 4 tiles.
+@pytest.mark.parametrize("K", (258, 420))
+@pytest.mark.parametrize("kid", (6, 52))
+@pytest.mark.parametrize("pad", ("contiguous", float("nan")))
+def test_gfx950_odd_k_tile_count_is_correct_for_flatmm_splitk(kid, K, pad):
+    """flatmm_splitk handles any tile count (it is not a paired pipeline)."""
+    if _runtime_arch() != "gfx950":
+        pytest.skip("requires gfx950 hardware")
+    gen = torch.Generator(device="cuda").manual_seed(0x130 + K)
+    if pad == "contiguous":
+        A = torch.randn((1, 512, K), device="cuda", dtype=torch.bfloat16, generator=gen)
+        B = torch.randn((1, 512, K), device="cuda", dtype=torch.bfloat16, generator=gen)
+    else:
+        A = _padded_k_operand(512, K, (K + 63) // 64 * 64 + 64, pad, gen)
+        B = _padded_k_operand(512, K, (K + 63) // 64 * 64 + 64, pad, gen)
+    Y = torch.empty((1, 512, 512), device="cuda", dtype=torch.bfloat16)
+    actual = _launch_or_skip_uncompiled(kid, A, B, Y)
+    torch.cuda.synchronize()
+    _assert_matches_golden(actual, A, B)
 
 
 def _padded_k_operand(rows, K, row_stride, pad, gen):
@@ -998,7 +1121,6 @@ _PARTIAL_K_CASES = [
     (6, 194),
     (6, 254),
     (6, 1250),
-    (10, 194),
     (12, 578),
     (12, 1250),
     (52, 578),
@@ -1018,7 +1140,7 @@ def test_gfx950_partial_k_result_is_independent_of_row_padding(kid, K):
         A = _padded_k_operand(M, K, stride, pad, gen)
         B = _padded_k_operand(N, K, stride, pad, gen)
         Y = torch.empty((1, M, N), device="cuda", dtype=torch.bfloat16)
-        actual = opus_bmm(A, B, Y, family="a16w16", kid=kid, split_k=0)
+        actual = _launch_or_skip_uncompiled(kid, A, B, Y)
         torch.cuda.synchronize()
         _assert_matches_golden(actual, A, B)
         outputs.append(actual.clone())
@@ -1035,24 +1157,36 @@ def test_gfx950_partial_k_contiguous_rows_match_torch(kid):
     A = torch.randn((1, 1536, K), device="cuda", dtype=torch.bfloat16)
     B = torch.randn((1, 1536, K), device="cuda", dtype=torch.bfloat16)
     Y = torch.empty((1, 1536, 1536), device="cuda", dtype=torch.bfloat16)
-    actual = opus_bmm(A, B, Y, family="a16w16", kid=kid, split_k=0)
+    actual = _launch_or_skip_uncompiled(kid, A, B, Y)
     torch.cuda.synchronize()
     _assert_matches_golden(actual, A, B)
 
 
 def test_gfx950_tuner_ignores_k_tail_for_every_kid():
-    """A partial last K tile alone never makes the tuner reject a kid."""
+    """A partial last K tile alone never makes the tuner reject a masked kid."""
     if _runtime_arch() != "gfx950":
         pytest.skip("requires gfx950 hardware")
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "csrc/opus_gemm"))
     from opus_gemm_tune import kid_rejects_shape
 
     for kid, inst in sorted(_gfx950_a16_registry().items()):
-        # Same ceil(K / B_K) = 16 (so the even-loops / prefetch-depth rules see
-        # the same loop count); only the K tail differs.
+        # Same ceil(K / B_K) = 16 (so the even-tile / prefetch-depth rules see
+        # the same tile count); only the K tail differs.
         aligned = kid_rejects_shape(inst, 1536, 1536, 16 * inst.B_K, 256)
         partial = kid_rejects_shape(inst, 1536, 1536, 15 * inst.B_K + 2, 256)
         assert partial == aligned, kid
+
+
+def test_gfx950_tuner_rejects_odd_k_tile_count_for_paired_kids():
+    if _runtime_arch() != "gfx950":
+        pytest.skip("requires gfx950 hardware")
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "csrc/opus_gemm"))
+    from opus_gemm_tune import kid_rejects_shape
+
+    for kid in _PAIRED_KIDS:
+        inst = _gfx950_a16_registry()[kid]
+        for K in _ODD_TILE_KS:
+            assert kid_rejects_shape(inst, 1536, 1536, K, 256), (kid, K)
 
 
 if __name__ == "__main__":
