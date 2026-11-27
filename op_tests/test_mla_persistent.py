@@ -2534,6 +2534,9 @@ def main():
         check_fp8_gqa16_multi_tile_batch(1)
         check_fp8_gqa16_multi_tile_batch(1, return_lse=True)
         aiter.logger.info("fp8 gqa16 qlen 1 multi-tile batch: passed")
+        check_fp8_gqa16_multi_tile_batch(4)
+        check_fp8_gqa16_multi_tile_batch(4, return_lse=True)
+        aiter.logger.info("fp8 gqa16 qlen 4 multi-tile batch: passed")
     return df if args.nhead else None
 
 
