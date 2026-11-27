@@ -97,6 +97,30 @@ def _check_coef(coef: torch.Tensor, K: int, group: int, pairs: bool) -> None:
     assert coef.size(-1) * coef.element_size() == stride * 4, "coefficient layout"
 
 
+def _check_w(w: torch.Tensor, K: int) -> None:
+    assert w.dtype == torch.int32, "weights are packed int32"
+    assert w.size(-1) == _tile_stride(_w_tile_dwords(K)), "weight layout"
+
+
+def row_lds_bytes(K: int, group: int) -> int:
+    """LDS of the row kernel: one activation row and one group of a tile."""
+    return (K // 2 + group * 8) * 4
+
+
+def reduce_lds_bytes(K: int, top_k: int) -> int:
+    """LDS of the reduce kernel: the activation rows of one token."""
+    return top_k * K * 2
+
+
+@functools.cache
+def lds_capacity_bytes() -> int:
+    from flydsl.runtime.device import get_rocm_arch
+
+    from aiter.jit.utils.lds_capacity import get_lds_capacity_bytes
+
+    return get_lds_capacity_bytes(get_rocm_arch())
+
+
 def _w_tile_dwords(K: int) -> int:
     return (K // 16) * 16 * 2 * REG_N
 
@@ -464,6 +488,7 @@ def _build_gemm_row(
     c_expert *= 2
     out_reg = REG_N // 2 if silu_mul else REG_N
     n_out = N // 2 if silu_mul else N
+    assert row_lds_bytes(K, group) <= lds_capacity_bytes(), "row kernel LDS"
     allocator = SmemAllocator(None, arch=get_rocm_arch(), global_sym_name="moe_row")
     # One wave per workgroup: workgroups of several waves (and their larger
     # LDS allocation) cost up to 5% of a decode step. Declaring the block
@@ -493,7 +518,7 @@ def _build_gemm_row(
         c_rsrc = buffer_ops.create_buffer_resource(arg_coef, max_size=True)
         eid_rsrc = buffer_ops.create_buffer_resource(arg_expert_ids, max_size=True)
 
-        # Rows without an expert (id -1) run zero groups and store nothing.
+        # Rows without an expert (id -1) run zero groups and store zeros.
         expert = buffer_ops.buffer_load(eid_rsrc, row, vec_width=1, dtype=fx.Int32)
         valid = expert >= 0
         expert = valid.select(expert, fx.Int32(0))
@@ -579,7 +604,7 @@ def _build_gemm_row(
             ]
 
         # Row 0 of the WMMA result is element 0 of the first 16 lanes.
-        if valid & (klane == 0):
+        if klane == 0:
             out_base = row * n_out + tile_n * (16 * out_reg) + lane16
             for rn in range_constexpr(out_reg):
                 buffer_ops.buffer_store(
@@ -653,6 +678,7 @@ def _build_gemm_reduce(
     c_tile = 2 * _tile_stride(_coef_tile_dwords(K, group, coef_pairs))
     c_expert *= 2
     x_dwords = top_k * k_dwords
+    assert reduce_lds_bytes(K, top_k) <= lds_capacity_bytes(), "reduce kernel LDS"
     allocator = SmemAllocator(None, arch=get_rocm_arch(), global_sym_name="moe_x")
     allocator.ptr = x_dwords * 4
     name = _kernel_name("reduce", K, N, group, coef_pairs, False, fp16)

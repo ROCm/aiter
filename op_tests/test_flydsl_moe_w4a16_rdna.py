@@ -7,6 +7,9 @@ reference.
 The sweep covers the three routing paths: the row and top-k-sum kernels (up to
 ROW_PATH_MAX_TOKENS tokens), the grouped GEMM with a separate top-k sum, and
 GEMM1 with SiLU-and-multiply in its epilogue or as a separate activation.
+Further cases cover routes without an expert (id -1) and shapes whose operands
+do not fit the LDS of the row or top-k-sum kernels. The workspace starts out
+as NaN, so rows the op does not write show up.
 """
 
 import argparse
@@ -21,6 +24,7 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.moe_w4a16_rdna import (
     ROW_PATH_MAX_TOKENS,
     flydsl_rdna_moe,
+    flydsl_rdna_moe_path,
     flydsl_rdna_moe_supported,
     gate_up_tile_order,
     pack_w4a16_weights,
@@ -38,6 +42,16 @@ MODEL_SHAPES = [
     (2048, 512, 256, 8),
     (2048, 768, 128, 8),
     (2816, 704, 128, 8),
+]
+
+# (hidden, intermediate, experts, top_k, group_size) off the default dispatch:
+# GEMM1 of the row kernel needs 68 KiB of LDS (grouped path at 1 token), the
+# top-k-sum kernel 128 KiB (row GEMM2 + topk_weighted_sum), and top_k above
+# MAX_REDUCE_ROWS.
+EDGE_SHAPES = [
+    (2048, 2048, 8, 8, 2048),
+    (2048, 8192, 8, 8, 128),
+    (2048, 512, 16, 10, 128),
 ]
 
 
@@ -66,6 +80,8 @@ def run_torch(x, d1, d2, topk_weights, topk_ids, round_gate_up, round_down):
 
     out = torch.zeros((x.size(0), d2.size(1)), dtype=torch.float32, device=x.device)
     for e in topk_ids.unique().tolist():
+        if e < 0:
+            continue
         token, slot = (topk_ids == e).nonzero(as_tuple=True)
         gate_up = rounded(x[token].float() @ d1[e].T, round_gate_up)
         gate, up = gate_up.chunk(2, dim=-1)
@@ -77,7 +93,16 @@ def run_torch(x, d1, d2, topk_weights, topk_ids, round_gate_up, round_down):
 
 @benchmark()
 def test_flydsl_moe_w4a16_rdna(
-    tokens, hidden, inter, experts, top_k, group_size, zero_points, fused_silu, dtype
+    tokens,
+    hidden,
+    inter,
+    experts,
+    top_k,
+    group_size,
+    zero_points,
+    fused_silu,
+    dtype,
+    invalid_routes=False,
 ):
     device = "cuda"
     torch.manual_seed(0)
@@ -96,7 +121,15 @@ def test_flydsl_moe_w4a16_rdna(
     logits = torch.randn((tokens, experts), dtype=torch.float32, device=device)
     topk_weights, topk_ids = torch.softmax(logits, dim=-1).topk(top_k)
     topk_ids = topk_ids.to(torch.int32)
-    # Up to ROW_PATH_MAX_TOKENS, GEMM2 sums the experts in f32.
+    if invalid_routes:
+        # As in an engine warm-up: the last route of every token and all
+        # routes of token 0 have no expert; their weights stay nonzero.
+        topk_ids[:, -1] = -1
+        topk_ids[0] = -1
+    path = flydsl_rdna_moe_path(
+        tokens, hidden, inter, top_k, group_size, topk_weights.dtype
+    )
+    # The top-k-sum kernel sums the experts in f32.
     ref = run_torch(
         x,
         d1,
@@ -104,7 +137,7 @@ def test_flydsl_moe_w4a16_rdna(
         topk_weights,
         topk_ids,
         round_gate_up=not fused_silu,
-        round_down=tokens > ROW_PATH_MAX_TOKENS,
+        round_down=path != "reduce",
     )
 
     def silu_and_mul(out, gate_up):
@@ -112,8 +145,8 @@ def test_flydsl_moe_w4a16_rdna(
         out.copy_(F.silu(gate) * up)
 
     out = torch.empty((tokens, hidden), dtype=dtype, device=device)
-    workspace = torch.empty(
-        tokens * top_k * (3 * inter + hidden), dtype=dtype, device=device
+    workspace = torch.full(
+        (tokens * top_k * (3 * inter + hidden),), torch.nan, dtype=dtype, device=device
     )
     _, us = run_perftest(
         flydsl_rdna_moe,
@@ -135,7 +168,7 @@ def test_flydsl_moe_w4a16_rdna(
     )
 
     # Only the weights routed to are read.
-    routed = min(tokens * top_k, experts)
+    routed = min(int((topk_ids >= 0).sum()), experts)
     weight_bytes = routed * 3 * hidden * inter // 2
     flops = 2 * tokens * top_k * 3 * hidden * inter
     err = checkAllclose(
@@ -150,12 +183,35 @@ def test_flydsl_moe_w4a16_rdna(
     ), f"flydsl_rdna_moe: {err:.4%} of elements outside rtol/atol"
     return {
         "gfx": get_gfx_runtime(),
-        "path": "row" if tokens <= ROW_PATH_MAX_TOKENS else "grouped",
+        "path": path,
         "flydsl_rdna us": us,
         "flydsl_rdna TFLOPS": flops / us / 1e6,
         "flydsl_rdna TB/s": weight_bytes / us / 1e6,
         "flydsl_rdna err": err,
     }
+
+
+def check_rejects_raw_pointer_misuse():
+    """Layouts the kernels cannot index are refused before a launch."""
+    hidden, inter, experts, top_k, group = 256, 128, 4, 2, 32
+    q1, s1, _, _ = quantize(2 * inter, hidden, experts, group, False, "cuda")
+    q2, s2, _, _ = quantize(hidden, inter, experts, group, False, "cuda")
+    order = gate_up_tile_order(2 * inter, "cuda")
+    w1, c1 = pack_w4a16_weights(q1[:, order], s1[:, order], None)
+    w2, c2 = pack_w4a16_weights(q2, s2, None)
+    x = torch.randn((2, 2 * hidden), dtype=dtypes.bf16, device="cuda")[:, :hidden]
+    ids = torch.zeros((2, top_k), dtype=torch.int32, device="cuda")
+    weights = torch.ones((2, top_k), dtype=torch.float32, device="cuda")
+    out = torch.empty((2, hidden), dtype=dtypes.bf16, device="cuda")
+    ws = torch.empty(2 * top_k * (3 * inter + hidden), dtype=dtypes.bf16, device="cuda")
+    args = (w1, c1, w2, c2, weights, ids, ws, group, experts, inter)
+    for bad_x, msg in ((x, "contiguous"), (x.contiguous().cpu(), "one device")):
+        try:
+            flydsl_rdna_moe(out, bad_x, *args)
+        except AssertionError as e:
+            assert msg in str(e), e
+        else:
+            raise AssertionError(f"flydsl_rdna_moe accepted x that is not {msg}")
 
 
 def main():
@@ -189,6 +245,7 @@ def main():
         "-f", "--fused_silu", type=dtypes.str2bool, nargs="*", default=[True, False]
     )
     args = parser.parse_args()
+    check_rejects_raw_pointer_misuse()
 
     for dtype in args.dtype:
         rows = [
@@ -204,6 +261,20 @@ def main():
             )
             # Both GEMMs need K to be a multiple of the group size.
             if shape[0] % group_size == 0 and shape[1] % group_size == 0
+        ]
+        rows += [
+            test_flydsl_moe_w4a16_rdna(
+                tokens, *shape, group_size, False, fused_silu, dtype, invalid
+            )
+            for (*shape, group_size), tokens, fused_silu, invalid in itertools.chain(
+                itertools.product(
+                    [(*MODEL_SHAPES[0], 128)],
+                    [1, ROW_PATH_MAX_TOKENS, ROW_PATH_MAX_TOKENS + 1, 64],
+                    [True, False],
+                    [True],
+                ),
+                itertools.product(EDGE_SHAPES, [1, 64], [True], [False, True]),
+            )
         ]
         logger.info(
             "flydsl_rdna_moe %s summary (markdown):\n%s",
