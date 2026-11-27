@@ -14,6 +14,18 @@ from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
+
+@gluon.jit
+def _sum_products_fma(x, y, BD: gl.constexpr):
+    # Fuse the (0, 2) and (1, 3) pairs without automatic FP fusion.
+    # Both split axes are register-local with this kernel's sizePerThread=8.
+    gl.static_assert(BD >= 4 and BD % 4 == 0)
+    x0, x1 = gl.split(gl.permute(x.reshape([BD // 4, 2, 2]), (0, 2, 1)))
+    y0, y1 = gl.split(gl.permute(y.reshape([BD // 4, 2, 2]), (0, 2, 1)))
+    partial = gl.fma(x0, y0, x1 * y1)
+    return gl.sum(partial.reshape([BD // 2]), axis=0)
+
+
 _attn_res_gate_tdm_kernel_gfx1250_repr = make_kernel_repr(
     "attn_res_gate_tdm_kernel_gfx1250",
     [
@@ -102,8 +114,8 @@ def attn_res_gate_tdm_kernel_gfx1250(
             ps.to(prefix_out.dtype.element_ty), prefix_out + t * D, o_d, mask=m_d
         )
     # The prefix is the first softmax term.
-    rstd = gl.rsqrt(gl.sum(ps * ps, axis=0) * (1.0 / D) + eps)
-    b_m = gl.sum(ps * b_qw, axis=0) * rstd * scale
+    rstd = gl.rsqrt(gl.fma(_sum_products_fma(ps, ps, BD), 1.0 / D, eps))
+    b_m = _sum_products_fma(ps, b_qw, BD) * rstd * scale
     b_acc = gl.full([], 1.0, dtype=gl.float32)
     b_o = ps
     for i_l in range(B):
@@ -120,20 +132,29 @@ def attn_res_gate_tdm_kernel_gfx1250(
             rows.index((i_l + PREFETCH) % (PREFETCH + 1)),
             pred=i_l + PREFETCH < B,
         )
-        v = rows.index(i_l % (PREFETCH + 1)).reshape([BD]).load(layout).to(gl.float32)
-        rstd = gl.rsqrt(gl.sum(v * v, axis=0) * (1.0 / D) + eps)
-        s = gl.sum(v * b_qw, axis=0) * rstd * scale
+        # Expose TDM's zero padding to the compiler.
+        v = gl.where(
+            m_d,
+            rows.index(i_l % (PREFETCH + 1)).reshape([BD]).load(layout).to(gl.float32),
+            0.0,
+        )
+        rstd = gl.rsqrt(gl.fma(_sum_products_fma(v, v, BD), 1.0 / D, eps))
+        s = _sum_products_fma(v, b_qw, BD) * rstd * scale
         b_mp = b_m
         b_m = gl.maximum(b_m, s)
         r = gl.exp(b_mp - b_m)
         p = gl.exp(s - b_m)
-        b_acc = b_acc * r + p
-        b_o = b_o * r + p * v
+        b_acc = gl.fma(b_acc, r, p)
+        b_o = gl.fma(b_o, r, p * v)
 
     b_o = b_o * (1.0 / b_acc)
     if HAS_ONORM:
         b_o_rstd = gl.rsqrt(
-            gl.sum(gl.where(m_d, b_o * b_o, 0.0), axis=0) * (1.0 / D) + out_eps
+            gl.fma(
+                _sum_products_fma(gl.where(m_d, b_o, 0.0), gl.where(m_d, b_o, 0.0), BD),
+                1.0 / D,
+                out_eps,
+            )
         )
         b_ow = gl.amd.cdna5.buffer_load(ow, o_d, mask=m_d, other=0.0).to(gl.float32)
         b_o = b_o * b_o_rstd * b_ow

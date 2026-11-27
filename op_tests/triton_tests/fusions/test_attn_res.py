@@ -936,6 +936,48 @@ def test_attn_res_gate_gluon_matches_reference(B, N, D, variant, dtype):
         )
 
 
+@_requires_gate_tdm
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("D", [257, 258, 259])
+def test_attn_res_gate_gluon_ignores_row_padding(D, dtype):
+    """Partial reduction groups must exclude the padding of aligned rows."""
+    N, B = 3, 3
+    eps, out_eps = 1e-6, 1e-5
+    prefix, residual, weight, hidden, hidden2 = generate_attn_res_gate_inputs(
+        N, D, B, dtype, with_add=True, with_add2=True
+    )
+    storage = torch.full((N, B, 264), float("nan"), dtype=dtype, device="cuda")
+    block = storage[..., :D]
+    block.copy_(residual)
+    onorm = torch.randn(D, dtype=dtype, device="cuda")
+    expected, expected_prefix = run_torch_gate(
+        prefix,
+        block,
+        weight,
+        eps,
+        hidden,
+        hidden2,
+        output_rms_weight=onorm,
+        output_rms_eps=out_eps,
+    )
+
+    actual, actual_prefix = attn_res_gate(
+        prefix,
+        block,
+        weight,
+        eps,
+        hidden,
+        hidden2,
+        output_rms_weight=onorm,
+        output_rms_eps=out_eps,
+        backend="gluon",
+    )
+
+    atol, rtol = _TOL[dtype]
+    torch.testing.assert_close(actual.float(), expected, atol=atol, rtol=rtol)
+    torch.testing.assert_close(actual_prefix, expected_prefix, atol=0, rtol=0)
+
+
 class _GateDispatchTensor(torch.Tensor):
     """CPU tensor metadata for tests that replace the kernel launch."""
 
