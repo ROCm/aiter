@@ -823,6 +823,10 @@ class AITER_CONFIG:
 
                         cu_num = pd.to_numeric(df["cu_num"], errors="coerce")
                         df[c] = cu_num.map(gfx_from_cu_num)
+                    elif merge_name == "tuned_grouped_fmoe":
+                        # Grouped-MoE readers treat a blank cell as "use the
+                        # default"; "0" would override defaults that are not 0.
+                        df[c] = ""
                     else:
                         df[c] = str(_FILL_DEFAULTS.get(c, 0))
             source_pairs[i] = (path, df[all_cols])

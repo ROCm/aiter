@@ -636,7 +636,8 @@ def _gemm_work_metrics(
     The byte model counts logical quantized inputs, weights and their E8M0 block
     scales, and the selected GEMM output formats. Weight and scale bytes use an
     active-expert count
-    of min(tokens * routed_topk, routed_experts) plus shared experts.
+    of min(tokens * routed_topk, routed_experts) plus shared experts, capped
+    by ``AITER_MOE_NUM_EXPERT_ACTIVATED`` when that override is set.
     GEMM1 writes MX payload plus scales when activation and requant are fused,
     BF16 gate/up when activation is separate, or BF16 post-activation output
     when only requant is separate. GEMM2 counts its BF16
@@ -652,6 +653,8 @@ def _gemm_work_metrics(
     active_experts = (
         min(tokens * (topk - shared_experts), experts - shared_experts) + shared_experts
     )
+    if AITER_MOE_NUM_EXPERT_ACTIVATED > 0:
+        active_experts = min(active_experts, AITER_MOE_NUM_EXPERT_ACTIVATED)
     if fuse_gemm1_act and fuse_gemm1_requant:
         # Match the MX output allocation, including padded E8M0 scale dwords.
         gemm1_output_bytes = routed_rows * (
@@ -711,9 +714,10 @@ def _rates(
     ],
 )
 def test_shared_expert_byte_accounting(
-    data_format, fuse_act, fuse_requant, gemm1_bytes, gemm2_bytes
+    data_format, fuse_act, fuse_requant, gemm1_bytes, gemm2_bytes, monkeypatch
 ):
     """Two tokens touch 16 routed weights plus one shared weight, not 18."""
+    monkeypatch.setattr(sys.modules[__name__], "AITER_MOE_NUM_EXPERT_ACTIVATED", 0)
     work = _gemm_work_metrics(
         experts=65,
         tokens=2,
@@ -1045,6 +1049,41 @@ def test_grouped_a8w4_situv2_matches_torch_ref():
         inter_dim=512,
         tol=VERIFY_TOL_A8W4,
     )
+
+
+@pytest.mark.parametrize("persistent_workers2", [0, 96])
+def test_grouped_a8w4_stage2_finer_tile_skips_alignment_gaps(
+    monkeypatch, persistent_workers2
+):
+    """Stage2 M16 must skip the three padding tiles in each M64 expert slab."""
+    from aiter.ops.flydsl import grouped_moe_gfx1250 as grouped
+
+    monkeypatch.setattr(sys.modules[__name__], "AITER_MOE_NUM_EXPERT_ACTIVATED", 64)
+    monkeypatch.setenv("AITER_FORCE_A8W4", "1")
+    monkeypatch.setenv("AITER_TDM_TILE_M2", "16")
+    monkeypatch.setenv("AITER_TDM_TILE_N2", "512")
+    monkeypatch.setenv("AITER_TDM_TILE_K2", "128")
+    monkeypatch.setenv("AITER_TDM_M_WARP2", "1")
+    monkeypatch.setenv("AITER_TDM_N_WARP2", "2")
+    monkeypatch.setenv("AITER_TDM_NUM_BUFFERS2", "1")
+    monkeypatch.setenv("AITER_FLYDSL_PERSISTENT_WORKERS2", str(persistent_workers2))
+    grouped._GROUPED_CONFIG_CACHE.clear()
+    grouped._find_grouped_config.cache_clear()
+    try:
+        run_moe(
+            "a8w4",
+            experts=384,
+            tokens=8,
+            topk=8,
+            model_dim=7168,
+            inter_dim=256,
+            activation=ActivationType.Silu,
+            use_bias=False,
+            check_aot_cache=False,
+        )
+    finally:
+        grouped._GROUPED_CONFIG_CACHE.clear()
+        grouped._find_grouped_config.cache_clear()
 
 
 # A 256x256x256 tile pins each A/B prefetch slot to 128 VGPRs. An a4w4 1x4
