@@ -5,6 +5,7 @@
 """Public QSA indexer correctness with synthetic inputs and independent references."""
 
 import argparse
+import inspect
 import itertools
 import os
 import subprocess
@@ -57,12 +58,12 @@ VERIFY_CASES = (
     ((12000, 11889), 2, 3, 16384),
 )
 
-DUAL_PREFILL_CASES = (
+PREFILL_CAPTURE_CASES = (
     *[(seq, ext, False) for seq, ext in PREFILL_CASES],
     ((12353,), (65,), True),
 )
 
-DUAL_DECODE_CASES = (
+DECODE_WIDE_GRAPH_CASES = (
     ((262144,), 1, 262144),
     ((262148, 300000, 9), 1, 300032),
     ((1048576,), 1, 1048576),
@@ -81,6 +82,113 @@ def _addresses(source):
         for name, tensor in source.inputs.items()
         if isinstance(tensor, torch.Tensor)
     }
+
+
+def test_original_public_signatures():
+    """SGLang's original keyword dictionaries need no field-name adapter."""
+    from aiter.ops.qsa import qsa_decode_indexer, qsa_prefill_indexer
+
+    prefill = [
+        "qk",
+        "heads",
+        "positions",
+        "logical_positions",
+        "state_slots",
+        "key_state",
+        "rope_state",
+        "write_locs",
+        "member_rows",
+        "group_sequences",
+        "group_ends",
+        "rope_matrix",
+        "compressed",
+        "token_slot_table",
+        "cos_sin_cache",
+        "axis_map",
+        "q_weight",
+        "k_weight",
+        "q_eps",
+        "k_eps",
+        "seq_lens",
+        "extend_lens",
+        "q_out",
+        "row_range",
+        "out",
+    ]
+    decode = [
+        "qk",
+        "positions",
+        "logical_positions",
+        "state_slots",
+        "key_state",
+        "rope_state",
+        "write_locs",
+        "group_locs",
+        "compressed",
+        "page_table",
+        "lengths",
+        "cos_sin_cache",
+        "axis_map",
+        "q_weight",
+        "k_weight",
+        "q_eps",
+        "k_eps",
+        "seq_lens",
+        "verify",
+        "q_out",
+        "logits_out",
+    ]
+    for op, names, defaults in (
+        (qsa_prefill_indexer, prefill, {"q_out": None, "row_range": None, "out": None}),
+        (
+            qsa_decode_indexer,
+            decode,
+            {"verify": False, "q_out": None, "logits_out": None},
+        ),
+    ):
+        params = inspect.signature(op).parameters
+        assert list(params) == names
+        for name, param in params.items():
+            assert param.kind == (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD
+                if name == "qk"
+                else inspect.Parameter.KEYWORD_ONLY
+            )
+            assert param.default == defaults.get(name, inspect.Parameter.empty)
+
+
+PREFILL_PLAN_ERRORS = (
+    "heads",
+    "group_sequences_dtype",
+    "group_ends_shape",
+    "group_sequences_cpu",
+    "group_ends_cpu",
+    "group_sequences_alias",
+    "group_ends_alias",
+)
+
+
+@pytest.mark.parametrize("case", PREFILL_PLAN_ERRORS)
+def test_prefill_write_plan_validation(case, device):
+    source = helpers.synthetic((2177,), (129,), device)
+    inputs = dict(source.inputs)
+    before = helpers.clone_state(source.state)
+    if case == "heads":
+        inputs["heads"] = 8
+    elif case == "group_sequences_dtype":
+        inputs["group_sequences"] = inputs["group_sequences"].int()
+    elif case == "group_ends_shape":
+        inputs["group_ends"] = inputs["group_ends"][:-1]
+    elif case.endswith("_cpu"):
+        name = case.removesuffix("_cpu")
+        inputs[name] = torch.empty(inputs[name].shape, dtype=torch.int64, device="cpu")
+    else:
+        name = case.removesuffix("_alias")
+        inputs[name] = inputs["rope_state"].view(-1)[: inputs[name].numel()]
+    with pytest.raises(ValueError):
+        helpers.run_prefill(**inputs)
+    for name in helpers.STATE_NAMES:
+        assert torch.equal(inputs[name], before[name])
 
 
 def _check_prefill(source):
@@ -535,11 +643,9 @@ def test_yarn_prefill_decode_verify(mode, axes, device):
     helpers.check_decode(source, out, q=q, expected=expected)
 
 
-def test_prefill_rejects_alias_and_partial_output(device):
+def test_prefill_rejects_alias(device):
     source = helpers.synthetic((2177,), (1,), device)
     before = helpers.clone_state(source.state)
-    with pytest.raises(ValueError, match="caller-owned"):
-        helpers.run_prefill(**source.inputs, row_range=(0, 0))
     with pytest.raises(ValueError, match="overlap"):
         helpers.run_prefill(
             **source.inputs, out=source.inputs["token_slot_table"][:, :2051]
@@ -549,6 +655,23 @@ def test_prefill_rejects_alias_and_partial_output(device):
         helpers.run_prefill(**source.inputs, q_out=q_alias)
     for name in helpers.STATE_NAMES:
         assert torch.equal(source.inputs[name], before[name])
+
+
+@pytest.mark.parametrize("row_range", ((3, 100), (0, 0)))
+def test_prefill_row_range_without_out(row_range, device):
+    """Like the original entry, allocate out and define only the selected rows."""
+    source = helpers.synthetic((2177,), (129,), device)
+    expected = helpers.reference_prep(source.inputs, source.state)
+    full = _check_prefill(source)
+    helpers.reset_state(source)
+    q = torch.full_like(expected.q, float("nan"))
+    out = helpers.run_prefill(**source.inputs, row_range=row_range, q_out=q)
+    assert out.shape == (source.rows, 2051) and out.dtype == torch.int32
+    assert out.data_ptr() != full.data_ptr()
+    first, end = row_range
+    helpers.assert_exact(out[first:end], full[first:end], "allocated row range")
+    helpers.assert_exact(q, expected.q, "row range still prepares all Q")
+    helpers.assert_state(source, expected)
 
 
 def test_decode_logits_padding_and_alias(device):
@@ -566,141 +689,6 @@ def test_decode_logits_padding_and_alias(device):
         helpers.run_decode(**source.inputs, q_out=q_alias)
     for name in helpers.STATE_NAMES:
         assert torch.equal(source.inputs[name], before[name])
-
-
-def _prepared_inputs(query_lens, prefix_lens, device, padding=0):
-    sequences = tuple(q + p for q, p in zip(query_lens, prefix_lens))
-    pages = tuple(max(1, -(-n // 64)) for n in sequences)
-    total_pages = sum(pages) + 3
-    order = torch.randperm(total_pages, device=device).to(torch.int32)
-    table = torch.full((len(pages), max(pages)), -1, dtype=torch.int32, device=device)
-    start = 0
-    for r, count in enumerate(pages):
-        table[r, :count] = order[start : start + count]
-        start += count
-    requests = torch.cat(
-        [
-            torch.full((n,), r, dtype=torch.int32, device=device)
-            for r, n in enumerate(query_lens)
-        ]
-        + [torch.full((padding,), -1, dtype=torch.int32, device=device)]
-    )
-    positions = torch.cat(
-        [
-            torch.arange(p, p + q, dtype=torch.int64, device=device)
-            for q, p in zip(query_lens, prefix_lens)
-        ]
-        + [torch.full((padding,), -1, dtype=torch.int64, device=device)]
-    )
-    return {
-        "q": torch.randn(
-            (positions.numel(), 4, 128), dtype=torch.bfloat16, device=device
-        ),
-        "compressed_k_cache": torch.randn(
-            (total_pages, 16, 1, 128), dtype=torch.bfloat16, device=device
-        ),
-        "page_table": table,
-        "token_to_request": requests,
-        "query_positions": positions,
-        "context_lens": torch.tensor(sequences, dtype=torch.int32, device=device),
-        "token_topk": 2048,
-        "max_seq_len": max(sequences),
-        "allow_flydsl": True,
-    }
-
-
-def _check_prepared(inputs, out):
-    q, cache = inputs["q"], inputs["compressed_k_cache"]
-    for request, length in enumerate(inputs["context_lens"].cpu().tolist()):
-        rows = (inputs["token_to_request"] == request).nonzero().flatten()
-        keys = cache[inputs["page_table"][request, : -(-length // 64)].long()].view(
-            -1, 128
-        )
-        for first in range(0, rows.numel(), 64):
-            selected_rows = rows[first : first + 64]
-            positions = inputs["query_positions"][selected_rows]
-            sequences = torch.full_like(positions, length)
-            exact = helpers._scores(q[selected_rows], keys)
-            helpers.assert_topk(out[selected_rows], positions, sequences, exact)
-    padding = inputs["token_to_request"] < 0
-    assert bool((out[padding] == -1).all())
-
-
-@pytest.mark.parametrize("mode", ("prefill", "decode", "verify"))
-def test_prepared_selection_and_replay(mode, device, monkeypatch):
-    from aiter.ops import qsa
-
-    if mode == "prefill":
-        # Prepared selection has no group-aligned-prefix restriction.
-        queries, prefixes = (300, 0, 129), (2049, 65, 12225)
-    else:
-        queries = (4, 4, 4) if mode == "verify" else (1, 1, 1)
-        prefixes = tuple(n - q for n, q in zip((1048576, 300000, 12000), queries))
-    inputs = _prepared_inputs(
-        queries, prefixes, device, padding=0 if mode == "prefill" else 2
-    )
-    if mode == "prefill":
-        inputs.update(query_lens=queries, prefix_lens=prefixes)
-
-    def fallback(*args, **kwargs):
-        raise AssertionError(
-            "The supported prepared-Q case must use the migrated selector"
-        )
-
-    monkeypatch.setattr(qsa, "qsa_paged_mqa_logits", fallback)
-    before = inputs["compressed_k_cache"].clone()
-    out = qsa.qsa_select_paged_tokens(**inputs)
-    _check_prepared(inputs, out)
-    assert torch.equal(inputs["compressed_k_cache"], before)
-    if mode == "prefill":
-        stream = torch.cuda.Stream(device=device)
-        stream.wait_stream(torch.cuda.current_stream(device))
-        with torch.cuda.stream(stream):
-            qsa.qsa_select_paged_tokens(**inputs)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, stream=stream):
-                out = qsa.qsa_select_paged_tokens(**inputs)
-        torch.cuda.current_stream(device).wait_stream(stream)
-        inputs["q"].neg_()
-        graph.replay()
-        _check_prepared(inputs, out)
-        assert torch.equal(inputs["compressed_k_cache"], before)
-    else:
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            out = qsa.qsa_select_paged_tokens(**inputs)
-        inputs["q"].neg_()
-        inputs["context_lens"].sub_(4)
-        inputs["query_positions"].sub_(1)
-        table = inputs["page_table"]
-        live = table >= 0
-        table[live] = (table[live] + 1) % inputs["compressed_k_cache"].shape[0]
-        graph.replay()
-        _check_prepared(inputs, out)
-        assert torch.equal(inputs["compressed_k_cache"], before)
-
-
-def test_prepared_prefill_workspace_budget(device, monkeypatch):
-    from aiter.ops import qsa
-
-    queries, prefixes = (17,), (1048576 - 17,)
-    inputs = _prepared_inputs(queries, prefixes, device)
-    budget = 8 * 1024 * 1024
-    inputs.update(
-        query_lens=queries, prefix_lens=prefixes, logits_workspace_bytes=budget
-    )
-
-    def fallback(*args, **kwargs):
-        raise AssertionError("Budgeted 1M prefill must use the paged selector")
-
-    monkeypatch.setattr(qsa, "qsa_paged_mqa_logits", fallback)
-    out = qsa.qsa_select_paged_tokens(**inputs)
-    _check_prepared(inputs, out)
-    layout = selection._layout(
-        (1048576,), queries, device, logits_workspace_bytes=budget
-    )
-    assert len(layout.chunks) > 1
-    assert (layout.logits_elements + 512) * 4 <= budget
 
 
 def test_prefill_capture_keeps_plan_after_eviction(device):
@@ -778,110 +766,49 @@ def test_indexer_to_sparse_prefill(heads, device):
     assert err == 0
 
 
-def _assert_dual_result(
-    source, prepared, full_out, prepared_out, q, expected, *, decode
-):
-    if decode:
-        helpers.check_decode(source, full_out, q=q, expected=expected)
-    else:
-        helpers.check(source, actual=full_out, q=q, expected=expected)
-    canonical, _ = prepared.check(prepared_out)
-    helpers.assert_exact(full_out, canonical, "full/prepared logical selections differ")
-    prepared.assert_logical_cache()
-
-
-@pytest.mark.parametrize("seq_lens,extend_lens,yarn", DUAL_PREFILL_CASES)
-@pytest.mark.parametrize("graph", (False, True), ids=("eager", "graph"))
-def test_dual_prefill_interfaces(seq_lens, extend_lens, yarn, graph, device):
+@pytest.mark.parametrize("seq_lens,extend_lens,yarn", PREFILL_CAPTURE_CASES)
+def test_prefill_graph_shapes(seq_lens, extend_lens, yarn, device):
     source = helpers.synthetic(seq_lens, extend_lens, device)
     if yarn:
         source.inputs["cos_sin_cache"] = _yarn_cache(device)
     expected = helpers.reference_prep(source.inputs, source.state)
-    prepared = helpers.PreparedIndexerCase(source, expected)
-    before = prepared.snapshot()
     q = torch.full_like(expected.q, float("nan"))
-    if graph:
-        stream = torch.cuda.Stream(device=device)
-        stream.wait_stream(torch.cuda.current_stream(device))
-        with torch.cuda.stream(stream):
-            helpers.run_prefill(**source.inputs, q_out=q)
-            prepared.run()
-            full_graph, prepared_graph = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
-            with torch.cuda.graph(full_graph, stream=stream):
-                full_out = helpers.run_prefill(**source.inputs, q_out=q)
-            with torch.cuda.graph(prepared_graph, stream=stream):
-                prepared_out = prepared.run()
-            # Undo warmup/capture only; validation uses this actual replay.
-            helpers.reset_state(source)
-            full_graph.replay()
-            prepared_graph.replay()
-        torch.cuda.current_stream(device).wait_stream(stream)
-    else:
-        full_out = helpers.run_prefill(**source.inputs, q_out=q)
-        prepared_out = prepared.run()
-    _assert_dual_result(
-        source, prepared, full_out, prepared_out, q, expected, decode=False
-    )
-    prepared.assert_read_only(before)
+    stream = torch.cuda.Stream(device=device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(stream):
+        warm = helpers.run_prefill(**source.inputs, q_out=q)
+        helpers.check(source, actual=warm, q=q, expected=expected)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            out = helpers.run_prefill(**source.inputs, q_out=q)
+        helpers.reset_state(source)
+        graph.replay()
+    torch.cuda.current_stream(device).wait_stream(stream)
+    helpers.check(source, actual=out, q=q, expected=expected)
 
 
-def test_dual_prefill_row_ranges(device):
-    source = helpers.synthetic((2055, 16, 13), (7, 0, 9), device)
-    expected = helpers.reference_prep(source.inputs, source.state)
-    prepared = helpers.PreparedIndexerCase(source, expected)
-    before = prepared.snapshot()
-    q = torch.full_like(expected.q, float("nan"))
-    full_out = torch.full((source.rows, 2051), -7, dtype=torch.int32, device=device)
-    prepared_out = torch.full_like(full_out, -7)
-    for first, end in ((0, 6), (6, 12), (12, source.rows), (source.rows, source.rows)):
-        helpers.run_prefill(
-            **source.inputs, q_out=q, row_range=(first, end), out=full_out
-        )
-        prepared_out[first:end].copy_(prepared.run_rows(first, end))
-        helpers.assert_state(source, expected)
-        assert bool((full_out[end:] == -7).all())
-        assert bool((prepared_out[end:] == -7).all())
-    _assert_dual_result(
-        source, prepared, full_out, prepared_out, q, expected, decode=False
-    )
-    prepared.assert_read_only(before)
-
-
-@pytest.mark.parametrize("lengths,window,context", DUAL_DECODE_CASES)
-@pytest.mark.parametrize("graph", (False, True), ids=("eager", "graph"))
-def test_dual_decode_wide(lengths, window, context, graph, device):
+@pytest.mark.parametrize("lengths,window,context", DECODE_WIDE_GRAPH_CASES)
+def test_decode_wide_graph(lengths, window, context, device):
     source = helpers.decode_case(
         lengths, device, window=window, padding=1, context=context
     )
     helpers.mask_decode_padding(source)
     expected = helpers.reference_prep(source.inputs, source.state, decode=True)
-    prepared = helpers.PreparedIndexerCase(source, expected, decode=True)
-    before = prepared.snapshot()
     q = torch.full_like(expected.q, float("nan"))
-    if graph:
-        helpers.run_decode(**source.inputs, verify=window > 1, q_out=q)
-        prepared.run()
-        full_graph, prepared_graph = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
-        with torch.cuda.graph(full_graph):
-            full_out = helpers.run_decode(**source.inputs, verify=window > 1, q_out=q)
-        with torch.cuda.graph(prepared_graph):
-            prepared_out = prepared.run()
-        helpers.reset_state(source)
-        full_graph.replay()
-        prepared_graph.replay()
-    else:
-        full_out = helpers.run_decode(**source.inputs, verify=window > 1, q_out=q)
-        prepared_out = prepared.run()
-    _assert_dual_result(
-        source, prepared, full_out, prepared_out, q, expected, decode=True
-    )
-    prepared.assert_read_only(before)
+    warm = helpers.run_decode(**source.inputs, verify=window > 1, q_out=q)
+    helpers.check_decode(source, warm, q=q, expected=expected)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = helpers.run_decode(**source.inputs, verify=window > 1, q_out=q)
+    helpers.reset_state(source)
+    graph.replay()
+    helpers.check_decode(source, out, q=q, expected=expected)
 
 
 @pytest.mark.parametrize("window", (1, 2, 3, 4))
 @pytest.mark.parametrize("yarn", (False, True), ids=("mrope", "yarn"))
 @pytest.mark.parametrize("graph", (False, True), ids=("eager", "graph"))
-def test_dual_decode_trajectory(window, yarn, graph, device):
+def test_decode_state_trajectory(window, yarn, graph, device):
     lengths = (12001, 12002, 12003, 12004)
     source = helpers.decode_case(
         lengths, device, window=window, padding=2, context=16384
@@ -891,44 +818,32 @@ def test_dual_decode_trajectory(window, yarn, graph, device):
         source.inputs["cos_sin_cache"] = _yarn_cache(device)
     oracle_state = helpers.clone_state(source.state)
     expected = helpers.reference_prep(source.inputs, oracle_state, decode=True)
-    prepared = helpers.PreparedIndexerCase(source, expected, decode=True)
     q = torch.full_like(expected.q, float("nan"))
     if graph:
         helpers.run_decode(**source.inputs, verify=window > 1, q_out=q)
-        prepared.run()
-        full_graph, prepared_graph = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
+        full_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(full_graph):
-            full_out = helpers.run_decode(**source.inputs, verify=window > 1, q_out=q)
-        with torch.cuda.graph(prepared_graph):
-            prepared_out = prepared.run()
+            out = helpers.run_decode(**source.inputs, verify=window > 1, q_out=q)
         helpers.reset_state(source)
-    full_addresses, prepared_addresses = _addresses(source), _addresses(prepared)
+    addresses = _addresses(source)
     for step in range(4):
         if step:
             helpers.decode_step(source, lengths)
             helpers.mask_decode_padding(source)
         expected = helpers.reference_prep(source.inputs, oracle_state, decode=True)
-        prepared.refresh(expected)
-        before = prepared.snapshot()
         if graph:
             full_graph.replay()
-            prepared_graph.replay()
         else:
-            full_out = helpers.run_decode(**source.inputs, verify=window > 1, q_out=q)
-            prepared_out = prepared.run()
-        _assert_dual_result(
-            source, prepared, full_out, prepared_out, q, expected, decode=True
-        )
-        prepared.assert_read_only(before)
-        assert _addresses(source) == full_addresses
-        assert _addresses(prepared) == prepared_addresses
-        # Keep the actual ring/cache untouched between steps. Only the oracle
-        # advances independently; partial acceptance changes the next window.
+            out = helpers.run_decode(**source.inputs, verify=window > 1, q_out=q)
+        helpers.check_decode(source, out, q=q, expected=expected)
+        assert _addresses(source) == addresses
+        # Actual state is never reset between steps. The oracle advances from
+        # its own state; the accepted prefix sets the next window's positions.
         oracle_state = expected.state
         accepted = tuple(1 + (step + r) % window for r in range(source.requests))
         lengths = tuple(n + a for n, a in zip(lengths, accepted))
 
-    # A normal decode after a partially accepted verify must use the same state.
+    # Resume ordinary decode from the same ring after partial acceptance.
     next_source = helpers.decode_case(
         lengths, device, padding=2, context=source.context
     )
@@ -946,20 +861,14 @@ def test_dual_decode_trajectory(window, yarn, graph, device):
     helpers.decode_step(next_source, lengths)
     helpers.mask_decode_padding(next_source)
     expected = helpers.reference_prep(next_source.inputs, oracle_state, decode=True)
-    next_prepared = helpers.PreparedIndexerCase(next_source, expected, decode=True)
-    before = next_prepared.snapshot()
     q = torch.empty_like(expected.q)
-    full_out = helpers.run_decode(**next_source.inputs, q_out=q)
-    prepared_out = next_prepared.run()
-    _assert_dual_result(
-        next_source, next_prepared, full_out, prepared_out, q, expected, decode=True
-    )
-    next_prepared.assert_read_only(before)
+    out = helpers.run_decode(**next_source.inputs, q_out=q)
+    helpers.check_decode(next_source, out, q=q, expected=expected)
 
 
 @benchmark()
-def benchmark_indexer(mode, batch, context, query_length, interface="full"):
-    """Time one API boundary; reference prep and metadata conversion are untimed."""
+def benchmark_indexer(mode, batch, context, query_length):
+    """Time projected QK through indices, with the Torch reference outside timing."""
     device = torch.device("cuda", torch.cuda.current_device())
     if mode == "prefill":
         source = helpers.synthetic((context,) * batch, (query_length,) * batch, device)
@@ -973,15 +882,8 @@ def benchmark_indexer(mode, batch, context, query_length, interface="full"):
     expected = helpers.reference_prep(
         source.inputs, source.state, decode=mode != "prefill"
     )
-    prepared = None
     q = torch.full_like(expected.q, float("nan"))
-    if interface == "prepared":
-        prepared = helpers.PreparedIndexerCase(
-            source, expected, decode=mode != "prefill", remap_pages=False
-        )
-        before = prepared.snapshot()
-        fn = prepared.run
-    elif mode == "prefill":
+    if mode == "prefill":
         fn = lambda: helpers.run_prefill(**source.inputs, q_out=q)
     else:
         fn = lambda: helpers.run_decode(
@@ -994,38 +896,25 @@ def benchmark_indexer(mode, batch, context, query_length, interface="full"):
     )
     flops = pairs * 2 * 4 * 128
     nbytes = q.numel() * 2 + pairs * (128 * 2 + 4)
-    if interface == "full":
-        nbytes += source.inputs["qk"].numel() * 2
+    nbytes += source.inputs["qk"].numel() * 2
     ret = {
         "gfx": get_gfx_runtime(),
-        "boundary": "qk -> indices" if interface == "full" else "Q/cache -> indices",
+        "boundary": "qk -> indices",
     }
     for name, call in candidates.items():
         helpers.reset_state(source)
         out, us = run_perftest(call)
-        if prepared is not None:
-            _, report = prepared.check(out)
-            prepared.assert_read_only(before)
-            gap = report["worst_relative_boundary_violation"]
-            err = checkAllclose(
-                torch.zeros(1, dtype=torch.float32, device=device),
-                torch.tensor([gap], dtype=torch.float32, device=device),
-                rtol=0,
-                atol=1e-5,
-                msg=f"{name}: worst per-row FP64 top-k boundary gap",
-            )
+        err = checkAllclose(
+            expected.q.float(),
+            q.float(),
+            rtol=0,
+            atol=0,
+            msg=f"{name}: QSA index Q",
+        )
+        if mode == "prefill":
+            helpers.check(source, actual=out, q=q, expected=expected)
         else:
-            err = checkAllclose(
-                expected.q.float(),
-                q.float(),
-                rtol=0,
-                atol=0,
-                msg=f"{name}: QSA index Q",
-            )
-            if mode == "prefill":
-                helpers.check(source, actual=out, q=q, expected=expected)
-            else:
-                helpers.check_decode(source, out, q=q, expected=expected)
+            helpers.check_decode(source, out, q=q, expected=expected)
         assert err == 0
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
@@ -1039,7 +928,7 @@ def main():
         aiter.logger.warning("QSA indexer requires gfx942; skipping")
         return
     parser = argparse.ArgumentParser(
-        description="QSA indexer correctness and whole-call performance"
+        description="QSA indexer correctness and GPU performance"
     )
     parser.add_argument(
         "--modes",
@@ -1049,15 +938,13 @@ def main():
     )
     parser.add_argument("-b", "--batch", nargs="+", type=int, default=[1, 8, 32])
     parser.add_argument("--contexts", nargs="+", type=int, default=[12000])
-    parser.add_argument(
-        "--interfaces",
-        nargs="+",
-        choices=("full", "prepared"),
-        default=["full", "prepared"],
-        help="Timing boundaries: qk-to-indices or prepared Q/cache-to-indices",
-    )
     args = parser.parse_args()
     device = helpers._gpu()
+    test_original_public_signatures()
+    for case in PREFILL_PLAN_ERRORS:
+        test_prefill_write_plan_validation(case, device)
+    for row_range in ((3, 100), (0, 0)):
+        test_prefill_row_range_without_out(row_range, device)
     for seq, ext in PREFILL_CASES:
         test_prefill_operator(seq, ext, device)
     for lengths, padding, context in DECODE_CASES:
@@ -1080,7 +967,7 @@ def main():
         test_decode_graph_replay,
         test_verify_graph_replay,
         test_topk_output_over_int32_elements,
-        test_prefill_rejects_alias_and_partial_output,
+        test_prefill_rejects_alias,
         test_decode_logits_padding_and_alias,
     ):
         test(device)
@@ -1088,25 +975,17 @@ def main():
         test_decode_rejects_malformed_inputs(name, device)
     for mode, axes in itertools.product(("prefill", "decode", "verify"), (1, 3)):
         test_yarn_prefill_decode_verify(mode, axes, device)
-    for mode in ("prefill", "decode", "verify"):
-        with pytest.MonkeyPatch.context() as patch:
-            test_prepared_selection_and_replay(mode, device, patch)
-    with pytest.MonkeyPatch.context() as patch:
-        test_prepared_prefill_workspace_budget(device, patch)
     test_prefill_capture_keeps_plan_after_eviction(device)
     for heads in (12, 6, 3):
         test_indexer_to_sparse_prefill(heads, device)
-    for seq, ext, yarn in DUAL_PREFILL_CASES:
-        for graph in (False, True):
-            test_dual_prefill_interfaces(seq, ext, yarn, graph, device)
-    test_dual_prefill_row_ranges(device)
-    for lengths, window, context in DUAL_DECODE_CASES:
-        for graph in (False, True):
-            test_dual_decode_wide(lengths, window, context, graph, device)
+    for seq, ext, yarn in PREFILL_CAPTURE_CASES:
+        test_prefill_graph_shapes(seq, ext, yarn, device)
+    for lengths, window, context in DECODE_WIDE_GRAPH_CASES:
+        test_decode_wide_graph(lengths, window, context, device)
     for window, yarn, graph in itertools.product(
         (1, 2, 3, 4), (False, True), (False, True)
     ):
-        test_dual_decode_trajectory(window, yarn, graph, device)
+        test_decode_state_trajectory(window, yarn, graph, device)
     for pattern, (counts, stride), split in itertools.product(
         ("random", "ties", "dense-threshold", "nan", "inf"),
         (((20000, 600, 65536, 513), 65536), ((70000, 600, 262144, 513, 65537), 262144)),
@@ -1116,24 +995,18 @@ def main():
             test_decode_topk_matches_row_kernel(
                 pattern, counts, stride, split, device, patch
             )
-    for interface in args.interfaces:
-        rows = []
-        for mode, batch, context in itertools.product(
-            args.modes, args.batch, args.contexts
-        ):
-            query_length = (
-                min(context, 16384)
-                if mode == "prefill"
-                else (4 if mode == "verify" else 1)
-            )
-            rows.append(
-                benchmark_indexer(mode, batch, context, query_length, interface)
-            )
-        aiter.logger.info(
-            "QSA %s interface summary (distinct timing boundary):\n%s",
-            interface,
-            pd.DataFrame(rows).to_markdown(index=False),
+    rows = []
+    for mode, batch, context in itertools.product(
+        args.modes, args.batch, args.contexts
+    ):
+        query_length = (
+            min(context, 16384) if mode == "prefill" else (4 if mode == "verify" else 1)
         )
+        rows.append(benchmark_indexer(mode, batch, context, query_length))
+    aiter.logger.info(
+        "QSA indexer summary (qk -> indices):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
 
 
 if __name__ == "__main__":

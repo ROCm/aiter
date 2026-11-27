@@ -29,15 +29,16 @@ _PAD = 512
 def qsa_prefill_indexer(
     qk: torch.Tensor,
     *,
-    query_lens: Sequence[int],
-    prefix_lens: Sequence[int],
+    heads: int,
     positions: torch.Tensor,
     logical_positions: torch.Tensor,
     state_slots: torch.Tensor,
     key_state: torch.Tensor,
     rope_state: torch.Tensor,
-    member_rows: torch.Tensor,
     write_locs: torch.Tensor,
+    member_rows: torch.Tensor,
+    group_sequences: torch.Tensor,
+    group_ends: torch.Tensor,
     rope_matrix: torch.Tensor,
     compressed: torch.Tensor,
     token_slot_table: torch.Tensor,
@@ -45,17 +46,21 @@ def qsa_prefill_indexer(
     axis_map: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
-    q_eps: float = 1e-6,
-    k_eps: float = 1e-6,
+    q_eps: float,
+    k_eps: float,
+    seq_lens: Sequence[int],
+    extend_lens: Sequence[int],
     q_out: torch.Tensor | None = None,
     row_range: tuple[int, int] | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Update QSA caches and return int32 [rows,2051] request-local token IDs.
 
-    QK is contiguous BF16 [sum(query_lens),640], with 4 Q heads and 1 K head
-    of D128. Host query/prefix lengths describe packed requests; prefixes
-    must be multiples of four. logical_positions must equal prefix+i.
+    QK is contiguous BF16 [sum(extend_lens),640], with heads=4 and 1 K head
+    of D128. Host seq_lens/extend_lens describe packed requests; each prefix
+    (seq_len - extend_len) must be a multiple of four. logical_positions
+    must equal prefix+i. group_sequences/group_ends retain the original
+    extend write-plan contract and are checked but not read by the kernels.
     member_rows identifies each complete four-row group in the current QK;
     write_locs holds its compressed slot (zero is inert). token_slot_table
     maps logical tokens to physical slots; key j is at table[request,4*j]//4.
@@ -63,8 +68,8 @@ def qsa_prefill_indexer(
     key_state [S,1,128], rope_state [S,3] and compressed [C,1,128] update
     in place. Slots are caller-owned, with eight ring slots per request.
     The norm/RoPE table may contain YaRN scaling. Prep updates all rows,
-    even with row_range=(first,end). A partial range requires caller-owned
-    contiguous out [>=rows,2051]; unselected rows remain unchanged.
+    even with row_range=(first,end). Caller-owned contiguous out [>=rows,2051]
+    preserves unselected rows. Without out, unselected rows are unspecified.
     out and q_out must not overlap inputs. Capture requires a previous call
     with the same host layout and stream; captured plans remain pinned.
     """
@@ -72,20 +77,29 @@ def qsa_prefill_indexer(
         raise ValueError("QSA prefill requires a GPU")
     if torch.compiler.is_compiling():
         raise RuntimeError("QSA prefill indexer does not support torch.compile")
-    extends = _host_lengths(query_lens, "query_lens")
-    prefixes = _host_lengths(prefix_lens, "prefix_lens")
+    if heads != 4:
+        raise ValueError("QSA prefill requires heads=4")
+    seq_lens = _host_lengths(seq_lens, "seq_lens")
+    extends = _host_lengths(extend_lens, "extend_lens")
     rows = sum(extends)
-    if not extends or len(extends) != len(prefixes) or rows == 0:
-        raise ValueError("Packed query/prefix lengths must describe nonempty queries")
-    if any(p % 4 for p in prefixes):
+    if (
+        not seq_lens
+        or len(seq_lens) != len(extends)
+        or rows == 0
+        or any(s < e for s, e in zip(seq_lens, extends))
+    ):
+        raise ValueError("Invalid host sequence/extend lengths")
+    if any((s - e) % 4 for s, e in zip(seq_lens, extends)):
         raise ValueError("QSA prefill requires prefixes aligned to compress_ratio=4")
-    seq_lens = tuple(p + e for p, e in zip(prefixes, extends))
     if max(seq_lens) // 4 > MAX_COMPRESSED_KEYS:
         raise ValueError(
             f"QSA prefill supports at most {MAX_COMPRESSED_KEYS} compressed keys"
         )
     _check(qk, "qk", torch.bfloat16, (rows, 640))
     _check(logical_positions, "logical_positions", torch.int64, (rows,))
+    groups = write_locs.numel()
+    _check(group_sequences, "group_sequences", torch.int64, (groups,))
+    _check(group_ends, "group_ends", torch.int64, (groups,))
     if token_slot_table.ndim != 2 or token_slot_table.shape[1] < max(seq_lens):
         raise ValueError("token_slot_table must cover each request's full context")
     _check(
@@ -97,7 +111,8 @@ def qsa_prefill_indexer(
     )
     if token_slot_table.stride(1) != 1:
         raise ValueError("token_slot_table must have unit column stride")
-    _same_device(qk.device, (logical_positions, token_slot_table))
+    metadata = (logical_positions, token_slot_table, group_sequences, group_ends)
+    _same_device(qk.device, metadata)
     if row_range is not None:
         row_range = tuple(row_range)
         if (
@@ -108,8 +123,6 @@ def qsa_prefill_indexer(
             raise ValueError("row_range must satisfy 0 <= first <= end <= rows")
         if row_range == (0, rows):
             row_range = None
-        elif out is None:
-            raise ValueError("A partial row_range requires caller-owned out")
     if out is not None:
         if out.ndim != 2 or out.shape[0] < rows:
             raise ValueError("out must be int32 [>=rows,2051]")
@@ -126,6 +139,8 @@ def qsa_prefill_indexer(
                 rope_state,
                 member_rows,
                 write_locs,
+                group_sequences,
+                group_ends,
                 rope_matrix,
                 compressed,
                 token_slot_table,
@@ -136,11 +151,9 @@ def qsa_prefill_indexer(
                 *(() if q_out is None else (q_out,)),
             ),
         )
-    _no_overlap(
-        (key_state, rope_state, compressed), (logical_positions, token_slot_table)
-    )
+    _no_overlap((key_state, rope_state, compressed), metadata)
     if q_out is not None:
-        _no_overlap((q_out,), (logical_positions, token_slot_table))
+        _no_overlap((q_out,), metadata)
     layout = selection._layout(seq_lens, extends, qk.device, row_range)
     q, stats = qsa_indexer_prefill_prep(
         qk,
@@ -175,19 +188,19 @@ def qsa_decode_indexer(
     state_slots: torch.Tensor,
     key_state: torch.Tensor,
     rope_state: torch.Tensor,
-    group_locs: torch.Tensor,
     write_locs: torch.Tensor,
+    group_locs: torch.Tensor,
     compressed: torch.Tensor,
     page_table: torch.Tensor,
     lengths: torch.Tensor,
-    seq_lens: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     axis_map: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
-    q_eps: float = 1e-6,
-    k_eps: float = 1e-6,
-    multi_query_per_request: bool = False,
+    q_eps: float,
+    k_eps: float,
+    seq_lens: torch.Tensor,
+    verify: bool = False,
     q_out: torch.Tensor | None = None,
     logits_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -199,7 +212,7 @@ def qsa_decode_indexer(
     [rows], not a host request list. group_locs is int32 [rows,4], oldest
     member first. Inert/padded rows use valid dump slots and zero lengths.
 
-    Set multi_query_per_request for verify/draft-extend windows (at most four
+    Set verify=True for verify/draft-extend windows (at most four
     rows per request in an eight-slot ring). Raw writes then precede a second
     compression launch. YaRN is encoded in the caller's cos/sin table.
     Warm before graph capture. logits_out, if supplied, is FP32 [rows,width]
@@ -281,7 +294,7 @@ def qsa_decode_indexer(
         k_weight=k_weight,
         q_eps=q_eps,
         k_eps=k_eps,
-        multi_query_per_request=multi_query_per_request,
+        verify=verify,
         q_out=q_out,
         stats_out=stats,
     )

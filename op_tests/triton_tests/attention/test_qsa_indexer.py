@@ -47,7 +47,7 @@ def make_prep_inputs(mode, rows, context, device=None):
         names = (*_SHARED, "group_locs")
     inputs = {name: source.inputs[name] for name in names}
     if mode != "prefill":
-        inputs["multi_query_per_request"] = mode == "verify"
+        inputs["verify"] = mode == "verify"
     return source, inputs
 
 

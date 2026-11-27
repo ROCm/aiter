@@ -10,7 +10,6 @@ from aiter.jit.utils.chip_info import get_cu_num
 from aiter.ops.flydsl.kernels.qsa import (
     indexer_decode,
     indexer_logits,
-    indexer_metadata,
     indexer_topk,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
@@ -45,9 +44,7 @@ def _run_variants(exe, args, count_index, variants, device):
         _run_compiled(exe, *args, specialization_key=key)
 
 
-def prefill_logits(
-    q, compressed, table, logits, items, rows, pitch, scale, stats, *, paged=False
-):
+def prefill_logits(q, compressed, table, logits, items, rows, pitch, scale, stats):
     """Write key-block-major logits for the host-planned query/key tiles."""
     flat_table = table.as_strided(
         ((table.shape[0] - 1) * table.stride(0) + table.shape[1],), (1,)
@@ -65,10 +62,9 @@ def prefill_logits(
         pitch,
         scale,
         items.shape[0],
-        paged,
         torch.cuda.current_stream(q.device),
     )
-    _run_variants(indexer_logits._launch, args, 11, [(False,), (True,)], q.device)
+    _run_variants(indexer_logits._launch, args, 11, [()], q.device)
 
 
 def prefill_topk(logits, width, row0, rows, pitch, positions, row_info, out, stats):
@@ -102,8 +98,6 @@ def decode_logits(
     logits,
     scale,
     stats=None,
-    *,
-    token_to_request=None
 ):
     """Score each query against its row of 16-key compressed pages."""
     rows, width = logits.shape
@@ -126,7 +120,6 @@ def decode_logits(
         lengths,
         logits.view(-1),
         (stats if fold else lengths).view(-1),
-        lengths if token_to_request is None else token_to_request,
         q.stride(0),
         page_table.stride(0),
         width,
@@ -135,40 +128,9 @@ def decode_logits(
         scale,
         rows,
         fold,
-        token_to_request is not None,
         torch.cuda.current_stream(q.device),
     )
-    variants = [(fold, mapped) for fold in (False, True) for mapped in (False, True)]
-    _run_variants(indexer_decode._launch, args, 13, variants, q.device)
-
-
-def row_metadata(token_to_request, positions, context_lens, width):
-    """Build query lengths and initialize stats without CPU reads or table copies."""
-    rows, device = positions.numel(), positions.device
-    long = width > indexer_topk.LONG_KEYS
-    lengths = torch.empty(rows, dtype=torch.int32, device=device)
-    sequences = torch.empty_like(lengths)
-    stats = torch.empty(
-        (rows, indexer_topk.STAT_SLOTS if long else 1, 2),
-        dtype=torch.int32,
-        device=device,
-    )
-    args = (
-        token_to_request,
-        positions,
-        context_lens,
-        lengths,
-        sequences,
-        stats.view(-1),
-        rows,
-        context_lens.numel(),
-        width,
-        rows if long else -(-rows // 256),
-        long,
-        torch.cuda.current_stream(device),
-    )
-    _run_variants(indexer_metadata._launch, args, 9, [(False,), (True,)], device)
-    return lengths, sequences, stats if long else None
+    _run_variants(indexer_decode._launch, args, 12, [(False,), (True,)], q.device)
 
 
 def decode_topk(logits, lengths, positions, sequence_lengths, out, stats=None):

@@ -10,7 +10,6 @@ from numbers import Integral
 import numpy as np
 import torch
 
-from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl import qsa_indexer_launch as launch
 from aiter.ops.flydsl.kernels.qsa.sparse_prefill_prepare import upload
 
@@ -39,23 +38,14 @@ class _Chunk:
 class _Layout:
     """Host-derived per-forward plan; device tensors are read-only and shared."""
 
-    def __init__(
-        self, seq_lens, extend_lens, device, row_range=None, logits_workspace_bytes=None
-    ):
+    def __init__(self, seq_lens, extend_lens, device, row_range=None):
         seq, extend = np.asarray(seq_lens, dtype=np.int64), np.asarray(
             extend_lens, dtype=np.int64
         )
         prefix, compressed = seq - extend, seq // _RATIO
-        budget = (
-            _LOGITS_BUDGET_BYTES
-            if logits_workspace_bytes is None
-            else max(1, logits_workspace_bytes - _PAD * 4)
-        )
-        min_rows = _CHUNK_ROWS if logits_workspace_bytes is None else 0
+        budget = _LOGITS_BUDGET_BYTES
+        min_rows = _CHUNK_ROWS
         tile_rows = _BM
-        if logits_workspace_bytes is not None:
-            row_bytes = max(1, -(-int(compressed.max()) // _KC)) * _PITCH * 4
-            tile_rows = max(1, min(_BM, budget // row_bytes))
         row_base = np.cumsum(extend) - extend
         self.rows = int(extend.sum())
         sequence = np.repeat(np.arange(len(seq)), extend)
@@ -142,14 +132,13 @@ _captured_layouts = {}
 _lock = threading.Lock()
 
 
-def _layout(seq_lens, extend_lens, device, row_range=None, logits_workspace_bytes=None):
+def _layout(seq_lens, extend_lens, device, row_range=None):
     key = (
         device,
         torch.cuda.current_stream(device).cuda_stream,
         seq_lens,
         extend_lens,
         row_range,
-        logits_workspace_bytes,
     )
     with _lock:
         capturing = torch.cuda.is_current_stream_capturing()
@@ -159,9 +148,7 @@ def _layout(seq_lens, extend_lens, device, row_range=None, logits_workspace_byte
                 raise RuntimeError(
                     "Warm the QSA prefill layout on this stream before capture"
                 )
-            layout = _Layout(
-                seq_lens, extend_lens, device, row_range, logits_workspace_bytes
-            )
+            layout = _Layout(seq_lens, extend_lens, device, row_range)
         if capturing:
             # HIP graphs retain addresses, not the tensors behind a host plan.
             _captured_layouts[key] = layout
@@ -180,8 +167,6 @@ def select_prefill(
     layout,
     stats,
     out,
-    *,
-    paged=False,
 ):
     """Select prepared queries using the caller's immutable packed-row plan."""
     logits = torch.empty(
@@ -199,7 +184,6 @@ def select_prefill(
             _PITCH,
             _SCALE,
             stats,
-            paged=paged,
         )
         launch.prefill_topk(
             view,
@@ -237,116 +221,4 @@ def select_decode(
     launch.decode_topk(
         logits, lengths, positions.contiguous(), seq_lens.contiguous(), out, stats
     )
-    return out
-
-
-def try_select_paged_tokens(
-    q,
-    compressed_k_cache,
-    page_table,
-    token_to_request,
-    query_positions,
-    context_lens,
-    columns,
-    out,
-    *,
-    query_lens=None,
-    prefix_lens=None,
-    logits_workspace_bytes=128 * 1024 * 1024,
-):
-    """Select prepared queries without changing raw/compressed model state.
-
-    Packed prefill may supply host query/prefix lengths. Small query batches
-    use device metadata and may be captured after warmup. Return None for
-    the existing QSA implementation to handle unsupported layouts.
-    """
-    rows = q.shape[0]
-    meta = (token_to_request, query_positions, context_lens)
-    if (
-        get_gfx_runtime() != "gfx942"
-        or torch.compiler.is_compiling()
-        or q.ndim != 3
-        or q.shape[1:] != (4, 128)
-        or q.dtype != torch.bfloat16
-        or not q.is_contiguous()
-        or not q.is_cuda
-        or rows == 0
-        or compressed_k_cache.ndim != 4
-        or compressed_k_cache.shape[1:] != (16, 1, 128)
-        or compressed_k_cache.dtype != torch.bfloat16
-        or not compressed_k_cache.is_contiguous()
-        or compressed_k_cache.numel() * 2 >= 2**31
-        or page_table.ndim != 2
-        or page_table.shape[0] == 0
-        or page_table.dtype != torch.int32
-        or page_table.stride(1) != 1
-        or columns % 16
-        or not 512 <= columns <= MAX_COMPRESSED_KEYS
-        or page_table.shape[1] * 16 < columns
-        or any(
-            t.ndim != 1
-            or t.dtype not in (torch.int32, torch.int64)
-            or not t.is_contiguous()
-            for t in meta
-        )
-        or token_to_request.shape != (rows,)
-        or query_positions.shape != (rows,)
-        or context_lens.shape != (page_table.shape[0],)
-        or out.shape != (rows, _WIDTH)
-        or out.dtype != torch.int32
-        or not out.is_contiguous()
-        or any(
-            t.device != q.device for t in (compressed_k_cache, page_table, *meta, out)
-        )
-    ):
-        return None
-    lo, hi = out.data_ptr(), out.data_ptr() + out.numel() * out.element_size()
-    for tensor in (q, compressed_k_cache, page_table, *meta):
-        size = 1 + sum(
-            (n - 1) * stride for n, stride in zip(tensor.shape, tensor.stride())
-        )
-        first = tensor.data_ptr()
-        if lo < first + size * tensor.element_size() and first < hi:
-            raise ValueError("QSA selection out must not overlap its inputs")
-    table = page_table[:, : columns // 16]
-    compressed = compressed_k_cache.view(-1, 1, 128)
-    if query_lens is not None and prefix_lens is not None:
-        queries = _host_lengths(query_lens, "query_lens")
-        prefixes = _host_lengths(prefix_lens, "prefix_lens")
-        if (
-            len(queries) != page_table.shape[0]
-            or len(prefixes) != len(queries)
-            or sum(queries) != rows
-        ):
-            return None
-        sequences = tuple(p + n for p, n in zip(prefixes, queries))
-        if max(sequences) // 4 > columns:
-            return None
-        layout = _layout(
-            sequences, queries, q.device, logits_workspace_bytes=logits_workspace_bytes
-        )
-        if (max(layout.logits_elements, 1) + _PAD) * 4 > logits_workspace_bytes:
-            return None
-        stats = torch.full((rows, 2), -1, dtype=torch.int32, device=q.device)
-        return select_prefill(
-            q, compressed, table, query_positions, layout, stats, out, paged=True
-        )
-    if rows > 256 or (rows * columns + _PAD) * 4 > logits_workspace_bytes:
-        return None
-    lengths, sequences, stats = launch.row_metadata(
-        token_to_request, query_positions, context_lens, columns
-    )
-    logits = torch.empty(rows * columns + _PAD, dtype=torch.float32, device=q.device)
-    logits = logits[: rows * columns].view(rows, columns)
-    launch.decode_logits(
-        q,
-        compressed,
-        table,
-        lengths,
-        logits,
-        _SCALE,
-        stats,
-        token_to_request=token_to_request,
-    )
-    launch.decode_topk(logits, lengths, query_positions, sequences, out, stats)
     return out

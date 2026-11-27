@@ -104,7 +104,6 @@ def _kernel(
     LENGTHS: fx.Tensor,
     LOGITS: fx.Tensor,
     STATS: fx.Tensor,
-    REQUESTS: fx.Tensor,
     q_stride: fx.Int32,
     page_stride: fx.Int32,
     width: fx.Int32,
@@ -112,7 +111,6 @@ def _kernel(
     key_bytes: fx.Int32,
     scale: fx.Float32,
     FOLD: fx.Constexpr[bool],
-    REQUEST_TABLE: fx.Constexpr[bool],
 ):
     storage = (
         fx.SharedAllocator().allocate(fx.Array[fx.Int8, WAVES * PAGE_BYTES, 16]).peek()
@@ -124,7 +122,6 @@ def _kernel(
     wave, lane = _uniform(tid >> 6), tid & 63
     column, group = lane & 15, lane >> 4
     split, row = fx.block_idx.x, fx.block_idx.y
-    request = _uniform(REQUESTS[row]) if REQUEST_TABLE else row
     length = _uniform(LENGTHS[row])
     length = (length < width).select(length, width)
     pages = (length + (PAGE - 1)) >> 4
@@ -152,7 +149,7 @@ def _kernel(
         )
         table = _buffer(
             fx.make_view(
-                fx.get_iter(PAGES) + fx.Int64(request) * fx.Int64(page_stride),
+                fx.get_iter(PAGES) + fx.Int64(row) * fx.Int64(page_stride),
                 fx.make_layout(1, 1),
             ),
             pages * 4,
@@ -227,7 +224,6 @@ def _launch(
     LENGTHS: fx.Tensor,
     LOGITS: fx.Tensor,
     STATS: fx.Tensor,
-    REQUESTS: fx.Tensor,
     q_stride: fx.Int32,
     page_stride: fx.Int32,
     width: fx.Int32,
@@ -236,7 +232,6 @@ def _launch(
     scale: fx.Float32,
     rows: fx.Int32,
     FOLD: fx.Constexpr[bool],
-    REQUEST_TABLE: fx.Constexpr[bool],
     stream: fx.Stream,
 ):
     if rows > 0:
@@ -247,7 +242,6 @@ def _launch(
             LENGTHS,
             LOGITS,
             STATS,
-            REQUESTS,
             q_stride,
             page_stride,
             width,
@@ -255,5 +249,4 @@ def _launch(
             key_bytes,
             scale,
             FOLD,
-            REQUEST_TABLE,
         ).launch(grid=(splits, rows, 1), block=(256, 1, 1), stream=stream)

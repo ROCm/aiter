@@ -48,15 +48,10 @@ def _buffer_word(resource, offset):
     return _buffer_words(resource, fx.Int32(offset), words=1)[0]
 
 
-def _load_slots(slots, start, end, tid, paged):
+def _load_slots(slots, start, end, tid):
     # Raw slots TABLE[request, 4 * key] of keys start + tid + 256 i; keys past `end` repeat the last.
     keys = [start + tid + 256 * i for i in range(ITEM_KEYS // 256)]
     keys = [(key < end).select(key, end - 1) for key in keys]
-    if paged:
-        # A compressed page contains 16 keys; reuse the existing slot pipeline.
-        return [
-            (_buffer_word(slots, (key // 16) * 4) * 16 + key % 16) * 4 for key in keys
-        ]
     return [_buffer_word(slots, key * 16) for key in keys]
 
 
@@ -168,7 +163,6 @@ def _kernel(
     block_stride: fx.Int32,
     pitch: fx.Int32,
     scale: fx.Float32,
-    PAGED: fx.Constexpr[bool],
 ):
     # Key c's 16-byte chunk j lives at c * 16 + (j ^ (c & 7)): conflict-free ds_read_b128. The
     # item's key byte offsets in the compressed pool follow the two key blocks.
@@ -206,9 +200,9 @@ def _kernel(
             fx.get_iter(TABLE) + fx.Int64(sequence) * fx.Int64(table_stride),
             fx.make_layout(1, 1),
         ),
-        ((end + 15) // 16) * 4 if PAGED else end * 16,
+        end * 16,
     )
-    raw_slots = _load_slots(slots, start, end, tid, PAGED)
+    raw_slots = _load_slots(slots, start, end, tid)
     wave_rows = rows - 32 * wave
     wave_rows = (wave_rows > 32).select(
         fx.Int32(32), (wave_rows < 0).select(fx.Int32(0), wave_rows)
@@ -321,7 +315,6 @@ def _launch(
     pitch: fx.Int32,
     scale: fx.Float32,
     items: fx.Int32,
-    PAGED: fx.Constexpr[bool],
     stream: fx.Stream,
 ):
     if items > 0:
@@ -337,6 +330,5 @@ def _launch(
             block_stride,
             pitch,
             scale,
-            PAGED,
             value_attrs={"rocdl.waves_per_eu": 2},
         ).launch(grid=(items, 1, 1), block=(256, 1, 1), stream=stream)

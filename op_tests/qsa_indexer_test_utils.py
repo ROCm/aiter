@@ -24,21 +24,13 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 def run_prefill(**inputs):
     from aiter.ops.qsa import qsa_prefill_indexer
 
-    inputs = dict(inputs)
-    seq_lens, extends = inputs.pop("seq_lens"), inputs.pop("extend_lens")
-    for name in ("heads", "group_sequences", "group_ends"):
-        inputs.pop(name)
-    return qsa_prefill_indexer(
-        **inputs,
-        query_lens=extends,
-        prefix_lens=tuple(s - e for s, e in zip(seq_lens, extends)),
-    )
+    return qsa_prefill_indexer(**inputs)
 
 
 def run_decode(*, verify=False, **inputs):
     from aiter.ops.qsa import qsa_decode_indexer
 
-    return qsa_decode_indexer(**inputs, multi_query_per_request=verify)
+    return qsa_decode_indexer(**inputs, verify=verify)
 
 
 HEADS, DIM, ROTARY, PAGE = 4, 128, 64, 64
@@ -804,177 +796,8 @@ def check_decode(source, actual=None, *, q=None, logits=None, expected=None):
 
 
 def mask_decode_padding(source):
-    """Use the same empty-query contract for both interfaces' padding rows."""
+    """Mask padded rows without changing graph input addresses."""
     if source.padding:
         source.inputs["logical_positions"][-source.padding :] = -1
         source.inputs["seq_lens"][-source.padding :] = 0
         source.inputs["lengths"][-source.padding :] = 0
-
-
-class PreparedIndexerCase:
-    """The same logical history in an independent, optionally remapped page pool.
-
-    Q and cache contents come from the independent reference, never from the
-    complete operator's output. refresh() runs outside capture and timing and
-    preserves every graph input address.
-    """
-
-    def __init__(self, source, expected, *, decode=False, remap_pages=True):
-        self.source, self.decode = source, decode
-        device = source.inputs["qk"].device
-        pages = expected.state["compressed"].shape[0] // 16
-        self.order = torch.arange(pages, device=device)
-        if remap_pages:
-            self.order = self.order.roll(1)
-        self.inverse = torch.empty_like(self.order)
-        self.inverse[self.order] = torch.arange(pages, device=device)
-        if decode:
-            requests = source.requests
-            table = source.table[1:, ::PAGE] // PAGE
-            row_requests = (
-                torch.tensor(
-                    source.host["request_ids"], dtype=torch.int32, device=device
-                )
-                - 1
-            )
-            maximum = source.context
-        else:
-            requests = len(source.seq_lens)
-            table = source.inputs["token_slot_table"][:, ::PAGE] // PAGE
-            row_requests = torch.repeat_interleave(
-                torch.arange(requests, dtype=torch.int32, device=device),
-                torch.tensor(source.extend_lens, dtype=torch.int64, device=device),
-                output_size=source.rows,
-            )
-            maximum = max(source.seq_lens)
-        self.inputs = {
-            "q": torch.empty_like(expected.q),
-            "compressed_k_cache": torch.empty(
-                (pages, 16, 1, DIM), dtype=torch.bfloat16, device=device
-            ),
-            "page_table": torch.empty_like(table),
-            "token_to_request": row_requests,
-            "query_positions": torch.empty_like(source.inputs["logical_positions"]),
-            "context_lens": torch.empty(requests, dtype=torch.int32, device=device),
-            "token_topk": TOPK * RATIO,
-            "max_seq_len": maximum,
-            "allow_flydsl": True,
-        }
-        if not decode:
-            self.inputs.update(
-                query_lens=source.extend_lens,
-                prefix_lens=tuple(
-                    s - q for s, q in zip(source.seq_lens, source.extend_lens)
-                ),
-            )
-        self.refresh(expected)
-
-    def refresh(self, expected):
-        self.expected = expected
-        source, inputs = self.source, self.inputs
-        inputs["q"].copy_(expected.q)
-        inputs["compressed_k_cache"].copy_(
-            expected.state["compressed"].view(-1, 16, 1, DIM)[self.order]
-        )
-        inputs["query_positions"].copy_(source.inputs["logical_positions"])
-        if self.decode:
-            table = source.table[1:, ::PAGE] // PAGE
-            lengths = source.inputs["seq_lens"][: source.requests * source.window].view(
-                source.requests, source.window
-            )[:, -1]
-        else:
-            table = source.inputs["token_slot_table"][:, ::PAGE] // PAGE
-            lengths = torch.tensor(
-                source.seq_lens, dtype=torch.int32, device=inputs["q"].device
-            )
-        inputs["page_table"].copy_(self.inverse[table.long()])
-        inputs["context_lens"].copy_(lengths)
-
-    def snapshot(self):
-        return {
-            name: value.clone()
-            for name, value in self.inputs.items()
-            if isinstance(value, torch.Tensor)
-        }
-
-    def assert_read_only(self, before):
-        for name, value in before.items():
-            assert_exact(
-                self.inputs[name], value, f"prepared selection modified {name}"
-            )
-
-    def run(self):
-        from aiter.ops.qsa import qsa_select_paged_tokens
-
-        return qsa_select_paged_tokens(**self.inputs)
-
-    def run_rows(self, first, end):
-        """Select a packed prefill shard without changing the full cache."""
-        from aiter.ops.qsa import qsa_select_paged_tokens
-
-        assert not self.decode
-        args = dict(self.inputs)
-        for name in ("q", "token_to_request", "query_positions"):
-            args[name] = args[name][first:end]
-        queries, prefixes, offset = [], [], 0
-        for q, p in zip(self.inputs["query_lens"], self.inputs["prefix_lens"]):
-            queries.append(max(0, min(end, offset + q) - max(first, offset)))
-            prefixes.append(p + min(q, max(0, first - offset)))
-            offset += q
-        args.update(query_lens=tuple(queries), prefix_lens=tuple(prefixes))
-        return qsa_select_paged_tokens(**args)
-
-    def canonical_tokens(self, output):
-        """Check quartets/tails and normalize only width and group order for comparison."""
-        assert output.dtype == torch.int32 and output.shape[0] == self.source.rows
-        assert 3 < output.shape[1] <= WIDTH and (output.shape[1] - 3) % RATIO == 0
-        slots = (output.shape[1] - 3) // RATIO
-        blocks = torch.full(
-            (output.shape[0], TOPK), -1, dtype=torch.int32, device=output.device
-        )
-        blocks[:, :slots] = output[:, RATIO - 1 : slots * RATIO : RATIO] // RATIO
-        requests = self.inputs["token_to_request"].long()
-        sequences = torch.where(
-            requests >= 0, self.inputs["context_lens"][requests.clamp_min(0)], 0
-        )
-        positions = self.inputs["query_positions"]
-        padded = torch.nn.functional.pad(output, (0, WIDTH - output.shape[1]), value=-1)
-        assert_exact(
-            padded,
-            expand_reference(blocks, positions, sequences),
-            "prepared token quartet/tail/-1 ABI",
-        )
-        ordered = torch.where(blocks >= 0, blocks, 1 << 30).sort(dim=1).values
-        ordered = torch.where(ordered == 1 << 30, -1, ordered)
-        return expand_reference(ordered, positions, sequences)
-
-    def check(self, output):
-        canonical = self.canonical_tokens(output)
-        if self.decode:
-            report = _check_selection(
-                self.source,
-                canonical,
-                q=self.expected.q,
-                compressed=self.expected.state["compressed"],
-            )
-        else:
-            report = check_prefill_selection(self.source, canonical, self.expected)
-        return canonical, report
-
-    def assert_logical_cache(self):
-        """Compare valid logical groups across the two physical cache layouts."""
-        source = self.source
-        old_table = (
-            source.table[1:, ::PAGE]
-            if self.decode
-            else source.inputs["token_slot_table"][:, ::PAGE]
-        ) // PAGE
-        full = source.inputs["compressed"].view(-1, 16, 1, DIM)
-        for request, length in enumerate(self.inputs["context_lens"].cpu().tolist()):
-            count = length // RATIO
-            page_count = -(-count // 16)
-            old_pages = old_table[request, :page_count].long()
-            new_pages = self.inputs["page_table"][request, :page_count].long()
-            a = full[old_pages].reshape(-1, DIM)[:count]
-            b = self.inputs["compressed_k_cache"][new_pages].reshape(-1, DIM)[:count]
-            assert_exact(a, b, "logical compressed keys differ between interfaces")

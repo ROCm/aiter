@@ -269,7 +269,7 @@ def qsa_indexer_decode_prep(
     k_weight,
     q_eps=1e-6,
     k_eps=1e-6,
-    multi_query_per_request=False,
+    verify=False,
     q_out=None,
     stats_out=None,
 ):
@@ -298,8 +298,8 @@ def qsa_indexer_decode_prep(
     rows = qk.shape[0]
     _check(group_locs, "group_locs", torch.int32, (rows, 4))
     _check(write_locs, "write_locs", torch.int32, (rows,))
-    if type(multi_query_per_request) is not bool:
-        raise ValueError("multi_query_per_request must be a host bool")
+    if type(verify) is not bool:
+        raise ValueError("verify must be a host bool")
     tensors = (group_locs, write_locs)
     if stats_out is not None:
         _check(stats_out, "stats_out", torch.int32, (rows, 256, 2))
@@ -355,11 +355,11 @@ def qsa_indexer_decode_prep(
         ROT=64,
         RATIO=4,
         CACHE_STRIDE=cos_sin_cache.stride(0),
-        COMPRESS=not multi_query_per_request,
+        COMPRESS=not verify,
         STAT_SLOTS=256,
         num_warps=config["decode_prep"]["num_warps"],
     )
-    if multi_query_per_request:
+    if verify:
         _indexer_ring_compress[(rows,)](
             key_state,
             rope_state,
