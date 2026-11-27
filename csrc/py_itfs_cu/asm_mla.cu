@@ -1236,6 +1236,31 @@ static void mla_decode_gfx1250_dispatch(
 #endif
 }
 
+// kv_addr32 kernels read KV through one buffer descriptor at KV's base with a
+// 32-bit byte offset of u24(page) * u24(page stride). Rows past the descriptor's
+// 2^32 - 16 bytes, or pages 16 MiB or more apart, are read from the wrong
+// address without a fault. kv_page_indices must stay below KV.size(0), so KV's
+// shape and strides bound every offset the kernel forms.
+static void check_kv_addr32(const aiter_tensor_t* KV, const std::string& co_name)
+{
+    const int64_t elem = KV->element_size();
+    int64_t span       = 0;
+    if(KV->numel() > 0)
+    {
+        span = elem;
+        for(int d = 0; d < KV->dim(); d++)
+            span += (KV->size(d) - 1) * KV->stride(d) * elem;
+    }
+    AITER_CHECK(span <= int64_t{0xFFFFFFF0},
+                "mla_decode_stage1_asm_fwd: KV view spans ", span, " bytes, but ", co_name,
+                " addresses KV with 32-bit offsets and reads at most 4294967280 bytes past its "
+                "base; pass a narrower KV view");
+    const int64_t page_stride = KV->stride(0) * elem;
+    AITER_CHECK(KV->size(0) <= 1 || page_stride < (int64_t{1} << 24),
+                "mla_decode_stage1_asm_fwd: KV page stride is ", page_stride, " bytes, but ",
+                co_name, " uses only its low 24 bits (page stride must be below 16 MiB)");
+}
+
 // Bridged: an exception crossing extern "C" would terminate the process.
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     mla_decode_stage1_asm_fwd,
@@ -1543,6 +1568,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
 
+        if(cfg.kv_addr32)
+            check_kv_addr32(KV, cfg.co_name);
         impl_ptr =
             &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
     }
