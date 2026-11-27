@@ -8,7 +8,7 @@ Simulates async_result behavior without GPU/multiprocessing to verify:
 2. half-GPU threshold triggers break at the right time
 3. PID mapping errors are deferred until other tasks expose the root failure
 
-Run: python3 -m unittest op_tests.test_mp_tuner_logic -v
+Run: python3 -m unittest op_tests.tuning_tests.test_mp_tuner_logic -v
 """
 
 import importlib
@@ -363,6 +363,59 @@ class TestAcceleratorError(unittest.TestCase):
 
 class TestTaskExecutionTiming(unittest.TestCase):
 
+    def test_builds_pause_the_budget_without_forgiving_previous_execution(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        core = importlib.import_module("aiter.jit.core")
+        slots = [0.0]
+        now = [100.0]
+
+        def task():
+            now[0] = 103.0
+            self.assertEqual(tuner._elapsed_since_task_start(slots, 0), 3.0)
+            with core._jit_build_scope():
+                now[0] = 150.0
+                self.assertIsNone(tuner._elapsed_since_task_start(slots, 0))
+                with core._jit_build_scope():
+                    now[0] = 180.0
+                self.assertLess(slots[0], 0, "nested builds must not resume timing")
+                now[0] = 203.0
+            now[0] = 205.0
+            self.assertEqual(tuner._elapsed_since_task_start(slots, 0), 5.0)
+            with core._jit_build_scope():
+                now[0] = 225.0
+            now[0] = 229.0
+            return tuner._elapsed_since_task_start(slots, 0)
+
+        with (
+            patch.object(tuner, "_TASK_START_TIMES", slots),
+            patch.object(tuner, "_TASK_PIDS", None),
+            patch.object(tuner.time, "monotonic", side_effect=lambda: now[0]),
+        ):
+            self.assertEqual(tuner._run_with_start_tracking(0, task, ()), 9.0)
+
+    def test_failed_build_resumes_timing_and_does_not_leak_the_observer(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        core = importlib.import_module("aiter.jit.core")
+        slots = [0.0]
+        now = [50.0]
+
+        def task():
+            now[0] = 52.0
+            with core._jit_build_scope():
+                now[0] = 65.0
+                raise RuntimeError("compiler failed")
+
+        with (
+            patch.object(tuner, "_TASK_START_TIMES", slots),
+            patch.object(tuner, "_TASK_PIDS", None),
+            patch.object(tuner.time, "monotonic", side_effect=lambda: now[0]),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "compiler failed"):
+                tuner._run_with_start_tracking(0, task, ())
+            self.assertEqual(tuner._elapsed_since_task_start(slots, 0), 2.0)
+            with core._jit_build_scope():
+                self.assertGreater(slots[0], 0, "observer must be task-local")
+
     def test_queued_task_has_no_elapsed_execution_time(self):
         tuner = importlib.import_module("aiter.utility.mp_tuner")
         elapsed_since_start = getattr(tuner, "_elapsed_since_task_start", None)
@@ -395,7 +448,9 @@ class TestTaskExecutionTiming(unittest.TestCase):
                 run_with_tracking, (1, _wait_for_release, (release, "second"))
             )
 
-            deadline = time.monotonic() + 5
+            # Spawn imports aiter/torch before it can take the first task.
+            # That startup is outside the execution clock being tested.
+            deadline = time.monotonic() + 60
             while start_times[0] == 0 and time.monotonic() < deadline:
                 time.sleep(0.01)
 

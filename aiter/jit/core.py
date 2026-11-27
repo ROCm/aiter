@@ -15,6 +15,8 @@ import traceback
 import types
 import typing
 from collections.abc import Callable
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from typing import Any, Optional
 
 from packaging.version import Version, parse
@@ -57,6 +59,29 @@ def is_experimental_enabled() -> bool:
 
 
 aiter_lib = None
+
+
+_jit_build_observer = ContextVar("aiter_jit_build_observer", default=nullcontext)
+
+
+@contextmanager
+def observe_jit_build(observer):
+    """Scope a context-manager factory to native JIT builds in this context.
+
+    This includes source generation and waiting for a peer's build, but never
+    the operator launch. Normal callers leave the observer unset.
+    """
+    token = _jit_build_observer.set(observer)
+    try:
+        yield
+    finally:
+        _jit_build_observer.reset(token)
+
+
+@contextmanager
+def _jit_build_scope():
+    with _jit_build_observer.get()():
+        yield
 
 
 def mp_lock(
@@ -1492,6 +1517,7 @@ def _cluster_launch_target(detect_gfx) -> bool:
     return _targets_gfx1250(detect_gfx)
 
 
+@_jit_build_scope()
 def build_module(
     md_name,
     srcs,

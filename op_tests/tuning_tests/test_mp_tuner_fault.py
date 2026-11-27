@@ -16,6 +16,7 @@ import contextlib
 import math
 import os
 import signal
+import time
 import unittest
 from typing import ClassVar
 
@@ -44,6 +45,39 @@ def _fault(x):
 
 def _die(x):
     os._exit(1)
+
+
+_built = False
+
+
+def _slow_build():
+    # Simulate codegen/compilation, not a slow kernel warmup. The separate
+    # JIT cache test checks that build_module actually enters this scope.
+    from aiter.jit.core import _jit_build_scope
+
+    global _built
+    if not _built:
+        with _jit_build_scope():
+            time.sleep(15)
+        _built = True
+
+
+def _slow_build_copy(x):
+    _slow_build()
+    return x.clone()
+
+
+def _hang_after_build(x):
+    _slow_build()
+    time.sleep(120)
+    return x.clone()
+
+
+def _die_during_build(x):
+    from aiter.jit.core import _jit_build_scope
+
+    with _jit_build_scope():
+        os._exit(1)
 
 
 SHAPE = ("shape-0",)
@@ -173,6 +207,37 @@ class TestPreLaunchFailure(_FaultCase, unittest.TestCase):
         _candidate("behind", _copy),
     )
     FAILED: ClassVar[dict] = {"prelaunch": ("crash", "boom before launch")}
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
+class TestSlowBuild(_FaultCase, unittest.TestCase):
+    """A 15-second build survives a 10-second execution budget.
+
+    Leave room for a fresh worker's GPU/profiler initialization, which is
+    legitimately counted as execution time (and can exceed three seconds).
+    """
+
+    TIMEOUT = 10
+    GROUP = (_candidate("building", _slow_build_copy), _candidate("behind", _copy))
+    NEXT = (_candidate("next", _copy, NEXT_SHAPE),)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
+class TestExecutionTimeoutAfterBuild(_FaultCase, unittest.TestCase):
+    """The first kernel call after a build still has a bounded execution time."""
+
+    TIMEOUT = 10
+    GROUP = (_candidate("hanging", _hang_after_build), _candidate("behind", _copy))
+    FAILED: ClassVar[dict] = {"hanging": ("timeout", "exceeded 10s")}
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
+class TestWorkerDeathDuringBuild(_FaultCase, unittest.TestCase):
+    """A dead builder cannot be mistaken for a queued task with no deadline."""
+
+    TIMEOUT = 600
+    GROUP = (_candidate("dying", _die_during_build), _candidate("behind", _copy))
+    FAILED: ClassVar[dict] = {"dying": ("crash", "exited")}
 
 
 if __name__ == "__main__":

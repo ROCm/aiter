@@ -266,9 +266,9 @@ class TunerCommon:
             "--timeout",
             type=int,
             default=defaults["timeout"],
-            help="per-task watchdog in seconds; a lost task (dead worker) is "
-            "reaped and the pool restarted after this many seconds. Defaults "
-            "generous so healthy shape groups are never falsely reaped.",
+            help="per-task execution watchdog in seconds, excluding native "
+            "AITER JIT builds and build-lock waits. Kernel warmup and execution "
+            "still count; an expired task is failed and the pool restarted.",
         )
         self.parser.add_argument(
             "--run_config",
