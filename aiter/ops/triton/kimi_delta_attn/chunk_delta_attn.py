@@ -23,9 +23,11 @@ Notes on the fla-compatible surface:
       kernel reads it. Since this path is forward-only and returns no scratch,
       honouring ``True`` would allocate and write a ``T x HV x K`` tensor that
       nothing can observe, so the flag is pinned off internally.
-    * ``allow_neg_eigval`` / ``return_intermediate_states`` / ``cp_context`` /
-      ``cu_seqlens_cpu`` have no counterpart yet and are rejected rather than
-      silently ignored.
+    * ``allow_neg_eigval`` / ``cp_context`` / ``cu_seqlens_cpu`` have no
+      counterpart yet and are rejected rather than silently ignored.
+      ``return_intermediate_states`` is not accepted either; the nearest thing
+      here is ``snapshot_targets`` / ``snapshot_out``, which write the
+      recurrent state at the chunk boundaries the caller names.
     * Tensor arguments are made contiguous, as fla's ``@input_guard`` does,
       because some kernels below assume contiguous strides. On gfx1250 the
       FlashKDA kernels read q, k, v and g at their own token stride instead.
@@ -33,6 +35,8 @@ Notes on the fla-compatible surface:
       when the inputs require grad, whereas fla returns a differentiable
       tensor.
 """
+
+import functools
 
 import torch
 
@@ -66,6 +70,8 @@ def chunk_kimi_delta_attn(
     state_cache: torch.Tensor | None = None,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
+    snapshot_targets: tuple[tuple[int, int], ...] | None = None,
+    snapshot_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""
     Chunked Kimi Delta Attention forward pass using Triton (Forward only).
@@ -162,6 +168,23 @@ def chunk_kimi_delta_attn(
         has_initial_state (torch.Tensor, optional):
             Bool `[N]`. False starts that sequence from zero. Required with
             `state_cache`.
+        snapshot_targets (tuple, optional):
+            `((n, off), ...)` host ints: also write sequence `n`'s recurrent
+            state after its first `off` tokens into `snapshot_out`, for `off` a
+            multiple of `FLASH_KDA_CHUNK` strictly inside the sequence. Nothing
+            more is returned. Any number per sequence, in any order, but no
+            position twice. FlashKDA-only:
+            `AITER_FDA_ENABLE` and `flash_kda_supported` decide whether a call
+            takes that path, and this package exports all three. It is the
+            state a forward ending at `off` would return as its final state
+            (bit for bit when both this call and that forward run unsegmented
+            on the Triton K2 with the same tuned K2 config), so prefix
+            checkpoints can be taken without ending the forward there.
+        snapshot_out (torch.Tensor, optional):
+            Destination, `[len(snapshot_targets), HV, V, K]` when
+            `state_v_first` else `[.., HV, K, V]`, contiguous; its floating
+            point dtype is the cast applied. Required with `snapshot_targets`,
+            and rejected without it.
 
     Returns:
         tuple[torch.Tensor, torch.Tensor | None]:
@@ -274,7 +297,13 @@ def chunk_kimi_delta_attn(
     # state_cache is not packed: stride(0) may be padded. Packing it would
     # copy the pool and write a clone.
 
-    o, final_state, *_ = chunk_delta_attn_fwd(
+    fwd = chunk_delta_attn_fwd
+    if snapshot_targets is not None or snapshot_out is not None:
+        # Named only when set: each name passed costs host time at every hop.
+        fwd = functools.partial(
+            fwd, snapshot_targets=snapshot_targets, snapshot_out=snapshot_out
+        )
+    o, final_state, *_ = fwd(
         q=q,
         k=k,
         v=v,

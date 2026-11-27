@@ -70,6 +70,9 @@ from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_delta_attn_utils imp
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.utils.index import (
     prepare_chunk_indices,
 )
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.utils.snapshot import (
+    snapshot_chunk_rows,
+)
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
 from aiter.ops.triton.utils.fast_launch import fast_launch
@@ -405,6 +408,36 @@ def _seg_occupancy_class(num_segs: int) -> int:
     return max(1, num_segs).bit_length()
 
 
+@triton.jit
+def _store_state(
+    dst,
+    row_off,
+    b_h1,
+    b_h2,
+    o_k1,
+    o_k2,
+    o_w,
+    m_w,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    V_FIRST: tl.constexpr,
+):
+    """Store one state tile, cast to the dtype of ``dst``.
+
+    ``row_off`` is the element offset of the state in ``dst``. The state is
+    ``[V, K]`` when ``V_FIRST``, else ``[K, V]``.
+    """
+    e_ty = dst.dtype.element_ty
+    if V_FIRST:
+        off = row_off + o_w[None, :] * K
+        tl.store(dst + off + o_k1[:, None], b_h1.to(e_ty), mask=m_w[None, :])
+        tl.store(dst + off + o_k2[:, None], b_h2.to(e_ty), mask=m_w[None, :])
+    else:
+        off = row_off + o_w[None, :]
+        tl.store(dst + off + o_k1[:, None] * V, b_h1.to(e_ty), mask=m_w[None, :])
+        tl.store(dst + off + o_k2[:, None] * V, b_h2.to(e_ty), mask=m_w[None, :])
+
+
 @triton.autotune(
     configs=autotune_configs(
         "CHUNK_DELTA_ATTN", _K2_CONFIGS, default_config=_K2_DEFAULT_CONFIG
@@ -432,6 +465,8 @@ def _seg_occupancy_class(num_segs: int) -> int:
         "PAGED_H_IN": lambda args: (
             args["state_cache"] is not None and args["h_in"] is None
         ),
+        # `.get`: only pass C passes it, and the heuristic sees passed args only.
+        "HAS_SNAP": lambda args: args.get("snap_out") is not None,
     }
 )
 @triton.jit
@@ -476,6 +511,9 @@ def _flash_kda_segment_kernel(
     cache_stride=0,
     PAGED_CACHE: tl.constexpr = False,
     PAGED_H_IN: tl.constexpr = False,
+    snap_out=None,
+    chunk_snap_row=None,
+    HAS_SNAP: tl.constexpr = False,
 ):
     """Delta-rule recurrence over one segment of chunks.
 
@@ -491,6 +529,12 @@ def _flash_kda_segment_kernel(
 
     With one segment per sequence this degenerates to a plain sequential scan
     and only the third form runs.
+
+    ``HAS_SNAP`` (third form only) also stores the state that enters each chunk
+    into row ``chunk_snap_row[chunk]`` of ``snap_out``, cast as the final state
+    is. A row of -1 stores nothing. The state that enters a chunk is the state
+    after every earlier token of the sequence, so it is the final state of a
+    forward that ends at that chunk boundary.
     """
     # Every V block of a (segment, head) re-reads its chunk workspace; remapped,
     # they land on one XCD and share its L2 instead of each pulling it through
@@ -549,6 +593,23 @@ def _flash_kda_segment_kernel(
         b_h2 = tl.zeros([64, BW], dtype=tl.float32)
 
     for j in range(n_chunks):
+        if HAS_SNAP:
+            snap_i = tl.load(chunk_snap_row + chunk_base + j).to(tl.int64)
+            if snap_i >= 0:
+                _store_state(
+                    snap_out,
+                    (snap_i * H + i_h) * V * K,
+                    b_h1,
+                    b_h2,
+                    o_k1,
+                    o_k2,
+                    o_w,
+                    m_w,
+                    K,
+                    V,
+                    STATE_V_FIRST,
+                )
+
         ws_idx = i_h * TOTAL_TILES + chunk_base + j
         ck = ws_idx * C * K
         t0 = tok_base + j * C
@@ -617,43 +678,35 @@ def _flash_kda_segment_kernel(
     if STORE_FINAL:  # noqa: SIM102
         if tl.load(seg_is_last + i_seg) == 1:
             i_n = tl.load(seg_seq + i_seg).to(tl.int64)
-            dt_s = tl.float32 if PAGED_CACHE else final_state.dtype.element_ty
             if PAGED_CACHE:
+                # A cache slot is fp32 `[H, V, K]`, at its own stride.
                 slot = tl.load(state_indices + i_n).to(tl.int64)
-                f_off = slot * cache_stride + i_h * V * K + o_w[None, :] * K
-                tl.store(
-                    state_cache + f_off + o_k1[:, None],
-                    b_h1.to(dt_s),
-                    mask=m_w[None, :],
-                )
-                tl.store(
-                    state_cache + f_off + o_k2[:, None],
-                    b_h2.to(dt_s),
-                    mask=m_w[None, :],
-                )
-            elif STATE_V_FIRST:
-                f_off = (i_n * H + i_h) * V * K + o_w[None, :] * K
-                tl.store(
-                    final_state + f_off + o_k1[:, None],
-                    b_h1.to(dt_s),
-                    mask=m_w[None, :],
-                )
-                tl.store(
-                    final_state + f_off + o_k2[:, None],
-                    b_h2.to(dt_s),
-                    mask=m_w[None, :],
+                _store_state(
+                    state_cache,
+                    slot * cache_stride + i_h * V * K,
+                    b_h1,
+                    b_h2,
+                    o_k1,
+                    o_k2,
+                    o_w,
+                    m_w,
+                    K,
+                    V,
+                    True,
                 )
             else:
-                f_off = (i_n * H + i_h) * K * V + o_w[None, :]
-                tl.store(
-                    final_state + f_off + o_k1[:, None] * V,
-                    b_h1.to(dt_s),
-                    mask=m_w[None, :],
-                )
-                tl.store(
-                    final_state + f_off + o_k2[:, None] * V,
-                    b_h2.to(dt_s),
-                    mask=m_w[None, :],
+                _store_state(
+                    final_state,
+                    (i_n * H + i_h) * V * K,
+                    b_h1,
+                    b_h2,
+                    o_k1,
+                    o_k2,
+                    o_w,
+                    m_w,
+                    K,
+                    V,
+                    STATE_V_FIRST,
                 )
 
 
@@ -1141,6 +1194,25 @@ def _build_segments(
     return desc, off, len(chunk_base), max_per_seq
 
 
+@functools.lru_cache(maxsize=64)
+def _build_snapshots(
+    seqs: tuple[tuple[int, int], ...],
+    C: int,
+    targets: tuple[tuple[int, int], ...],
+    device: torch.device,
+) -> torch.Tensor:
+    """`snapshot_chunk_rows` as an int32 tensor on ``device``.
+
+    Cached like `_build_segments`: every KDA layer of a forward asks with the
+    same key. The build copies from the host, which a CUDA graph capture
+    refuses, so a target set must run once eagerly before it is captured. A
+    captured graph reads the cached table, so it stays valid only while that
+    table is in this cache.
+    """
+    rows = snapshot_chunk_rows(seqs, C, targets)
+    return torch.tensor(rows, dtype=torch.int32, device=device)
+
+
 # key_shapes=False: the heuristics of these kernels only test arguments for
 # None, and their autotune keys hold ints, bools and dtypes, not shapes.
 _prepare_fast = fast_launch(_flash_kda_prepare_kernel, key_shapes=False)
@@ -1184,7 +1256,7 @@ def _check_paged_state_cache(
         raise ValueError(f"state_indices and has_initial_state must have N={N} entries")
 
 
-@input_guard(skip=("q", "k", "v", "g", "state_cache", "out"))
+@input_guard(skip=("q", "k", "v", "g", "state_cache", "out", "snapshot_out"))
 def flash_kda_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1205,6 +1277,8 @@ def flash_kda_fwd(
     state_cache: torch.Tensor | None = None,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
+    snapshot_targets: tuple[tuple[int, int], ...] | None = None,
+    snapshot_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
     Two-kernel KDA forward, with an optional segmented (context parallel) scan.
@@ -1242,6 +1316,25 @@ def flash_kda_fwd(
                             ``[0, slots)``. Not range-checked: that would
                             need a host sync per call.
         has_initial_state:  Bool ``[N]``; false starts that sequence from zero.
+        snapshot_targets:   ``((n, off), ...)``: also write sequence ``n``'s
+                            state after its first ``off`` tokens. ``off`` is an
+                            interior multiple of ``FLASH_KDA_CHUNK``. A sequence
+                            can have any number of targets, in any order, but
+                            no position twice. Host ints, so the mapping needs
+                            no device read. A call with targets runs K2 on
+                            Triton, which is the only K2 that stores them.
+        snapshot_out:       ``[len(snapshot_targets), H, V, K]`` when
+                            ``state_v_first`` else ``[.., H, K, V]``, floating
+                            point, on the device of ``q``, and contiguous: it
+                            is written in place rather than packed by
+                            ``input_guard``. Row ``i`` receives target ``i``.
+                            Rejected without ``snapshot_targets``, which would
+                            leave it unwritten; ``()`` leaves it unused.
+                            Cast as the final state is, so in ``final_state``'s
+                            dtype it holds the bits that a forward ending at
+                            ``off`` returns as its final state, when both this
+                            call and that forward run unsegmented on the
+                            Triton K2 with the same tuned K2 config.
 
     Returns:
         ``(o, final_state)`` with ``o`` shaped like ``v``. ``final_state`` is
@@ -1276,7 +1369,11 @@ def flash_kda_fwd(
             raise ValueError("out must be contiguous")
 
     use_gluon_k1 = AITER_FDA_USE_GLUON_K1 and _gluon_k1_usable(C, K)
-    use_gluon_k2 = AITER_FDA_USE_GLUON_K2 and _gluon_k2_usable(C, K, V)
+    # Only the Triton K2 stores snapshots. Deciding it here also keeps v packed
+    # for it on gfx1250.
+    use_gluon_k2 = (
+        AITER_FDA_USE_GLUON_K2 and _gluon_k2_usable(C, K, V) and not snapshot_targets
+    )
     # The gfx1250 Gluon kernels read q, k, g (K1) and v (K2) at their own token
     # stride. Every other kernel needs them packed.
     stride_q = stride_k = stride_g = H * K
@@ -1321,6 +1418,34 @@ def flash_kda_fwd(
         seqs = _seq_bounds(cu_seqlens)
     else:
         seqs = tuple((b * T, b * T + T) for b in range(B))
+
+    # Checked here, like `out` and the paged cache above, so that a bad
+    # snapshot argument raises before a workspace is allocated or K1 launched.
+    snap_args = {}
+    if snapshot_targets is None and snapshot_out is not None:
+        raise ValueError(
+            "snapshot_out is given without snapshot_targets, so nothing would write it"
+        )
+    if snapshot_targets:
+        if snapshot_out is None:
+            raise ValueError("snapshot_targets needs snapshot_out")
+        targets = tuple((int(n), int(off)) for n, off in snapshot_targets)
+        want = (len(targets), H, V, K) if state_v_first else (len(targets), H, K, V)
+        if (
+            tuple(snapshot_out.shape) != want
+            or not snapshot_out.is_contiguous()
+            or not snapshot_out.dtype.is_floating_point
+            or snapshot_out.device != dev
+        ):
+            raise ValueError(
+                f"snapshot_out must be a contiguous floating-point {want} tensor "
+                f"on {dev}, got {snapshot_out.dtype} {tuple(snapshot_out.shape)} "
+                f"on {snapshot_out.device}"
+            )
+        snap_args = {
+            "snap_out": snapshot_out,
+            "chunk_snap_row": _build_snapshots(seqs, C, targets, dev),
+        }
 
     # Longest sequence in chunks: segmentation is judged per sequence, and
     # passing it as the segment length is what disables segmentation. Resolved
@@ -1691,6 +1816,7 @@ def flash_kda_fwd(
             STORE_H_OUT=False,
             STORE_FINAL=store_final,
             **(paged_args if paged else {}),
+            **snap_args,
         )
 
     return o, final_state

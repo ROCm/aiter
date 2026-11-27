@@ -13,6 +13,8 @@ Pipeline:
   4. Output:       compute final output via chunk_gla_fwd_o (gated q * h + A * v).
 """
 
+import functools
+
 import torch
 
 from aiter.ops.triton._triton_kernels.gated_delta_net.prefill.chunk_delta_h import (
@@ -72,6 +74,8 @@ def chunk_delta_attn_fwd(
     state_cache: torch.Tensor | None = None,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
+    snapshot_targets: tuple[tuple[int, int], ...] | None = None,
+    snapshot_out: torch.Tensor | None = None,
 ) -> tuple:
     """
     Forward pass for chunk_delta_attn.
@@ -110,6 +114,10 @@ def chunk_delta_attn_fwd(
         out:                Optional contiguous output buffer, same shape as
                             ``v``. FlashKDA-only, like ``state_cache``.
         state_cache:        Optional paged fp32 V-first cache. FlashKDA-only.
+        snapshot_targets:   Optional interior states to write out, see
+                            ``flash_kda_fwd``. FlashKDA-only.
+        snapshot_out:       Their destination, rejected without them.
+                            FlashKDA-only.
 
     Returns:
         (o, final_state, g_cumsum, Aqk, Akk, w, u, qg, kg)
@@ -168,9 +176,25 @@ def chunk_delta_attn_fwd(
             "out is only implemented on the FlashKDA path; use the returned "
             "tensor, or pass a call that flash_kda_supported accepts"
         )
+    if snapshot_targets is None and snapshot_out is not None:
+        raise ValueError(
+            "snapshot_out is given without snapshot_targets, so nothing would write it"
+        )
+    if snapshot_targets and not use_flash_kda:
+        raise ValueError(
+            "state snapshots are only implemented on the FlashKDA path; pass a "
+            "call that flash_kda_supported accepts, with AITER_FDA_ENABLE on "
+            "(both exported by aiter.ops.triton.kimi_delta_attn)"
+        )
 
     if use_flash_kda:
-        o, final_state = flash_kda_fwd(
+        fwd = flash_kda_fwd
+        if snapshot_targets is not None or snapshot_out is not None:
+            # Named only when set: `input_guard` rebuilds every name it is passed.
+            fwd = functools.partial(
+                fwd, snapshot_targets=snapshot_targets, snapshot_out=snapshot_out
+            )
+        o, final_state = fwd(
             q=q,
             k=k,
             v=v,
