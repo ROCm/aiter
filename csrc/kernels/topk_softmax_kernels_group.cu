@@ -357,16 +357,15 @@ __device__ __forceinline__ int warp_rank_desc_upto(uint64_t key)
     return rank;
 }
 
-// w[0] + w[1] + ... + w[n - 1] over lanes, left to right.
-template <int MAX_N>
-__device__ __forceinline__ float lane_serial_sum(float w, int n)
+// w[0] + w[1] + ... + w[N - 1] over lanes, left to right; unused lanes must hold +0.0f.
+template <int N>
+__device__ __forceinline__ float lane_serial_sum(float w)
 {
     float total = 0.0f;
 #pragma unroll
-    for(int i = 0; i < MAX_N; ++i)
-        if(i < n)
-            total +=
-                __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, w), i));
+    for(int i = 0; i < N; ++i)
+        total +=
+            __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, w), i));
     return total;
 }
 
@@ -410,7 +409,7 @@ __device__ __forceinline__ void emit_legacy_ordered_topk(float* cand_val,
     {
         // Preserve the legacy serial renormalization order.
         if(UNROLLED && topk <= 8)
-            total = lane_serial_sum<8>(w, topk);
+            total = lane_serial_sum<8>(w);
         else
             for(int i = 0; i < topk; ++i)
                 total += __builtin_bit_cast(
@@ -989,11 +988,9 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
         int q = 0;
         for_each_owned([&](float& v, int) {
             const uint64_t m = __ballot(v >= pivot);
-            cand_slot[q++] =
-                v >= pivot
-                    ? n_cand + int(__builtin_amdgcn_mbcnt_hi(
-                                   uint32_t(m >> 32), __builtin_amdgcn_mbcnt_lo(uint32_t(m), 0u)))
-                    : -1;
+            const int pos    = n_cand + int(__builtin_amdgcn_mbcnt_hi(
+                                             uint32_t(m >> 32), __builtin_amdgcn_mbcnt_lo(uint32_t(m), 0u)));
+            cand_slot[q++]   = v >= pivot ? pos : -1;
             n_cand += __builtin_popcountll(m);
         });
     }

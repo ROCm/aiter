@@ -894,14 +894,10 @@ __device__ __forceinline__ float lane_xor(float v)
     else if constexpr(OFF == 2)
         return __builtin_bit_cast(float, __builtin_amdgcn_mov_dpp(x, 0x4e, 0xf, 0xf, true));
     else if constexpr(OFF == 4) // row_shl:4 into banks 0 and 2, row_shr:4 into banks 1 and 3
-        return __builtin_bit_cast(
-            float,
-            __builtin_amdgcn_update_dpp(__builtin_amdgcn_update_dpp(x, x, 0x104, 0xf, 0x5, false),
-                                        x,
-                                        0x114,
-                                        0xf,
-                                        0xa,
-                                        false));
+    {
+        const int r = __builtin_amdgcn_mov_dpp(x, 0x104, 0xf, 0x5, true);
+        return __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(r, x, 0x114, 0xf, 0xa, true));
+    }
     else if constexpr(OFF == 8) // row_ror:8
         return __builtin_bit_cast(float, __builtin_amdgcn_mov_dpp(x, 0x128, 0xf, 0xf, true));
     else if constexpr(OFF == 16) // ds_swizzle bit mode, xor_mask 0x10
@@ -1222,8 +1218,13 @@ void topk_gating_kernel_prefill(
 #pragma unroll
         for(int i = 1; i < VPT; i++)
             local_max = fmaxf(local_max, row_chunk[i]);
-        local_max =
-            xor_butterfly<THREADS_PER_ROW>(local_max, [](float a, float b) { return fmaxf(a, b); });
+        // NaNs are scrubbed above, so the max is order-independent.
+        if constexpr(THREADS_PER_ROW == WARP_SIZE)
+            local_max = readlane_f32(
+                multithread_reduce_max_dpp<THREADS_PER_ROW, false>(local_max), THREADS_PER_ROW - 1);
+        else
+            local_max = xor_butterfly<THREADS_PER_ROW>(local_max,
+                                                       [](float a, float b) { return fmaxf(a, b); });
 
         float local_sum = 0.0f;
 #pragma unroll
