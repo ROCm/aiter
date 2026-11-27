@@ -9,7 +9,7 @@
 // K4 / K5 round a product to fp32 before anything is added to it: never contract a * b + c into an FMA.
 #pragma clang fp contract(off)
 
-namespace opus_moe_permute {
+namespace opus_moe_token_reorder {
 
 
 // ============================================================================
@@ -486,4 +486,4 @@ __global__ void __launch_bounds__(workgroup_traits::BLOCK_SIZE) moe_sort_rows(op
     sort_rows_body(k);
 }
 
-} // namespace opus_moe_permute
+} // namespace opus_moe_token_reorder

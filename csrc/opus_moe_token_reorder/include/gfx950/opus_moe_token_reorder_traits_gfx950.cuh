@@ -7,7 +7,7 @@
 #include "opus/opus.hpp"
 #include "opus_moe_token_reorder.h"
 
-namespace opus_moe_permute {
+namespace opus_moe_token_reorder {
 
 // The workgroup of every kernel.
 struct workgroup_traits {
@@ -62,4 +62,4 @@ struct sort_traits : workgroup_traits {
     static_assert(LDS_BYTES <= LDS_LIMIT);
 };
 
-} // namespace opus_moe_permute
+} // namespace opus_moe_token_reorder

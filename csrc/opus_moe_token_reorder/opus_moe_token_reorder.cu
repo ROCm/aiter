@@ -15,7 +15,7 @@
 
 namespace {
 
-using namespace opus_moe_permute;
+using namespace opus_moe_token_reorder;
 
 constexpr int64_t VEC = OPUS_MOE_TOKEN_REORDER_VEC;
 
