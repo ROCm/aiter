@@ -547,6 +547,42 @@ void check_mx_v_scale_backing_storage(const fmha_v4_fwdConfig& cfg,
                 "zeroed slack");
 }
 
+// The hd128 64x64 MXFP8 Sol-Attn object reads its pooled K scales, and the Jensen variance's, past
+// their last scale-row tile and on into the next tile's rows, as it reads K's own. sol_prepare,
+// sol_jensen_cap and sol_tilt_planes back them with the producers' kKvScaleLookaheadRows zeroed
+// rows past the last batch. With the tilt, the scale is plane 0 of a stack whose later planes sit
+// behind it, so this bounds plane 0 only; sol_tilt_planes backs the last plane the same way.
+void check_pooled_k_scale_backing_storage(const fmha_v4_fwdConfig& cfg,
+                                          const at::Tensor& scale,
+                                          const char* name)
+{
+    const bool fp8_k = cfg.k_format >= format_id(AttentionFormat::Fp8E4M3) &&
+                       cfg.k_format <= format_id(AttentionFormat::Fp8E5M2Fnuz);
+    if(!fp8_k || cfg.hdim_q != 128 || cfg.ts_qo != 64 || cfg.ts_kv != 64)
+        return;
+    int64_t extent = 1;
+    for(int64_t dim = 0; dim < scale.dim(); ++dim)
+        extent += (scale.size(dim) - 1) * scale.stride(dim);
+    const int64_t rows = scale.size(1);
+    const int64_t padded =
+        (rows + kKvScaleTileRows - 1) / kKvScaleTileRows * kKvScaleTileRows + kKvScaleLookaheadRows;
+    const int64_t required = extent + (padded - rows) * scale.stride(1);
+    const int64_t backed   = static_cast<int64_t>(scale.storage().nbytes()) -
+                           scale.storage_offset() * scale.element_size();
+    TORCH_CHECK(backed >= required,
+                name,
+                " needs ",
+                required,
+                " mapped bytes so the ",
+                cfg.ts_qo,
+                "x",
+                cfg.ts_kv,
+                " kernel's reads past its last scale tile stay in bounds, but only ",
+                backed,
+                " are backed; pool it with sol_prepare(), or take it from sol_jensen_cap() or "
+                "sol_tilt_planes(), which reserve zeroed lookahead rows");
+}
+
 // The hd128 MXFP6 K packer writes each 128-token tile as one record of codes followed by that
 // tile's E8M0 scales, and the kernels read both from the record. So an MXFP6 K operand has to be a
 // view of such records: a tensor of the right shape with any other backing hands them codes from
@@ -1782,6 +1818,7 @@ void fmha_v4_fwd_sol(const at::Tensor& q,
                     padded_rows,
                     "), matching K's own scale image with key_length replaced by num_kv_blocks");
         TORCH_CHECK(ks.stride(3) == 1, "mean_k_scale must have a contiguous last dimension");
+        check_pooled_k_scale_backing_storage(cfg, ks, "mean_k_scale");
     }
     if(v_needs_pooled_scale)
     {
@@ -1834,6 +1871,7 @@ void fmha_v4_fwd_sol(const at::Tensor& q,
                         "mean_k_var_scale must be a uint8 E8M0 tensor");
             TORCH_CHECK(vs.sizes() == ks.sizes() && vs.strides() == ks.strides(),
                         "mean_k_var_scale must have mean_k_scale's shape and strides");
+            check_pooled_k_scale_backing_storage(cfg, vs, "mean_k_var_scale");
         }
         else if(k_scales_inline)
         {

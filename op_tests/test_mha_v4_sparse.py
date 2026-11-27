@@ -49,6 +49,7 @@ from aiter.ops.mha_v4 import (
     scale_modes_for_formats,
 )
 from aiter.ops.mha_v4_quant import (
+    MHA_V4_KV_SCALE_LOOKAHEAD_ROWS,
     MHA_V4_LOG2E,
     mha_v4_q_multiplier,
     mxfp4_k_view,
@@ -67,6 +68,11 @@ from aiter.ops.mha_v4_quant import (
     quantize_v_mxfp4_fp6_p,
     quantize_v_mxfp6_fp6_p,
     rotate_activation_hd128,
+)
+from aiter.ops.triton.attention.sol_tilt import (
+    sol_q_abs_max,
+    sol_tilt_planes,
+    sol_tilt_scaled_params,
 )
 from aiter.ops.triton.attention.utils import (
     SOL_ATTN_TS_KV,
@@ -2133,11 +2139,12 @@ def _sol_attn_launch(
     sorted_dispatch=None,
     kv_range_tokens=0,
     jensen=False,
+    sol_tilt=None,
 ):
     """Launch the Sol-Attn row over a sol_prepare() plan, overriding tensors if asked.
 
     jensen passes the plan's mean_k_var (and its scale), so the plan must have been prepared with
-    k_variance=True.
+    k_variance=True. sol_tilt is passed through.
     """
     recipe = _FP8_SOL_ATTN_RECIPE if recipe is None else recipe
     block_tile = recipe.block_tile() if block_tile is None else block_tile
@@ -2169,6 +2176,7 @@ def _sol_attn_launch(
         mean_k_var=plan["mean_k_var"] if jensen else None,
         mean_k_var_scale=plan["mean_k_var_scale"] if jensen else None,
         v_pack=recipe.v_pack,
+        sol_tilt=sol_tilt,
     )
 
 
@@ -2980,6 +2988,267 @@ def test_mha_v4_mx_scales_must_be_producer_contiguous(recipe, block_tile, mode):
             RuntimeError, match=f"MX {slot.upper()} descale must be contiguous"
         ):
             _mx_k_scale_launch(recipe, *launched.values(), plan, block_tile, mode)
+
+
+_SOL_ATTN_MXFP8 = next(r for r in _SOL_ATTN_RECIPES if r.id == "mxfp8")
+# 8 pooled rows leave most of the 128-row scale tile as padding; 128 fill it.
+_POOLED_K_SCALE_ROWS = [
+    param(8, id="padded-tile"),
+    param(SOL_ATTN_TS_KV, id="full-tile"),
+]
+
+
+def _mxfp8_64x64_plan(kv_blocks, compiled=False, heads=2):
+    """MXFP8 operands over kv_blocks 64-key blocks, and their sol_prepare plan at 64x64 with the
+    Jensen variance, traced under torch.compile if asked."""
+    recipe = _SOL_ATTN_MXFP8
+    operands = recipe.operands(sequence_k=kv_blocks * _MHA_V4_FINE_TILE[1], heads=heads)
+    args, kwargs = recipe.prepare_args(
+        *operands, block_tile=_MHA_V4_FINE_TILE, k_variance=True
+    )
+
+    def prepare():
+        return sol_prepare(*args, beta=0.4, num_heads=heads, **kwargs)
+
+    return operands, (torch.compile(prepare, fullgraph=True) if compiled else prepare)()
+
+
+def _mxfp8_64x64_tilt(operands, plan, rank):
+    """sol_tilt_planes' rank-`rank` planes over the plan, and the plan with their pooled tensors."""
+    q, k, v = operands
+
+    def dequantized(x):
+        scale = torch.exp2(x.descale.float() - 127).repeat_interleave(32, -1)
+        return (x.quantized.float() * scale).to(torch.bfloat16)
+
+    planes = sol_tilt_planes(
+        dequantized(k),
+        v.quantized,
+        sol_q_abs_max(dequantized(q), _MHA_V4_FINE_TILE[0]),
+        plan["mean_k"],
+        plan["mean_v"],
+        _SOL_ATTN_MXFP8.ref_softmax_scale,
+        rank,
+        _MHA_V4_FINE_TILE[1],
+        k_format="mxfp8",
+        v_format="e4m3",
+        v_descale=v.descale,
+        mean_k_scale=plan["mean_k_scale"],
+        mean_v_scale=plan["mean_v_scale"],
+    )
+    stacked = {
+        **plan,
+        **{key: getattr(planes, key) for key in ("mean_k", "mean_v")},
+        **{key: getattr(planes, key) for key in ("mean_k_scale", "mean_v_scale")},
+    }
+    return planes, stacked
+
+
+def _mxfp8_64x64_launch(operands, plan, planes=None, jensen=False, kv_range_tokens=0):
+    tilt = None
+    if planes is not None:
+        params = sol_tilt_scaled_params(planes, planes.k_scale_plane_stride)
+        tilt = (planes.rank, planes.k_plane_stride, params)
+    return _sol_attn_launch(
+        *operands,
+        plan,
+        recipe=_SOL_ATTN_MXFP8,
+        block_tile=_MHA_V4_FINE_TILE,
+        kv_range_tokens=kv_range_tokens,
+        jensen=jensen,
+        sol_tilt=tilt,
+    )
+
+
+@_requires_sol_row(_SOL_ATTN_MXFP8, _MHA_V4_FINE_TILE)
+@parametrize("compiled", [False, True], ids=["eager", "compiled"])
+@parametrize("kv_blocks", _POOLED_K_SCALE_ROWS)
+def test_mha_v4_mxfp8_sol_64x64_pooled_k_scales_carry_lookahead_rows(
+    kv_blocks, compiled
+):
+    """The 64x64 MXFP8 row reads its pooled K scales, and the Jensen variance's, past their last
+    128-row tile, as it reads K's own. So sol_prepare backs both with the zeroed lookahead rows
+    AITER's own K scales carry, under torch.compile too, and the launch takes them as they are.
+    """
+    operands, plan = _mxfp8_64x64_plan(kv_blocks, compiled)
+    out = _mxfp8_64x64_launch(operands, plan, jensen=True)
+    torch.cuda.synchronize()
+    assert torch.isfinite(out).all()
+
+    for name in ("mean_k_scale", "mean_k_var_scale"):
+        scale = plan[name]
+        assert scale.is_contiguous(), name
+        row_bytes = scale[0, 0].numel()
+        tile_rows = -(-scale.shape[1] // SOL_ATTN_TS_KV) * SOL_ATTN_TS_KV
+        padding = tile_rows - scale.shape[1] + MHA_V4_KV_SCALE_LOOKAHEAD_ROWS
+        backed = padding * row_bytes
+        end = (scale.storage_offset() + scale.numel()) * scale.element_size()
+        tail = _uint8_storage(scale)[end:]
+        assert (
+            tail.numel() >= backed
+        ), f"{name}: {tail.numel()} of {backed} bytes backed"
+        assert not tail[:backed].any(), f"{name}: backing past its tile is not zeroed"
+
+
+@_requires_sol_row(_SOL_ATTN_MXFP8, _MHA_V4_FINE_TILE)
+def test_mha_v4_mxfp8_sol_64x64_refuses_pooled_k_scales_without_lookahead_rows():
+    """A pooled K scale without the lookahead rows is refused rather than read past. A clone keeps
+    the values and drops the backing."""
+    operands, plan = _mxfp8_64x64_plan(SOL_ATTN_TS_KV)
+    for name in ("mean_k_scale", "mean_k_var_scale"):
+        bare = {**plan, name: plan[name].clone()}
+        with expect_raises(RuntimeError, match=f"{name} needs .* mapped bytes"):
+            _mxfp8_64x64_launch(operands, bare, jensen=True)
+
+
+@_requires_sol_row(_SOL_ATTN_MXFP8, _MHA_V4_FINE_TILE)
+@parametrize("rank", [2, 8])
+@parametrize("kv_blocks", _POOLED_K_SCALE_ROWS)
+def test_mha_v4_mxfp8_sol_64x64_tilt_reads_its_k_scale_planes(kv_blocks, rank):
+    """With the tilt, mean_k_scale is plane 0 of sol_tilt_planes' stack, planes 1..rank a byte
+    stride behind it, and the row reads every plane. The launch passes the stack through as it is,
+    so the tilt moves the output, and stays finite, at every rank."""
+    operands, plan = _mxfp8_64x64_plan(kv_blocks)
+    planes, stacked = _mxfp8_64x64_tilt(operands, plan, rank)
+    plain = _mxfp8_64x64_launch(operands, stacked)
+    tilted = _mxfp8_64x64_launch(operands, stacked, planes)
+    torch.cuda.synchronize()
+    assert torch.isfinite(tilted).all()
+    assert not torch.equal(tilted, plain), "the tilt planes did not reach the row"
+
+
+class _DeviceBytes:
+    """A raw device range in the form torch.as_tensor takes."""
+
+    def __init__(self, pointer, nbytes):
+        self.__cuda_array_interface__ = {
+            "shape": (nbytes,),
+            "typestr": "|u1",
+            "data": (pointer, False),
+            "version": 2,
+        }
+
+
+def _hip_vmm_available():
+    try:
+        from aiter.jit.utils.hip_runtime import load_hip_runtime
+
+        return hasattr(load_hip_runtime(), "hipMemAddressReserve")
+    except (ImportError, OSError):
+        return False
+
+
+_END_OF_MAPPING_KEEP = []
+
+
+def _at_end_of_mapping(x, image_bytes):
+    """A copy of x's first image_bytes from its first element, ending at the last mapped byte of
+    a VMM mapping whose next granule is reserved and unmapped, so any read past it faults.
+    """
+    import ctypes
+
+    from aiter.dist.device_communicators import vmm_allocator as vmm
+    from aiter.jit.utils.hip_runtime import load_hip_runtime
+
+    hip = load_hip_runtime()
+    device = x.device.index or 0
+    granule = vmm._get_granularity(device)
+    size = -(-image_bytes // granule) * granule
+    physical, address = ctypes.c_void_p(), ctypes.c_void_p()
+    prop = vmm._make_prop(device)
+    vmm._check(hip.hipMemCreate(ctypes.byref(physical), size, ctypes.byref(prop), 0))
+    vmm._check(
+        hip.hipMemAddressReserve(
+            ctypes.byref(address), size + granule, granule, ctypes.c_void_p(0), 0
+        )
+    )
+    vmm._check(hip.hipMemMap(address, size, 0, physical, 0))
+    access = vmm._hipMemAccessDesc(vmm._DEVICE, device, vmm._READ_WRITE)
+    vmm._check(hip.hipMemSetAccess(address, size, ctypes.byref(access), 1))
+    # Left mapped: the child process exits after its last launch.
+    _END_OF_MAPPING_KEEP.append((physical, address))
+    source = torch.empty(0, dtype=torch.uint8, device=x.device)
+    source.set_(x.untyped_storage(), 0, (x.untyped_storage().nbytes(),))
+    start = x.storage_offset() * x.element_size()
+    placed = torch.as_tensor(
+        _DeviceBytes(address.value + size - image_bytes, image_bytes), device=x.device
+    )
+    placed.copy_(source[start : start + image_bytes])
+    out = torch.empty(0, dtype=x.dtype, device=x.device)
+    out.set_(placed.untyped_storage(), 0, x.shape, x.stride())
+    return out
+
+
+def _mxfp8_64x64_end_of_mapping_child(cases):
+    """For each (kv_blocks, kv_range_tokens) of cases, launch the 64x64 MXFP8 row with each pooled
+    K scale's whole allocation ending at the last mapped byte: sol_prepare's two with Jensen on,
+    then sol_tilt_planes' K-scale stack with the tilt. Prints `placed ...` before each launch, and
+    `done` after the last; a read past an allocation is a fault, which ends the process.
+    """
+    for kv_blocks, kv_range_tokens in cases:
+        operands, plan = _mxfp8_64x64_plan(kv_blocks)
+        planes, stacked = _mxfp8_64x64_tilt(operands, plan, rank=2)
+        launches = {
+            "mean_k_scale": (plan, None),
+            "mean_k_var_scale": (plan, None),
+            "tilt mean_k_scale": (stacked, planes),
+        }
+        for label, (tensors, tilt) in launches.items():
+            name = label.split()[-1]
+            launch = functools.partial(
+                _mxfp8_64x64_launch,
+                operands,
+                planes=tilt,
+                jensen=tilt is None,
+                kv_range_tokens=kv_range_tokens,
+            )
+            reference = launch(tensors)
+            torch.cuda.synchronize()
+            x = tensors[name]
+            whole = x.untyped_storage().nbytes() - x.storage_offset() * x.element_size()
+            print(
+                f"placed {label} at {kv_blocks} blocks, range {kv_range_tokens}",
+                flush=True,
+            )
+            out = launch({**tensors, name: _at_end_of_mapping(x, whole)})
+            torch.cuda.synchronize()
+            assert torch.equal(
+                out, reference
+            ), f"{label} changed the output where placed"
+    print("done", flush=True)
+
+
+@skipif(not _hip_vmm_available(), reason="HIP virtual memory management")
+@_requires_sol_row(_SOL_ATTN_MXFP8, _MHA_V4_FINE_TILE)
+def test_mha_v4_mxfp8_sol_64x64_pooled_k_scale_reads_stay_in_their_allocation():
+    """The 64x64 MXFP8 row's pooled K-scale reads end inside what their producers allocate: each
+    allocation, placed whole at the end of a mapping, leaves the output as it was. A ragged, a
+    whole and a long last scale tile, and KV ranges where the row has them; a read past the
+    mapping faults, which ends the process, so the cases run in one child."""
+    cases = [
+        (8, 0),
+        (SOL_ATTN_TS_KV, 0),
+        (SOL_ATTN_TS_KV + 8, 0),
+        (8 * SOL_ATTN_TS_KV, 0),
+    ]
+    if _sol_attn_row_declares(_SOL_ATTN_MXFP8, _MHA_V4_FINE_TILE, "kv_range"):
+        cases.append((SOL_ATTN_TS_KV, 32 * _MHA_V4_FINE_TILE[1]))
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    child = (
+        "from op_tests.test_mha_v4_sparse import _mxfp8_64x64_end_of_mapping_child; "
+        f"_mxfp8_64x64_end_of_mapping_child({cases!r})"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", child],
+        cwd=repo_root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    placed = [line for line in result.stdout.splitlines() if line.startswith("placed")]
+    assert (
+        result.returncode == 0 and "done" in result.stdout.splitlines()
+    ), f"stopped with {placed[-1:]} at the end of a mapping:\n{result.stderr[-3000:]}"
 
 
 def test_mha_v4_sol_rejects_recipes_without_a_manifest_row():
