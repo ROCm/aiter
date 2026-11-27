@@ -1,0 +1,76 @@
+{
+    "ahead_k": {"5": 23, "6": 23, "7": 23, "8": 17},
+    "plain": {"kernel": "plain", "nslot": 2, "early": 0, "num_warps": 8, "cpc": 0, "ub": 0},
+    "consume": {"nslot": 1, "num_warps": 4, "cpc": 3, "cpc_no_delta": 4},
+    "produce": {"nslot": 2, "num_warps": 8, "cpc": 0, "ub": 0, "ks": 1},
+    "default": {
+        "T_LEQ_255": {
+            "n1f": {"kernel": "produce", "nslot": 1, "early": 1, "num_warps": 4, "cpc": 3},
+            "n1b": {"kernel": "produce", "nslot": 1, "early": 1, "num_warps": 4, "cpc": 2},
+            "n3f": {"nslot": 1, "early": 1, "num_warps": 4, "cpc": 2},
+            "n3b": {"nslot": 1, "early": 1, "num_warps": 4, "cpc": 2},
+            "n4f": {"nslot": 1, "early": 1, "num_warps": 4, "cpc": 2},
+            "n4b": {"nslot": 1, "early": 1, "num_warps": 4, "cpc": 2}
+        },
+        "T_LEQ_511": {
+            "n1f": {"kernel": "produce", "nslot": 1, "early": 1, "num_warps": 4, "cpc": 3},
+            "n1b": {"kernel": "produce", "nslot": 1, "early": 1, "num_warps": 4, "cpc": 2},
+            "n3f": {"nslot": 1, "early": 1, "num_warps": 4, "cpc": 2},
+            "n3b": {"nslot": 1, "early": 1, "num_warps": 4, "cpc": 2},
+            "n4f": {"nslot": 1, "early": 1, "num_warps": 4, "cpc": 2},
+            "n4b": {"nslot": 1, "early": 1, "num_warps": 4, "cpc": 2}
+        },
+        "T_LEQ_1023": {
+            "n1f": {"kernel": "produce", "nslot": 1, "early": 1, "num_warps": 4, "cpc": 3, "ub": 1},
+            "n1b": {"kernel": "produce", "nslot": 1, "early": 1, "num_warps": 4, "cpc": 2},
+            "n2f": {"num_warps": 4},
+            "n2b": {"num_warps": 4},
+            "n3f": {"nslot": 1, "early": 1, "cpc": 2, "ub": 1},
+            "n3b": {"nslot": 1, "early": 1, "num_warps": 4, "cpc": 2, "ub": 1},
+            "n4f": {"nslot": 1, "early": 1, "num_warps": 4, "cpc": 2, "ub": 1},
+            "n4b": {"nslot": 1, "early": 1, "num_warps": 4, "cpc": 2, "ub": 1},
+            "consf": {"num_warps": 8},
+            "h": {"ub": 1}
+        },
+        "T_LEQ_4095": {
+            "n0f": {"num_warps": 4},
+            "n0b": {"num_warps": 4},
+            "n1f": {"kernel": "produce", "nslot": 1, "early": 1, "num_warps": 4, "cpc": 3},
+            "n1b": {"kernel": "produce", "nslot": 1, "early": 1, "num_warps": 4, "cpc": 2},
+            "n2f": {"nslot": 1, "early": 1, "num_warps": 4, "cpc": 2, "ub": 1},
+            "n2b": {"num_warps": 4, "ub": 1},
+            "n3f": {"nslot": 1, "early": 1, "num_warps": 4, "cpc": 2, "ub": 1},
+            "n3b": {"nslot": 1, "early": 1, "num_warps": 4, "cpc": 2, "ub": 1},
+            "n4f": {"nslot": 1, "early": 1, "num_warps": 4, "cpc": 2, "ub": 1},
+            "n4b": {"nslot": 1, "early": 1, "num_warps": 4, "cpc": 2, "ub": 1},
+            "consb": {"cpc_no_delta": 3},
+            "h": {"ub": 1}
+        },
+        "any": {
+            "n0f": {"num_warps": 4},
+            "n0b": {"num_warps": 4},
+            "n1f": {"kernel": "produce", "nslot": 1, "early": 1, "num_warps": 4, "cpc": 3, "ub": 1},
+            "n1b": {"kernel": "produce", "nslot": 1, "early": 1, "num_warps": 4, "cpc": 2, "ub": 1},
+            "n2f": {"nslot": 1, "early": 1, "num_warps": 4, "cpc": 2, "ub": 1},
+            "n2b": {"nslot": 1, "early": 1, "num_warps": 4, "cpc": 3, "ub": 1},
+            "n3f": {"nslot": 1, "early": 1, "num_warps": 4, "cpc": 2, "ub": 1},
+            "n3b": {"nslot": 1, "early": 1, "num_warps": 4, "cpc": 2, "ub": 1},
+            "n4f": {"nslot": 1, "early": 1, "num_warps": 4, "cpc": 2, "ub": 1},
+            "n4b": {"nslot": 1, "early": 1, "num_warps": 4, "cpc": 2, "ub": 1},
+            "h": {"ub": 1}
+        }
+    },
+    "residual_added": {
+        "T_LEQ_255": {
+            "h": {"ks": 4}
+        },
+        "T_LEQ_511": {
+            "h": {"ub": 1}
+        },
+        "T_LEQ_1023": {},
+        "T_LEQ_4095": {
+            "consb": {"cpc": 4, "cpc_no_delta": 4}
+        },
+        "any": {}
+    }
+}
