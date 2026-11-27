@@ -178,6 +178,23 @@ def _mla_gluon(
             split_kv_end = cur_batch_seq_len
     # early return for inactive split
     if split_kv_start >= split_kv_end:
+        if NUM_KV_SPLITS == 1:
+            # an empty sequence, and no reduce follows: o = 0, lse = sink or -inf
+            blocked_empty: gl.constexpr = gl.BlockedLayout(size_per_thread=[1, 8], threads_per_warp=[8, 8], warps_per_cta=[4, 1], order=[1, 0])
+            heads = cur_head_id * BLOCK_H + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, blocked_empty))
+            offs_d = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(0, blocked_empty))
+            offs_o = cur_batch * stride_o_b + q_pos * stride_o_s + heads[:, None] * stride_o_h + offs_d[None, :]
+            zeros = gl.zeros([BLOCK_H, HEAD_DIM_CKV], dtype=O.type.element_ty, layout=blocked_empty)
+            gl.amd.cdna4.buffer_store(zeros, ptr=O, offsets=offs_o, mask=(heads < NHEAD)[:, None])
+            if RETURN_LSE:
+                blocked_empty_lse: gl.constexpr = gl.BlockedLayout(size_per_thread=[1], threads_per_warp=[64], warps_per_cta=[4], order=[0])
+                heads_lse = cur_head_id * BLOCK_H + gl.arange(0, BLOCK_H, layout=blocked_empty_lse)
+                if HAS_ATTN_SINK:
+                    lse = gl.load(Attn_sink + heads_lse, mask=heads_lse < NHEAD, other=float("-inf")).to(gl.float32)
+                else:
+                    lse = gl.full([BLOCK_H], float("-inf"), gl.float32, layout=blocked_empty_lse)
+                offs_lse = cur_batch * stride_final_lse_b + q_pos * stride_final_lse_s + heads_lse * stride_final_lse_h
+                gl.amd.cdna4.buffer_store(lse, ptr=Final_lse, offsets=offs_lse, mask=heads_lse < NHEAD)
         return
     num_iter = gl.cdiv(split_kv_end - split_kv_start, BLOCK_N)
     start_n = split_kv_start
