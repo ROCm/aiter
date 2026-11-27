@@ -817,9 +817,13 @@ def _varlen_ref_fp32(q, k, v, lens_q, lens_k, causal, scale):
             continue
         s = (qi @ ki.transpose(1, 2)) * scale
         if causal:
-            mask = torch.ones(lq, lk, dtype=torch.bool, device=q.device).triu(1)
+            # Bottom-right aligned, as in flash-attn: row r sees keys <= r + lk - lq.
+            mask = torch.ones(lq, lk, dtype=torch.bool, device=q.device).triu(
+                1 + lk - lq
+            )
             s = s.masked_fill(mask, float("-inf"))
-        outs.append((torch.softmax(s, dim=-1) @ vi).transpose(0, 1))
+        p = torch.softmax(s, dim=-1).nan_to_num(0.0)  # a row with no keys: out 0
+        outs.append((p @ vi).transpose(0, 1))
         lses.append(torch.logsumexp(s, dim=-1))
     return torch.cat(outs), torch.cat(lses, dim=1)
 
@@ -874,6 +878,10 @@ def _make_varlen_qkv(lens_q, lens_k, num_heads, num_kv_heads, head_dim, dtype):
         ([572] * 8 + [952] * 8, [572] * 8 + [952] * 8, 16, 16, 64, False, "bf16"),
         ([100, 200, 7], [300, 50, 1], 4, 4, 64, False, "bf16"),  # cross lengths
         ([129, 1000, 64], [129, 1000, 64], 8, 8, 128, True, "bf16"),
+        ([512], [2048], 8, 2, 256, True, "bf16"),  # chunked prefill over a prefix
+        ([4] * 32, [2048] * 32, 8, 2, 128, True, "bf16"),  # speculative decode
+        ([1300, 600, 1], [1300, 2000, 900], 16, 16, 64, True, "bf16"),  # mixed
+        ([64, 100], [32, 100], 4, 4, 64, True, "f16"),  # fewer keys: rows with none
         ([100, 257, 1000], [100, 257, 1000], 8, 2, 128, False, "f16"),  # GQA
         ([333, 777], [333, 777], 4, 4, 40, False, "f16"),  # head_dim % 16 == 8
         ([100, 0, 50], [100, 0, 50], 4, 4, 64, False, "bf16"),  # empty sequence
@@ -885,8 +893,7 @@ def test_flydsl_fmha_gfx11_varlen(
 ):
     dtype = torch.bfloat16 if dtype_str == "bf16" else torch.float16
     q, k, v = _make_varlen_qkv(lens_q, lens_k, num_heads, num_kv_heads, head_dim, dtype)
-    cu_q = _cu_seqlens(lens_q)
-    cu_k = cu_q if causal else _cu_seqlens(lens_k)
+    cu_q, cu_k = _cu_seqlens(lens_q), _cu_seqlens(lens_k)  # two tables, as vLLM passes
     res = flydsl_fmha_kernels.flydsl_flash_attn_varlen_fwd(
         q, k, v, cu_q, cu_k, max(lens_q), max(lens_k), causal=causal, return_lse=True
     )
@@ -970,8 +977,8 @@ def test_flydsl_fmha_gfx11_varlen_falls_through():
     assert fwd(q, k, v, cu.to(torch.int64), cu.to(torch.int64), 128, 128) is None
     assert fwd(q, k, v, cu, cu, 128, 128, dropout_p=0.1) is None
     assert fwd(q, k, v, cu, cu, 128, 128, window_size=(64, -1)) is None
-    # causal needs one cu_seqlens table: the mask is top-left aligned
-    assert fwd(q, k, v, cu, cu.clone(), 128, 128, causal=True) is None
+    # causal takes separate tables (bottom-right aligned mask)
+    assert fwd(q, k, v, cu, cu.clone(), 128, 128, causal=True) is not None
     assert fwd(q, k, v, cu, cu, 128, 128, causal=True) is not None
     assert (
         fwd(q, k, v, cu, cu, 128, 128, alibi_slopes=torch.ones(4, device="cuda"))

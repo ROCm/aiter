@@ -575,8 +575,8 @@ def _gfx11_varlen_supported(
 ) -> bool:
     """Gate for the gfx11 varlen kernel: packed THD bf16 / f16, head_dim % 8 == 0,
     GQA by head ratio, int32 ``cu_seqlens`` of equal length on the device, and
-    none of the options the kernel has no code for. Causal needs one table for
-    both sides: the mask is top-left aligned, which is right for equal lengths."""
+    none of the options the kernel has no code for. Causal takes separate tables:
+    the mask is bottom-right aligned, as in flash-attn."""
     if q.dim() != 3 or k.dim() != 3 or v.dim() != 3 or k.shape != v.shape:
         return False
     if q.dtype not in (torch.bfloat16, torch.float16) or not (
@@ -599,11 +599,6 @@ def _gfx11_varlen_supported(
         ):
             return False
     if cu_seqlens_q.numel() != cu_seqlens_k.numel():
-        return False
-    if causal and not (
-        cu_seqlens_q is cu_seqlens_k
-        or cu_seqlens_q.data_ptr() == cu_seqlens_k.data_ptr()
-    ):
         return False
     if softmax_scale is not None and (
         torch.is_tensor(softmax_scale) or not (0 < float(softmax_scale) < float("inf"))

@@ -63,6 +63,7 @@ from .tensor_shim import (
 KERNEL_NAME = "flash_attn_varlen_func_gfx11_kernel"
 
 NEG_BIG = -1.0e30  # finite: NEG_BIG - m stays finite, exp2 of it is exactly 0
+POS_BIG = 1.0e30  # initial m of a causal row with no visible key: all its p are 0
 _LN2 = host_math.log(2.0)
 
 
@@ -91,8 +92,11 @@ def build_flash_attn_varlen_func_module_gfx11(
 
     Args:
         num_heads, head_dim: compile-time head geometry (``head_dim % 8 == 0``).
-        causal: top-left aligned causal mask; the caller guarantees that every
-            sequence has as many keys as queries (one ``cu_seqlens`` table).
+        causal: bottom-right aligned causal mask, as in flash-attn: query row r
+            of a sequence attends keys ``<= r + seq_kv - seq_q``, so a chunk of
+            queries over a longer key range (chunked prefill, prefix caching,
+            speculative decode) sees its whole prefix. Equal lengths give the
+            usual diagonal; a row with no keys gets O = 0 and LSE = -inf.
         num_waves: waves per workgroup; each wave owns 16 query rows.
         block_n: keys per main-loop tile (multiple of 16).
         vt_rows: keys packed per LDS write in the V -> V^T transpose (2, 4, 8).
@@ -292,6 +296,9 @@ def build_flash_attn_varlen_func_module_gfx11(
         kv_start, kv_end = cu_pair(CU_K, bat)
         seq_q = q_end - q_start
         seq_kv = kv_end - kv_start
+        # Causal diagonal offset (bottom-right alignment): row r sees keys
+        # <= r + diag. 0 for equal lengths, negative when the keys are fewer.
+        diag = seq_kv - seq_q
         n_qblk = (seq_q + (BLOCK_M - 1)) // BLOCK_M
         # Linear block id -> (head, qblk), HEAD_GROUP heads fastest. In THD one
         # token row holds every head, so workgroups resident together that cover
@@ -431,8 +438,13 @@ def build_flash_attn_varlen_func_module_gfx11(
             q_vecs.append(Vec(lo).shuffle(Vec(hi), CONCAT16))
 
         if const_expr(causal):
-            n_tiles = ((qblk + 1) * BLOCK_M + (BLOCK_N - 1)) // BLOCK_N
+            # Keys this block's last row can see: its row index + diag, clamped
+            # at 0 so a block with no visible keys walks no tile.
+            last_key = (qblk + 1) * BLOCK_M + diag
+            last_key = (last_key > 0).select(last_key, fx.Int32(0))
+            n_tiles = (last_key + (BLOCK_N - 1)) // BLOCK_N
             n_tiles = (n_tiles < n_kv_tiles).select(n_tiles, n_kv_tiles)
+            q_lim = q_row + diag
         else:
             n_tiles = n_kv_tiles
         n_tiles = active.select(n_tiles, fx.Int32(0))
@@ -557,9 +569,15 @@ def build_flash_attn_varlen_func_module_gfx11(
         sel_odd = is_h0.select(fx.Int32(0x07060302), fx.Int32(0x03020706))
 
         zero8 = Vec.filled(8, 0.0, fx.Float32)
-        init = [fx.Float32(NEG_BIG), fx.Float32(0.0)] + [
-            zero8 for _ in range_constexpr(ND)
-        ]
+        m0 = fx.Float32(NEG_BIG)
+        if const_expr(causal):
+            # A row that can see no key at all (fewer keys than queries): with
+            # m = NEG_BIG its masked x - m would be rounding noise and exp2 of it
+            # 1 or inf. Starting such a row at +BIG makes every p exactly 0, so
+            # l and O stay 0 and the LSE is -inf. Rows with keys see key 0 in
+            # the first tile and are unchanged.
+            m0 = (q_lim < 0).select(fx.Float32(POS_BIG), m0)
+        init = [m0, fx.Float32(0.0)] + [zero8 for _ in range_constexpr(ND)]
 
         store_tile(gload_tile(fx.Int32(0)), 0)
         _lds_barrier()
@@ -598,7 +616,7 @@ def build_flash_attn_varlen_func_module_gfx11(
                     if const_expr(causal or mask_tail):
                         key = j32 * BLOCK_N + kb * 16 + 2 * si + hh
                     if const_expr(causal):
-                        x = (key > q_row).select(fx.Float32(NEG_BIG), x)
+                        x = (key > q_lim).select(fx.Float32(NEG_BIG), x)
                     if const_expr(mask_tail):
                         x = (key >= seq_kv).select(fx.Float32(NEG_BIG), x)
                     row.append(x)
