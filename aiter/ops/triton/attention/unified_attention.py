@@ -136,6 +136,76 @@ WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
 
 _GLUON_SUPPORTED_ARCHS = ("gfx1250", "gfx1250-strict", "gfx950")
 
+# gfx11 (RDNA3 / RDNA3.5): the FlyDSL paged kernels of
+# aiter.ops.flydsl.paged_attention_gfx11 take the bf16 / f16 calls they have
+# code for when AITER_FLYDSL_UNIFIED_ATTN=1. Off by default until they are
+# at least as fast as the Triton kernels on every measured shape.
+_FLYDSL_GFX11 = (
+    DEVICE_ARCH.startswith(("gfx110", "gfx115"))
+    and os.environ.get("AITER_FLYDSL_UNIFIED_ATTN", "0") == "1"
+)
+
+
+def _flydsl_gfx11(
+    q,
+    k,
+    v,
+    out,
+    cu_seqlens_q,
+    max_seqlen_q,
+    seqused_k,
+    max_seqlen_k,
+    softmax_scale,
+    causal,
+    window_size,
+    block_table,
+    softcap,
+    q_descale,
+    k_descale,
+    v_descale,
+    alibi_slopes,
+    sinks,
+    qq_bias,
+    output_scale,
+):
+    """Run the gfx11 FlyDSL paged kernels if they take this call, else None."""
+    from aiter.ops.flydsl import paged_attention_gfx11 as pa
+
+    if not pa.gfx11_paged_supported(
+        q,
+        k,
+        v,
+        out,
+        cu_seqlens_q,
+        seqused_k,
+        block_table,
+        causal,
+        window_size,
+        softcap,
+        q_descale,
+        k_descale,
+        v_descale,
+        alibi_slopes,
+        sinks,
+        qq_bias,
+        output_scale,
+    ):
+        return None
+    return pa.flydsl_unified_attention_gfx11(
+        q,
+        k,
+        v,
+        out,
+        cu_seqlens_q,
+        max_seqlen_q,
+        seqused_k,
+        max_seqlen_k,
+        softmax_scale,
+        block_table,
+        arch=DEVICE_ARCH,
+    )
+
+
 # LDS the gfx950 KV double buffer may occupy; a wider tile falls back to one buffer.
 _GFX950_LDS_BUDGET = 160 * 1024
 
@@ -470,6 +540,40 @@ def unified_attention(
     output_rows: torch.Tensor | None = None,
 ):
     assert causal, "Only causal attention is supported"
+
+    if (
+        _FLYDSL_GFX11
+        and backend != "gluon"
+        and not shuffled_kv_cache
+        and not skip_reduce
+        and output_gate is None
+        and output_rows is None
+        and q_scales is None
+    ):
+        res = _flydsl_gfx11(
+            q,
+            k,
+            v,
+            out,
+            cu_seqlens_q,
+            max_seqlen_q,
+            seqused_k,
+            max_seqlen_k,
+            softmax_scale,
+            causal,
+            window_size,
+            block_table,
+            softcap,
+            q_descale,
+            k_descale,
+            v_descale,
+            alibi_slopes,
+            sinks,
+            qq_bias,
+            output_scale,
+        )
+        if res is not None:
+            return res
 
     if backend is None:
         backend = "gluon" if _is_gluon_available() else "triton"
