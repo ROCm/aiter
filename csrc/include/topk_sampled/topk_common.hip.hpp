@@ -19,7 +19,7 @@
 
 constexpr int WAVE_SIZE = opus::get_warp_size();
 // The kernels are wave64 code tuned for gfx950, and their launch plan assumes
-// its 256 CUs and 160 KiB of LDS (topk_shape.hip.hpp). A device pass for any
+// its 160 KiB of LDS per CU (topk_shape.hip.hpp). A device pass for any
 // other target compiles each kernel to a trap so the module that carries them
 // still builds there; topk_sampled_supports() keeps them from being launched.
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx950__)

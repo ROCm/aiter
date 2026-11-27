@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <initializer_list>
+#include <type_traits>
 
 namespace aiter {
 namespace {
@@ -674,10 +675,11 @@ __global__ __launch_bounds__(512,1) void glm53_gate_m1_kernel(
 #endif
 }
 
-__device__ __forceinline__ int glm53_remap8(int index,int total)
+template<int XCD>
+__device__ __forceinline__ int glm53_remap_xcd(int index,int total)
 {
- const int per=(total+7)/8,tall=total%8==0?8:total%8;
- const int xcd=index%8,local=index/8;
+ const int per=(total+XCD-1)/XCD,tall=total%XCD==0?XCD:total%XCD;
+ const int xcd=index%XCD,local=index/XCD;
  return xcd<tall?xcd*per+local:tall*per+(xcd-tall)*(per-1)+local;
 }
 
@@ -1943,7 +1945,7 @@ __device__ __forceinline__ void glm53_quad_decode_mfma_cached(
 
 // Decode gate: one CTA per (16-row task, N tile); the eight waves each sum
 // a K768 slice and the partials are reduced through LDS.
-template<bool XCD,int NT>
+template<int XCD,int NT>
 __global__ __launch_bounds__(512,1) void glm53_gate_decode_kernel(
     const opus::fp8_t* __restrict__ activations,
     const uint8_t* __restrict__ scales,
@@ -1972,7 +1974,9 @@ __global__ __launch_bounds__(512,1) void glm53_gate_decode_kernel(
     const int total=num_tasks*NT;
     for(int work=blockIdx.x;work<total;work+=gridDim.x)
     {
-        const int index=XCD?glm53_remap8(work,total):work;
+        int index=work;
+        if constexpr(XCD>0)
+            index=glm53_remap_xcd<XCD>(work,total);
         const int task=XCD?index/NT:work%num_tasks;
         const int n_tile=XCD?index%NT:work/num_tasks;
         const int row_begin=tasks[task*3];
@@ -2117,7 +2121,7 @@ __device__ __forceinline__ void glm53_cross_k_decode_mfma(
 
 // Decode gate variant that keeps weights in registers (no LDS staging), so
 // work items only synchronize to load a new expert's codebook.
-template<int NT>
+template<int XCD,int NT>
 __global__ __launch_bounds__(512,1) void glm53_gate_decode_nobarrier_kernel(
     const opus::fp8_t* __restrict__ activations,
     const uint8_t* __restrict__ scales,
@@ -2144,7 +2148,7 @@ __global__ __launch_bounds__(512,1) void glm53_gate_decode_nobarrier_kernel(
     int previous_expert=-1;
     for(int work=blockIdx.x;work<total;work+=gridDim.x)
     {
-        const int index=glm53_remap8(work,total);
+        const int index=glm53_remap_xcd<XCD>(work,total);
         const int task=index/NT,n_tile=index%NT;
         const int row_begin=tasks[task*3];
         const int row_end=min(row_begin+16,row_begin+tasks[task*3+1]);
@@ -2547,17 +2551,18 @@ void iq2r_glm53_gate_out(const aiter_tensor_t& activations,
     using gate_kernel = void (*)(const opus::fp8_t*, const uint8_t*, const uint8_t*, const uint8_t*,
                                  const int32_t*, const int32_t*, const int32_t*, opus::fp8_t*, uint8_t*,
                                  int, int, int);
-    gate_kernel launch;
-    int waves = 8;
-    if(prefill)
-    {
-        launch = tp4 ? glm53_gate_prefill_kernel<4, 8, 4, 2, 16> : glm53_gate_prefill_kernel<4, 8, 4, 2, 8>;
-        waves  = 4;
-    }
-    else if(kernel == kGlm53GateDecodeNoBarrier)
-        launch = tp4 ? glm53_gate_decode_nobarrier_kernel<16> : glm53_gate_decode_nobarrier_kernel<8>;
-    else
-        launch = tp4 ? glm53_gate_decode_kernel<true, 16> : glm53_gate_decode_kernel<false, 8>;
+    // The kernels remap work over the dies at compile time; one instance per die count.
+    auto select = [&](auto xcd) -> gate_kernel {
+        constexpr int XCD = decltype(xcd)::value;
+        if(prefill)
+            return tp4 ? glm53_gate_prefill_kernel<4, XCD, 4, 2, 16> : glm53_gate_prefill_kernel<4, XCD, 4, 2, 8>;
+        if(kernel == kGlm53GateDecodeNoBarrier)
+            return tp4 ? glm53_gate_decode_nobarrier_kernel<XCD, 16> : glm53_gate_decode_nobarrier_kernel<XCD, 8>;
+        return tp4 ? glm53_gate_decode_kernel<XCD, 16> : glm53_gate_decode_kernel<0, 8>;
+    };
+    const gate_kernel launch = get_num_xcds_func() == 4 ? select(std::integral_constant<int, 4>{})
+                                                        : select(std::integral_constant<int, 8>{});
+    const int waves          = prefill ? 4 : 8;
     hipLaunchKernelGGL(launch,
                        dim3(static_cast<int>(grid_multiplier) * static_cast<int>(get_num_cu_func())),
                        dim3(64, waves),
@@ -2610,22 +2615,30 @@ void iq2r_glm53_down_out(const aiter_tensor_t& activations,
         static_cast<const int32_t*>(task_count.data_ptr()),                                 \
         static_cast<__hip_bfloat16*>(output.data_ptr()), routes, kGlm53Experts,             \
         static_cast<int>(data.size(1)), static_cast<int>(auxiliary.size(1))
-    // Single: one 16-row atom per pass for decode-sized tasks, three workgroups per CU.
-    if(tp4 && kernel == kGlm53DownSingle)
-        hipLaunchKernelGGL((glm53_down_tp4_kernel<4, 1, 2, 8, 4, 4, 3>),
-                           grid, dim3(64, 4), 0, getCurrentHIPStream(), GLM53_DOWN_ARGS);
-    else if(kernel == kGlm53DownSingle)
-        hipLaunchKernelGGL((glm53_down_tp8_ordered_kernel<4, 1, 2, 8, 4>),
-                           grid, dim3(64, 4), 0, getCurrentHIPStream(), GLM53_DOWN_ARGS);
-    else if(tp4)
-        hipLaunchKernelGGL((glm53_down_tp4_kernel<4, 2, 2, 8, 4, 4>),
-                           grid, dim3(64, 4), 0, getCurrentHIPStream(), GLM53_DOWN_ARGS);
-    else if(kernel == kGlm53DownOrdered)
-        hipLaunchKernelGGL((glm53_down_tp8_ordered_kernel<4, 2, 2, 8, 4>),
-                           grid, dim3(64, 4), 0, getCurrentHIPStream(), GLM53_DOWN_ARGS);
+    // The kernels remap work over the dies at compile time; one instance per die count.
+    auto launch = [&](auto xcd) {
+        constexpr int XCD = decltype(xcd)::value;
+        // Single: one 16-row atom per pass for decode-sized tasks, three workgroups per CU.
+        if(tp4 && kernel == kGlm53DownSingle)
+            hipLaunchKernelGGL((glm53_down_tp4_kernel<4, 1, 2, XCD, 4, 4, 3>),
+                               grid, dim3(64, 4), 0, getCurrentHIPStream(), GLM53_DOWN_ARGS);
+        else if(kernel == kGlm53DownSingle)
+            hipLaunchKernelGGL((glm53_down_tp8_ordered_kernel<4, 1, 2, XCD, 4>),
+                               grid, dim3(64, 4), 0, getCurrentHIPStream(), GLM53_DOWN_ARGS);
+        else if(tp4)
+            hipLaunchKernelGGL((glm53_down_tp4_kernel<4, 2, 2, XCD, 4, 4>),
+                               grid, dim3(64, 4), 0, getCurrentHIPStream(), GLM53_DOWN_ARGS);
+        else if(kernel == kGlm53DownOrdered)
+            hipLaunchKernelGGL((glm53_down_tp8_ordered_kernel<4, 2, 2, XCD, 4>),
+                               grid, dim3(64, 4), 0, getCurrentHIPStream(), GLM53_DOWN_ARGS);
+        else
+            hipLaunchKernelGGL((glm53_down_prefill_tp8_kernel<4, 2, 2, XCD, 4, 1, false>),
+                               grid, dim3(64, 4), 0, getCurrentHIPStream(), GLM53_DOWN_ARGS, 0);
+    };
+    if(get_num_xcds_func() == 4)
+        launch(std::integral_constant<int, 4>{});
     else
-        hipLaunchKernelGGL((glm53_down_prefill_tp8_kernel<4, 2, 2, 8, 4, 1, false>),
-                           grid, dim3(64, 4), 0, getCurrentHIPStream(), GLM53_DOWN_ARGS, 0);
+        launch(std::integral_constant<int, 8>{});
 #undef GLM53_DOWN_ARGS
     HIP_CALL_LAUNCH(hipGetLastError());
 }
@@ -2702,7 +2715,8 @@ void iq2r_glm53_down_reduce_out(const aiter_tensor_t& activations,
                 "GLM-5.3 IQ2R prefill output must be BF16 [tokens, 6144]");
     AITER_CHECK(chunks == 1 || chunks == 2, "GLM-5.3 IQ2R prefill down splits N into 1 or 2 chunks");
     HipDeviceGuard device_guard(data.device_id);
-    const int cus = static_cast<int>(get_num_cu_func());
+    const int cus        = static_cast<int>(get_num_cu_func());
+    const bool four_xcds = get_num_xcds_func() == 4;
     for(int chunk = 0; chunk < chunks; ++chunk)
     {
 #define GLM53_PREFILL_DOWN(KERNEL, GRID, ...)                                                   \
@@ -2715,19 +2729,27 @@ void iq2r_glm53_down_reduce_out(const aiter_tensor_t& activations,
                        static_cast<const int32_t*>(task_count.data_ptr()), __VA_ARGS__,        \
                        static_cast<int>(data.size(1)), static_cast<int>(auxiliary.size(1)), chunk)
         // TP4: 16 persistent CTAs per CU with weight-stationary K loops; TP8:
-        // N-wave tiles sharing one cached activation tile.
-        if(K == 512 && chunks == 1)
-            GLM53_PREFILL_DOWN((glm53_down_prefill_tp4_kernel<4, 2, 8, 4, 4, 1, 3>), 16,
-                               static_cast<__hip_bfloat16*>(route_output.data_ptr()), routes, kGlm53Experts);
-        else if(K == 512)
-            GLM53_PREFILL_DOWN((glm53_down_prefill_tp4_kernel<4, 2, 8, 4, 4, 2, 3>), 16,
-                               static_cast<__hip_bfloat16*>(route_output.data_ptr()), routes, kGlm53Experts);
-        else if(chunks == 1)
-            GLM53_PREFILL_DOWN((glm53_down_prefill_tp8_kernel<4, 2, 2, 8, 4, 1, true>), 8,
-                               static_cast<__hip_bfloat16*>(route_output.data_ptr()), routes, kGlm53Experts);
+        // N-wave tiles sharing one cached activation tile. The kernels remap work
+        // over the dies at compile time; one instance per die count.
+        auto launch = [&](auto xcd) {
+            constexpr int XCD = decltype(xcd)::value;
+            if(K == 512 && chunks == 1)
+                GLM53_PREFILL_DOWN((glm53_down_prefill_tp4_kernel<4, 2, XCD, 4, 4, 1, 3>), 16,
+                                   static_cast<__hip_bfloat16*>(route_output.data_ptr()), routes, kGlm53Experts);
+            else if(K == 512)
+                GLM53_PREFILL_DOWN((glm53_down_prefill_tp4_kernel<4, 2, XCD, 4, 4, 2, 3>), 16,
+                                   static_cast<__hip_bfloat16*>(route_output.data_ptr()), routes, kGlm53Experts);
+            else if(chunks == 1)
+                GLM53_PREFILL_DOWN((glm53_down_prefill_tp8_kernel<4, 2, 2, XCD, 4, 1, true>), 8,
+                                   static_cast<__hip_bfloat16*>(route_output.data_ptr()), routes, kGlm53Experts);
+            else
+                GLM53_PREFILL_DOWN((glm53_down_prefill_tp8_kernel<4, 2, 2, XCD, 4, 2, true>), 8,
+                                   static_cast<__hip_bfloat16*>(route_output.data_ptr()), routes, kGlm53Experts);
+        };
+        if(four_xcds)
+            launch(std::integral_constant<int, 4>{});
         else
-            GLM53_PREFILL_DOWN((glm53_down_prefill_tp8_kernel<4, 2, 2, 8, 4, 2, true>), 8,
-                               static_cast<__hip_bfloat16*>(route_output.data_ptr()), routes, kGlm53Experts);
+            launch(std::integral_constant<int, 8>{});
 #undef GLM53_PREFILL_DOWN
         const int width = kGlm53Hidden / static_cast<int>(chunks);
         hipLaunchKernelGGL((chunks == 1 ? glm53_reduce_chunk_kernel<1> : glm53_reduce_chunk_kernel<2>),
