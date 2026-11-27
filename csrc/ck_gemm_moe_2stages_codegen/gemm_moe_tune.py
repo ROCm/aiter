@@ -42,6 +42,7 @@ from aiter.fused_moe import (
     cktile_moe_stage2,
     fused_moe,
     fused_topk,
+    get_padded_M,
     moe_sorting,
     swiglu_limit_tag,
     torch_moe,
@@ -103,7 +104,7 @@ from aiter.ops.shuffle import (
     shuffle_weight_a16w4,
 )
 from aiter.utility import fp4_utils
-from aiter.utility.base_tuner import TunerCommon
+from aiter.utility.base_tuner import TunerCommon, _read_csv
 from aiter.utility.dtypes import str2ActivationType, str2Dtype
 from aiter.utility.fp4_utils import moe_mxfp4_sort
 from aiter.utility.mp_tuner import (
@@ -957,6 +958,7 @@ _GEN_DATA_1STAGE_KEYS = [
 class FmoeTuner(TunerCommon):
     SUPPORTS_FAST_SCAN = False
     SUPPORTS_POWER_SELECT = True
+    USES_TOKEN_BUCKET_CONTRACT = True
     swiglu_limit = None
     swiglu_limit_tag = ""
 
@@ -984,6 +986,51 @@ class FmoeTuner(TunerCommon):
         if hasattr(fmoe_module, "get_2stage_cfgs"):
             fmoe_module.get_2stage_cfgs.cache_clear()
 
+    @staticmethod
+    def _normalize_tuning_tokens(untunedf, token_bucket_contract="runtime"):
+        """Use the same token buckets as the runtime config lookup.
+
+        ``fused_moe`` indexes tuned rows with ``get_padded_M(M)``.  Keeping a
+        raw non-power-of-two token count in the tuner input therefore creates a
+        row that the runtime can never select.  Tune the canonical bucket while
+        retaining the runtime's actual M handling when the kernel is launched.
+
+        The DP-shared expert path has a separate bucket contract and passes
+        ``token_bucket_contract="dp_shared"`` for its online tuning request.
+        Its caller has already converted the raw token count to that contract,
+        so this normalizer must leave the row unchanged.  A runtime bucket is a
+        representative benchmark size: for example, 65536 maps to the 32768
+        row for config lookup, while a serving call still keeps its raw M.
+        """
+        if token_bucket_contract == "dp_shared":
+            return untunedf
+        if token_bucket_contract != "runtime":
+            raise ValueError(f"unknown token bucket contract: {token_bucket_contract}")
+        if "token" not in untunedf.columns or untunedf.empty:
+            return untunedf
+        normalized = untunedf.copy()
+        normalized["token"] = normalized["token"].map(
+            lambda token: get_padded_M(int(token))
+        )
+        # Keep the newest row when an online request (for example raw M=96)
+        # canonicalizes to a row already present in the file (token=128).
+        # ``--last`` must then tune the request that was just appended.
+        return normalized.drop_duplicates(keep="last").reset_index(drop=True)
+
+    def get_untuned_gemm_list(self, untuned_gemm_file):
+        if not self.USES_TOKEN_BUCKET_CONTRACT:
+            return super().get_untuned_gemm_list(untuned_gemm_file)
+        assert os.path.exists(
+            untuned_gemm_file
+        ), f"Not exist untuned file: {untuned_gemm_file}"
+        # The base reader keeps the first duplicate, losing an already-canonical
+        # request appended for --last before the normalizer can keep it.
+        untunedf = self._normalize_fp8_columns(_read_csv(untuned_gemm_file))
+        untunedf = untunedf.drop_duplicates(keep="last").reset_index(drop=True)
+        return self._normalize_tuning_tokens(
+            untunedf, getattr(self, "_token_bucket_contract", "runtime")
+        )
+
     def _setup_specific_arguments(self):
 
         self.parser.add_argument(
@@ -992,6 +1039,14 @@ class FmoeTuner(TunerCommon):
             required=False,
             help="Only last kernel is tuned, if not, only kernels that are not in the tuned_fmoe.csv are tuned",
         )
+        if self.USES_TOKEN_BUCKET_CONTRACT:
+            self.parser.add_argument(
+                "--token-bucket-contract",
+                choices=("runtime", "dp_shared"),
+                default="runtime",
+                help="Token bucket contract used by the input rows. The dp_shared "
+                "online tuner uses its own 16-to-1024 contract.",
+            )
         self.parser.add_argument(
             "--grouped-gemm",
             action="store_true",
@@ -1050,6 +1105,8 @@ class FmoeTuner(TunerCommon):
 
     def parse_args(self) -> argparse.Namespace:
         args = super().parse_args()
+        if self.USES_TOKEN_BUCKET_CONTRACT:
+            self._token_bucket_contract = args.token_bucket_contract
         try:
             self.swiglu_limit = normalize_swiglu_limit(args.swiglu_limit)
         except ValueError as exc:
@@ -7128,6 +7185,7 @@ class FmoeTuner(TunerCommon):
 
 
 class GroupedFmoeTuner(FmoeTuner):
+    USES_TOKEN_BUCKET_CONTRACT = False
     WARP_TILE_N = 64
     TILE_K = 256
     TILE_M_CANDIDATES = (16, 32, 64, 128)
@@ -7528,6 +7586,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
     """
 
     SUPPORTS_FAST_SCAN = True
+    USES_TOKEN_BUCKET_CONTRACT = False
 
     def _setup_specific_arguments(self):
         super()._setup_specific_arguments()
