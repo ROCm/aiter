@@ -2305,6 +2305,7 @@ def compile_intra_mfma(
     l2norm_qk: bool,
     beta_sigmoid: bool,
     varlen: bool = False,
+    safe_gate: bool = False,
 ):
     """``compile_intra`` with the off-diagonal sub-chunk products on MFMA.
 
@@ -2466,8 +2467,9 @@ def compile_intra_mfma(
             lds_st(s_b, tid, _sel(tid < nvalid, bb, _zero()))
         gpu.barrier()
 
-        # Rows are read as b128: each thread owns CPT contiguous columns.
-        g_r = _lds_row(s_g, r * LDG + seg * CPT, CPT, fx.Float32)
+        if const_expr(not safe_gate):
+            # Rows are read as b128: each thread owns CPT contiguous columns.
+            g_r = _lds_row(s_g, r * LDG + seg * CPT, CPT, fx.Float32)
 
         # dq2 / dk2 = sum_{j <= r} dA[r, j] k[j] exp2(g[r] - g[j]), sub-chunks apart
         lane = tid % 64
@@ -2478,6 +2480,8 @@ def compile_intra_mfma(
         m0 = sub * 16
         n16 = lane % 16
         kq4 = (lane // 16) * 4
+        # Diagonal-block pivot: the sub-chunk midpoint (or its last valid row).
+        g_mid = _min(m0 + 8, nvalid - 1)
 
         def off_lower():
             """s_s[m] = sum over earlier sub-chunks of s_a[m, j] k[j] exp2(g[m] - g[j])
@@ -2508,17 +2512,51 @@ def compile_intra_mfma(
                         bv = fx.Float32x4(bv)
                         acc_q = _mfma16_f32(fx.Float32x4(aq), bv, acc_q)
                         acc_k = _mfma16_f32(fx.Float32x4(ak), bv, acc_k)
-                scl = [
-                    _decay(lds_ld(s_g, (m0 + kq4 + p) * LDG + c) - gn)
-                    for p in range_constexpr(4)
-                ]
-                accs.append((c, scl, acc_q, acc_k))
+                scl, scl_d, dq_d, dk_d = [], [], acc_q, acc_k
+                if const_expr(safe_gate):
+                    # Own sub-chunk (j <= m) on MFMA too, pivoted on its midpoint as
+                    # Triton's safe-gate path: the bounded gate keeps both factors
+                    # in fp32 range.
+                    gm = lds_ld(s_g, g_mid * LDG + c)
+                    aq = _lds_row(s_aq, (m0 + n16) * LDA + m0 + kq4, 4, fx.Float32)
+                    ak = _lds_row(s_ak, (m0 + n16) * LDA + m0 + kq4, 4, fx.Float32)
+                    bv = []
+                    for p in range_constexpr(4):
+                        j = m0 + kq4 + p
+                        tri = (kq4 + p) <= n16
+                        aq[p] = _sel(tri, aq[p], _zero())
+                        ak[p] = _sel(tri, ak[p], _zero())
+                        bv.append(
+                            lds_ld(s_k, j * LDQ + c, fx.BFloat16)
+                            * _exp2(gm - lds_ld(s_g, j * LDG + c))
+                        )
+                    bv = fx.Float32x4(bv)
+                    dq_d = _mfma16_f32(fx.Float32x4(aq), bv, fx.Float32x4(0.0))
+                    dk_d = _mfma16_f32(fx.Float32x4(ak), bv, fx.Float32x4(0.0))
+                    for p in range_constexpr(4):
+                        m = m0 + kq4 + p
+                        g_m = lds_ld(s_g, m * LDG + c)
+                        scl.append(_decay(g_m - gn))
+                        # Padded rows (g = 0) could overflow; their products are 0.
+                        scl_d.append(_sel(m < nvalid, _exp2(g_m - gm), _zero()))
+                else:
+                    for p in range_constexpr(4):
+                        scl.append(
+                            _decay(lds_ld(s_g, (m0 + kq4 + p) * LDG + c) - gn)
+                        )
+                        scl_d.append(_zero())
+                accs.append((c, scl, scl_d, acc_q, acc_k, dq_d, dk_d))
             outs = []
             for which in range_constexpr(2):
-                for c, scl, acc_q, acc_k in accs:
+                for c, scl, scl_d, acc_q, acc_k, dq_d, dk_d in accs:
                     acc = acc_q if which == 0 else acc_k
+                    acc_d = dq_d if which == 0 else dk_d
                     for p in range_constexpr(4):
-                        lds_st(s_s, (m0 + kq4 + p) * LDK + c, acc[p] * scl[p])
+                        lds_st(
+                            s_s,
+                            (m0 + kq4 + p) * LDK + c,
+                            acc[p] * scl[p] + acc_d[p] * scl_d[p],
+                        )
                 gpu.barrier()
                 outs = outs + _lds_row(s_s, r * LDK + seg * CPT, CPT, fx.Float32)
                 gpu.barrier()
@@ -2544,35 +2582,75 @@ def compile_intra_mfma(
                             bk.append(lds_ld(s_k, j * LDQ + c, fx.BFloat16) * dec)
                         acc = _mfma16_f32(fx.Float32x4(aq), fx.Float32x4(bq), acc)
                         acc = _mfma16_f32(fx.Float32x4(ak), fx.Float32x4(bk), acc)
-                for p in range_constexpr(4):
-                    m = m0 + kq4 + p
-                    lds_st(
-                        s_s, m * LDK + c, acc[p] * _decay(gn - lds_ld(s_g, m * LDG + c))
+                if const_expr(safe_gate):
+                    # Own sub-chunk (j >= m), midpoint pivot.
+                    gm = lds_ld(s_g, g_mid * LDG + c)
+                    aq, ak, bq, bk = [], [], [], []
+                    for p in range_constexpr(4):
+                        j = m0 + kq4 + p
+                        ok = ((kq4 + p) >= n16) & (j < nvalid)
+                        aq.append(_sel(ok, lds_ld(s_aq, j * LDA + m0 + n16), _zero()))
+                        ak.append(
+                            _sel(
+                                ok,
+                                lds_ld(s_ak, j * LDA + m0 + n16) * lds_ld(s_b, j),
+                                _zero(),
+                            )
+                        )
+                        # Padded rows (g = 0) could overflow and poison the product.
+                        dec = _sel(
+                            j < nvalid, _exp2(lds_ld(s_g, j * LDG + c) - gm), _zero()
+                        )
+                        bq.append(lds_ld(s_q, j * LDQ + c, fx.BFloat16) * dec)
+                        bk.append(lds_ld(s_k, j * LDQ + c, fx.BFloat16) * dec)
+                    acc_d = _mfma16_f32(
+                        fx.Float32x4(aq), fx.Float32x4(bq), fx.Float32x4(0.0)
                     )
+                    acc_d = _mfma16_f32(fx.Float32x4(ak), fx.Float32x4(bk), acc_d)
+                    for p in range_constexpr(4):
+                        m = m0 + kq4 + p
+                        g_m = lds_ld(s_g, m * LDG + c)
+                        lds_st(
+                            s_s,
+                            m * LDK + c,
+                            acc[p] * _decay(gn - g_m) + acc_d[p] * _exp2(gm - g_m),
+                        )
+                else:
+                    for p in range_constexpr(4):
+                        m = m0 + kq4 + p
+                        lds_st(
+                            s_s,
+                            m * LDK + c,
+                            acc[p] * _decay(gn - lds_ld(s_g, m * LDG + c)),
+                        )
             gpu.barrier()
             out = _lds_row(s_s, r * LDK + seg * CPT, CPT, fx.Float32)
             gpu.barrier()
             return out
 
-        jb = (r // 16) * 16
-        init = off_lower()
-        # Pairs inside the row's own sub-chunk.
-        for jj, st in range(0, 16, 1, init=init):
-            jq = jb + fx.Int32(jj)
-            ok = (jq <= r) & (jq < nvalid)
-            aq = _sel(ok, lds_ld(s_aq, r * LDA + jq), _zero())
-            ak = _sel(ok, lds_ld(s_ak, r * LDA + jq), _zero())
-            acc_q, acc_k = [], []
-            g_j = _lds_row(s_g, jq * LDG + seg * CPT, CPT, fx.Float32)
-            k_j = _lds_row(s_k, jq * LDQ + seg * CPT, CPT, fx.BFloat16)
-            for e in range_constexpr(CPT):
-                ex = _decay(_sel(ok, g_r[e] - g_j[e], _zero()))
-                kx = k_j[e] * ex
-                acc_q.append(st[e] + aq * kx)
-                acc_k.append(st[CPT + e] + ak * kx)
-            res = yield acc_q + acc_k
-        acc = _results(res, 2 * CPT)
-        b_dq2, b_dk2 = acc[:CPT], acc[CPT:]
+        if const_expr(safe_gate):
+            acc = off_lower()
+            b_dq2, b_dk2 = acc[:CPT], acc[CPT:]
+        else:
+            jb = (r // 16) * 16
+            init = off_lower()
+            # Pairs inside the row's own sub-chunk.
+            for jj, st in range(0, 16, 1, init=init):
+                jq = jb + fx.Int32(jj)
+                ok = (jq <= r) & (jq < nvalid)
+                aq = _sel(ok, lds_ld(s_aq, r * LDA + jq), _zero())
+                ak = _sel(ok, lds_ld(s_ak, r * LDA + jq), _zero())
+                acc_q, acc_k = [], []
+                g_j = _lds_row(s_g, jq * LDG + seg * CPT, CPT, fx.Float32)
+                k_j = _lds_row(s_k, jq * LDQ + seg * CPT, CPT, fx.BFloat16)
+                for e in range_constexpr(CPT):
+                    ex = _decay(_sel(ok, g_r[e] - g_j[e], _zero()))
+                    kx = k_j[e] * ex
+                    acc_q.append(st[e] + aq * kx)
+                    acc_k.append(st[CPT + e] + ak * kx)
+                res = yield acc_q + acc_k
+            acc = _results(res, 2 * CPT)
+            b_dq2, b_dk2 = acc[:CPT], acc[CPT:]
 
         k_r = _lds_row(s_k, r * LDQ + seg * CPT, CPT, fx.BFloat16)
         q_r = _lds_row(s_q, r * LDQ + seg * CPT, CPT, fx.BFloat16)
@@ -2609,21 +2687,24 @@ def compile_intra_mfma(
             stg(_flat(db2, hb), r * H, db_r, OBN)
 
         # dkt = sum_{j >= r} (dAqk[j, r] q[j] + dAkk[j, r] beta[j] k[j]) exp2(g[j] - g[r])
-        for jj, st in range(0, 16, 1, init=off_upper()):
-            jq = jb + fx.Int32(jj)
-            # Padded rows j >= nvalid hold g = 0, so g[j] - g[r] > 0 there.
-            ok = (jq >= r) & (jq < nvalid)
-            aq = _sel(ok, lds_ld(s_aq, jq * LDA + r), _zero())
-            ak = _sel(ok, lds_ld(s_ak, jq * LDA + r) * lds_ld(s_b, jq), _zero())
-            acc = []
-            g_j = _lds_row(s_g, jq * LDG + seg * CPT, CPT, fx.Float32)
-            q_j = _lds_row(s_q, jq * LDQ + seg * CPT, CPT, fx.BFloat16)
-            k_j = _lds_row(s_k, jq * LDQ + seg * CPT, CPT, fx.BFloat16)
-            for e in range_constexpr(CPT):
-                ex = _decay(_sel(ok, g_j[e] - g_r[e], _zero()))
-                acc.append(st[e] + (aq * q_j[e] + ak * k_j[e]) * ex)
-            res = yield acc
-        dkt = _results(res, CPT)
+        if const_expr(safe_gate):
+            dkt = off_upper()
+        else:
+            for jj, st in range(0, 16, 1, init=off_upper()):
+                jq = jb + fx.Int32(jj)
+                # Padded rows j >= nvalid hold g = 0, so g[j] - g[r] > 0 there.
+                ok = (jq >= r) & (jq < nvalid)
+                aq = _sel(ok, lds_ld(s_aq, jq * LDA + r), _zero())
+                ak = _sel(ok, lds_ld(s_ak, jq * LDA + r) * lds_ld(s_b, jq), _zero())
+                acc = []
+                g_j = _lds_row(s_g, jq * LDG + seg * CPT, CPT, fx.Float32)
+                q_j = _lds_row(s_q, jq * LDQ + seg * CPT, CPT, fx.BFloat16)
+                k_j = _lds_row(s_k, jq * LDQ + seg * CPT, CPT, fx.BFloat16)
+                for e in range_constexpr(CPT):
+                    ex = _decay(_sel(ok, g_j[e] - g_r[e], _zero()))
+                    acc.append(st[e] + (aq * q_j[e] + ak * k_j[e]) * ex)
+                res = yield acc
+            dkt = _results(res, CPT)
 
         dg_row = row_in(dg, f32)
         dk_row = row_in(dk, f32)

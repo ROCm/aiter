@@ -573,18 +573,25 @@ def chunk_kda_bwd_flydsl_full(
     dk2 = alloc(k.shape, device=dev, dtype=k.dtype)
     dg2 = alloc(B, T, H, K, **f32)
     db2 = alloc(beta.shape, device=dev, dtype=beta.dtype)
+    intra_args = (
+        H,
+        qn.dtype,
+        bn.dtype,
+        q.dtype,
+        beta.dtype,
+        q.dtype,
+        beta.dtype,
+        use_qk_l2norm_in_kernel,
+        use_beta_sigmoid_in_kernel,
+        varlen,
+    )
     _run_compiled(
-        (compile_intra_mfma if _MFMA else compile_intra)(
-            H,
-            qn.dtype,
-            bn.dtype,
-            q.dtype,
-            beta.dtype,
-            q.dtype,
-            beta.dtype,
-            use_qk_l2norm_in_kernel,
-            use_beta_sigmoid_in_kernel,
-            varlen,
+        # The bounded (safe) gate lets the MFMA kernel put the diagonal
+        # sub-chunk blocks on MFMA too, pivoted on the sub-chunk midpoint.
+        (
+            compile_intra_mfma(*intra_args, bool(safe_gate))
+            if _MFMA
+            else compile_intra(*intra_args)
         ),
         qn,
         kn,
