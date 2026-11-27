@@ -25,7 +25,27 @@ distinct per token either way. ``uniform`` (the default) draws it uniformly.
 experts by a seeded permutation per layer that every rank shares, so the same
 experts run hot everywhere and their ranks receive more rows. ``zipf_rank``
 deals a different permutation on each rank, so each rank sends its own hot
-experts. ``--zipf_s 0`` is ``uniform`` again, id for id.
+experts. ``--zipf_s 0`` is ``uniform`` again, id for id. ``--routing_dir DIR``
+replays routing recorded from a model instead (``load_routings``): a real
+model's routing is far more skewed than ``uniform`` (DeepSeek-R1: an expert's
+rows spread with a CV of 0.4 to 1.5 over the layers, the hottest at 7x to 18x
+the mean), and the MoE's time depends on it.
+
+``--max_tpr`` sizes the MegaMoE instance the way a model does, for its largest
+step (ATOM: ``max_num_batched_tokens``) rather than for ``-tpr``, and
+``--recv_bound`` is the per-step receive bound the model passes down (ATOM: the
+group's running tokens; default ``world * tpr`` once ``--max_tpr`` is larger
+than ``-tpr``). The kernels a step runs depend on both.
+
+The summary's ``per_layer_us`` holds the chain's glue as well (each layer's
+input rmsnorm and residual add, ~90 us at 2048 tokens per rank);
+``moe_per_layer_us`` is the MoE alone, the glue timed by itself right after the
+timed replays and taken off. ``power_w`` and ``gfx_clk_mhz`` are the GPUs'
+socket power and GFX clock over the timed replays (amdsmi; empty without it,
+or when the replays are shorter than a sample). Compare two paths on runs long
+enough to reach the power limit (``--warmup`` / ``--iters`` in the hundreds):
+a path that draws more power runs at a lower clock there, which a short run
+does not show.
 
 Two isolated paths (never touch each other's intermediates; they only share the
 config, the bf16 weights and the per-layer routings):
@@ -63,6 +83,7 @@ Launch (4x gfx1250; every env knob below is already the script's default):
 Env / CLI: --layers --logits_tol --acc_verify --dispatch_backend
            --stage1_fused --stage2_fused --dispatch_wire --combine --combine_quant
            -tpr -hd -id -e -k --fused_shared_experts --routing --zipf_s -q
+           --routing_dir --max_tpr --recv_bound
            --data-init --seed --warmup --iters --prof_replays
 
 ``--data-init`` / ``--scale-init`` / ``--seed`` are the shared ubench knobs from
@@ -396,6 +417,43 @@ def make_routings(
     return routings
 
 
+def load_routings(routing_dir, rank, n_layers, ct, E, topk, dev):
+    """Per-layer routing recorded from a model, in ``make_routings``' format.
+
+    ``routing_dir/rank<r>.pt`` holds ``{"ids": [L, T, topk], "weights": [L, T,
+    topk]}``: rank r's routed expert ids (global, without the shared columns)
+    and their weights over the L MoE layers of one step. The chain takes
+    ``n_layers`` of the L, spread evenly, and each layer's first ``ct`` tokens.
+    The weights are renormalized per token as ``make_routings``' are: the
+    accuracy budget was calibrated on those.
+    """
+    rec = torch.load(os.path.join(routing_dir, f"rank{rank}.pt"), map_location="cpu")
+    ids, wts = rec["ids"], rec["weights"]
+    if ids.dim() != 3 or wts.shape != ids.shape:
+        raise ValueError(
+            f"--routing_dir: rank {rank} holds ids {tuple(ids.shape)} and weights "
+            f"{tuple(wts.shape)}, expected the same [layers, tokens, topk]"
+        )
+    n_rec, n_tok, k = ids.shape
+    if k != topk or n_tok < ct:
+        raise ValueError(
+            f"--routing_dir: rank {rank} recorded {n_tok} tokens of top-{k}, "
+            f"the run needs {ct} of top-{topk}"
+        )
+    if int(ids.min()) < 0 or int(ids.max()) >= E:
+        raise ValueError(
+            f"--routing_dir: rank {rank} routes to experts {int(ids.min())}.."
+            f"{int(ids.max())}, outside the {E} routed ones"
+        )
+    routings = []
+    for layer_idx in range(n_layers):
+        src = layer_idx * n_rec // n_layers
+        w = wts[src, :ct].to(dev, torch.float32)
+        w = w / w.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+        routings.append((ids[src, :ct].to(dev, dtypes.i32), w))
+    return routings
+
+
 # ATOM fuses routed_scaling_factor into the routed weights, which leaves the
 # shared columns at 1.
 _SHARED_EXPERT_WEIGHT = 1.0
@@ -678,6 +736,8 @@ class DeviceMoEPipeline:
         stage1_fused=False,
         stage2_fused=True,
         combine_quant="none",
+        max_tokens_per_rank=None,
+        recv_bound=None,
     ):
         self.dist_ctx = dist_ctx
         self.E, self.hdim, self.idim, self.topk = E, hdim, idim, topk
@@ -690,14 +750,18 @@ class DeviceMoEPipeline:
         self.stage1_fused = stage1_fused
         self.stage2_fused = stage2_fused
         self.combine_quant = combine_quant
+        self.max_tokens_per_rank = max_tokens_per_rank or ct
+        self.recv_bound = recv_bound
         self.EPR = E // dist_ctx.world
         self.n_shared = 0 if sw1 is None else sw1.shape[0]
         self.dev = torch.device("cuda", dist_ctx.local_rank)
         self.comm = None
         self.mega = None
         self.graph = None
+        self.glue_graph = None
         self.x0_static = None
         self.out_static = None
+        self.glue_static = None
 
     # ---- initialization (grouped together) ---- #
     def setup(self, x0):
@@ -726,7 +790,7 @@ class DeviceMoEPipeline:
 
         # The recipe + geometry are per-model, so they are fixed here; the
         # weights are per-layer and go to each forward() call. ONE op, reused by
-        # every layer. max_tokens_per_rank = ct.
+        # every layer. max_tokens_per_rank = ct unless --max_tpr sizes it larger.
         recipe = MegaMoERecipe.from_legacy(
             stage1_fused=self.stage1_fused,
             stage2_fused=self.stage2_fused,
@@ -744,7 +808,7 @@ class DeviceMoEPipeline:
             inter_dim=self.idim,
             experts=self.E + self.n_shared * self.dist_ctx.world,
             topk=self.topk + self.n_shared,
-            max_tokens_per_rank=self.ct,
+            max_tokens_per_rank=self.max_tokens_per_rank,
         )
         # The communicator carries nothing but this op's arena.
         uid = Communicator.get_unique_id() if r == 0 else None
@@ -775,6 +839,7 @@ class DeviceMoEPipeline:
             w2=self.w2_a,
             w1_scale=self.w1_s,
             w2_scale=self.w2_s,
+            recv_token_bound=self.recv_bound,
             next_topk_ids=next_ids,
             # Named per step, not inherited from construction: building the
             # reduce and running it are separate decisions now.
@@ -788,6 +853,15 @@ class DeviceMoEPipeline:
             self.mega.prefetch_compact_plan(self.routings[0][0])
         for layer_idx in range(self.n_layers):
             x = self._layer_step(x, layer_idx)
+        return x
+
+    def _glue(self, x0):
+        """What ``_pipeline`` runs around its MegaMoE forwards, alone: each
+        layer's input rmsnorm and residual add (the normalized input stands in
+        for the MoE's output: same shape and dtype)."""
+        x = x0
+        for _ in range(self.n_layers):
+            x = x + _rmsnorm(x)
         return x
 
     # ---- CUDA graph capture (all N layers in ONE graph) ---- #
@@ -814,19 +888,33 @@ class DeviceMoEPipeline:
             self.out_static = self._pipeline(self.x0_static)
         torch.cuda.synchronize()
         self.comm.barrier()
+        # The glue graph has no collective: every rank replays its own.
+        self.glue_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.glue_graph):
+            self.glue_static = self._glue(self.x0_static)
+        torch.cuda.synchronize()
+
+    # Timed glue replays at most: ~1 ms each, so they end before the clock the
+    # timed chain left has moved.
+    _GLUE_ITERS = 50
 
     # ---- perf: graph-replay wall-clock + torch.profiler breakdown ---- #
     def bench(self, warmup=5, iters=10):
         """Time the ONE-graph N-layer dispatch->gemm->combine chain. The graph
         already contains all N layers, so ONE replay is one full chain; `iters` of
         them are timed individually after `warmup` untimed ones.
-        Returns stats = {min, median, mean, max} in us.
+        Returns (stats, smi): stats = {min, median, mean, max, glue_median} in
+        us, smi = {power_w, gfx_clk_mhz} of this rank's GPU over the timed
+        replays (None each without amdsmi or a sample in them).
 
         - a sample is the host wall-clock of one graph replay (one sync after; not
           cuda.Event). For a GPU-bound MoE chain this ~= GPU time.
         - min is the closest to an undisturbed replay, median to the steady state
           of a GPU held at full load; the two drifting apart is what a straggler
-          rank or a throttled clock looks like, hence both are reported."""
+          rank or a throttled clock looks like, hence both are reported.
+        - glue_median is a replay of the chain's glue alone (``_glue``), timed
+          right after the chain so it runs at the clock the chain left; the
+          chain's median less it is the MoE's own time."""
         assert iters >= 1, f"--iters must time at least one replay, got {iters}"
 
         for _ in range(warmup):
@@ -834,22 +922,34 @@ class DeviceMoEPipeline:
         torch.cuda.synchronize()
         self.comm.barrier()
 
+        monitor = _start_gpu_monitor()
         # each full N-layer graph replay is one measurement.
         samples = []
+        window_start = time.perf_counter()
         for _ in range(iters):
             t0 = time.perf_counter()
             self.graph.replay()
             torch.cuda.synchronize()
             samples.append((time.perf_counter() - t0) * 1e6)
+        window_end = time.perf_counter()
+        glue = []
+        for _ in range(min(iters, self._GLUE_ITERS)):
+            t0 = time.perf_counter()
+            self.glue_graph.replay()
+            torch.cuda.synchronize()
+            glue.append((time.perf_counter() - t0) * 1e6)
+        smi = _stop_gpu_monitor(monitor, window_start, window_end)
         self.comm.barrier()
 
         samples.sort()
+        glue.sort()
         return {
             "min": samples[0],
             "median": samples[len(samples) // 2],
             "mean": sum(samples) / len(samples),
             "max": samples[-1],
-        }
+            "glue_median": glue[len(glue) // 2],
+        }, smi
 
     def profile(self, warmup=5, prof_replays=3):
         """torch.profiler over `prof_replays` graph replays, after `warmup`
@@ -888,8 +988,10 @@ class DeviceMoEPipeline:
         # graph right after this, and this graph's pool would otherwise stay
         # reserved.
         self.graph = None
+        self.glue_graph = None
         self.x0_static = None
         self.out_static = None
+        self.glue_static = None
         self._prof = None
         if self.mega is not None:
             self.mega.close()
@@ -907,6 +1009,41 @@ def _event_device_us(e):
         if v:
             return float(v)
     return 0.0
+
+
+_SMI_KEYS = ("power_w", "gfx_clk_mhz")
+
+
+def _start_gpu_monitor():
+    """This rank's GPU monitor, polling; None when amdsmi is not there (the
+    timing does not depend on it)."""
+    try:
+        from aiter.smi_monitor import GpuMonitor
+
+        monitor = GpuMonitor(device_index=torch.cuda.current_device(), interval_s=0.1)
+        monitor.start()
+        return monitor
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _stop_gpu_monitor(monitor, start_s, end_s):
+    """Medians of _SMI_KEYS over [start_s, end_s]; None where there is none."""
+    if monitor is None:
+        return dict.fromkeys(_SMI_KEYS)
+    monitor.stop()
+    summary = monitor.summary(start_s=start_s, end_s=end_s)
+    return {key: summary.get(key, {}).get("median") for key in _SMI_KEYS}
+
+
+def _average_smi(dist_ctx, smi):
+    """Each _SMI_KEYS value averaged over the ranks that have one (collective)."""
+    per_rank = dist_ctx.gather_objects(smi)
+    out = {}
+    for key in _SMI_KEYS:
+        vals = [float(s[key]) for s in per_rank if s.get(key) is not None]
+        out[key] = sum(vals) / len(vals) if vals else None
+    return out
 
 
 def _run_distributed_smi_replay(pipe, dist_ctx, median_us, n_layers, label):
@@ -1246,6 +1383,20 @@ def main():
             f"--routing {args.routing} skews random scores, which "
             "AITER_MOE_EXPERT_BALANCE=true replaces with a fixed round-robin"
         )
+    if args.routing_dir and (args.routing != "uniform" or expert_balance):
+        raise ValueError(
+            "--routing_dir replays recorded routing; drop --routing "
+            f"{args.routing} / AITER_MOE_EXPERT_BALANCE"
+        )
+    routing_name = "file" if args.routing_dir else args.routing
+    max_tpr = args.max_tpr or ct
+    if max_tpr < ct:
+        raise ValueError(f"--max_tpr {max_tpr} is below -tpr {ct}")
+    # What ATOM passes down: the group's running tokens, once that is less
+    # than the instance was sized for.
+    recv_bound = args.recv_bound
+    if recv_bound is None and max_tpr > ct:
+        recv_bound = dist_ctx.world * ct
 
     data_dist = resolve_data_init(args.data_init)
 
@@ -1263,8 +1414,9 @@ def main():
             f"combine_quant={args.combine_quant} "
             f"force_a8w4={os.environ['AITER_FORCE_A8W4']} "
             f"gate={spec['gate_mode'].name} fused_shared_experts={n_shared} "
-            f"routing={args.routing}"
+            f"routing={routing_name}"
             f"{f' zipf_s={args.zipf_s}' if args.routing != 'uniform' else ''} "
+            f"max_tpr={max_tpr} recv_bound={recv_bound} "
             f"expert_balance={expert_balance} data_init={data_dist} "
             f"seed={args.seed} gfx={get_gfx()} "
             f"hip_graph={'classic' if classic_graph else 'default'} pass={run_pass}",
@@ -1341,21 +1493,26 @@ def main():
         dtype=dtypes.bf16,
         device=dev,
     )
-    routings = make_routings(
-        n_layers,
-        ct,
-        E,
-        topk,
-        dev,
-        seed=4242 + 100 * dist_ctx.rank + args.seed,
-        expert_balance=expert_balance,
-        routing=args.routing,
-        zipf_s=args.zipf_s,
-        # zipf deals the same popularities on every rank, zipf_rank its own.
-        popularity_seed=_POPULARITY_SEED
-        + args.seed
-        + (100_000 * (dist_ctx.rank + 1) if args.routing == "zipf_rank" else 0),
-    )
+    if args.routing_dir:
+        routings = load_routings(
+            args.routing_dir, dist_ctx.rank, n_layers, ct, E, topk, dev
+        )
+    else:
+        routings = make_routings(
+            n_layers,
+            ct,
+            E,
+            topk,
+            dev,
+            seed=4242 + 100 * dist_ctx.rank + args.seed,
+            expert_balance=expert_balance,
+            routing=args.routing,
+            zipf_s=args.zipf_s,
+            # zipf deals the same popularities on every rank, zipf_rank its own.
+            popularity_seed=_POPULARITY_SEED
+            + args.seed
+            + (100_000 * (dist_ctx.rank + 1) if args.routing == "zipf_rank" else 0),
+        )
     ref_routings = dispatch_routings = routings
     if n_shared:
         ref_routings = shared_logical_routings(routings, E, n_shared)
@@ -1418,16 +1575,20 @@ def main():
             stage1_fused=stage1_fused,
             stage2_fused=stage2_fused,
             combine_quant=combine_quant,
+            max_tokens_per_rank=max_tpr,
+            recv_bound=recv_bound,
         )
         pipe.setup(x0)
         pipe.capture(x0)
         if not profile_pass:
-            stats = pipe.bench(warmup=args.warmup, iters=args.iters)
+            stats, smi = pipe.bench(warmup=args.warmup, iters=args.iters)
             # Aggregate perf across ranks (collective calls -> run on every rank,
             # and the dict is built in the same order everywhere so the
             # allreduces stay in step).
             stats = {k: dist_ctx.allreduce_avg_float(v) for k, v in stats.items()}
+            smi = _average_smi(dist_ctx, smi)
             per_layer_us = stats["median"] / n_layers
+            glue_per_layer_us = stats["glue_median"] / n_layers
             _run_distributed_smi_replay(
                 pipe, dist_ctx, stats["median"], n_layers, label
             )
@@ -1504,10 +1665,12 @@ def main():
                     "seed": args.seed,
                     "world_size": dist_ctx.world,
                     "tokens_per_rank": ct,
+                    "max_tokens_per_rank": max_tpr,
+                    "recv_bound": recv_bound,
                     "experts": E,
                     "topk": topk,
                     "fused_shared_experts": n_shared,
-                    "routing": args.routing,
+                    "routing": routing_name,
                     "zipf_s": args.zipf_s if args.routing != "uniform" else None,
                     **(routing_load or {}),
                     "hidden": hdim,
@@ -1520,6 +1683,9 @@ def main():
                     "median_us": stats["median"],
                     "max_us": stats["max"],
                     "per_layer_us": per_layer_us,
+                    "glue_per_layer_us": glue_per_layer_us,
+                    "moe_per_layer_us": per_layer_us - glue_per_layer_us,
+                    **smi,
                     "prof_device_us": prof_us_by_mode.get(mode) or None,
                 }
             )
@@ -1653,6 +1819,27 @@ def _parse_args():
         default=0.5,
         help="Zipf exponent of the routed-expert popularities under --routing "
         "zipf/zipf_rank; 0 is uniform",
+    )
+    p.add_argument(
+        "--routing_dir",
+        type=str,
+        default=None,
+        help="replay routing recorded from a model instead of drawing it: "
+        "DIR/rank<r>.pt, see load_routings",
+    )
+    p.add_argument(
+        "--max_tpr",
+        type=int,
+        default=None,
+        help="tokens per rank the MegaMoE instance is sized for (a model's "
+        "largest step); default -tpr",
+    )
+    p.add_argument(
+        "--recv_bound",
+        type=int,
+        default=None,
+        help="recv_token_bound of every step; default world * tpr when "
+        "--max_tpr is larger than -tpr, else none",
     )
     p.add_argument("--layers", type=int, default=61, help="number of MoE layers")
     # The shared ubench data-init knobs: --data-init, --scale-init and --seed.
