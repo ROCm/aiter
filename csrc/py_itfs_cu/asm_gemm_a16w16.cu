@@ -245,6 +245,30 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     args.splitk              = split;
     AiterAsmKernel* impl_ptr = get_or_load_kernel(name, config_map, SUBM, SUBN);
 
+    // The kernels address A, B and D through buffer descriptors: the per-lane offset
+    // and num_records are 32-bit byte quantities, so an operand spanning 2**32 bytes
+    // or more silently wraps. Rows are padded to tileM. The Python wrapper splits M
+    // to stay below this; fail loudly for any caller that did not.
+    {
+        constexpr size_t kMaxBufferBytes = size_t(1) << 32;
+        const size_t padded_m            = (size_t(Mdim) + SUBM - 1) / SUBM * SUBM;
+        const size_t a_bytes             = padded_m * A->stride(0) * A->element_size();
+        const size_t d_bytes             = padded_m * Ndim * out->element_size();
+        const size_t b_bytes             = size_t(Ndim) * B->stride(0) * B->element_size();
+        AITER_CHECK(a_bytes < kMaxBufferBytes && d_bytes < kMaxBufferBytes &&
+                        b_bytes < kMaxBufferBytes,
+                    __func__,
+                    " operands exceed the 32-bit buffer addressing range of the kernel (A=",
+                    a_bytes,
+                    " B=",
+                    b_bytes,
+                    " D=",
+                    d_bytes,
+                    " bytes, limit ",
+                    kMaxBufferBytes,
+                    "); split M into smaller launches");
+    }
+
     int gdx = (Ndim + SUBN - 1) / SUBN;
     int gdy = (Mdim + SUBM - 1) / SUBM;
     int gdz = split;
