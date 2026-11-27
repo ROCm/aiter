@@ -56,20 +56,20 @@
       "_note": "N<=256, K<=256, E<=8"
     },
     "medium_NK": {
-      "BLOCK_M": 128,
+      "BLOCK_M": 256,
       "BLOCK_N": 128,
       "BLOCK_K": 64,
-      "GROUP_SIZE_M": 8,
-      "num_warps": 8,
+      "GROUP_SIZE_M": 16,
+      "num_warps": 16,
       "num_stages": 2,
       "_note": "N<=2048, K<=2048, E<=32"
     },
     "large_NK": {
-      "BLOCK_M": 128,
+      "BLOCK_M": 256,
       "BLOCK_N": 128,
       "BLOCK_K": 64,
       "GROUP_SIZE_M": 8,
-      "num_warps": 4,
+      "num_warps": 16,
       "num_stages": 2,
       "_note": "N>=4096 or K>=4096, E>=64"
     }
@@ -111,16 +111,16 @@
       "_note": "N<=128, K<=128, E<=4"
     },
     "medium_NK": {
-      "BLOCK_K": 128,
-      "BLOCK_N": 128,
-      "BLOCK_T": 16,
-      "num_warps": 4,
+      "BLOCK_K": 256,
+      "BLOCK_N": 64,
+      "BLOCK_T": 32,
+      "num_warps": 8,
       "num_stages": 2,
       "_note": "N<=2048, K<=2048, E<=32"
     },
     "large_NK": {
-      "BLOCK_K": 128,
-      "BLOCK_N": 128,
+      "BLOCK_K": 256,
+      "BLOCK_N": 64,
       "BLOCK_T": 16,
       "num_warps": 4,
       "num_stages": 2,
