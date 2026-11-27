@@ -428,6 +428,17 @@ build candidates before spawning workers. They pass requests through
 the generated sidecar and a receipt binding its contents to that binary.
 Runtime exact dispatch does not read this sidecar.
 
+The binary also embeds the same compiled set, so a prebuilt module carries its
+own manifest. `opus_compiled_kids()` returns it as `family/gfx/cu_num/kid` keys,
+and `aiter/ops/opus/compiled_kids.py` wraps it. Callers that take a kid from a
+*tuned row* (`get_GEMM_A16W16_tuned_config`, `gemm_a16w16_opus` and the
+`a8w8_blockscale_bpreshuffle` tuned rows) skip a row whose kid is not in the set
+and use the next candidate or the default backend, with one warning that names
+the kid and how to rebuild. A kid passed explicitly is not filtered. A module
+built before the manifest cannot be checked, so those callers keep their old
+behavior for it. The `a16w16` family and the gfx950 `a8w8_blockscale_bpreshuffle`
+family are the subset-built ones; the other families are always compiled in full.
+
 A tuner skips rebuilding only when the sidecar and its receipt match the
 required kids and installed binary. Missing or stale metadata triggers a
 rebuild. An explicit `AITER_REBUILD` request runs once in the parent even on

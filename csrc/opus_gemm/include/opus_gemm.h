@@ -5,6 +5,10 @@
 // Exact-kid OPUS entry points. aiter_tensor_t keeps this header torch-free.
 #include "aiter_tensor.h"
 #include <optional>
+#include <string>
+
+// Kernel ids compiled into this module, ';'-joined "family/gfx/cu_num/kid".
+std::string opus_compiled_kids();
 
 void opus_gemm_a16w16_launch(aiter_tensor_t& XQ,
                              aiter_tensor_t& WQ,

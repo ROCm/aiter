@@ -678,6 +678,11 @@ def _capture_shape_driven_opus_launch(monkeypatch, *, arch, tuned_config):
     )
     monkeypatch.setattr(gemm_op_a16w16, "_launch_a16w16_gemm", capture("gemm"))
     monkeypatch.setattr(gemm_op_a16w16, "_launch_a16w16_bmm", capture("bmm"))
+    # These tests pick tuned kids by policy, not by what a module compiled;
+    # test_opus_compiled_kid_fallback.py covers the compiled-kid filter.
+    from aiter.ops.opus import compiled_kids
+
+    monkeypatch.setattr(compiled_kids, "compiled_opus_kids", lambda: None)
     return opus, calls
 
 

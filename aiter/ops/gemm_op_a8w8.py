@@ -1498,6 +1498,8 @@ def _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y):
             get_kernel_instance,
         )
 
+        from .opus.compiled_kids import tuned_kid_is_compiled
+
         kid = int(config["kernelId"])
         gfx, cu_num = get_gfx(), get_cu_num()
         instance = get_kernel_instance(
@@ -1510,6 +1512,9 @@ def _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y):
             and x_block == 128
             and Y.dtype == dtypes.bf16
             and a8w8_mxscale_bpreshuffle_supports_shape(instance, m, n, k)
+            # Last: a kid absent from the subset-built module drops to the
+            # fallback below, and the check warns only for a row that would run.
+            and tuned_kid_is_compiled("a8w8_blockscale_bpreshuffle", gfx, cu_num, kid)
         ):
             from .opus import opus_gemm
 
@@ -2025,6 +2030,7 @@ def _gemm_a8w8_blockscale_bpreshuffle_native(
             _warn_blockscale_asm_row_not_bf16(n, k, dtype)
         elif libtype == "opus":
             from aiter.ops.opus import opus_gemm
+            from aiter.ops.opus.compiled_kids import tuned_kid_is_compiled
             from csrc.opus_gemm.opus_gemm_common import (
                 get_kernel_instance,
                 parse_integer,
@@ -2039,16 +2045,19 @@ def _gemm_a8w8_blockscale_bpreshuffle_native(
             ):
                 raise ValueError(f"Invalid tuned OPUS kernel {kid}")
 
-            return opus_gemm(
-                XQ,
-                WQ,
-                Y,
-                kid=kid,
-                layout="bpreshuffle",
-                x_scale=x_scale,
-                w_scale=w_scale,
-                family="a8w8_blockscale_bpreshuffle",
-            )
+            # A kid missing from the subset-built module falls through to the
+            # default backend below instead of raising in the launcher.
+            if tuned_kid_is_compiled("a8w8_blockscale_bpreshuffle", gfx, cu, kid):
+                return opus_gemm(
+                    XQ,
+                    WQ,
+                    Y,
+                    kid=kid,
+                    layout="bpreshuffle",
+                    x_scale=x_scale,
+                    w_scale=w_scale,
+                    family="a8w8_blockscale_bpreshuffle",
+                )
         elif libtype == "flydsl" and kernelName.startswith("flydsl_blockscale_8w_"):
             return gemm_a8w8_blockscale_flydsl(
                 XQ, WQ, x_scale, w_scale, Y, config, isBpreshuffled=True

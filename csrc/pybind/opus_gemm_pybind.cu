@@ -12,6 +12,7 @@
 PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     AITER_SET_STREAM_PYBIND
+    m.def("opus_compiled_kids", &opus_compiled_kids, "opus_compiled_kids");
     OPUS_GEMM_A16W16_LAUNCH_PYBIND;
     OPUS_GEMM_A8W8_LAUNCH_PYBIND;
     OPUS_GEMM_A8W8_BLOCKSCALE_LAUNCH_PYBIND;

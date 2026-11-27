@@ -956,6 +956,26 @@ class opus_gemm_codegen:
                 },
             )
 
+    def gen_compiled_kids_header(self, kernels_dict):
+        """Embed the compiled (family, gfx, cu, kid) set in the module.
+
+        Python reads it through ``opus_compiled_kids()`` to learn which tuned
+        kids this binary can launch, instead of discovering an uncompiled kid
+        from a C++ exception. It is written from the same dict that feeds every
+        dispatch table, so the two cannot drift apart.
+        """
+        keys = sorted(
+            key.encode() for key in kernels_dict if isinstance(key, KernelKey)
+        )
+        write_if_changed(
+            os.path.join(self.working_path, "opus_compiled_kids.h"),
+            "#pragma once\n"
+            "// SPDX-License-Identifier: MIT\n"
+            "// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.\n"
+            "// Auto-generated. Do not edit. See gen_instances.py:gen_compiled_kids_header.\n"
+            f'#define OPUS_COMPILED_KIDS "{";".join(keys)}"\n',
+        )
+
     def gen_manifest_head(self, kernels_dict):
         # Forward declarations for every launcher symbol the dispatcher references.
         MANIFEST_HEAD = """#pragma once
@@ -1323,6 +1343,7 @@ void
             self._emit_splitk_reduce_tu()
 
         self.gen_manifest_head(by_symbol)
+        self.gen_compiled_kids_header(kernels_dict)
         self.gen_a16w16_kid_dispatch(kernels_dict)
         self.gen_a8w8_kid_dispatch(kernels_dict)
         self.gen_bmm_mxscale_kid_dispatch(kernels_dict)

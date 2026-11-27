@@ -241,6 +241,16 @@ def get_GEMM_A16W16_tuned_config(
                             )
                     except (ValueError, KeyError, TypeError):
                         pass
+                if resolved is not None:
+                    from aiter.ops.opus.compiled_kids import tuned_kid_is_compiled
+
+                    # A valid kid can still be absent from the (subset-built)
+                    # module; the launcher would raise, so skip the row.
+                    if not tuned_kid_is_compiled(
+                        "a16w16", runtime_gfx, cu_num, resolved.resolved_kid
+                    ):
+                        config = None
+                        continue
                 if resolved is None:
                     # Discard the whole stale (kid, split-K) pair before
                     # trying another padded row or the default fallback.
