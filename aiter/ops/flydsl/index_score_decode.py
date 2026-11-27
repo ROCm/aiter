@@ -60,10 +60,11 @@ def index_score_decode_nvfp4_supported(idx_q, payload, scale, max_query_len) -> 
 
 # The flat scorer's ring a wave (LDS slots; blocks in flight + 1).
 FLAT_RING = 4
-# Waves a row's selection takes by default. Four cut a 4688-block row from
-# ~147 blocks a lane to ~37 for four barriers and a looser cut (~3x the
-# survivors); unmeasured, so one until the bench's Sk1 / Sk4 say otherwise.
-SELECT_WAVES = 1
+# Waves a row's selection takes by default. MI455X, bs 15 / 16, graph bound
+# 2574 blocks (600K: 4688), replay event time, us, one -> four waves:
+# 50K 13.2 -> 12.9, 88K 14.9 -> 12.6, 150K 17.0 -> 14.2, 300K 21.3 -> 14.7,
+# 600K 30.6 -> 18.9 (each holds ~9 us of replay launch).
+SELECT_WAVES = 4
 
 
 def flat_workgroups_per_cu(ring: int) -> int:
