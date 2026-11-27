@@ -576,17 +576,15 @@ def test_4wave_mxfp8_csv_rows_reach_flydsl_through_public_replay(tmp_path):
     assert result.returncode == 0, result.stderr[-4000:]
 
 
-def test_a_replay_traces_the_kernel_of_an_aot_entry_once(tmp_path, monkeypatch):
-    """A prebuild requests each kernel many times; a launcher bound to the AOT
-    cache is traced for its entry's build and for nothing after it, and every
-    request is still recorded as that kernel."""
+def _aot_bound_launcher(tmp_path, monkeypatch, name):
+    """A launcher bound to an AOT cache in ``tmp_path``, the names of the
+    launchers FlyDSL traces from here on, and what requests it."""
     import functools
 
     from aiter.ops.flydsl.aot_launch import aot_factory
     from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
-    jit_cache = tmp_path / "jit"
-    monkeypatch.setenv("FLYDSL_RUNTIME_CACHE_DIR", str(jit_cache))
+    monkeypatch.setenv("FLYDSL_RUNTIME_CACHE_DIR", str(tmp_path / "jit"))
     monkeypatch.setenv("AITER_FLYDSL_AOT_CACHE_DIR", str(tmp_path / "aot"))
     monkeypatch.delenv("FLYDSL_RUNTIME_RUN_ONLY", raising=False)
     traces = []
@@ -598,7 +596,7 @@ def test_a_replay_traces_the_kernel_of_an_aot_entry_once(tmp_path, monkeypatch):
 
     monkeypatch.setattr(JitFunction, "_trace", counted)
 
-    @aot_factory("test_replay_traces_once", sources=[], env=[])
+    @aot_factory(name, sources=[], env=[])
     @functools.cache
     def factory(n):
         @flyc.jit
@@ -612,6 +610,16 @@ def test_a_replay_traces_the_kernel_of_an_aot_entry_once(tmp_path, monkeypatch):
             _run_compiled(factory(4), torch.empty(8, device="cuda"))
         return kernels
 
+    return factory, traces, request
+
+
+def test_a_replay_traces_the_kernel_of_an_aot_entry_once(tmp_path, monkeypatch):
+    """A prebuild requests each kernel many times; a launcher bound to the AOT
+    cache is traced once by the process that builds its entry and once by
+    any other, and every request is still recorded as that kernel."""
+    factory, traces, request = _aot_bound_launcher(
+        tmp_path, monkeypatch, "test_replay_traces_once"
+    )
     with dry_run("gfx950", 256):
         built = request()
         assert len(built) == 1 and len(traces) == 1
@@ -621,54 +629,85 @@ def test_a_replay_traces_the_kernel_of_an_aot_entry_once(tmp_path, monkeypatch):
         with replay.requested_kernels() as enclosing:
             assert request() == built
         assert enclosing == built and len(traces) == 1
-        # Without the kernel in FlyDSL's own cache the launch is made, for
-        # FlyDSL to fill it (this process's launcher still holds the kernel
-        # in memory, so here it writes nothing).
-        (artifact,) = jit_cache.glob("*/*.pkl")
-        artifact.unlink()
+        # A process that did not build the entry launches it once, to see
+        # that it is the kernel the request traces to.
+        factory.aot_cache._confirmed.clear()
         assert request() == built and len(traces) == 2
+        assert request() == built and len(traces) == 2
+        # A replay that only identifies kernels confirms nothing: its
+        # launches end at their key.
+        factory.aot_cache._confirmed.clear()
+        assert request(replay.identified_kernels) == built and len(traces) == 3
+        assert request(replay.identified_kernels) == built and len(traces) == 4
     assert len(list((tmp_path / "aot").glob("*/*/*.o"))) == 1
 
 
 def test_a_prebuild_tells_an_entry_built_from_other_ir(tmp_path, monkeypatch):
-    """What leaving the launch out relies on, checked whenever it is made: the
-    key an entry recorded is the key a launch of its request derives."""
-    import functools
+    """What leaving a launch out relies on, checked by each process before it
+    leaves any out: the key an entry recorded is the key a launch of its
+    request derives. Also where FlyDSL's cache holds the recorded kernel."""
     import json
 
     from aiter.ops.flydsl import aot_cache
-    from aiter.ops.flydsl.aot_launch import aot_factory
-    from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
-    monkeypatch.setenv("FLYDSL_RUNTIME_CACHE_DIR", str(tmp_path / "jit"))
-    monkeypatch.setenv("AITER_FLYDSL_AOT_CACHE_DIR", str(tmp_path / "aot"))
-    monkeypatch.delenv("FLYDSL_RUNTIME_RUN_ONLY", raising=False)
+    factory, traces, request = _aot_bound_launcher(
+        tmp_path, monkeypatch, "test_entry_of_other_ir"
+    )
     errors = []
     monkeypatch.setattr(aot_cache.logger, "error", errors.append)
 
-    @aot_factory("test_entry_of_other_ir", sources=[], env=[])
-    @functools.cache
-    def factory(n):
-        @flyc.jit
-        def launch(a: fx.Tensor):
-            pass
-
-        return launch
-
-    def request():
-        with replay.requested_kernels() as kernels:
-            _run_compiled(factory(4), torch.empty(8, device="cuda"))
-        return kernels
+    @flyc.jit
+    def other(a: fx.Tensor, b: fx.Tensor):
+        pass
 
     with dry_run("gfx950", 256):
         built = request()
-        # An entry that says it was built from another kernel, one FlyDSL's
-        # cache does not hold: the launch is made, and tells the two apart.
+        a = torch.empty(8, device="cuda")
+        with replay.requested_kernels() as other_kernel:
+            other(a, a)
+        assert other_kernel.isdisjoint(built)
+        # The entry says it was built from that other kernel, which FlyDSL's
+        # cache holds. Another process launches the request all the same,
+        # and tells the two apart; it leaves no launch of the entry out.
         (sidecar,) = (tmp_path / "aot").glob("*/*/*.json")
         meta = json.loads(sidecar.read_text())
-        sidecar.write_text(json.dumps({**meta, "ir": "0" * 64}))
-        assert request() == built
+        sidecar.write_text(json.dumps({**meta, "ir": next(iter(other_kernel))}))
+        factory.aot_cache._confirmed.clear()
+        traced = len(traces)
+        for count in (1, 2, 3):
+            assert request() == built
+            assert len(traces) == traced + count
         assert len(errors) == 1 and "built from other IR" in errors[0]
-        # The key of the launch, where the entry records it, raises nothing.
+        # The key of the launch, where the entry records it, confirms it.
         sidecar.write_text(json.dumps(meta))
-        assert request() == built and len(errors) == 1
+        assert request() == built and len(traces) == traced + 4
+        assert request() == built and len(traces) == traced + 4
+    assert len(errors) == 1
+
+
+def test_moe_batches_keep_the_rows_of_one_model_together():
+    from aiter.aot.flydsl import moe
+
+    def row(token, model_dim, kernel, jobs):
+        fields = dict.fromkeys(moe._ROW_KEY, "")
+        fields.update(token=token, model_dim=model_dim, kernelName1=kernel)
+        return [{**fields, "m": m} for m in range(jobs)]
+
+    cap = moe._JOBS_PER_WORKER
+    jobs = (
+        row(1, 4096, "a", 8)
+        + row(1, 7168, "a", 8)
+        + row(2, 4096, "b", 8)
+        + row(4, 4096, "a", 8)
+        + row(8, 7168, "c", cap + 4)
+    )
+    batches = moe._batches(jobs)
+    assert sorted(job["m"] for batch in batches for job in batch) == sorted(
+        job["m"] for job in jobs
+    )
+    assert all(len(batch) <= cap for batch in batches)
+    assert all(len({job["model_dim"] for job in batch}) == 1 for batch in batches)
+    # The three 4096 rows share a worker. A row larger than a worker's share
+    # is split, and no part of it joins a run it does not fit.
+    assert sorted(len(batch) for batch in batches) == [4, 8, 24, cap]
+    assert [len(batch) for batch in batches] == sorted(map(len, batches), reverse=True)

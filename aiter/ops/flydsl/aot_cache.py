@@ -829,42 +829,17 @@ def entry_requests(report):
     try:
         yield
     finally:
-        _request_listeners.remove(report)
+        # This registration, not an equal one of an enclosing collection.
+        for index in range(len(_request_listeners) - 1, -1, -1):
+            if _request_listeners[index] is report:
+                del _request_listeners[index]
+                break
 
 
-_jit_layout_warned = False
-
-
-def _jit_artifact_built(ir: str) -> bool:
-    """Whether FlyDSL's own cache holds the kernel of key ``ir`` (a sidecar's
-    ``"ir"``), so that a compile-only launch of it would compile nothing.
-
-    Private to FlyDSL: ``_disk_cache_key`` and the cache's
-    ``<root>/<launcher name>/<key>.pkl`` layout. Without the former this is
-    False, the launch is made, and a prebuild is told once that it traces
-    every request; a FlyDSL that names its files otherwise shows as the
-    same slowdown, which tests/test_flydsl_aot_replay.py watches for.
-    """
-    global _jit_layout_warned
-    from flydsl.compiler import jit_function
-
-    root = fly_env.runtime.cache_dir
-    if not root or not (fly_env.runtime.enable_cache or fly_env.runtime.run_only):
-        return False
-    disk_key = getattr(jit_function, "_disk_cache_key", None)
-    if disk_key is None:
-        if not _jit_layout_warned:
-            _jit_layout_warned = True
-            logger.warning(
-                "[FlyDSL AOT] this FlyDSL has no jit_function._disk_cache_key: "
-                "a prebuild cannot tell which kernels FlyDSL's cache holds and "
-                "traces every request, as it did before it left any out"
-            )
-        return False
-    try:
-        return any(Path(root).glob(f"*/{disk_key(ir)}.pkl"))
-    except OSError:
-        return False
+def _dumping() -> bool:
+    """Whether FlyDSL dumps what it compiles, for which it compiles every
+    launch again instead of reading its cache."""
+    return fly_env.debug.dump_ir or fly_env.debug.dump_asm
 
 
 def _recorded_key(stem: Path) -> str | None:
@@ -983,7 +958,9 @@ class FlyDSLAotCache:
         self._jit = {}
         # Entries this process built; _prebuild skips the trace a build ran.
         self._builds = 0
-        # Entries _check_launch has reported.
+        # Entries whose recorded key a launch of this process derived (or
+        # that it built), with that key, and those _check_launch reported.
+        self._confirmed = {}
         self._mismatched = set()
         # Set by invalidate(): this process then runs every key through the JIT.
         self._jit_only = False
@@ -1072,6 +1049,7 @@ class FlyDSLAotCache:
             self.epoch += 1
             self._mem.clear()
             self._jit.clear()
+            self._confirmed.clear()
 
     def launch(self, key, make_exe, *args) -> None:
         """Launch the specialization ``key`` (built by ``make_exe()``) on ``args``.
@@ -1123,63 +1101,70 @@ class FlyDSLAotCache:
         besides: an AOT replay records it as the kernel the call requests,
         and it fills FlyDSL's cache for mode ``0`` and the fallback. The
         export's compile does both for a new entry. For an entry already on
-        disk the launch would trace the kernel (FlyDSL derives its key from
-        the trace) only to find it compiled, and a prebuild requests each of
-        its kernels many times over. So where the entry records its kernel's
-        key and FlyDSL's cache holds that kernel, the launch is left out and
-        the key reported instead (``entry_requests``). Only a prebuild does:
-        under the COMPILE_ONLY of a preload the launch is made, as it is
-        inside another launcher's trace.
+        disk the launch traces the kernel (FlyDSL derives its key from the
+        trace) only to find it compiled, and a prebuild requests each of its
+        kernels many times over.
 
-        That takes the recorded key for the one the launch would derive.
-        Whenever the launch is made for an entry with a recorded key, the two
-        are compared (``_check_launch``), and mode ``verify`` makes it for
-        every request.
+        So a process makes that launch once for an entry it did not build,
+        and compares the key the launch derived with the one the entry
+        recorded when it was built (``_check_launch``). Where they are the
+        same, the entry is the kernel its request traces to and FlyDSL's
+        cache holds it, and later requests of the entry in this process
+        leave the launch out and report the recorded key instead
+        (``entry_requests``). Only a prebuild does: under the COMPILE_ONLY
+        of a preload every launch is made, as it is inside another
+        launcher's trace, in mode ``verify`` and while FlyDSL dumps what it
+        compiles.
         """
-        recorded = entry = None
+        entry = None
         with self._lock:
-            jit = self._jit.get(key)
             # The export first: its compile is also the compile-only launch.
             if _MODE != "0" and _load_module is not None and not self._jit_only:
                 builds = self._builds
                 entry = self._kernel(key, make_exe, args, entry_only=True)
                 if self._builds != builds:
+                    # Built from the trace this request just made.
+                    self._confirmed[entry] = _recorded_key(entry)
                     return
-                if isinstance(entry, _JitKernel):
-                    # No entry for this key: its launch is the JIT path's.
-                    jit = jit or entry
-                elif _prebuilding() and not _tracing():
-                    recorded = _recorded_key(entry)
-                    if (
-                        recorded is not None
-                        and _MODE != "verify"
-                        and _jit_artifact_built(recorded)
-                    ):
+                if isinstance(entry, Path) and _prebuilding() and not _tracing():
+                    confirmed = self._confirmed.get(entry)
+                    if confirmed is not None and _MODE != "verify" and not _dumping():
                         for report in tuple(_request_listeners):
-                            report(recorded)
+                            report(confirmed)
                         return
+                else:
+                    entry = None
+            jit = self._jit.get(key)
             if jit is None:
-                jit = _JitKernel(make_exe(), key)
-            self._jit[key] = jit
+                jit = self._jit[key] = _JitKernel(make_exe(), key)
         before = _last_compile(jit._exe)
         jit(*args)
-        if recorded is not None:
-            self._check_launch(key, entry, recorded, before, _last_compile(jit._exe))
+        if entry is not None:
+            self._check_launch(key, entry, before, _last_compile(jit._exe))
 
-    def _check_launch(self, key, entry, recorded, before, after) -> None:
+    def _check_launch(self, key, entry, before, after) -> None:
         """Compare the key FlyDSL's compile-only launch derived with the one
-        the entry at ``entry`` recorded when it was built.
+        the entry at ``entry`` recorded when it was built, and confirm the
+        entry where they are the same: later requests of it leave the launch
+        out (``_prebuild``).
 
-        A prebuild that leaves the launch out reports the recorded key in its
-        place, and the entry is what a serving process loads for the request,
+        The entry is what a serving process loads for the request, and its
+        recorded key is what a prebuild reports for a launch it leaves out,
         so they must be one kernel. ``before`` and ``after`` are the
         launcher's last compile around the launch: the same one means it
         derived no key (an AOT replay that only identifies kernels stops it
-        first), and there is nothing to compare. The launch runs outside
-        the cache's lock, so this takes a launcher to be launched by one
-        thread at a time, as a prebuild does.
+        first; a FlyDSL that keeps no last compile), and nothing is
+        compared or confirmed. The launch runs outside the cache's lock, so
+        this takes a launcher to be launched by one thread at a time, as a
+        prebuild does.
         """
-        if after is None or after is before or after[0] == recorded:
+        if after is None or after is before:
+            return
+        recorded = _recorded_key(entry)
+        if recorded is None:
+            return
+        if after[0] == recorded:
+            self._confirmed[entry] = recorded
             return
         message = (
             f"[FlyDSL AOT] {self.name}: the entry {entry.name} for {key!r} was "
