@@ -789,6 +789,447 @@ def test_flydsl_fmha_gfx11_rejects_gqa_head_ratio():
         flydsl_flash_attn_func(q, kv, kv.clone())
 
 
+# gfx11 varlen: packed THD + cu_seqlens through flydsl_flash_attn_varlen_fwd, the
+# same kernel built with varlen=True. Lengths include the Qwen3.5 ViT call shapes
+# (16 heads, head_dim 64: 1-16 images of 208-2880 tokens).
+
+
+def _cu_seqlens(lens):
+    return torch.tensor(
+        [0] + list(itertools.accumulate(lens)), dtype=torch.int32, device="cuda"
+    )
+
+
+def _varlen_ref_fp32(q, k, v, lens_q, lens_k, causal, scale):
+    """fp32 attention per packed sequence: (out ``[T, H, D]``, lse ``[H, T]``).
+    A sequence without keys gives out 0 and lse -inf."""
+    group = q.shape[1] // k.shape[1]
+    outs, lses = [], []
+    q0 = k0 = 0
+    for lq, lk in zip(lens_q, lens_k):
+        qi = q[q0 : q0 + lq].float().transpose(0, 1)  # [H, Lq, D]
+        ki = k[k0 : k0 + lk].float().transpose(0, 1).repeat_interleave(group, 0)
+        vi = v[k0 : k0 + lk].float().transpose(0, 1).repeat_interleave(group, 0)
+        q0, k0 = q0 + lq, k0 + lk
+        if lk == 0:
+            outs.append(torch.zeros_like(qi).transpose(0, 1))
+            lses.append(torch.full(qi.shape[:2], float("-inf"), device=q.device))
+            continue
+        s = (qi @ ki.transpose(1, 2)) * scale
+        if causal:
+            # Bottom-right aligned, as in flash-attn: row r sees keys <= r + lk - lq.
+            mask = torch.ones(lq, lk, dtype=torch.bool, device=q.device).triu(
+                1 + lk - lq
+            )
+            s = s.masked_fill(mask, float("-inf"))
+        p = torch.softmax(s, dim=-1).nan_to_num(0.0)  # a row with no keys: out 0
+        outs.append((p @ vi).transpose(0, 1))
+        lses.append(torch.logsumexp(s, dim=-1))
+    return torch.cat(outs), torch.cat(lses, dim=1)
+
+
+def _check_varlen_gfx11(out, lse, q, k, v, lens_q, lens_k, causal, scale):
+    assert out.shape == q.shape and out.dtype == q.dtype
+    assert not torch.isnan(out).any()
+    ref_out, ref_lse = _varlen_ref_fp32(q, k, v, lens_q, lens_k, causal, scale)
+    tol = 1e-2 if q.dtype == torch.bfloat16 else 2e-3
+    q0 = 0
+    for b, lq in enumerate(lens_q):
+        if lq == 0:
+            continue
+        for h in (0, q.shape[1] - 1):
+            got = out[q0 : q0 + lq, h].float()
+            ref = ref_out[q0 : q0 + lq, h]
+            if ref.norm() == 0:
+                assert got.abs().max().item() == 0, f"(b={b}, h={h}) out not 0"
+            else:
+                rel = ((got - ref).norm() / ref.norm()).item()
+                assert rel < tol, f"(b={b}, h={h}) rel_err={rel:.3e} >= {tol}"
+        q0 += lq
+    if lse is not None:
+        assert lse.shape == (q.shape[1], q.shape[0]) and lse.dtype == torch.float32
+        finite = torch.isfinite(ref_lse)
+        assert torch.equal(torch.isinf(lse), ~finite)
+        err = (lse[finite] - ref_lse[finite]).abs().max().item() if finite.any() else 0
+        assert err < 1e-3, f"max |lse - ref| = {err:.2e}"
+
+
+def _make_varlen_qkv(lens_q, lens_k, num_heads, num_kv_heads, head_dim, dtype):
+    g = torch.Generator(device="cuda").manual_seed(0)
+    q = torch.randn(
+        sum(lens_q), num_heads, head_dim, generator=g, dtype=dtype, device="cuda"
+    )
+    k, v = (
+        torch.randn(
+            sum(lens_k), num_kv_heads, head_dim, generator=g, dtype=dtype, device="cuda"
+        )
+        for _ in range(2)
+    )
+    return q, k, v
+
+
+@_gfx11_only
+@pytest.mark.parametrize(
+    "lens_q,lens_k,num_heads,num_kv_heads,head_dim,causal,dtype_str",
+    [
+        ([572] * 8, [572] * 8, 16, 16, 64, False, "bf16"),  # 192-row tile
+        ([208], [208], 16, 16, 64, False, "bf16"),  # 256-row tile
+        ([432, 1080, 2880], [432, 1080, 2880], 16, 16, 64, False, "bf16"),  # 128
+        ([572] * 8 + [952] * 8, [572] * 8 + [952] * 8, 16, 16, 64, False, "bf16"),
+        ([100, 200, 7], [300, 50, 1], 4, 4, 64, False, "bf16"),  # cross lengths
+        ([129, 1000, 64], [129, 1000, 64], 8, 8, 128, True, "bf16"),
+        ([512], [2048], 8, 2, 256, True, "bf16"),  # chunked prefill over a prefix
+        ([4] * 32, [2048] * 32, 8, 2, 128, True, "bf16"),  # speculative decode
+        ([1300, 600, 1], [1300, 2000, 900], 16, 16, 64, True, "bf16"),  # mixed
+        ([64, 100], [32, 100], 4, 4, 64, True, "f16"),  # fewer keys: rows with none
+        ([100, 257, 1000], [100, 257, 1000], 8, 2, 128, False, "f16"),  # GQA
+        ([333, 777], [333, 777], 4, 4, 40, False, "f16"),  # head_dim % 16 == 8
+        ([100, 0, 50], [100, 0, 50], 4, 4, 64, False, "bf16"),  # empty sequence
+        ([10, 20, 30], [10, 0, 30], 4, 4, 64, False, "bf16"),  # no keys
+    ],
+)
+def test_flydsl_fmha_gfx11_varlen(
+    lens_q, lens_k, num_heads, num_kv_heads, head_dim, causal, dtype_str
+):
+    dtype = torch.bfloat16 if dtype_str == "bf16" else torch.float16
+    q, k, v = _make_varlen_qkv(lens_q, lens_k, num_heads, num_kv_heads, head_dim, dtype)
+    cu_q, cu_k = _cu_seqlens(lens_q), _cu_seqlens(lens_k)  # two tables, as vLLM passes
+    res = flydsl_fmha_kernels.flydsl_flash_attn_varlen_fwd(
+        q, k, v, cu_q, cu_k, max(lens_q), max(lens_k), causal=causal, return_lse=True
+    )
+    assert res is not None, "gfx11 varlen path did not take the call"
+    out, lse = res
+    scale = 1.0 / math.sqrt(head_dim)
+    _check_varlen_gfx11(out, lse, q, k, v, lens_q, lens_k, causal, scale)
+    # The LSE build writes the same output as the plain one.
+    plain = flydsl_fmha_kernels.flydsl_flash_attn_varlen_fwd(
+        q, k, v, cu_q, cu_k, max(lens_q), max(lens_k), causal=causal
+    )
+    assert torch.equal(out, plain)
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_varlen_matches_batched():
+    """Equal lengths: the varlen build gives the batched kernel's output bitwise
+    (same KV tile order), whatever query tile each picks."""
+    batch, seq, heads, dim = 8, 572, 16, 64
+    q, k, v = _make_varlen_qkv(
+        [seq] * batch, [seq] * batch, heads, heads, dim, torch.bfloat16
+    )
+    cu = _cu_seqlens([seq] * batch)
+    out = flydsl_fmha_kernels.flydsl_flash_attn_varlen_fwd(q, k, v, cu, cu, seq, seq)
+    ref = flydsl_flash_attn_func(
+        q.view(batch, seq, heads, dim),
+        k.view(batch, seq, heads, dim),
+        v.view(batch, seq, heads, dim),
+    )
+    assert torch.equal(out.view(batch, seq, heads, dim), ref)
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_varlen_packed_qkv():
+    """Views of a packed [T, 3, H, D] tensor are read in place."""
+    lens = [300, 572]
+    g = torch.Generator(device="cuda").manual_seed(0)
+    qkv = torch.randn(
+        sum(lens), 3, 8, 64, generator=g, dtype=torch.bfloat16, device="cuda"
+    )
+    q, k, v = qkv.unbind(1)
+    assert all(flydsl_fmha_kernels._gfx11_thd_direct(t) for t in (q, k, v))
+    cu = _cu_seqlens(lens)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        out = flydsl_fmha_kernels.flydsl_flash_attn_varlen_fwd(
+            q, k, v, cu, cu, 572, 572
+        )
+    ref = flydsl_fmha_kernels.flydsl_flash_attn_varlen_fwd(
+        q.contiguous(), k.contiguous(), v.contiguous(), cu, cu, 572, 572
+    )
+    assert torch.equal(out, ref)
+
+
+@_gfx11_only
+@pytest.mark.parametrize("contiguous", [True, False])
+def test_flydsl_fmha_gfx11_varlen_out(contiguous):
+    lens = [100, 300]
+    q, k, v = _make_varlen_qkv(lens, lens, 4, 4, 64, torch.bfloat16)
+    cu = _cu_seqlens(lens)
+    out = torch.empty(sum(lens), 4, 64, dtype=torch.bfloat16, device="cuda")
+    if not contiguous:
+        out = torch.empty(
+            4, sum(lens), 64, dtype=torch.bfloat16, device="cuda"
+        ).transpose(0, 1)
+    res = flydsl_fmha_kernels.flydsl_flash_attn_varlen_fwd(
+        q, k, v, cu, cu, 300, 300, out=out
+    )
+    assert res is out
+    _check_varlen_gfx11(out, None, q, k, v, lens, lens, False, 1.0 / 8.0)
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_varlen_falls_through():
+    """Calls the kernel has no code for return None, so the caller goes on to CK."""
+    fwd = flydsl_fmha_kernels.flydsl_flash_attn_varlen_fwd
+    lens = [64, 128]
+    q, k, v = _make_varlen_qkv(lens, lens, 4, 4, 64, torch.bfloat16)
+    cu = _cu_seqlens(lens)
+    assert fwd(q, k, v, cu, cu, 128, 128) is not None
+    assert fwd(q, k, v, cu.to(torch.int64), cu.to(torch.int64), 128, 128) is None
+    assert fwd(q, k, v, cu, cu, 128, 128, dropout_p=0.1) is None
+    assert fwd(q, k, v, cu, cu, 128, 128, window_size=(64, -1)) is None
+    # causal takes separate tables (bottom-right aligned mask)
+    assert fwd(q, k, v, cu, cu.clone(), 128, 128, causal=True) is not None
+    assert fwd(q, k, v, cu, cu, 128, 128, causal=True) is not None
+    assert (
+        fwd(q, k, v, cu, cu, 128, 128, alibi_slopes=torch.ones(4, device="cuda"))
+        is None
+    )
+    assert fwd(q.float(), k.float(), v.float(), cu, cu, 128, 128) is None
+    assert fwd(q[None], k[None], v[None], cu, cu, 128, 128) is None  # not THD
+    assert (
+        fwd(q, k, v, cu, cu, 128, 128, out=torch.empty_like(q, dtype=torch.float16))
+        is None
+    )
+
+
+def test_flydsl_fmha_gfx11_varlen_config():
+    """Non-causal, head_dim 64: 128-row blocks with 2-key transpose writes and
+    32 keys at 193-511 tokens, 64 keys at 640-767 and from 1024; the first
+    rule's padding-least tile elsewhere. Causal: 128-row blocks; keys and
+    transpose width by head_dim, 64 keys for a chunk over a longer prefix, 256
+    rows for long chunks and long prefills."""
+    config = flydsl_fmha_kernels._gfx11_varlen_config
+    # ViT (16 heads, head_dim 64), from 1024 tokens and at 640-767: 128 / 64
+    assert config("gfx1151", 2880, 2880, 16, 64, 1, False) == (8, 64, None, 2)
+    assert config("gfx1151", 2880, 2880, 16, 64, 5, False) == (8, 64, None, 2)
+    assert config("gfx1151", 1156, 1156, 16, 64, 3, False) == (8, 64, None, 2)
+    assert config("gfx1151", 700, 700, 16, 64, 3, False) == (8, 64, None, 2)
+    # 193-511 tokens: 128 rows / 32 keys, except 256-383 with over four sequences
+    assert config("gfx1151", 208, 208, 16, 64, 1, False) == (8, 32, None, 2)
+    assert config("gfx1151", 224, 224, 16, 64, 6, False) == (8, 32, None, 2)
+    assert config("gfx1151", 288, 288, 16, 64, 3, False) == (8, 32, None, 2)
+    assert config("gfx1151", 288, 288, 16, 64, 6, False) == (12, 32, None, 2)
+    assert config("gfx1151", 432, 432, 16, 64, 1, False) == (8, 32, None, 2)
+    # the first rule: 160 -> 1 x 192 rows; 572 -> 3 x 192; 988 -> 4 x 256
+    assert config("gfx1151", 160, 160, 16, 64, 3, False) == (12, 32, None, 2)
+    assert config("gfx1151", 192, 192, 16, 64, 3, False) == (12, 32, None, 2)
+    assert config("gfx1151", 572, 572, 16, 64, 3, False) == (12, 64, None, 4)
+    assert config("gfx1151", 572, 572, 16, 64, 8, False) == (12, 32, None, 2)
+    assert config("gfx1151", 952, 952, 16, 64, 16, False) == (12, 32, None, 2)
+    assert config("gfx1151", 988, 988, 16, 64, 8, False) == (16, 32, None, 2)
+    assert config("gfx1151", 924, 924, 16, 64, 3, False) == (12, 64, None, 4)
+    assert config("gfx1151", 840, 840, 16, 64, 1, False) == (8, 64, None, 4)
+    # head_dim 72 ViT: 192 rows where head_dim 64 took 128, 64 keys from 512
+    assert config("gfx1151", 160, 160, 16, 72, 3, False) == (12, 32, None, 2)
+    assert config("gfx1151", 288, 288, 16, 72, 3, False) == (8, 32, None, 2)
+    assert config("gfx1151", 432, 432, 16, 72, 1, False) == (16, 32, None, 2)
+    assert config("gfx1151", 572, 572, 16, 72, 3, False) == (12, 64, None, 2)
+    assert config("gfx1151", 572, 572, 16, 72, 8, False) == (12, 32, None, 2)
+    assert config("gfx1151", 700, 700, 16, 72, 3, False) == (12, 64, None, 2)
+    assert config("gfx1151", 700, 700, 16, 72, 6, False) == (16, 32, None, 2)
+    assert config("gfx1151", 924, 924, 16, 72, 3, False) == (12, 64, None, 2)
+    assert config("gfx1151", 924, 924, 16, 72, 6, False) == (16, 32, None, 2)
+    assert config("gfx1151", 1156, 1156, 16, 72, 3, False) == (16, 64, None, 2)
+    assert config("gfx1151", 1156, 1156, 16, 72, 6, False) == (16, 32, None, 2)
+    assert config("gfx1151", 1100, 1100, 16, 72, 3, False) == (12, 64, None, 2)
+    assert config("gfx1151", 1440, 1440, 16, 72, 6, False) == (12, 64, None, 2)
+    assert config("gfx1151", 1728, 1728, 16, 72, 3, False) == (12, 64, None, 2)
+    assert config("gfx1151", 1728, 1728, 16, 72, 6, False) == (12, 64, None, 2)
+    assert config("gfx1151", 2880, 2880, 16, 72, 3, False) == (12, 64, None, 2)
+    assert config("gfx1151", 8160, 8160, 16, 72, 3, False) == (16, 64, None, 2)
+    # head_dim 80 is not measured: the batched rule
+    assert config("gfx1151", 1000, 1000, 16, 80, 3, False) == (16, 32, None, 2)
+    # larger head dims keep the batched rule
+    assert config("gfx1151", 1000, 1000, 8, 128, 1, False) == (16, 32, None, 2)
+    assert config("gfx1151", 4096, 4096, 12, 128, 1, False) == (32, 32, 6, 2)
+    # causal, head_dim 64 (Qwen2-0.5B class): one config
+    assert config("gfx1151", 512, 512, 14, 64, 1, True) == (8, 64, None, 2)
+    assert config("gfx1151", 4, 2048, 14, 64, 32, True) == (8, 64, None, 2)
+    # causal, head_dim 128: prefill, speculative decode, short and long chunks
+    assert config("gfx1151", 2048, 2048, 32, 128, 1, True) == (8, 32, None, 2)
+    assert config("gfx1151", 2048, 2560, 32, 128, 1, True) == (8, 32, None, 2)
+    assert config("gfx1151", 4096, 4096, 16, 128, 1, True) == (8, 32, None, 2)
+    assert config("gfx1151", 8192, 8192, 32, 128, 1, True) == (16, 64, None, 8)
+    assert config("gfx1151", 4, 2048, 32, 128, 32, True) == (8, 64, None, 8)
+    assert config("gfx1151", 8, 4096, 32, 128, 8, True) == (8, 64, None, 8)
+    assert config("gfx1151", 512, 2048, 16, 128, 1, True) == (8, 64, None, 8)
+    assert config("gfx1151", 1024, 2048, 16, 128, 3, True) == (8, 64, None, 8)
+    assert config("gfx1151", 512, 4096, 32, 128, 4, True) == (16, 64, None, 8)
+    assert config("gfx1151", 1024, 4096, 32, 128, 1, True) == (16, 64, None, 8)
+    assert config("gfx1151", 2048, 8192, 16, 128, 1, True) == (16, 64, None, 8)
+    # causal, head_dim 256 (Qwen3.5 decoder): 64 keys do not fit the LDS
+    assert config("gfx1151", 1280, 1280, 8, 256, 1, True) == (8, 32, None, 8)
+    assert config("gfx1151", 2048, 8192, 8, 256, 1, True) == (8, 32, None, 8)
+
+
+# gfx11 vision attention from the packed qkv projection, RoPE in the kernel
+# (flydsl_flash_attn_varlen_qkv_rope_fwd): the Qwen-VL ViT block between its qkv
+# and output projections.
+
+
+def _rope_inputs(lens, num_heads, head_dim, dtype, cs_dtype, layout):
+    g = torch.Generator(device="cuda").manual_seed(0)
+    total = sum(lens)
+    x = torch.randn(
+        total, 3 * num_heads * head_dim, generator=g, dtype=dtype, device="cuda"
+    )
+    # 2D RoPE tables as the ViT builds them: row and column angles side by side.
+    quarter = head_dim // 4
+    inv = 10000.0 ** (
+        -torch.arange(quarter, dtype=torch.float32, device="cuda") / quarter
+    )
+    pos = torch.randint(0, 96, (total, 2), generator=g, device="cuda").float()
+    ang = torch.cat((pos[:, :1] * inv, pos[:, 1:] * inv), dim=1)
+    cos, sin = (f(ang).to(cs_dtype).contiguous() for f in (torch.cos, torch.sin))
+    qkv = {
+        "s_w": x,
+        "s_1_w": x.view(total, 1, -1),
+        "s_3_h_d": x.view(total, 3, num_heads, head_dim),
+    }[layout]
+    return x, qkv, cos, sin
+
+
+def _rope_ref_fp32(x, cos, sin, lens, num_heads, head_dim):
+    """fp32 NeoX RoPE on q and k, then fp32 attention per sequence: [T, H, D]."""
+    total = x.shape[0]
+    q, k, v = x.float().view(total, 3, num_heads, head_dim).unbind(1)
+    c, s = cos.float()[:, None], sin.float()[:, None]
+    half = head_dim // 2
+
+    def rot(t):
+        t1, t2 = t[..., :half], t[..., half:]
+        return torch.cat((t1 * c - t2 * s, t2 * c + t1 * s), dim=-1)
+
+    q, k = rot(q), rot(k)
+    outs, t0 = [], 0
+    for n in lens:
+        qi, ki, vi = (t[t0 : t0 + n].transpose(0, 1) for t in (q, k, v))
+        t0 += n
+        if n == 0:
+            continue
+        p = torch.softmax((qi @ ki.transpose(1, 2)) / math.sqrt(head_dim), dim=-1)
+        outs.append((p @ vi).transpose(0, 1))
+    return torch.cat(outs)
+
+
+@_gfx11_only
+@pytest.mark.parametrize(
+    "lens,num_heads,head_dim,dtype_str,cs_dtype_str,layout",
+    [
+        ([2400] * 3, 16, 64, "bf16", "bf16", "s_1_w"),  # vLLM's qkv as given
+        ([480] * 3 + [8160] * 3, 16, 64, "bf16", "bf16", "s_1_w"),  # 512-row tile
+        ([576] * 6, 16, 64, "bf16", "bf16", "s_w"),  # 192-row tile
+        ([288] * 12, 16, 64, "bf16", "bf16", "s_3_h_d"),  # 32-key tile
+        ([208], 16, 64, "bf16", "f32", "s_w"),  # fp32 tables
+        ([600, 1024], 16, 80, "bf16", "bf16", "s_w"),  # Qwen2.5-VL head_dim
+        ([500, 700], 8, 64, "f16", "f32", "s_w"),
+        ([100, 0, 50], 4, 64, "bf16", "bf16", "s_w"),  # empty sequence
+    ],
+)
+def test_flydsl_fmha_gfx11_varlen_qkv_rope(
+    lens, num_heads, head_dim, dtype_str, cs_dtype_str, layout
+):
+    dtype = torch.bfloat16 if dtype_str == "bf16" else torch.float16
+    cs_dtype = torch.bfloat16 if cs_dtype_str == "bf16" else torch.float32
+    x, qkv, cos, sin = _rope_inputs(lens, num_heads, head_dim, dtype, cs_dtype, layout)
+    cu = _cu_seqlens(lens)
+    out = flydsl_fmha_kernels.flydsl_flash_attn_varlen_qkv_rope_fwd(
+        qkv, num_heads, cos, sin, cu, max(lens)
+    )
+    assert out is not None, "gfx11 rope path did not take the call"
+    assert out.shape == (sum(lens), num_heads, head_dim) and out.dtype == dtype
+    assert not torch.isnan(out).any()
+    ref = _rope_ref_fp32(x, cos, sin, lens, num_heads, head_dim)
+    rel = ((out.float() - ref).norm() / ref.norm()).item()
+    tol = 1e-2 if dtype == torch.bfloat16 else 2e-3
+    assert rel < tol, f"rel_err={rel:.3e} >= {tol}"
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_varlen_qkv_rope_matches_unfused():
+    """Same as rotating q / k first (fp32 math, one rounding) and running the
+    varlen kernel; within one bf16 rounding of the rotated inputs."""
+    lens, heads, dim = [572, 1008, 300], 16, 64
+    x, qkv, cos, sin = _rope_inputs(
+        lens, heads, dim, torch.bfloat16, torch.bfloat16, "s_w"
+    )
+    cu = _cu_seqlens(lens)
+    q, k, v = x.view(sum(lens), 3, heads, dim).unbind(1)
+    c, s = cos.float()[:, None], sin.float()[:, None]
+
+    def rot(t):
+        t1, t2 = t.float()[..., : dim // 2], t.float()[..., dim // 2 :]
+        return torch.cat((t1 * c - t2 * s, t2 * c + t1 * s), -1).to(torch.bfloat16)
+
+    unfused = flydsl_fmha_kernels.flydsl_flash_attn_varlen_fwd(
+        rot(q), rot(k), v.contiguous(), cu, cu, max(lens), max(lens)
+    )
+    fused = flydsl_fmha_kernels.flydsl_flash_attn_varlen_qkv_rope_fwd(
+        qkv, heads, cos, sin, cu, max(lens)
+    )
+    assert (fused.float() - unfused.float()).abs().max().item() < 2e-2
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_varlen_qkv_rope_out():
+    lens = [100, 300]
+    x, qkv, cos, sin = _rope_inputs(lens, 4, 64, torch.bfloat16, torch.bfloat16, "s_w")
+    cu = _cu_seqlens(lens)
+    out = torch.empty(sum(lens), 4, 64, dtype=torch.bfloat16, device="cuda")
+    res = flydsl_fmha_kernels.flydsl_flash_attn_varlen_qkv_rope_fwd(
+        qkv, 4, cos, sin, cu, 300, out=out
+    )
+    assert res is out
+    ref = _rope_ref_fp32(x, cos, sin, lens, 4, 64)
+    assert ((out.float() - ref).norm() / ref.norm()).item() < 1e-2
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_varlen_qkv_rope_falls_through():
+    """Calls the kernel has no code for return None (the caller keeps its
+    unfused path)."""
+    fwd = flydsl_fmha_kernels.flydsl_flash_attn_varlen_qkv_rope_fwd
+    lens = [64, 128]
+    _, qkv, cos, sin = _rope_inputs(lens, 4, 64, torch.bfloat16, torch.bfloat16, "s_w")
+    cu = _cu_seqlens(lens)
+    assert fwd(qkv, 4, cos, sin, cu, 128) is not None
+    assert fwd(qkv, 4, cos, sin, cu.to(torch.int64), 128) is None
+    assert (
+        fwd(qkv, 4, cos[:, :16].contiguous(), sin[:, :16].contiguous(), cu, 128) is None
+    )
+    assert fwd(qkv, 4, cos, sin.float(), cu, 128) is None  # mixed table dtypes
+    assert fwd(qkv.float(), 4, cos, sin, cu, 128) is None
+    assert fwd(qkv, 5, cos, sin, cu, 128) is None  # width not 3 * heads * D
+    assert fwd(qkv.view(sum(lens), 2, -1), 4, cos, sin, cu, 128) is None  # batch 2
+    _, qkv72, cos72, sin72 = _rope_inputs(
+        lens, 4, 72, torch.bfloat16, torch.bfloat16, "s_w"
+    )
+    assert fwd(qkv72, 4, cos72, sin72, cu, 128) is None  # head_dim % 16 != 0
+
+
+def test_flydsl_fmha_gfx11_varlen_rope_config():
+    """128 rows under 512 tokens; else 512 rows when they pad at most 3% more
+    than 192 rows (and leave >= 64 blocks), else 256 rows from 3000 tokens and
+    192 below; 32 keys only for many short sequences."""
+    config = flydsl_fmha_kernels._gfx11_varlen_rope_config
+    assert config(8160, 16, 3) == (32, 64)
+    assert config(6392, 16, 3) == (32, 64)
+    assert config(4624, 16, 3) == (16, 64)
+    assert config(4216, 16, 3) == (16, 64)
+    assert config(3264, 16, 3) == (16, 64)
+    assert config(3100, 16, 3) == (16, 64)  # 3584 padded rows: not the 512 branch
+    assert config(2700, 16, 3) == (12, 64)
+    assert config(2400, 16, 3) == (32, 64)
+    assert config(1440, 16, 3) == (32, 64)
+    assert config(1292, 16, 3) == (12, 64)
+    assert config(1008, 16, 9) == (32, 64)
+    assert config(1008, 16, 1) == (12, 64)  # 512 rows would leave 32 blocks
+    assert config(576, 16, 6) == (12, 64)
+    assert config(480, 16, 3) == (8, 64)
+    assert config(224, 16, 3) == (8, 64)
+    assert config(288, 16, 12) == (8, 32)
+
+
 def _ref_lse_fp32(q, k, b, h, causal, scale, chunk=4096):
     """fp32 natural-log logsumexp of the scaled scores of one (batch, head)."""
     group = q.shape[2] // k.shape[2]

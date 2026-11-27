@@ -25,6 +25,7 @@ from __future__ import annotations
 import math
 import os
 import warnings
+from contextlib import nullcontext
 from functools import lru_cache
 
 import torch
@@ -32,6 +33,9 @@ import torch.nn.functional as F
 
 from .fmha_bwd_gfx942 import flash_attn_varlen_bwd_d192_gfx942
 from .kernels.flash_attn_func_gfx11 import build_flash_attn_func_module_gfx11
+from .kernels.flash_attn_varlen_func_gfx11 import (
+    build_flash_attn_varlen_func_module_gfx11,
+)
 from .kernels.fmha_gfx1201.flash_attn_func import (
     build_flash_attn_func_module,
     get_flash_attn_lds_bytes,
@@ -284,6 +288,43 @@ def _get_kernel_gfx11(
     )
 
 
+@lru_cache(maxsize=64)
+def _get_varlen_kernel_gfx11(
+    device_index: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    causal: bool,
+    dtype_str: str,
+    softmax_scale: float | None,
+    num_waves: int,
+    block_n: int,
+    vt_rows: int,
+    head_group: int | None,
+    token_strides: tuple[int, int, int],
+    return_lse: bool,
+    rope: str | None = None,
+):
+    # device_index intentionally participates in the cache key.
+    return build_flash_attn_varlen_func_module_gfx11(
+        rope=rope,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        causal=causal,
+        dtype_str=dtype_str,
+        sm_scale=softmax_scale,
+        num_waves=num_waves,
+        block_n=block_n,
+        vt_rows=vt_rows,
+        head_group=head_group,
+        q_token_stride=token_strides[0],
+        k_token_stride=token_strides[1],
+        v_token_stride=token_strides[2],
+        num_kv_heads=num_kv_heads,
+        return_lse=return_lse,
+    )
+
+
 def _gfx11_direct(t: torch.Tensor) -> bool:
     """True if the gfx11 kernel reads ``t`` in place: head_dim and heads packed
     (strides 1 and head_dim), token / batch strides multiples of 8 elements and a
@@ -325,6 +366,189 @@ def _gfx11_config(
     if arch == "gfx1151" and head_dim == 128 and min(seq_q, seq_kv) >= 4096:
         return 32, 32, max(g for g in range(1, 9) if num_heads % g == 0)
     return 16, 32, None
+
+
+def _gfx11_varlen_config(
+    arch: str,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    num_heads: int,
+    head_dim: int,
+    batch: int,
+    causal: bool,
+) -> tuple[int, int, int | None, int]:
+    """(num_waves, block_n, head_group, vt_rows) for the gfx11 kernel on a
+    varlen call; ``vt_rows`` is the number of keys per LDS write in the V
+    transpose.
+
+    Causal (decoder prefill), measured on gfx1151 with 14 / 2 heads at head_dim
+    64, 32 / 8 and 16 / 8 heads at head_dim 128 and 8 / 2 heads at head_dim 256,
+    on single and batched prefills of 256-8192 tokens, query chunks over a 2-4x
+    longer prefix and speculative-decode batches (4-8 queries over 2048-4096
+    keys):
+
+    - 128-row query blocks everywhere: under the mask the blocks of one sequence
+      do very different amounts of work, and smaller blocks balance them. The
+      batched rule's 256 rows lost 5-45% on prefills and about 2x on speculative
+      decode, where a 4-row sequence pads to a whole block.
+    - head_dim up to 64: 64 keys, 2 keys per transpose write.
+    - head_dim up to 128: 32 keys. A chunk of queries over a prefix at least
+      twice as long walks a long KV range per block and takes 64 keys with 8-key
+      transpose writes, in 256-row blocks from 512 queries over 4096+ keys,
+      where 128 rows lost 4-8% (single and batched chunks); a 6144+ token
+      prefill takes the same 256-row tile (2%).
+    - head_dim above 128: 32 keys (64 do not fit the LDS at head_dim 256) with
+      8-key transpose writes, 17-33% faster than 2-key writes.
+
+    Non-causal, head_dim up to 64, measured on gfx1151 with 16-head and
+    12-head head_dim-64 ViTs on the 863 ``cu_seqlens`` patterns of a recorded
+    vLLM video workload (1-16 images of 144-8160 tokens), weighted by call
+    count. The first rule took the query tile of 128 / 192 / 256 rows that pads
+    the longest sequence least (ties to the larger) and 64 keys with 4-key
+    transpose writes for at most four sequences of 512+ tokens, else 32 keys.
+    Every (rows) x (32 / 64 keys) x (2 / 4 transpose keys) combination was then
+    measured on the patterns under 1280 tokens, and a band changes only where
+    one choice beats the first rule on both head counts without losing on any
+    pattern:
+
+    - 128-row blocks with 2-key writes: 32 keys at 193-511 tokens (9% over
+      the first rule), 64 keys at 640-767 tokens (5-6%) and from 1024 tokens
+      (7% up to 1280, 3-3.5% beyond).
+    - the first rule stays up to 192 tokens, at 512-639 and 768-1023 tokens,
+      and at 256-383 tokens with more than four sequences: there its
+      padding-least tile wins, by up to 23% on 3 x 160 tokens, and the other
+      choices lose on some patterns of one head count.
+
+    Whole workload: 3.6% (16 heads) and 3.1% (12 heads) over the first rule,
+    no pattern slower by more than 2.2%.
+
+    Non-causal head_dim 65-72 (the 16 x 72 ViTs of Qwen3-VL 8B+ and Qwen3.5
+    9B+), same patterns and grid, against the batched rule's 256-row / 32-key
+    tile: the larger K / V tiles favour 192 rows where head_dim 64 took 128.
+    Up to 192 tokens and at 384-511 the padding-least tile with 32 keys (50%
+    and 2%); 193-383 tokens 128 rows / 32 keys (32%); 512-767 tokens with at
+    most four sequences the padding-least of 128 / 192 rows with 64 keys, with
+    more sequences 32 keys below 640 and the batched tile above (10%);
+    768-1023 with at most four sequences the padding-least of 192 / 256 rows
+    with 64 keys, else the batched tile (3%); 1024-1279 the padding-least tile
+    with 64 keys for at most four sequences, else 32 (5%); 192 rows / 64 keys
+    at 1280-1535, and up to 2047 for at most four sequences (6%); from there
+    the padding-least of 192 / 256 rows with 64 keys (3%). All with 2-key
+    writes. Whole workload 3.7%, no pattern slower beyond the 2.3% noise
+    between two runs of the same tile.
+
+    Other non-causal head dims keep the batched rule with 2-key writes.
+    """
+    if causal:
+        if head_dim <= 64:
+            return 8, 64, None, 2
+        if head_dim <= 128:
+            chunk = max_seqlen_k >= 2 * max_seqlen_q
+            if max_seqlen_k >= 4096 and (
+                max_seqlen_q >= 6144 or (chunk and max_seqlen_q >= 512)
+            ):
+                return 16, 64, None, 8
+            if chunk:
+                return 8, 64, None, 8
+            return 8, 32, None, 2
+        return 8, 32, None, 8
+    if head_dim <= 64:
+        mx = max_seqlen_q
+        if (
+            mx <= 192
+            or 512 <= mx < 640
+            or 768 <= mx < 1024
+            or (256 <= mx < 384 and batch > 4)
+        ):
+            # The first rule: the query tile that pads the longest sequence
+            # least, 64 keys for at most four sequences of 512+ tokens.
+            num_waves = min(
+                (8, 12, 16), key=lambda n: (-(-mx // (16 * n)) * 16 * n, -n)
+            )
+            block_n = 64 if batch <= 4 and mx >= 512 else 32
+            return num_waves, block_n, None, 4 if block_n == 64 else 2
+        if mx < 512:
+            return 8, 32, None, 2
+        return 8, 64, None, 2
+    if head_dim <= 72:
+        mx = max_seqlen_q
+        few = batch <= 4
+
+        def pad_least(cands: tuple[int, ...]) -> int:
+            return min(cands, key=lambda n: (-(-mx // (16 * n)) * 16 * n, -n))
+
+        if mx <= 192 or 384 <= mx < 512:
+            return pad_least((8, 12, 16)), 32, None, 2
+        if mx < 384:
+            return 8, 32, None, 2
+        if mx < 768:
+            if few:
+                return pad_least((8, 12)), 64, None, 2
+            if mx < 640:
+                return pad_least((8, 12, 16)), 32, None, 2
+            return 16, 32, None, 2
+        if mx < 1024:
+            return (pad_least((12, 16)), 64, None, 2) if few else (16, 32, None, 2)
+        if mx < 1280:
+            return pad_least((8, 12, 16)), 64 if few else 32, None, 2
+        if mx < 1536 or (mx < 2048 and few):
+            return 12, 64, None, 2
+        return pad_least((12, 16)), 64, None, 2
+    num_waves, block_n, head_group = _gfx11_config(
+        arch, max_seqlen_q, max_seqlen_k, num_heads, head_dim
+    )
+    return num_waves, block_n, head_group, 4 if block_n >= 64 else 2
+
+
+def _gfx11_varlen_rope_config(
+    max_seqlen: int, num_heads: int, batch: int
+) -> tuple[int, int]:
+    """(num_waves, block_n) for the gfx11 varlen kernel with RoPE in the kernel.
+
+    Every query block rotates the K tiles it walks, so fewer, larger query
+    blocks pay less for it than in the plain varlen kernel. Measured on gfx1151
+    with 16-head and 12-head head_dim-64 ViTs on the 863 cu_seqlens patterns of
+    a recorded vLLM video workload (1-16 images of 144-8160 tokens), weighted by
+    call count:
+
+    - query tile: 128 rows (8 waves) for sequences under 512 tokens (192 and
+      256 rows lost 1-7% there). Longer ones take 512 rows (32 waves) when that
+      pads the longest sequence at most 3% more than 192 rows (12 waves) and
+      still gives at least 64 workgroups; otherwise 256 rows (16 waves) from
+      3000 tokens, which gained 2% over 192 rows, and 192 rows below.
+    - KV tile: 64 keys (4-12% faster than 32) unless there are more than four
+      sequences of under 512 tokens, where 32 keys keep more blocks resident.
+
+    The caller builds this kernel with ``vt_rows=2``: with the rotation in the
+    loop, 2 keys per V transpose write beat 4 by 0.3-0.6% at 64 keys on every
+    tile, and by 2-3% on the short sequences.
+    """
+    block_n = 32 if max_seqlen < 512 and batch > 4 else 64
+    if max_seqlen < 512:
+        return 8, block_n
+
+    def padded(rows: int) -> int:
+        return -(-max_seqlen // rows) * rows
+
+    big_blocks = -(-max_seqlen // 512) * num_heads * batch
+    if padded(512) <= 1.03 * padded(192) and big_blocks >= 64:
+        return 32, block_n
+    return (16 if max_seqlen >= 3000 else 12), block_n
+
+
+def _gfx11_thd_direct(t: torch.Tensor) -> bool:
+    """THD counterpart of ``_gfx11_direct``: ``[total, heads, head_dim]`` is read
+    in place when head_dim and heads are packed, the token stride is a multiple
+    of 8 elements and at least one row, and the start is 16-byte aligned. Covers
+    plain THD and views of a packed ``[total, 3, H, D]`` tensor."""
+    total, num_heads, head_dim = t.shape
+    s_t, s_h, s_d = t.stride()
+    return (
+        s_d == 1
+        and (num_heads == 1 or s_h == head_dim)
+        and (total == 1 or (s_t >= num_heads * head_dim and s_t % 8 == 0))
+        and t.data_ptr() % 16 == 0
+    )
 
 
 def _flydsl_flash_attn_func_gfx11(
@@ -422,6 +646,164 @@ def _flydsl_flash_attn_func_gfx11(
             if out is not None and not write_in_place:
                 out.copy_(o)
                 o = out
+    return (o, lse) if return_lse else o
+
+
+def _gfx11_varlen_supported(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    *,
+    softmax_scale,
+    causal,
+    dropout_p,
+    window_size,
+    bias,
+    alibi_slopes,
+    sink,
+    block_table,
+    return_attn_probs,
+    descales,
+    out,
+) -> bool:
+    """Gate for the gfx11 varlen kernel: packed THD bf16 / f16, head_dim % 8 == 0,
+    GQA by head ratio, int32 ``cu_seqlens`` of equal length on the device, and
+    none of the options the kernel has no code for. Causal takes separate tables:
+    the mask is bottom-right aligned, as in flash-attn."""
+    if q.dim() != 3 or k.dim() != 3 or v.dim() != 3 or k.shape != v.shape:
+        return False
+    if q.dtype not in (torch.bfloat16, torch.float16) or not (
+        q.dtype == k.dtype == v.dtype
+    ):
+        return False
+    if q.shape[2] != k.shape[2] or q.shape[2] % 8 != 0 or q.shape[2] == 0:
+        return False
+    if k.shape[1] < 1 or q.shape[1] % k.shape[1] != 0:
+        return False
+    if not (q.is_cuda and k.device == q.device and v.device == q.device):
+        return False
+    for cu in (cu_seqlens_q, cu_seqlens_k):
+        if (
+            not torch.is_tensor(cu)
+            or cu.dtype != torch.int32
+            or cu.dim() != 1
+            or cu.numel() < 2
+            or cu.device != q.device
+        ):
+            return False
+    if cu_seqlens_q.numel() != cu_seqlens_k.numel():
+        return False
+    if softmax_scale is not None and (
+        torch.is_tensor(softmax_scale) or not (0 < float(softmax_scale) < float("inf"))
+    ):
+        return False
+    if dropout_p != 0.0 or any(w >= 0 for w in window_size[:2]):
+        return False
+    if len(window_size) > 2 and window_size[2] != 0:
+        return False
+    if (
+        bias is not None
+        or alibi_slopes is not None
+        or sink is not None
+        or block_table is not None
+        or return_attn_probs
+        or any(d is not None for d in descales)
+    ):
+        return False
+    return out is None or (
+        out.shape == q.shape and out.dtype == q.dtype and out.device == q.device
+    )
+
+
+def _flydsl_flash_attn_varlen_gfx11(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    softmax_scale,
+    causal,
+    out,
+    return_lse,
+    arch,
+):
+    """gfx11 varlen launch; ``_gfx11_varlen_supported`` has accepted the call.
+    Returns ``out`` (``[total_q, H, D]``), or ``(out, lse)`` with ``return_lse``
+    (lse fp32 ``[H, total_q]``, flash-attn's varlen convention)."""
+    total_q, num_heads, head_dim = q.shape
+    batch = cu_seqlens_q.numel() - 1
+    num_waves, block_n, head_group, vt_rows = _gfx11_varlen_config(
+        arch, max_seqlen_q, max_seqlen_k, num_heads, head_dim, batch, causal
+    )
+    # Switching the current device costs several microseconds; a 208-token ViT
+    # image takes 13. Only do it when q lives on another device.
+    device_ctx = (
+        nullcontext()
+        if q.device.index == torch.cuda.current_device()
+        else torch.cuda.device(q.device.index)
+    )
+    with device_ctx:
+        stream = torch.cuda.current_stream(q.device)
+
+        def _readable(t):
+            if _gfx11_thd_direct(t):
+                return t
+            c = t.contiguous()
+            return (
+                c
+                if _gfx11_thd_direct(c)
+                else t.clone(memory_format=torch.contiguous_format)
+            )
+
+        q_c, k_c, v_c = (_readable(t) for t in (q, k, v))
+        cu_q, cu_k = cu_seqlens_q.contiguous(), cu_seqlens_k.contiguous()
+        token_strides = tuple(
+            t.stride(0) if t.shape[0] > 1 else t.shape[1] * head_dim
+            for t in (q_c, k_c, v_c)
+        )
+        for t, seq, tok in zip(
+            (q_c, k_c, v_c), (max_seqlen_q, max_seqlen_k, max_seqlen_k), token_strides
+        ):
+            # Per-sequence buffer descriptors address with 32-bit byte offsets.
+            rows = (seq - 1) * tok + t.shape[1] * head_dim
+            if rows * t.element_size() >= 2**31:
+                raise ValueError("one sequence of q/k/v must be smaller than 2 GiB")
+        write_in_place = (
+            out is not None and out.is_contiguous() and out.data_ptr() % 16 == 0
+        )
+        o = (
+            out
+            if write_in_place
+            else torch.empty(q.shape, dtype=q.dtype, device=q.device)
+        )
+        lse = (
+            torch.empty(num_heads, total_q, dtype=torch.float32, device=q.device)
+            if return_lse
+            else None
+        )
+        exe = _get_varlen_kernel_gfx11(
+            device_index=q.device.index,
+            num_heads=num_heads,
+            num_kv_heads=k.shape[1],
+            head_dim=head_dim,
+            causal=causal,
+            dtype_str=_torch_dtype_to_str(q.dtype),
+            softmax_scale=softmax_scale,
+            num_waves=num_waves,
+            block_n=block_n,
+            vt_rows=vt_rows,
+            head_group=head_group,
+            token_strides=token_strides,
+            return_lse=return_lse,
+        )
+        exe(q_c, k_c, v_c, o, cu_q, cu_k, batch, max_seqlen_q, stream=stream, lse=lse)
+        if out is not None and not write_in_place:
+            out.copy_(o)
+            o = out
     return (o, lse) if return_lse else o
 
 
@@ -1018,7 +1400,220 @@ def flydsl_flash_attn_varlen_fwd(
             ),
         )
 
+    elif gfxip.startswith(("gfx110", "gfx115")):
+        # gfx11 (RDNA3 / RDNA3.5), not gfx117x: its WMMA follows the gfx12 layout.
+        try:
+            _max_q, _max_k = int(max_seqlen_q), int(max_seqlen_k)
+        except (TypeError, ValueError):
+            return None
+        if _max_q < 1 or _max_k < 0:
+            return None
+        if not _gfx11_varlen_supported(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            dropout_p=dropout_p,
+            window_size=window_size,
+            bias=bias,
+            alibi_slopes=alibi_slopes,
+            sink=sink,
+            block_table=block_table,
+            return_attn_probs=return_attn_probs,
+            descales=(q_descale, k_descale, v_descale),
+            out=out,
+        ):
+            return None
+        return _flydsl_flash_attn_varlen_gfx11(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            _max_q,
+            _max_k,
+            None if softmax_scale is None else float(softmax_scale),
+            bool(causal),
+            out,
+            return_lse,
+            gfxip,
+        )
+
     return None
+
+
+def flydsl_flash_attn_varlen_qkv_rope_fwd(
+    qkv: torch.Tensor,
+    num_heads: int,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+    softmax_scale: float | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """Vision-encoder attention from the packed qkv projection, RoPE included.
+
+    For ViT blocks such as the Qwen2.5-VL / Qwen3-VL vision attention: ``qkv`` is
+    the qkv linear output, one row ``[q (H*D) | k (H*D) | v (H*D)]`` per packed
+    token, as ``[total, 3*H*D]``, ``[total, 1, 3*H*D]`` or ``[total, 3, H, D]``
+    (inner dims contiguous, any row stride). Q and K are rotated with NeoX RoPE
+    over the whole head (``x[d] * cos[d] - x[d + D/2] * sin[d]``,
+    ``x[d + D/2] * cos[d] + x[d] * sin[d]``) using ``cos`` / ``sin`` of shape
+    ``[total, D/2]`` (bf16 or fp32, one row per token), then attend within each
+    ``cu_seqlens`` sequence (self-attention, non-causal). Equivalent to the
+    separate rotary + ``flydsl_flash_attn_varlen_fwd``, without writing the
+    rotated Q / K to memory.
+
+    Returns ``[total, H, D]`` (``out`` if given), or None when the call is not
+    supported here, so the caller falls back to the unfused path. gfx110x /
+    gfx115x, bf16 / f16 qkv, ``head_dim % 16 == 0``.
+    """
+    from ...jit.utils.chip_info import get_gfx_runtime
+
+    gfxip = get_gfx_runtime()
+    if not gfxip.startswith(("gfx110", "gfx115")):
+        return None
+    if not (torch.is_tensor(qkv) and qkv.is_cuda) or num_heads < 1:
+        return None
+    if qkv.dtype not in (torch.bfloat16, torch.float16):
+        return None
+    total = qkv.shape[0]
+    if qkv.dim() == 4:
+        if qkv.shape[1] != 3 or qkv.shape[2] != num_heads:
+            return None
+        head_dim = qkv.shape[3]
+        inner_ok = (
+            qkv.stride(3) == 1
+            and qkv.stride(2) == head_dim
+            and qkv.stride(1) == num_heads * head_dim
+        )
+    elif qkv.dim() in (2, 3):
+        if qkv.dim() == 3 and qkv.shape[1] != 1:
+            return None
+        width = qkv.shape[-1]
+        if width % (3 * num_heads):
+            return None
+        head_dim = width // (3 * num_heads)
+        inner_ok = qkv.stride(-1) == 1
+    else:
+        return None
+    if not inner_ok or head_dim % 16 != 0 or total < 1:
+        return None
+    tok = qkv.stride(0) if total > 1 else 3 * num_heads * head_dim
+    if tok % 8 != 0 or qkv.data_ptr() % 16 != 0:
+        return None
+    for t in (cos, sin):
+        if (
+            not torch.is_tensor(t)
+            or t.dim() != 2
+            or t.shape != (total, head_dim // 2)
+            or t.dtype not in (torch.bfloat16, torch.float32)
+            or t.device != qkv.device
+            or t.stride(1) != 1
+            or (t.stride(0) * t.element_size()) % 16 != 0
+            or t.data_ptr() % 16 != 0
+        ):
+            return None
+    if cos.dtype != sin.dtype or cos.stride(0) != sin.stride(0):
+        return None
+    if (
+        not torch.is_tensor(cu_seqlens)
+        or cu_seqlens.dtype != torch.int32
+        or cu_seqlens.dim() != 1
+        or cu_seqlens.numel() < 2
+        or cu_seqlens.device != qkv.device
+    ):
+        return None
+    try:
+        max_seqlen = int(max_seqlen)
+    except (TypeError, ValueError):
+        return None
+    if max_seqlen < 1:
+        return None
+    if softmax_scale is not None:
+        if torch.is_tensor(softmax_scale) or not (
+            0 < float(softmax_scale) < float("inf")
+        ):
+            return None
+        softmax_scale = float(softmax_scale)
+    if out is not None and (
+        out.shape != (total, num_heads, head_dim)
+        or out.dtype != qkv.dtype
+        or out.device != qkv.device
+    ):
+        return None
+    # Per-sequence buffer descriptors address with 32-bit byte offsets.
+    if ((max_seqlen - 1) * tok + 3 * num_heads * head_dim) * 2 >= 2**31:
+        return None
+
+    batch = cu_seqlens.numel() - 1
+    num_waves, block_n = _gfx11_varlen_rope_config(max_seqlen, num_heads, batch)
+    head_group = None
+    row = qkv.view(total, 3 * num_heads * head_dim) if qkv.dim() != 4 else None
+    if row is None:
+        q, k, v = qkv.unbind(1)
+    else:
+        part = num_heads * head_dim
+        q, k, v = (
+            row[:, i * part : (i + 1) * part].view(total, num_heads, head_dim)
+            for i in range(3)
+        )
+    device_ctx = (
+        nullcontext()
+        if qkv.device.index == torch.cuda.current_device()
+        else torch.cuda.device(qkv.device.index)
+    )
+    with device_ctx:
+        write_in_place = (
+            out is not None and out.is_contiguous() and out.data_ptr() % 16 == 0
+        )
+        o = (
+            out
+            if write_in_place
+            else torch.empty(
+                total, num_heads, head_dim, dtype=qkv.dtype, device=qkv.device
+            )
+        )
+        exe = _get_varlen_kernel_gfx11(
+            device_index=qkv.device.index,
+            num_heads=num_heads,
+            num_kv_heads=num_heads,
+            head_dim=head_dim,
+            causal=False,
+            dtype_str=_torch_dtype_to_str(qkv.dtype),
+            softmax_scale=softmax_scale,
+            num_waves=num_waves,
+            block_n=block_n,
+            # With RoPE in the loop, 2 keys per V transpose write measured
+            # faster than 4 at 64 keys (see _gfx11_varlen_rope_config).
+            vt_rows=2,
+            head_group=head_group,
+            token_strides=(tok, tok, tok),
+            return_lse=False,
+            rope="bf16" if cos.dtype == torch.bfloat16 else "f32",
+        )
+        cu = cu_seqlens.contiguous()
+        exe(
+            q,
+            k,
+            v,
+            o,
+            cu,
+            cu,
+            batch,
+            max_seqlen,
+            stream=torch.cuda.current_stream(qkv.device),
+            cos=cos,
+            sin=sin,
+        )
+        if out is not None and not write_in_place:
+            out.copy_(o)
+            o = out
+    return o
 
 
 def flydsl_flash_attn_paged_fwd(
