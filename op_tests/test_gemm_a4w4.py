@@ -248,8 +248,9 @@ def test_gemm(dtype, M, N, K):
     x_scales = x_scales.view(torch.uint8)
     w_scales = w_scales.view(torch.uint8)
     a = run_torch(x, w, x_scales, w_scales, dtype)
-    from aiter.ops.gemm_op_a4w4 import get_GEMM_config
+    from aiter.ops.gemm_op_a4w4 import _a4w4_fallback_config, get_GEMM_config
 
+    out_shape = ((M + 31) // 32 * 32, N)
     candidates = {
         "tuned": lambda: gemm_a4w4(
             x, wshuffle, x_scales_shuffle, w_scales_shuffle, dtype=dtype
@@ -260,6 +261,29 @@ def test_gemm(dtype, M, N, K):
         "gfx": get_gfx(),
         "configured kernel": config["kernelName"] if config else "asm",
     }
+    if config and str(config["kernelName"]).startswith(("triton_", "flydsl_")):
+        fallback = _a4w4_fallback_config(config)
+        if fallback["kernelName"] and not fallback["kernelName"].startswith("_ZN"):
+            candidates["baseline"] = lambda: aiter.gemm_a4w4_blockscale(
+                x,
+                wshuffle,
+                x_scales_shuffle,
+                w_scales_shuffle,
+                torch.empty(out_shape, dtype=dtype, device=x.device),
+                kernelName=fallback["kernelName"],
+                splitK=fallback["splitK"],
+            )[:M]
+        else:
+            candidates["baseline"] = lambda: aiter.gemm_a4w4_asm(
+                x,
+                wshuffle,
+                x_scales_shuffle,
+                w_scales_shuffle,
+                torch.empty(out_shape, dtype=dtype, device=x.device),
+                fallback["kernelName"],
+                bpreshuffle=True,
+                log2_k_split=fallback["splitK"],
+            )[:M]
     for name, fn in candidates.items():
         result, us = run_perftest(fn)
         err = checkAllclose(
