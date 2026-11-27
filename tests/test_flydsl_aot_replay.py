@@ -778,6 +778,7 @@ def _run_in_a_process(body, tmp_path, timeout=120, **env):
         capture_output=True,
         text=True,
         timeout=timeout,
+        check=False,  # the caller asserts on what it printed
     )
 
 
