@@ -23,8 +23,6 @@ gfx950 serves a ds_read_b128 in four phases of 16 lanes: lane groups
 layouts give each phase 16 distinct 16-byte bank groups.
 """
 
-import functools
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 
@@ -51,6 +49,7 @@ from aiter.ops.flydsl.kernels.gemm_hooks import (
 from aiter.ops.flydsl.kernels.kernels_common import (
     ceildiv,
     format_kernel_name,
+    per_device_cache,
     set_slp_vectorize_once_used,
 )
 from aiter.ops.flydsl.kernels.mfma_preshuffle_pipeline import split_row_major_2d
@@ -251,7 +250,7 @@ def _mfma_i8(a, b, c):
     )
 
 
-@functools.cache
+@per_device_cache
 def compile_int8_gemm_4w(
     *,
     K: int,

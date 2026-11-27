@@ -142,7 +142,6 @@ def validate_4wave_config(
         )
 
 
-@functools.lru_cache(maxsize=1024)
 def compile_4wave_gemm(
     *,
     K: int,
@@ -151,12 +150,21 @@ def compile_4wave_gemm(
     num_xcds: int | None = None,
     bias: bool = False,
 ):
-    """One 4-wave launcher of the op path (``compile_int8_gemm_4w``, which compiles each
-    configuration once); this cache keeps the op's per-call lookup short.
+    """The current device's 4-wave launcher of the op path (``compile_int8_gemm_4w``,
+    which compiles each configuration once per device); this cache keeps the op's
+    per-call lookup short.
 
     With ``bias`` the epilogue adds a per-column FP32 bias before the BF16 rounding, and
     the launcher's column operand holds the N column scales followed by the N biases.
     """
+    return _compile_4wave_gemm(
+        torch.cuda.current_device(), K, xcd_swizzle, num_cu, num_xcds, bias
+    )
+
+
+@functools.lru_cache(maxsize=1024)
+def _compile_4wave_gemm(device, K, xcd_swizzle, num_cu, num_xcds, bias):
+    # device only keys the cache: a launcher runs on the device that first ran it.
     _lazy_import()
     if num_xcds is None:
         num_xcds = get_cdna4_num_xcds() if int(xcd_swizzle) > 0 else 8
@@ -333,6 +341,12 @@ def run_gemm_a8w8_bpreshuffle_4wave(
             f"[FlyDSL INT8 4wave] unsupported kernel contract: {kernel_name!r}"
         )
     M, N, K = _validate_runtime(XQ, WQ, x_scale, w_scale, Out)
+    device = XQ.get_device()
+    if device != torch.cuda.current_device():
+        with torch.cuda.device(device):
+            return run_gemm_a8w8_bpreshuffle_4wave(
+                XQ, WQ, x_scale, w_scale, Out, kernel_name, bias
+            )
     if int(config["k"]) != K:
         raise ValueError(
             f"[FlyDSL INT8 4wave] kernelName K={config['k']} does not match K={K}"
@@ -357,12 +371,13 @@ def run_gemm_a8w8_bpreshuffle_4wave(
     columns = _as_scale(w_scale, N, "w_scale")
     if bias is not None:
         columns = torch.cat((columns, _as_bias(bias, N, XQ.device)))
-    executable = compile_4wave_gemm(
-        K=K,
-        xcd_swizzle=int(config["xcd_swizzle"]),
-        num_cu=int(config["num_cu"]),
-        num_xcds=int(config["num_xcds"]),
-        bias=bias is not None,
+    executable = _compile_4wave_gemm(
+        device,
+        K,
+        int(config["xcd_swizzle"]),
+        int(config["num_cu"]),
+        int(config["num_xcds"]),
+        bias is not None,
     )
     _run_compiled(
         executable,
@@ -373,7 +388,7 @@ def run_gemm_a8w8_bpreshuffle_4wave(
         columns,
         M,
         N,
-        _fx.Stream(torch.cuda.current_stream(device=XQ.device)),
+        _fx.Stream(torch.cuda.current_stream(device)),
     )
     return Out
 

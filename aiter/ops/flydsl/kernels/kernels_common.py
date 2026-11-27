@@ -4,11 +4,13 @@ Keep helper naming consistent with other kernel helpers (e.g. `mfma_preshuffle_p
 but this module is intentionally small and MLIR-dialect facing.
 """
 
+import functools
 from collections.abc import Callable
 from threading import Lock
 from typing import Any
 
 import flydsl.expr as fx
+import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import builtin
 from flydsl._mlir.dialects import gpu as _gpu
@@ -21,6 +23,25 @@ LOG2E = 1.4426950408889634
 def ceildiv(numer, denom):
     """Ceiling division preserving Python-int or DSL-scalar operand types."""
     return (numer + denom - 1) // denom
+
+
+def per_device_cache(fn):
+    """``functools.cache`` that also keys on the current device.
+
+    FlyDSL loads a compiled kernel into the device that first runs it and keeps it on
+    the launcher, so a process that drives several GPUs needs a launcher per device.
+    """
+
+    @functools.cache
+    def cached(device, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        return cached(torch.cuda.current_device(), *args, **kwargs)
+
+    wrapper.cache_clear = cached.cache_clear
+    return wrapper
 
 
 def format_kernel_name(name: str) -> str:

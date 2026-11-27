@@ -316,5 +316,34 @@ def test_rejects_what_it_would_run_otherwise():
         )
 
 
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two GPUs")
+@torch.no_grad()
+def test_each_device_runs_its_own_launcher():
+    """cuda:0 runs the kernel and the op first; cuda:1 then matches them bit for bit, the
+    op with cuda:0 still current."""
+    from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_4wave import (
+        default_4wave_kernel_name,
+        run_gemm_a8w8_bpreshuffle_4wave,
+    )
+
+    m, n, k = 300, 512, 512
+    case = _case(m, n, k, True, seed=5)
+    keys = ("x", "w", "w_shuffled", "x_scale", "w_scale", "bias")
+    other = {key: case[key].to("cuda:1") for key in keys}
+
+    def op(c):
+        out = torch.empty((m, n), dtype=torch.bfloat16, device=c["x"].device)
+        name = default_4wave_kernel_name(m, n, k)
+        return run_gemm_a8w8_bpreshuffle_4wave(
+            c["x"], c["w_shuffled"], c["x_scale"], c["w_scale"], out, name, c["bias"]
+        )
+
+    expected = (_launch(case, amax=True)()[0], op(case))
+    with torch.cuda.device(1):
+        kernel = _launch(other, amax=True)()[0]
+    for want, got in zip(expected, (kernel, op(other))):
+        assert torch.equal(want.cpu().view(torch.int16), got.cpu().view(torch.int16))
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
