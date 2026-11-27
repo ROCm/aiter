@@ -51,6 +51,7 @@ SHAPES = [
     (129, 6144, 512, 5),  # MiniMax-M3 (INTER 384 pads to 512)
     (129, 6144, 768, 5),  # MiniMax-M3
     (129, 6144, 1536, 5),  # MiniMax-M3 TP=2
+    (128, 6144, 512, 4),  # MiniMax-M3 shared expert not fused, TP=8 (INTER 384->512)
     (128, 6144, 768, 4),  # MiniMax-M3 shared expert not fused, TP=4
     (128, 6144, 1536, 4),  # MiniMax-M3 shared expert not fused, TP=2
     (256, 3072, 256, 8),  # MiniMax-M2.5 TP=6
@@ -60,8 +61,11 @@ SHAPES = [
     (384, 7168, 256, 8),  # Kimi-K2 TP=8
     (512, 4096, 512, 10),  # Qwen3.5 TP=1
     (513, 4096, 512, 11),  # Qwen3.5 shared-expert variant
+    (513, 4096, 256, 11),  # Qwen3.5 TP=4 (shared-expert variant)
     (513, 8192, 256, 11),  # Qwen3.8 TP=8 (shared-expert variant)
     (513, 2560, 768, 11),  # Qwen3.8-Flash-Next TP=1 (INTER 640 pads to 768)
+    (513, 2560, 512, 11),  # Qwen3.8-Flash-Next TP=2 (INTER 384 pads to 512)
+    (513, 2560, 256, 11),  # Qwen3.8-Flash-Next TP=4 (INTER 160 pads to 256)
     (512, 2048, 512, 10),  # Qwen3-Coder-Next TP=1
     (256, 6144, 2048, 8),  # GLM-5.3 TP=1
     (256, 6144, 3072, 6),  # Inkling TP=1

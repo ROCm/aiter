@@ -1,0 +1,7 @@
+{
+    "any": {
+        "waves_per_eu": 0,
+        "cache_modifier": null,
+        "num_warps": 1
+    }
+}

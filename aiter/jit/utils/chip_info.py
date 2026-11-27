@@ -95,29 +95,17 @@ def get_gfx():
     return GFX_MAP.get(gfx_num, "unknown")
 
 
-_LDS_CAPACITY_BYTES = {
-    "gfx90a": 64 * 1024,
-    "gfx942": 64 * 1024,
-    "gfx950": 160 * 1024,
-    "gfx1100": 64 * 1024,
-    "gfx1101": 64 * 1024,
-    "gfx1102": 64 * 1024,
-    "gfx1150": 64 * 1024,
-    "gfx1151": 64 * 1024,
-    "gfx1200": 64 * 1024,
-    "gfx1201": 64 * 1024,
-    "gfx1250": 320 * 1024,
-    "gfx1250-strict": 320 * 1024,
-}
+if __package__:
+    from . import lds_capacity as _lds_capacity
+else:
+    import lds_capacity as _lds_capacity
+
+_LDS_CAPACITY_BYTES = _lds_capacity._LDS_CAPACITY_BYTES
 
 
 def get_lds_capacity_bytes(gfx: str | None = None) -> int:
     """Return the architectural LDS capacity for one workgroup."""
-    arch = (gfx or get_gfx()).split(":", 1)[0].lower()
-    try:
-        return _LDS_CAPACITY_BYTES[arch]
-    except KeyError as exc:
-        raise ValueError(f"Unknown LDS capacity for architecture {arch!r}") from exc
+    return _lds_capacity.get_lds_capacity_bytes(gfx or get_gfx())
 
 
 @functools.lru_cache(maxsize=1)
@@ -151,9 +139,7 @@ def get_gfx_runtime() -> str:
 
             if torch.version.hip is None or not torch.cuda.is_available():
                 raise
-            gfx_arch = (
-                torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0].lower()
-            )
+            gfx_arch = get_gfx_runtime_for_device(0)
     supported = set(GFX_MAP.values())
     if gfx_arch not in supported:
         raise KeyError(
@@ -161,6 +147,18 @@ def get_gfx_runtime() -> str:
             f"Supported architectures: {sorted(supported)}"
         )
     return gfx_arch
+
+
+def get_gfx_runtime_for_device(device=None) -> str:
+    """Return the selected Torch device's exact runtime architecture.
+
+    None (or an unindexed CUDA device) follows the current device each call,
+    so this query must not use the node-wide get_gfx_runtime cache. Device
+    errors propagate. Build-time GPU_ARCHS does not affect this query.
+    """
+    import torch
+
+    return torch.cuda.get_device_properties(device).gcnArchName.split(":", 1)[0].lower()
 
 
 def _parse_asic_revision(value: str) -> int:
@@ -340,6 +338,49 @@ def get_cu_num_custom_op() -> int:
 def get_cu_num():
     cu_num = get_cu_num_custom_op()
     return cu_num
+
+
+_CDNA4_CUS_PER_XCD = 32
+_CDNA4_MAX_XCDS = 8
+
+
+def get_cdna4_num_xcds(cu_num: int | None = None) -> int:
+    """Return the number of CDNA4 XCDs represented by ``cu_num``.
+
+    gfx950 exposes 32 CUs per XCD. ``cu_num`` can come from a live device, the
+    ``CU_NUM`` override, or offline AOT metadata, so reject partial-XCD and
+    out-of-range values here rather than silently truncating them.
+    """
+    cu_num = int(get_cu_num() if cu_num is None else cu_num)
+    if cu_num <= 0 or cu_num % _CDNA4_CUS_PER_XCD != 0:
+        raise ValueError(
+            "CDNA4 CU count must be a positive multiple of "
+            f"{_CDNA4_CUS_PER_XCD}, got {cu_num}"
+        )
+    num_xcds = cu_num // _CDNA4_CUS_PER_XCD
+    if num_xcds > _CDNA4_MAX_XCDS:
+        raise ValueError(
+            f"CDNA4 XCD count must be no larger than {_CDNA4_MAX_XCDS}, "
+            f"got {num_xcds} from {cu_num} CUs"
+        )
+    return num_xcds
+
+
+@functools.cache
+def get_cu_num_device(device_index: int) -> int:
+    """CU count of one GPU, which `CU_NUM` may lower but never raise past the card.
+
+    Unlike `get_cu_num()`, it does not assert when the node's GPUs differ, e.g. an
+    iGPU beside the card.
+    """
+    import torch
+
+    props = torch.cuda.get_device_properties(device_index)
+    physical = torch_processor_count_to_cu(
+        props.gcnArchName, props.multi_processor_count
+    )
+    cu_num = int(os.getenv("CU_NUM", "0"))
+    return min(cu_num, physical) if cu_num > 0 else physical
 
 
 def get_build_targets() -> list[tuple[str, int]]:
@@ -641,6 +682,8 @@ def _get_pci_chip_id(device_id=None):
 
 
 MI308_CHIP_IDS = {0x74A2, 0x74A8, 0x74B6, 0x74BC}
+# MI300A is the gfx942 APU: 228 CUs and 6 XCCs, against MI300X's 304 and 8.
+MI300A_CHIP_IDS = {0x74A0}
 
 
 def get_device_name():
@@ -666,6 +709,8 @@ def _get_device_name(device_id: int) -> str:
         chip_id = _get_pci_chip_id(device_id)
         if chip_id in MI308_CHIP_IDS:
             return "MI308"
+        if chip_id in MI300A_CHIP_IDS:
+            return "MI300A"
         return "MI300"
     elif gfx == "gfx950":
         num_xcds = _num_xcds_for_device(device_id)

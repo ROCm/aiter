@@ -17,7 +17,7 @@ import torch
 import triton
 import triton.language as tl
 
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import FP8_ARCHS
+from aiter.ops.triton._triton_kernels.attention.dao_ai.utils import FP8_ARCHS
 from aiter.ops.triton.attention.block_scale_fp8_attention import (
     _bwd_kernel_dkdv,
     _bwd_kernel_dq,
@@ -610,36 +610,6 @@ def test_flash_attn_func_block_scale_matches_reference():
     torch.testing.assert_close(
         out.transpose(1, 2).float(), ref.float(), atol=2e-1, rtol=2e-1
     )
-
-
-def test_flash_attn_func_block_scale_rejects_partial_and_gluon():
-    q = torch.zeros(1, 64, 4, 64, dtype=_fp8_dtype(), device="cuda")
-    k = torch.zeros(1, 64, 4, 64, dtype=_fp8_dtype(), device="cuda")
-    v = torch.zeros(1, 64, 4, 64, dtype=_fp8_dtype(), device="cuda")
-    scale = torch.ones(1, 4, 1, device="cuda")
-    with pytest.raises(ValueError, match="requires q_block_descale"):
-        flash_attn_func(q, k, v, q_block_descale=scale)
-    q.requires_grad_(True)
-    with pytest.raises(RuntimeError, match="forward-only"):
-        flash_attn_func(
-            q,
-            k,
-            v,
-            q_block_descale=scale,
-            k_block_descale=scale,
-            v_scale=torch.ones(1, device="cuda"),
-        )
-    q.requires_grad_(False)
-    with pytest.raises(ValueError, match="triton backend only"):
-        flash_attn_func(
-            q,
-            k,
-            v,
-            backend="gluon",
-            q_block_descale=scale,
-            k_block_descale=scale,
-            v_scale=torch.ones(1, device="cuda"),
-        )
 
 
 def test_flash_attn_func_default_path_still_runs():

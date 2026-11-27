@@ -24,6 +24,54 @@ _GLUON_PLAIN_AR_MAX_BYTES = 4 << 20
 
 should_nccl_symm_mem_allreduce = False
 _SUPPORTED_ALL2ALL_MANAGER_BACKENDS = ("flydsl", "mori", "mori_v2")
+# all_reduce_rmsnorm_per_token_quant is faster than the Lamport one-shot of the same
+# op (bf16 or per-token FP8 out) up to about this many rows: TP4 graph replay, hidden
+# 2048 to 8192. The Lamport kernel takes more rows where it can.
+_GLUON_AR_NORM_MAX_TOKENS = 128
+
+
+def _use_gluon_ar_norm(comm, input_, res_inp_, weight_, lamport: bool) -> bool:
+    """True if all_reduce_rmsnorm_per_token_quant takes the call: up to the 4 MiB of
+    the plain Gluon all-reduce, and up to _GLUON_AR_NORM_MAX_TOKENS rows if the
+    Lamport one-shot can take it (lamport). As for Lamport, operand addresses are
+    not looked at: all ranks must take the same path."""
+    if comm.gluon_ar_plain is None or input_.dim() != 2:
+        return False
+    from aiter.ops.triton.comms.all_reduce import norm_fits
+
+    tokens, hidden = input_.shape
+    return (
+        norm_fits(tokens, hidden, comm.gluon_ar_plain[1])
+        and (tokens <= _GLUON_AR_NORM_MAX_TOKENS or not lamport)
+        and input_.dtype == res_inp_.dtype == weight_.dtype == torch.bfloat16
+        and res_inp_.shape == input_.shape
+        and weight_.shape == (hidden,)
+        and input_.is_contiguous()
+        and res_inp_.is_contiguous()
+        and weight_.is_contiguous()
+        and input_.device == res_inp_.device == weight_.device
+        and input_.numel() * input_.element_size() <= _GLUON_PLAIN_AR_MAX_BYTES
+    )
+
+
+def _gluon_ar_norm(comm, input_, res_inp_, weight_, eps, gemma_norm, quant):
+    """all_reduce_rmsnorm_per_token_quant on the inboxes of the plain Gluon
+    all-reduce: one launch instead of the all-reduce, the HIP add_rmsnorm and with
+    quant the per-token quant."""
+    from aiter.ops.triton.comms.all_reduce import all_reduce_rmsnorm_per_token_quant
+
+    inboxes, calls = comm.gluon_ar_plain
+    return all_reduce_rmsnorm_per_token_quant(
+        input_,
+        res_inp_,
+        weight_,
+        eps,
+        gemma_norm,
+        quant=quant,
+        group=comm.cpu_group,
+        inboxes=inboxes,
+        calls=calls,
+    )
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
@@ -136,7 +184,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         # Inboxes and call counters of the Gluon fused all-reduce + RMSNorm and of the
         # plain Gluon all-reduce (gfx1250, 4 ranks), one set for each op. They live as
-        # long as the process: destroy() runs after the groups are gone.
+        # long as the process: destroy() does not free them.
         self.gluon_ar = None
         self.gluon_ar_plain = None
         if (
@@ -234,6 +282,22 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.all2all_backend if value is not None else None
         )
 
+    def all_reduce_add(
+        self,
+        input_,
+        other,
+        use_new: bool = True,
+        ca_fp8_quant: bool = False,
+        prefill_support: bool = False,
+    ) -> torch.Tensor:
+        """all_reduce(input_ + other). gfx1250: the Lamport one-shot kernel adds
+        the pair as it sends, so the sum is never written; elsewhere the add
+        and then all_reduce."""
+        ca_comm = self.ca_comm
+        if ca_comm is not None and ca_comm.should_lamport_ar_add(input_, other):
+            return ca_comm.lamport_ar_add(input_, other)
+        return self.all_reduce(input_ + other, use_new, ca_fp8_quant, prefill_support)
+
     def all_reduce(
         self,
         input_,
@@ -270,7 +334,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if (
             ca_comm is not None
             and not ca_comm.disabled
-            and ca_comm.should_custom_ar(input_, prefill_support)
+            and ca_comm.should_custom_plain_ar(input_, prefill_support)
         ):
             out = ca_comm.custom_all_reduce(input_, use_new, ca_fp8_quant)
             assert out is not None
@@ -292,6 +356,25 @@ class CudaCommunicator(DeviceCommunicatorBase):
         out = input_.clone()
         torch.distributed.all_reduce(out, group=self.device_group)
         return out
+
+    def dcp_lse_merge(
+        self,
+        o: torch.Tensor,
+        lse: torch.Tensor,
+        owned_counts: torch.Tensor | None = None,
+        return_lse: bool = False,
+    ):
+        """Merge decode context parallel partials with the custom kernel (see
+        CustomAllreduce.custom_dcp_merge), or return None when it does not take
+        them and the caller merges its own way."""
+        ca_comm = self.ca_comm
+        if (
+            ca_comm is None
+            or ca_comm.disabled
+            or not ca_comm.should_custom_dcp_merge(o, lse)
+        ):
+            return None
+        return ca_comm.custom_dcp_merge(o, lse, owned_counts, return_lse)
 
     def fused_allreduce_rmsnorm(
         self,
@@ -362,10 +445,28 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 self.cpu_group,
                 *self.gluon_ar,
             )
+        ca_comm = self.ca_comm
+        # gfx1250 Lamport one-shot fused kernel: no barrier and no copy-in, so
+        # it beats the routes below up to its size cap (see
+        # _LAMPORT_AR_RMS_MAX_BYTES).
+        lamport = (
+            ca_comm is not None
+            and x_pad_to_multiple == 0
+            and ca_comm.should_lamport_ar_rms(input_, res_inp_, weight_, out_n)
+        )
+        if x_pad_to_multiple == 0 and _use_gluon_ar_norm(
+            self, input_, res_inp_, weight_, lamport
+        ):
+            return _gluon_ar_norm(
+                self, input_, res_inp_, weight_, eps, gemma_norm, quant=False
+            )
+        if lamport:
+            return ca_comm.lamport_fused_ar_rms(
+                input_, res_inp_, weight_, eps, gemma_norm
+            )
         can_use_fuse_ar_rms = (
             n <= 16384 and total_bytes < 8 * 1024 * 8192 and self.world_size != 6
         )
-        ca_comm = self.ca_comm
         can_use_custom_ar = (
             ca_comm is not None
             and not ca_comm.disabled
@@ -382,7 +483,25 @@ class CudaCommunicator(DeviceCommunicatorBase):
             if self._ar_1stage_override is not None
             else (total_bytes <= total_bytes_limit)
         )
+
         qr_comm = self.qr_comm
+
+        # FlyDSL fused first when enabled. Try first the quantized kernels,
+        # then exact one-shot.
+        if (
+            not use_general_path
+            and x_pad_to_multiple == 0
+            and input_n == n
+            and not gemma_norm
+        ):
+            for comm in (qr_comm, ca_comm):
+                if (
+                    comm is not None
+                    and not comm.disabled
+                    and comm.should_fly_allreduce_rmsnorm(input_, res_inp_, weight_)
+                ):
+                    return comm.fly_allreduce_rmsnorm(input_, res_inp_, weight_, eps)
+
         if (
             not use_1stage
             and not use_general_path
@@ -555,7 +674,26 @@ class CudaCommunicator(DeviceCommunicatorBase):
             else 64 * 1024 * 1024
         )
         ca_comm = self.ca_comm
-        if (
+        lamport = ca_comm is not None and ca_comm.should_lamport_ar_rms(
+            input_, res_inp_, weight_, hidden_dim
+        )
+        if not emit_bf16 and _use_gluon_ar_norm(
+            self, input_, res_inp_, weight_, lamport
+        ):
+            out, res_out, scale_out = _gluon_ar_norm(
+                self, input_, res_inp_, weight_, eps, gemma_norm, quant=True
+            )
+        elif lamport:
+            # The Lamport one-shot of fused_allreduce_rmsnorm with the per-token
+            # quant in the same kernel: one launch, the bits of the two below.
+            result = ca_comm.lamport_fused_ar_rms_quant(
+                input_, res_inp_, weight_, eps, gemma_norm, emit_bf16
+            )
+            if emit_bf16:
+                out, res_out, scale_out, bf16_out = result
+            else:
+                out, res_out, scale_out = result
+        elif (
             ca_comm is not None
             and not ca_comm.disabled
             and (

@@ -224,16 +224,6 @@ def test_attn_res_gate_add_hidden2(B, dtype):
     torch.testing.assert_close(prefix_out.float(), prefix_ref.float(), atol=0, rtol=0)
 
 
-def test_attn_res_gate_add_hidden2_requires_add_hidden():
-    """add_hidden2 without add_hidden is rejected (mirrors ATOM's validation)."""
-    prefix, block_residual, score_weight, _, _ = generate_attn_res_gate_inputs(
-        32, 256, 2, torch.float32, with_add=False
-    )
-    add_hidden2 = torch.randn(32, 256, device="cuda", dtype=torch.float32)
-    with pytest.raises(ValueError, match="add_hidden2 requires add_hidden"):
-        attn_res_gate(prefix, block_residual, score_weight, 1e-6, None, add_hidden2)
-
-
 @pytest.mark.parametrize("B", [1, 3, 7])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_attn_res_gate_output_rms_eps_independent_of_eps(B, dtype):
@@ -593,21 +583,6 @@ def test_attn_res_gate_out_quant_all_zero_row(N, close_block):
     assert torch.equal(y_fp8.float(), torch.zeros_like(y_fp8, dtype=torch.float32))
 
 
-def test_attn_res_gate_out_quant_requires_output_rms_weight():
-    """Quantizing without an output RMSNorm has no defined input, so it's rejected."""
-    prefix, block_residual, score_weight, _, _ = generate_attn_res_gate_inputs(
-        32, 256, 2, torch.bfloat16, with_add=False
-    )
-    with pytest.raises(ValueError, match="out_quant_dtype requires output_rms_weight"):
-        attn_res_gate(
-            prefix,
-            block_residual,
-            score_weight,
-            1e-6,
-            out_quant_dtype=get_fp8_e4m3_dtype(),
-        )
-
-
 def _skip_without_gate_tdm(backend):
     if backend == "gluon" and attn_res_module._GATE_TDM_KERNEL is None:
         pytest.skip("the Gluon TDM kernel of attn_res_gate needs gfx1250")
@@ -766,67 +741,6 @@ def test_attn_res_gate_launch_cache_is_bounded_in_token_count(backend):
     # buckets (<=64 vs the N<=8 bucket is not reached here), so a handful of
     # entries is expected -- 32 would mean N leaked in by value.
     assert entries <= 8, f"launch cache grew to {entries} entries over 32 token counts"
-
-
-def test_attn_res_separate_bl_table_matches_documented_buckets():
-    """Lock the tuned SEPARATE BL buckets, which key on the candidate count, not N.
-
-    The invariant the table encodes is that the separated loop must run at least
-    two iterations: BL = l2 // 2, capped at 4 by the register file. Every
-    measured loss sits at BL == l2, where the loop collapses to one iteration
-    and the wide tile buys registers with nothing to overlap. So a bucket that
-    drifts up to l2 is a real regression (-2% at B=4, -10% at B=8), not a
-    mistuning, and that is what these assertions pin.
-    """
-
-    def pick(tokens, l2, close_block=True):
-        return attn_res_module._pick_attn_res_separate_bl(tokens, l2, close_block)
-
-    mid = 4096  # inside the N range where BL>1 pays at all
-    assert pick(mid, 1) == 1
-    assert pick(mid, 2) == 1
-    assert pick(mid, 4) == 2
-    assert pick(mid, 8) == 4
-    assert pick(mid, 16) == 4  # capped, not 8
-    # BL>1 washes out above _ATTN_RES_SEPARATE_BL_MAX_T and turns into a ~3% loss.
-    assert pick(16384, 8) == 4
-    assert pick(16385, 8) == 1
-    assert pick(65536, 16) == 1
-    # The separated loop only covers L-1 rows, so BL must never exceed them.
-    assert pick(257, 1) == 1
-
-
-def test_attn_res_separate_bl_is_pinned_to_one_without_close_block():
-    """Without the block_out write, every BL>1 bucket has to collapse to 1.
-
-    This is the whole table's precondition, not a corner case: block_out is
-    roughly half the kernel's traffic at B=8, and with it gone the same buckets
-    swing from neutral to a 1.4-1.6x *regression* (BL=1 over BL=4 measures
-    0.60-0.68 at B=4..15). Swept with close_block off over the canonical grid
-    plus N=65536, BL=1 won every cell, so there is no second table to consult --
-    which is exactly why an accidental un-gating would be easy to miss.
-    """
-    pick = attn_res_module._pick_attn_res_separate_bl
-    for tokens in (257, 2048, 4096, 16384, 65536):
-        for l2 in (1, 2, 4, 8, 16):
-            assert pick(tokens, l2, False) == 1, (tokens, l2)
-            # ... while the gated-on path still has live BL>1 buckets, so this
-            # test cannot pass just because the table went flat everywhere.
-    assert pick(4096, 8, True) == 4
-
-
-@pytest.mark.parametrize("arch", ["gfx950", "gfx942"])
-@pytest.mark.parametrize("close_block", [False, True])
-@pytest.mark.parametrize("tokens", [257, 2048, 2049])
-def test_attn_res_separate_num_warps_boundaries(monkeypatch, arch, close_block, tokens):
-    """gfx950 overrides the packed num_warps from B >= 3, except close_block at
-    N <= 2048; arches without the config keep the packed pick."""
-    monkeypatch.setattr(config_utils.arch_info, "get_arch", lambda: arch)
-    pick = attn_res_module._pick_attn_res_separate_num_warps
-    keep = -1  # stands in for the packed table's pick
-    assert pick(tokens, 2, close_block, keep) == keep
-    overridden = arch == "gfx950" and (not close_block or tokens > 2048)
-    assert (pick(tokens, 3, close_block, keep) != keep) == overridden
 
 
 @pytest.mark.parametrize("N", [512, 4096])

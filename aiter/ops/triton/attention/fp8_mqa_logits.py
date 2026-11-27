@@ -102,6 +102,8 @@ def fp8_mqa_logits(
     cu_starts,
     cu_ends,
     clean_logits=True,
+    out: torch.Tensor | None = None,
+    out_offsets: torch.Tensor | None = None,
 ):
     """
     This function computes the logits to be used by a topk function for sparse attention.
@@ -115,9 +117,22 @@ def fp8_mqa_logits(
     clean_logits: bool. If True, positions outside [cu_starts[i], cu_ends[i]) in row i
                   are explicitly written as -inf. If False those positions are
                   unspecified.
+    out:         optional output on Q.device: [seq_len, seq_len_kv] float32, unit
+                  column stride, row stride of at least seq_len_kv. With
+                  out_offsets: a contiguous 1-D float32 buffer. A mismatch raises
+                  ValueError.
+    out_offsets: optional contiguous [seq_len] int32 or int64 on Q.device. Row i
+                  writes its scores for keys [cu_starts[i], cu_ends[i]) from
+                  element out_offsets[i] of out, so out must hold
+                  out_offsets[i] + min(cu_ends[i], seq_len_kv) - max(cu_starts[i], 0)
+                  elements. The wrapper does not check this (it needs a host
+                  sync). The rows must not overlap. Other elements of out are
+                  not written; clean_logits has no effect.
 
     Returns:
-    logits:      [seq_len, seq_len_kv], dtype float32 (must be initialized to -inf, because of causal masking)
+    logits:      out, or an allocated [seq_len, seq_len_kv] float32 tensor. Only
+                  with clean_logits and not in packed mode, values outside each
+                  row's range are -inf.
     """
 
     seq_len, num_heads, head_size = Q.shape
@@ -125,10 +140,45 @@ def fp8_mqa_logits(
     # TODO: Currently assuming num_heads and head_size is power of 2.
     assert num_heads & (num_heads - 1) == 0, "num q. heads should be power of 2."
     assert head_size & (head_size - 1) == 0, "head size should be power of 2."
-    # Initialize with -inf because of causal masking
+    # An allocated output pads each row to 256 columns.
     aligned_size = 256
     seq_len_kv_aligned = (seq_len_kv + aligned_size - 1) // aligned_size * aligned_size
-    if clean_logits:
+    packed = out_offsets is not None
+    logits = out
+    if packed:
+        if out is None or out.dtype != torch.float32 or out.dim() != 1:
+            raise ValueError("out_offsets requires a 1-D float32 out buffer")
+        if out.stride(0) != 1 or out.device != Q.device:
+            raise ValueError("packed out must be contiguous and on Q.device")
+        if (
+            out_offsets.dtype not in (torch.int32, torch.int64)
+            or tuple(out_offsets.shape) != (seq_len,)
+            or not out_offsets.is_contiguous()
+            or out_offsets.device != Q.device
+        ):
+            raise ValueError(
+                "out_offsets must be contiguous [seq_len] int32 or int64 on Q.device"
+            )
+    elif out is not None:
+        if out.dtype != torch.float32 or out.dim() != 2:
+            raise ValueError(
+                f"out must be a 2-D float32 tensor, got {out.dtype} "
+                f"with {out.dim()} dims"
+            )
+        if tuple(out.shape) != (seq_len, seq_len_kv):
+            raise ValueError(
+                f"out must be [{seq_len}, {seq_len_kv}], got {tuple(out.shape)}"
+            )
+        if out.stride(1) != 1 or (seq_len > 1 and out.stride(0) < seq_len_kv):
+            raise ValueError(
+                "out needs a unit column stride and a row stride of at least "
+                f"seq_len_kv={seq_len_kv}, got strides {out.stride()}"
+            )
+        if out.device != Q.device:
+            raise ValueError(f"out is on {out.device}, Q on {Q.device}")
+        if clean_logits:
+            out.fill_(-float("inf"))
+    elif clean_logits:  # -inf outside each row's causal range
         logits = torch.full(
             (seq_len, seq_len_kv_aligned),
             fill_value=-float("inf"),
@@ -146,7 +196,9 @@ def fp8_mqa_logits(
     stride_q_s, stride_q_h, stride_q_d = Q.stride()
     stride_kv_s, stride_kv_d = KV.stride()
     stride_w_s, stride_w_h = weights.stride()
-    stride_logits_s, stride_logits_k = logits.stride()
+    stride_logits_s, stride_logits_k = (0, 1) if packed else logits.stride()
+    if seq_len == 0:
+        return logits
     if not use_gluon:
         # On gfx942 (MI300X), drop to (64, 1) when our LDS estimate predicts
         # the default (128, 2) tile would not fit two co-resident workgroups
@@ -189,6 +241,8 @@ def fp8_mqa_logits(
             cu_start_ptr=cu_starts,
             cu_end_ptr=cu_ends,
             logits_ptr=logits,
+            out_offsets_ptr=out_offsets,
+            PACKED=packed,
             seq_len=seq_len,
             seq_len_kv=seq_len_kv,
             NUM_HEADS=num_heads,
@@ -216,9 +270,11 @@ def fp8_mqa_logits(
         # fallback path widens those strides to int64 instead.
         INT32_MAX = 2**31 - 1
         max_kv_offset = (seq_len_kv - 1) * stride_kv_s + (head_size - 1) * stride_kv_d
-        max_logits_offset = (seq_len - 1) * stride_logits_s + (
-            seq_len_kv - 1
-        ) * stride_logits_k
+        max_logits_offset = (
+            logits.numel() - 1
+            if packed
+            else (seq_len - 1) * stride_logits_s + (seq_len_kv - 1) * stride_logits_k
+        )
         use_buffer_load = max_kv_offset <= INT32_MAX
         use_buffer_store = max_logits_offset <= INT32_MAX
 
@@ -277,8 +333,8 @@ def fp8_mqa_logits(
                 m_chunk = mfma_nonk_dim
             else:
                 m_chunk = 0
-            # Relax the store masking if we don't have to provide clean logits
-            relaxed_store = 0 if clean_logits else 1
+            # Relax the store masking without clean logits; packed rows need exact masks
+            relaxed_store = 0 if clean_logits or packed else 1
             other = {
                 "USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED,
                 "BLOCK_M": block_m,
@@ -310,6 +366,8 @@ def fp8_mqa_logits(
             cu_start_ptr=cu_starts,
             cu_end_ptr=cu_ends,
             logits_ptr=logits,
+            out_offsets_ptr=out_offsets,
+            PACKED=packed,
             seq_len=seq_len,
             seq_len_kv=seq_len_kv,
             NUM_HEADS=num_heads,

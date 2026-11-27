@@ -5,6 +5,7 @@
 
 import functools
 
+from aiter.ops.flydsl.aot_launch import aot_factory
 from aiter.ops.flydsl.moe_common import GateMode
 
 from .mixed_moe_gemm_2stage_common import (
@@ -13,6 +14,7 @@ from .mixed_moe_gemm_2stage_common import (
 )
 
 
+@aot_factory("mixed_fhmoe_gemm1")
 @functools.cache
 def compile_mixed_fhmoe_gemm1(
     *,
@@ -83,6 +85,7 @@ def compile_mixed_fhmoe_gemm1(
     )
 
 
+@aot_factory("mixed_fhmoe_gemm2")
 @functools.cache
 def compile_mixed_fhmoe_gemm2(
     *,

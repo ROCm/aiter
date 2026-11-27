@@ -4,6 +4,9 @@ aiter/_version.py
 # aiter install mode
 aiter/install_mode
 
+# FlyDSL AOT cache entries (aiter/ops/flydsl/aot_cache.py)
+aiter/jit/flydsl_aot/
+
 # Prerequisites
 *.d
 

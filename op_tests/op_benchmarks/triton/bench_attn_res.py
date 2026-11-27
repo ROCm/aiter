@@ -29,6 +29,7 @@ Legacy --warmup/--rep remain millisecond budgets, calibrated per case to whole
 graph replays. They exclude the extra calibration, capture and setup work.
 """
 
+import functools
 import math
 import sys
 
@@ -56,6 +57,33 @@ from op_tests.triton_tests.fusions.test_attn_res import (
     generate_attn_res_gate_inputs,
     generate_attn_res_inputs,
 )
+
+
+def _generate_attn_res_gate_pool_inputs(N, D, L, dtype, with_add, with_add2, onorm):
+    prefix, block_residual, score_weight, add_hidden, add_hidden2 = (
+        generate_attn_res_gate_inputs(
+            N, D, L, dtype, with_add=with_add, with_add2=with_add2
+        )
+    )
+    output_rms_weight = torch.randn(D, dtype=dtype, device="cuda") if onorm else None
+    return (
+        prefix,
+        block_residual,
+        score_weight,
+        add_hidden,
+        add_hidden2,
+        output_rms_weight,
+    )
+
+
+def _generate_attn_res_fwd_pool_inputs(N, D, L, dtype, with_onorm, layout):
+    query, residuals, rms_weight, output_rms_weight = generate_attn_res_inputs(
+        N, D, L, dtype, with_onorm=with_onorm
+    )
+    if layout == "packed":
+        residuals = torch.stack(residuals, dim=-2).contiguous()
+    return query, residuals, rms_weight, output_rms_weight
+
 
 arg_to_torch_dtype = {
     "fp16": torch.float16,
@@ -130,19 +158,16 @@ def bench_attn_res_fn(N, D, L, layout, args):
     if args.op == "gate":
         out_quant_dtype = get_fp8_e4m3_dtype() if args.out_quant == "fp8" else None
 
-        def generate_inputs():
-            inputs = generate_attn_res_gate_inputs(
-                N,
-                D,
-                L - 1,
-                dtype,
-                with_add=args.add_hidden or args.add_hidden2,
-                with_add2=args.add_hidden2,
-            )
-            output_rms_weight = (
-                torch.randn(D, dtype=dtype, device="cuda") if args.onorm else None
-            )
-            return (*inputs, output_rms_weight)
+        generate_inputs = functools.partial(
+            _generate_attn_res_gate_pool_inputs,
+            N,
+            D,
+            L - 1,
+            dtype,
+            args.add_hidden or args.add_hidden2,
+            args.add_hidden2,
+            args.onorm,
+        )
 
         keys = [
             "prefix",
@@ -168,13 +193,9 @@ def bench_attn_res_fn(N, D, L, layout, args):
 
     else:
 
-        def generate_inputs():
-            query, residuals, rms_weight, output_rms_weight = generate_attn_res_inputs(
-                N, D, L, dtype, with_onorm=args.onorm
-            )
-            if layout == "packed":
-                residuals = torch.stack(residuals, dim=-2).contiguous()
-            return query, residuals, rms_weight, output_rms_weight
+        generate_inputs = functools.partial(
+            _generate_attn_res_fwd_pool_inputs, N, D, L, dtype, args.onorm, layout
+        )
 
         keys = ["query", "residuals", "rms_weight", "output_rms_weight"]
         pool = bencher.build_pool([generate_inputs], [keys])
