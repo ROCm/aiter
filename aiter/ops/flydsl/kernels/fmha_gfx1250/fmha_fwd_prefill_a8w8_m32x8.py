@@ -333,6 +333,7 @@ USE_VSM = os.environ.get("AITER_FMHA_A8W8_VEC_SOFTMAX", "1") != "0"
 # it actually used; LSE then carries P's FP8 rounding (same as the ASM FP8 kernel).
 # AITER_FMHA_A8W8_WMMA_ROWSUM=0 restores the f32 VALU row sum everywhere.
 USE_WSUM = os.environ.get("AITER_FMHA_A8W8_WMMA_ROWSUM", "1") != "0"
+WSUM_MASKED = os.environ.get("AITER_FMHA_A8W8_WMMA_ROWSUM", "1") == "2"
 _VSM_NO_REASSOC = (
     _fx_arith.FastMathFlags.nnan
     | _fx_arith.FastMathFlags.ninf
@@ -1468,8 +1469,7 @@ def _attention_core_multi_kv_tiles(
         USE_WSUM
         and USE_W128
         and (n_block // (v_mgr.loads_per_frag * WMMA_N)) % 2 == 0
-        and not mask_left
-        and not mask_right
+        and (WSUM_MASKED or (not mask_left and not mask_right))
     )
     # Per-q-tile carried state: [m, d, O, P_0 .. P_{num_kv_frags-1}]. The lagging half
     # carries the f32 s_acc in the P slots instead of bf16 P; the slot count is the same.
