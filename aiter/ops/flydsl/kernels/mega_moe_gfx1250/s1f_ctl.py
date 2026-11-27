@@ -84,6 +84,11 @@ _S1F_MAX_RECV_BY_SHAPE: dict = {
     # EP8 top-16 (K3 decode c1024): bucket 8192 runs stage-1 fused (tile 128).
     (8, 16): 8192,
     (16, 6): 1 << 30,
+    # EP16 top-16 (K3): stage-1 fused up to a 8192 bound (tpr 512) on tile 64/64.
+    # EP4 runs emulating EP16 (bench --sim_ep 16, -e 224, SiTUv2), us/layer,
+    # fused vs best unfused: tpr 320 210 vs 219, 384 217 vs 227, 448 239 vs
+    # 260, 512 266 vs 296 (the old 4096 cap fell back: 237/244/268/297).
+    (16, 16): 8192,
     (2, 7): 1 << 30,
     (4, 7): 1 << 30,
 }
