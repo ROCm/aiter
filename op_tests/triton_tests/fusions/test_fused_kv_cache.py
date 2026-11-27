@@ -7,6 +7,7 @@ from aiter.ops.triton.fusions.fused_kv_cache import (
     fused_qk_rope_cat_and_cache_mla,
     fused_qk_rope_cosine_cache_llama,
     fused_qk_rope_reshape_and_cache,
+    q_nope_prestored_supported,
     reshape_and_cache_k4v8,
 )
 from aiter.ops.triton.utils._triton import arch_info
@@ -1692,6 +1693,19 @@ def test_seg_packed_mla_cache_cuda_graph():
     graphed.copy_(sentinel)
     graph.replay()
     torch.testing.assert_close(graphed, eager, atol=0, rtol=0)
+
+
+def test_q_nope_prestored_supported_matches_the_wrapper():
+    # Where the query says yes the wrapper runs with q_nope_prestored=True, and
+    # elsewhere it rejects it. The case has one KV head, one slot per token and
+    # a q_out, so only the arch / kernel clause decides.
+    case = _seg_case(7, 7, 8, torch.bfloat16)
+    cache = _fresh_cache(256, torch.bfloat16)
+    if q_nope_prestored_supported():
+        _run_seg(case, cache, 0, True, None)
+    else:
+        with pytest.raises(AssertionError, match="gfx1250 pure-decode"):
+            _run_seg(case, cache, 0, True, None)
 
 
 try:
