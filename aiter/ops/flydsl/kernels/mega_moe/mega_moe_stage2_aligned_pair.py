@@ -10,11 +10,15 @@ two experts sequentially with one accumulator set, and scatters their weighted
 sum once.  The ordinary Stage2 kernel concurrently handles all residual rows.
 """
 
+import functools
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import Int8, T
 from flydsl.runtime.device import get_rocm_arch
+
+from aiter.ops.flydsl.aot_launch import aot_factory
 
 from ..mxfp4_gemm_common import lds_typed_ptr, lds_vec_load
 from ..tensor_shim import (
@@ -158,6 +162,8 @@ def _pair_routewise_half_scatter(lds_a, lds_b, n_block_idx, wave, lane, *,
 
 
 # fmt: off
+@aot_factory("mega_moe_stage2_aligned_pair")
+@functools.cache
 def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
     experts: int, topk: int, rank: int, npes: int, max_tok: int,
     recv_cap: int, comb_inp_nbytes: int, BM: int = 32,
@@ -456,9 +462,6 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
     return launch
 
 
-_PAIR_LAUNCH_CACHE = {}
-
-
 # fmt: off
 def run_mega_moe_stage2_aligned_pair(arg_aq, arg_ascale, arg_bq, arg_bscale,
     arg_stids, arg_sweights, arg_expert_tile_end, arg_count_matrix,
@@ -466,11 +469,7 @@ def run_mega_moe_stage2_aligned_pair(arg_aq, arg_ascale, arg_bq, arg_bscale,
     i32_inter, i32_hidden, stream, **compile_kw):
 # fmt: on
     """Compile/cache and launch the aligned common-row Stage2 kernel."""
-    key = tuple(sorted(compile_kw.items()))
-    launch = _PAIR_LAUNCH_CACHE.get(key)
-    if launch is None:
-        launch = compile_mega_moe_stage2_aligned_pair(**compile_kw)
-        _PAIR_LAUNCH_CACHE[key] = launch
+    launch = compile_mega_moe_stage2_aligned_pair.lazy(**compile_kw)
     bm = int(compile_kw.get("BM", 64))
     max_m_blocks = (int(row_capacity) + bm - 1) // bm
     _run_compiled(
@@ -500,11 +499,7 @@ def preload_mega_moe_stage2_aligned_pair(arg_aq, arg_ascale, arg_bq, arg_bscale,
     i32_inter, i32_hidden, stream, **compile_kw):
 # fmt: on
     """Compile and load the aligned-pair Stage2 kernel without dispatching it."""
-    key = tuple(sorted(compile_kw.items()))
-    launch = _PAIR_LAUNCH_CACHE.get(key)
-    if launch is None:
-        launch = compile_mega_moe_stage2_aligned_pair(**compile_kw)
-        _PAIR_LAUNCH_CACHE[key] = launch
+    launch = compile_mega_moe_stage2_aligned_pair.lazy(**compile_kw)
     bm = int(compile_kw.get("BM", 64))
     max_m_blocks = (int(row_capacity) + bm - 1) // bm
     return _preload_compiled(
