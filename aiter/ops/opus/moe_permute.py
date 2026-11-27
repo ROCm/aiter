@@ -49,7 +49,9 @@ GROUP_ALIGN = 128  # rows every expert's group is padded to (OPUS_A16W16_GROUP_A
 # per expert: up to PLAN_MAX_EXPERTS experts (OPUS_MOE_PERMUTE_PLAN_* of the kernels).
 PLAN_BLOCK_TOKENS = 256
 PLAN_MAX_EXPERTS = 256
-PLAN_COUNT_BATCH = 64  # the counts workspace holds a multiple of this many blocks per expert
+PLAN_COUNT_BATCH = (
+    64  # the counts workspace holds a multiple of this many blocks per expert
+)
 
 # Accumulation structure of the d_weights dot product over H elements, fixed by K5:
 # the row is cut into chunks of DW_VEC elements; thread i of DW_THREADS adds the products of chunks
@@ -63,16 +65,27 @@ class MoEPermutePlan(NamedTuple):
     """The row of every token: the output of the plan kernels. On the device of expert_ids."""
 
     sorted_token_ids: torch.Tensor  # [R] int32   token of the row, -1: padding
-    reverse_sorted: torch.Tensor  # [N] int32     row of token i, -1: its id is not an expert
-    grouped_layout: torch.Tensor  # [R] int32     expert of the row, -1: padding (M-grouped layout)
-    group_rows: torch.Tensor  # [E] int32         rows of each expert, without padding (K-grouped layout)
-    num_valid_ids: torch.Tensor  # [1] int32      rows in use: up to the end of the last group; the rest is the tail
+    reverse_sorted: (
+        torch.Tensor
+    )  # [N] int32     row of token i, -1: its id is not an expert
+    grouped_layout: (
+        torch.Tensor
+    )  # [R] int32     expert of the row, -1: padding (M-grouped layout)
+    group_rows: (
+        torch.Tensor
+    )  # [E] int32         rows of each expert, without padding (K-grouped layout)
+    num_valid_ids: (
+        torch.Tensor
+    )  # [1] int32      rows in use: up to the end of the last group; the rest is the tail
 
 
 def moe_permute_rows(n: int, num_experts: int) -> int:
     """The most rows N tokens of num_experts experts can take, whatever their experts are: N rounded up to
-    GROUP_ALIGN (all of them in one group) and one more group of padding for every further expert."""
-    return (n + GROUP_ALIGN - 1) // GROUP_ALIGN * GROUP_ALIGN + GROUP_ALIGN * (num_experts - 1)
+    GROUP_ALIGN (all of them in one group) and one more group of padding for every further expert.
+    """
+    return (n + GROUP_ALIGN - 1) // GROUP_ALIGN * GROUP_ALIGN + GROUP_ALIGN * (
+        num_experts - 1
+    )
 
 
 # ---- kernel entries (csrc/opus_moe_permute/opus_moe_permute.cu) ------------------
@@ -92,17 +105,24 @@ def _plan_launch(
 
 # scatter copy: x_perm[r] = x[sorted_token_ids[r]], padding rows 0
 @compile_ops("module_moe_permute_opus", fc_name="opus_moe_permute_fwd", develop=True)
-def _permute_fwd_launch(x: torch.Tensor, sorted_token_ids: torch.Tensor, x_perm: torch.Tensor) -> None: ...
+def _permute_fwd_launch(
+    x: torch.Tensor, sorted_token_ids: torch.Tensor, x_perm: torch.Tensor
+) -> None: ...
 
 
 # gather copy: dx[i] = d_perm[reverse_sorted[i]]
 @compile_ops("module_moe_permute_opus", fc_name="opus_moe_permute_bwd", develop=True)
-def _permute_bwd_launch(d_perm: torch.Tensor, reverse_sorted: torch.Tensor, dx: torch.Tensor) -> None: ...
+def _permute_bwd_launch(
+    d_perm: torch.Tensor, reverse_sorted: torch.Tensor, dx: torch.Tensor
+) -> None: ...
 
 
 @compile_ops("module_moe_permute_opus", fc_name="opus_moe_unpermute_fwd", develop=True)
 def _unpermute_fwd_launch(
-    y_perm: torch.Tensor, reverse_sorted: torch.Tensor, weights: torch.Tensor, out: torch.Tensor
+    y_perm: torch.Tensor,
+    reverse_sorted: torch.Tensor,
+    weights: torch.Tensor,
+    out: torch.Tensor,
 ) -> None: ...
 
 
@@ -124,20 +144,25 @@ def _is_per_token(t: torch.Tensor, dtype: torch.dtype) -> bool:
     return t.dtype == dtype and (t.dim() == 1 or (t.dim() == 2 and t.shape[1] == 1))
 
 
-def moe_permute_plan(expert_ids: torch.Tensor, num_experts: int, exact: bool = True) -> MoEPermutePlan:
+def moe_permute_plan(
+    expert_ids: torch.Tensor, num_experts: int, exact: bool = True
+) -> MoEPermutePlan:
     """The plan for expert_ids (int32 [N] or [N, 1]). Not differentiable.
     exact True (default): R is the rows in use (the groups with their padding, a multiple of GROUP_ALIGN;
     GROUP_ALIGN when no id is an expert), so nothing behind the last group is allocated in x_perm / y_perm and
     in what the grouped GEMMs make of them. The [R] tables are views of tables of moe_permute_rows(N, E) rows;
     num_valid_ids is read back for it, so the call waits for the plan kernels.
-    exact False: R = moe_permute_rows(N, E), the upper bound known before the launch; nothing is read back."""
+    exact False: R = moe_permute_rows(N, E), the upper bound known before the launch; nothing is read back.
+    """
     if not _is_per_token(expert_ids, torch.int32):
         raise ValueError("expert_ids must be int32 [N] or [N, 1]")
     if not 0 < num_experts <= PLAN_MAX_EXPERTS:
         raise ValueError(f"num_experts must be in 1 .. {PLAN_MAX_EXPERTS}")
     n = expert_ids.shape[0]
     rows = moe_permute_rows(n, num_experts)
-    if rows >= 2**30:  # the plan kernels address the [R] tables with 32-bit byte offsets
+    if (
+        rows >= 2**30
+    ):  # the plan kernels address the [R] tables with 32-bit byte offsets
         raise ValueError("too many rows")
     dev = expert_ids.device
 
@@ -145,11 +170,15 @@ def moe_permute_plan(expert_ids: torch.Tensor, num_experts: int, exact: bool = T
         return torch.empty(shape, dtype=torch.int32, device=dev)
 
     plan = MoEPermutePlan(i32(rows), i32(n), i32(rows), i32(num_experts), i32(1))
+    blocks = (n + PLAN_BLOCK_TOKENS - 1) // PLAN_BLOCK_TOKENS
+    block_stride = (
+        (blocks + PLAN_COUNT_BATCH - 1) // PLAN_COUNT_BATCH * PLAN_COUNT_BATCH
+    )
     with torch.cuda.device(dev):
         _plan_launch(
             expert_ids.contiguous(),
             # workspace: the expert counts of every token block
-            i32(-(-(-(-n // PLAN_BLOCK_TOKENS)) // PLAN_COUNT_BATCH) * PLAN_COUNT_BATCH * num_experts),
+            i32(block_stride * num_experts),
             plan.reverse_sorted,
             plan.sorted_token_ids,
             plan.grouped_layout,
@@ -158,7 +187,10 @@ def moe_permute_plan(expert_ids: torch.Tensor, num_experts: int, exact: bool = T
         )
     if exact:
         used = max(int(plan.num_valid_ids), GROUP_ALIGN)
-        plan = plan._replace(sorted_token_ids=plan.sorted_token_ids[:used], grouped_layout=plan.grouped_layout[:used])
+        plan = plan._replace(
+            sorted_token_ids=plan.sorted_token_ids[:used],
+            grouped_layout=plan.grouped_layout[:used],
+        )
     return plan
 
 
@@ -186,7 +218,9 @@ class _MoEUnpermuteRows(torch.autograd.Function):
         y_perm = y_perm.contiguous()
         with torch.cuda.device(y_perm.device):
             if weights is None:
-                _permute_bwd_launch(y_perm, reverse_sorted, out)  # the gather copy of K3
+                _permute_bwd_launch(
+                    y_perm, reverse_sorted, out
+                )  # the gather copy of K3
             else:
                 weights = weights.contiguous()
                 _unpermute_fwd_launch(y_perm, reverse_sorted, weights, out)
@@ -204,7 +238,9 @@ class _MoEUnpermuteRows(torch.autograd.Function):
                 return d_perm, None, None, None
             y_perm, weights = ctx.saved_tensors
             d_weights = torch.empty_like(weights)
-            _unpermute_bwd_launch(d_out, y_perm, weights, ctx.sorted_token_ids, d_perm, d_weights)
+            _unpermute_bwd_launch(
+                d_out, y_perm, weights, ctx.sorted_token_ids, d_perm, d_weights
+            )
         return d_perm, d_weights, None, None
 
 
@@ -227,7 +263,8 @@ def moe_permute(
 ) -> tuple[torch.Tensor, MoEPermutePlan]:
     """x_perm [R, H]: row plan.reverse_sorted[i] = x[i], padding rows 0. Gradient: dx[i] = d_perm[row of i].
     weights: not read (moe_unpermute takes them). plan: reuse one already computed for these expert_ids
-    (expert_ids, num_experts and exact are then not read). exact: of moe_permute_plan (R = the rows in use)."""
+    (expert_ids, num_experts and exact are then not read). exact: of moe_permute_plan (R = the rows in use).
+    """
     if plan is None:
         plan = moe_permute_plan(expert_ids, num_experts, exact)
     _check_rows("x", x, plan.reverse_sorted.numel(), "expert_ids has")
@@ -235,13 +272,18 @@ def moe_permute(
     return x_perm, plan
 
 
-def moe_unpermute(y_perm: torch.Tensor, plan: MoEPermutePlan, weights: torch.Tensor | None = None) -> torch.Tensor:
+def moe_unpermute(
+    y_perm: torch.Tensor, plan: MoEPermutePlan, weights: torch.Tensor | None = None
+) -> torch.Tensor:
     """out [N, H]: out[i] = weights[i] * y_perm[plan.reverse_sorted[i]] (weights None: the row itself).
     Gradients: d_perm[row of i] = weights[i] * d_out[i] (padding rows 0; weights None: d_out[i] itself),
     d_weights[i] = dot(d_out[i], y_perm[row of i]). weights: fp32 [N] or [N, 1]."""
     _check_rows("y_perm", y_perm, plan.sorted_token_ids.numel(), "the plan has")
     if weights is not None and not (
-        _is_per_token(weights, torch.float32) and weights.shape[0] == plan.reverse_sorted.numel()
+        _is_per_token(weights, torch.float32)
+        and weights.shape[0] == plan.reverse_sorted.numel()
     ):
         raise ValueError("weights must be fp32 [N] or [N, 1], one per token")
-    return _MoEUnpermuteRows.apply(y_perm, weights, plan.sorted_token_ids, plan.reverse_sorted)
+    return _MoEUnpermuteRows.apply(
+        y_perm, weights, plan.sorted_token_ids, plan.reverse_sorted
+    )
