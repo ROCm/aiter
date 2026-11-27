@@ -21,6 +21,7 @@ from packaging.version import Version, parse
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
+from build_targets import base_gfx_arch
 from chip_info import _detect_native, get_gfx, get_gfx_list, get_gfx_runtime
 from cpp_extension import _jit_compile, executable_path, get_hip_version
 from file_baton import FileBaton
@@ -162,6 +163,22 @@ AITER_CONFIG_FMOE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fmoe.csv",
 )
 
+AITER_CONFIG_FMOE_SWIGLU_LIMIT = os.getenv(
+    "AITER_CONFIG_FMOE_SWIGLU_LIMIT",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_swiglu_limit_fmoe.csv",
+)
+
+AITER_CONFIG_FMOE_STAGE2_FP8 = os.getenv(
+    "AITER_CONFIG_FMOE_STAGE2_FP8",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_stage2_fp8_fmoe.csv",
+)
+
+# NVFP4 MoE kernel rows (aiter/ops/moe_nvfp4_dispatch.py)
+AITER_CONFIG_MOE_NVFP4 = os.getenv(
+    "AITER_CONFIG_MOE_NVFP4",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_moe_nvfp4.csv",
+)
+
 AITER_CONFIG_FHMOE = os.getenv(
     "AITER_CONFIG_FHMOE",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fhmoe.csv",
@@ -235,6 +252,11 @@ AITER_CONFIG_CONV3D_BF16 = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_conv3d.csv",
 )
 
+AITER_CONFIG_MQA_LOGITS = os.getenv(
+    "AITER_CONFIG_MQA_LOGITS",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_mqa_logits.csv",
+)
+
 # K5 opt BV tuned config. Per-model tuned rows live under model_configs/
 # (qwen3_5_*_chunk_gdn_h_opt_tuned.csv) and get merged into this canonical file by
 # get_config_file. It ships header-only: with no per-model table present
@@ -262,9 +284,20 @@ AITER_CONFIG_MEGA_MOE_TP = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/mega_moe_tp_tuned.csv",
 )
 
+# the small-M schedule's per-batch launch configs (row tile, CTAs, two-shot all-reduce)
+AITER_CONFIG_MEGA_MOE_TP_SM = os.getenv(
+    "AITER_CONFIG_MEGA_MOE_TP_SM",
+    f"{AITER_ROOT_DIR}/aiter/configs/mega_moe_tp_sm_tuned.csv",
+)
+
 AITER_CONFIG_MEGA_MOE_TP_BIGM = os.getenv(
     "AITER_CONFIG_MEGA_MOE_TP_BIGM",
     f"{AITER_ROOT_DIR}/aiter/configs/mega_moe_tp_bigm_tuned.csv",
+)
+
+AITER_CONFIG_PAGED_MQA_LOGITS = os.getenv(
+    "AITER_CONFIG_PAGED_MQA_LOGITS",
+    f"{AITER_ROOT_DIR}/aiter/configs/paged_mqa_logits_tuned.csv",
 )
 
 
@@ -281,6 +314,18 @@ def _runtime_power_selection() -> bool:
     if raw not in {"power", "efficiency", "power_efficiency"}:
         return False
     return "aiter" in sys.modules
+
+
+def model_config_files(tuned_file_name: str) -> list[str]:
+    """Per-model tuned CSVs merged with the default one when no env var is set."""
+    from pathlib import Path
+
+    model_config_dir = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs/")
+    return [
+        str(p)
+        for p in model_config_dir.glob(f"*{tuned_file_name}*.csv")
+        if (p.is_file() and "untuned" not in p.name)
+    ]
 
 
 class AITER_CONFIG:
@@ -361,6 +406,22 @@ class AITER_CONFIG:
         )
 
     @property
+    def AITER_CONFIG_FMOE_SWIGLU_LIMIT_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_FMOE_SWIGLU_LIMIT",
+            AITER_CONFIG_FMOE_SWIGLU_LIMIT,
+            "tuned_swiglu_limit_fmoe",
+        )
+
+    @property
+    def AITER_CONFIG_FMOE_STAGE2_FP8_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_FMOE_STAGE2_FP8",
+            AITER_CONFIG_FMOE_STAGE2_FP8,
+            "tuned_stage2_fp8_fmoe",
+        )
+
+    @property
     def AITER_CONFIG_FHMOE_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_FHMOE", AITER_CONFIG_FHMOE, "tuned_fhmoe"
@@ -435,6 +496,14 @@ class AITER_CONFIG:
         )
 
     @property
+    def AITER_CONFIG_MQA_LOGITS_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_MQA_LOGITS",
+            AITER_CONFIG_MQA_LOGITS,
+            "tuned_mqa_logits",
+        )
+
+    @property
     def AITER_CONFIG_GDN_K5_OPT_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_GDN_K5_OPT",
@@ -463,11 +532,27 @@ class AITER_CONFIG:
         )
 
     @property
+    def AITER_CONFIG_MEGA_MOE_TP_SM_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_MEGA_MOE_TP_SM",
+            AITER_CONFIG_MEGA_MOE_TP_SM,
+            "mega_moe_tp_sm_tuned",
+        )
+
+    @property
     def AITER_CONFIG_MEGA_MOE_TP_BIGM_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_MEGA_MOE_TP_BIGM",
             AITER_CONFIG_MEGA_MOE_TP_BIGM,
             "mega_moe_tp_bigm_tuned",
+        )
+
+    @property
+    def AITER_CONFIG_PAGED_MQA_LOGITS_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_PAGED_MQA_LOGITS",
+            AITER_CONFIG_PAGED_MQA_LOGITS,
+            "paged_mqa_logits_tuned",
         )
 
     @property
@@ -779,15 +864,8 @@ class AITER_CONFIG:
     def get_config_file(self, env_name, default_file, tuned_file_name):
         config_env_file = (os.getenv(env_name) or "").strip()
         # default_file = f"{AITER_ROOT_DIR}/aiter/configs/{tuned_file_name}.csv"
-        from pathlib import Path
-
         if not config_env_file:
-            model_config_dir = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs/")
-            op_tuned_file_list = [
-                p
-                for p in model_config_dir.glob(f"*{tuned_file_name}*.csv")
-                if (p.is_file() and "untuned" not in p.name)
-            ]
+            op_tuned_file_list = model_config_files(tuned_file_name)
 
             if not op_tuned_file_list:
                 # No per-model table to merge with, so the canonical CSV is used
@@ -798,9 +876,7 @@ class AITER_CONFIG:
                     default_file, tuned_file_name, env_name
                 )
             else:
-                tuned_files = os.pathsep.join(
-                    [default_file] + [str(p) for p in op_tuned_file_list]
-                )
+                tuned_files = os.pathsep.join([default_file] + op_tuned_file_list)
                 logger.info(
                     f"merge tuned file under model_configs/ and configs/ {tuned_files}"
                 )
@@ -1023,6 +1099,50 @@ def check_LLVM_MAIN_REVISION():
         except OSError:
             pass
     return 554785 - 1
+
+
+@functools.lru_cache
+def check_hipblaslt_has_w4a16() -> bool:
+    """Whether the hipBLASLt headers declare the w4a16 API.
+
+    The version number cannot tell: hipBLASLt develop reported 1.5.0 before the
+    API existed. So compile the declarations module_hipbsolgemm uses instead.
+    """
+    import subprocess
+    import tempfile
+
+    probe_src = (
+        "#include <hipblaslt/hipblaslt.h>\n"
+        "int main() {\n"
+        "  hipblasLtInt4Encoding_t e = HIPBLASLT_INT4_ENCODING_UNSIGNED_BIAS8_EXT;\n"
+        "  return (int)e + (int)HIPBLASLT_MATMUL_DESC_A_INT4_ENCODING_EXT\n"
+        "         + (int)HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_16F_ZP_EXT;\n"
+        "}\n"
+    )
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".cpp", delete=False) as tf:
+        tf.write(probe_src)
+        probe_path = tf.name
+    try:
+        subprocess.check_output(
+            [
+                executable_path("hipcc"),
+                "-x",
+                "hip",
+                "-std=c++20",
+                "-fsyntax-only",
+                "-Wno-unused-command-line-argument",
+                probe_path,
+            ],
+            stderr=subprocess.STDOUT,
+        )
+    except (subprocess.CalledProcessError, AssertionError, FileNotFoundError):
+        return False
+    finally:
+        try:
+            os.remove(probe_path)
+        except OSError:
+            pass
+    return True
 
 
 def rename_cpp_to_cu(els, dst, hipify, recursive=False):
@@ -1359,12 +1479,17 @@ def _build_archs_from_env(detect_gfx) -> list[str]:
     return explicit or [detect_gfx()]
 
 
-def _cluster_launch_target(detect_gfx) -> bool:
-    """True when any targeted arch wants -DAITER_ENABLE_CLUSTER_LAUNCH."""
+def _targets_gfx1250(detect_gfx) -> bool:
+    """True when any targeted arch is gfx1250 or gfx1250-strict."""
     return any(
         arch in ("gfx1250", "gfx1250-strict")
         for arch in _build_archs_from_env(detect_gfx)
     )
+
+
+def _cluster_launch_target(detect_gfx) -> bool:
+    """True when any targeted arch wants -DAITER_ENABLE_CLUSTER_LAUNCH."""
+    return _targets_gfx1250(detect_gfx)
 
 
 def build_module(
@@ -1479,6 +1604,11 @@ def build_module(
         # path was compiled out (AiterAsmKernelFast then rejects them at launch).
         if _cluster_launch_target(get_gfx) and hip_version >= Version("7.0.0"):
             flags_hip += ["-DAITER_ENABLE_CLUSTER_LAUNCH"]
+        # CK's CMakeLists forces the unified ck_tile framework off for any build that
+        # targets gfx1250, which it does not support yet; the JIT bypasses that CMake.
+        # It has to be a whole-TU define so the host and device passes agree.
+        if _targets_gfx1250(get_gfx):
+            flags_hip += ["-DUSE_NEW_UNIFIED_FRAMEWORK=0"]
 
         if not torch_exclude:
             import torch
@@ -1512,6 +1642,19 @@ def build_module(
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()
+        # If GPU_ARCHS has gfx1250 but the GPU is gfx1250-strict, also build for gfx1250-strict.
+        if "native" not in archs:
+            try:
+                runtime_arch = get_gfx_runtime()
+            except Exception:  # noqa: BLE001 -- no GPU visible: keep GPU_ARCHS
+                runtime_arch = None
+            if (
+                runtime_arch
+                and runtime_arch not in archs
+                and base_gfx_arch(runtime_arch) != runtime_arch
+                and base_gfx_arch(runtime_arch) in archs
+            ):
+                archs = archs + [runtime_arch]
         flags_hip += [f"--offload-arch={arch}" for arch in archs]
         flags_hip = sorted(set(flags_hip))  # remove same flags
         flags_hip = [el for el in flags_hip if hip_flag_checker(el)]
@@ -1839,6 +1982,9 @@ def get_args_of_build(ops_name: str, exclude=None):
                         "srcs": single_ops["srcs"],
                         "flags_extra_cc": single_ops["flags_extra_cc"],
                         "flags_extra_hip": single_ops["flags_extra_hip"],
+                        "flags_extra_hip_per_source": single_ops[
+                            "flags_extra_hip_per_source"
+                        ],
                         "extra_ldflags": single_ops["extra_ldflags"],
                         "extra_include": single_ops["extra_include"],
                         "blob_gen_cmd": single_ops["blob_gen_cmd"],
@@ -1941,17 +2087,6 @@ def _ctypes_call(func, fc_name, md_name):
     import torch
 
     from ..utility.dtypes import aiter_tensor_t, torch_to_aiter
-
-    # Avoid constructing a Python Stream object on every ctypes invocation.
-    # Keep the public API fallback for torch versions without the private raw
-    # stream getter, and preserve the first tensor's device selection.
-    raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
-    if raw_stream is None:
-
-        def raw_stream(device_index):
-            return torch.cuda.current_stream(device_index).cuda_stream
-
-    current_device = torch.cuda.current_device
 
     _cache = {}
     _arg_checked = False
@@ -2187,6 +2322,12 @@ def _ctypes_call(func, fc_name, md_name):
             else:  # _ARG_BOOL
                 add_arg(1 if value else 0)
 
+        # The same stream/device getters as the develop pybind path (no Python
+        # Stream object per call), read per call so an AOT dry run can swap
+        # them; the first tensor's device still selects the stream.
+        _, _, raw_stream, current_device = (
+            _pybind_develop_hooks_cache or _pybind_develop_hooks()
+        )
         if tensor_device is None:
             tensor_device = current_device()
         c_args.append(ctypes.c_void_p(raw_stream(tensor_device)))
@@ -2238,8 +2379,8 @@ def _pybind_develop_hooks():
         raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
         if raw_stream is None:
 
-            def raw_stream(_device_index):
-                return torch.cuda.current_stream().cuda_stream
+            def raw_stream(device_index):
+                return torch.cuda.current_stream(device_index).cuda_stream
 
         _pybind_develop_hooks_cache = (
             torch_to_aiter_pybind,

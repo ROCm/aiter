@@ -9,9 +9,13 @@ import torch
 
 import aiter
 import aiter.fused_moe as fm
+
+# moe_sorting lives in aiter.moev2 (under development, not graduated; owners @qli88,
+# see aiter/moev2/README.md); its backend flags are patched there.
+import aiter.moev2.segments.sort as sorting
 from aiter import dtypes
 from aiter.fused_moe import fused_topk, moe_sorting
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -23,6 +27,7 @@ SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1250"]
 def test_moe_sorting_opus_host_dispatch_boundaries():
     if get_gfx() != "gfx950":
         device_id = torch.cuda.current_device()
+        assert aiter.moe_sorting_opus_get_workspace_size(1, 384, 8, 0, device_id) == 0
         assert aiter.moe_sorting_opus_get_workspace_size(1, 385, 8, 0, device_id) == 0
         assert aiter.moe_sorting_opus_get_workspace_size(1, 512, 8, 0, device_id) > 0
         return
@@ -36,7 +41,8 @@ def test_moe_sorting_opus_host_dispatch_boundaries():
         255: (17, 24, 25, 31),
         256: (8, 12, 16, 17, 24, 25, 31),
         257: (8, 12, 16, 17, 24, 25, 31),
-        384: (8, 12, 16, 17, 24, 25, 31),
+        383: (8, 12, 16, 17, 24, 25, 31),
+        384: tokens,
         385: tokens,
     }
     for E, token in itertools.product(multi_tokens, tokens):
@@ -99,14 +105,14 @@ def _device_arch(device_id: int) -> str:
 def set_moe_sorting_backend(backend: str) -> None:
     """Force which moe_sorting backend `moe_sorting()` dispatches to."""
     if backend == "flydsl":
-        fm._USE_CK_MOE_SORTING = False
-        fm._USE_FLYDSL_MOE_SORTING = True
+        sorting._USE_CK_MOE_SORTING = False
+        sorting._USE_FLYDSL_MOE_SORTING = True
     elif backend == "opus":
-        fm._USE_CK_MOE_SORTING = False
-        fm._USE_FLYDSL_MOE_SORTING = False
+        sorting._USE_CK_MOE_SORTING = False
+        sorting._USE_FLYDSL_MOE_SORTING = False
     elif backend == "ck":
-        fm._USE_CK_MOE_SORTING = True
-        fm._USE_FLYDSL_MOE_SORTING = False
+        sorting._USE_CK_MOE_SORTING = True
+        sorting._USE_FLYDSL_MOE_SORTING = False
     elif backend == "auto":
         pass
     else:
@@ -174,6 +180,220 @@ def run_torch_moe_sorting(
     return sorted_ids, sorted_weights, sorted_expert_ids, num_tokens_post_pad
 
 
+def _onewg_pair_keys(ids, weights, eids, num_rows, block_size, topk, M, topk_weights):
+    """(expert, packed id) of every real pair of a sorted table, after checking the padding rows and weights."""
+    rows = ids[:num_rows]
+    expert = eids[: num_rows // block_size].repeat_interleave(block_size)
+    real = rows != (topk << 24 | M)
+    tok, slot = rows[real] & 0x00FFFFFF, rows[real] >> 24
+    assert bool((tok < M).all()) and bool(
+        (slot < topk).all()
+    ), "pad sentinel must be (topk << 24) | M"
+    assert torch.equal(
+        weights[:num_rows][real], topk_weights[tok.long(), slot.long()]
+    ), "sorted_weights must follow their ids"
+    return (expert[real].long() << 32) | rows[real].long()
+
+
+def _check_onewg(gen, topk, block_size, M, case):
+    """One (topk, block_size, M, routing case): the one-workgroup table equals the reference up to the pair order
+    inside an expert."""
+    E = 128
+    score = torch.rand(M, E, device="cuda", generator=gen)
+    if case == "skewed":
+        score[:, :8] += 2.0
+    elif case == "one_expert_set":
+        score[:, :] = torch.rand(1, E, device="cuda", generator=gen)
+    topk_ids = score.topk(topk, dim=1).indices.to(dtypes.i32).contiguous()
+    topk_weights = torch.rand(M, topk, device="cuda", generator=gen)
+    ref = run_torch_moe_sorting(topk_ids, topk_weights, E, block_size)
+    # record what the public unordered branch itself returns (no separate launch)
+    import aiter.moev2.segments.sort as sort_mod
+    from aiter.ops.flydsl.kernels.moe_sorting_onewg import onewg_supported
+
+    calls = []
+    orig = sort_mod._flydsl_moe_sorting_onewg
+
+    def recording(*args, **kwargs):
+        calls.append(orig(*args, **kwargs))
+        return calls[-1]
+
+    sort_mod._flydsl_moe_sorting_onewg = recording
+    try:
+        out = moe_sorting(
+            topk_ids,
+            topk_weights,
+            E,
+            4096,
+            torch.bfloat16,
+            block_size,
+            accumulate=False,
+            unordered=True,
+        )
+    finally:
+        sort_mod._flydsl_moe_sorting_onewg = orig
+    used = calls[0] if calls else None
+    if get_gfx_runtime() == "gfx950" and onewg_supported(M, E, topk, block_size):
+        assert used is not None, "unordered=True did not take the one-workgroup sort"
+        assert all(a is b for a, b in zip(out[:4], used)), "result is not its output"
+    if (
+        used is None
+    ):  # topk=8 at the largest M does not fit one workgroup's LDS: normal path, exact
+        errs = _compare_moe_sorting_outputs(ref, out, topk, M)
+        assert not any(errs.values()), errs
+        return False
+    ids, w, eids, nv = out[:4]
+    assert (
+        nv.tolist() == ref[3].tolist()
+    ), f"num_valid_ids {nv.tolist()} vs {ref[3].tolist()}"
+    n = nv[0].item()
+    assert ids.shape == ref[0].shape and eids.shape == ref[2].shape
+    assert torch.equal(eids[: n // block_size], ref[2][: n // block_size])
+    got = _onewg_pair_keys(ids, w, eids, n, block_size, topk, M, topk_weights)
+    want = _onewg_pair_keys(
+        ref[0],
+        torch.where(ref[0] != (topk << 24 | M), 1.0, 0.0),
+        ref[2],
+        n,
+        block_size,
+        topk,
+        M,
+        torch.ones(M + 1, topk, device="cuda"),
+    )
+    assert torch.equal(
+        got.sort().values, want.sort().values
+    ), f"pairs differ: topk={topk} bm={block_size} M={M} {case}"
+    assert not (ids[:n] == (topk << 24 | M)).all() or M == 0
+    return True
+
+
+def test_moe_sorting_onewg_table_boundary():
+    """Configs whose block -> sorted-row bound fills whole 16 B tiles (the table needs one more row for the invalid
+    pairs): topk 1 / 2 at the 64-token tier, topk 3 at 384, topk 6 at 192 used to fail the compile-time assert.
+    """
+    if get_gfx_runtime() != "gfx950":  # the one-workgroup path is gfx950-only
+        return
+    gen = torch.Generator(device="cuda").manual_seed(11)
+    for topk, block_size, M in (
+        (1, 16, 1),
+        (1, 32, 64),
+        (1, 64, 100),
+        (2, 16, 1),
+        (2, 32, 33),
+        (3, 16, 300),
+        (6, 16, 150),
+    ):
+        assert _check_onewg(gen, topk, block_size, M, "random"), (topk, block_size, M)
+
+
+def test_moe_sorting_onewg():
+    """One-workgroup sort (``moe_sorting(unordered=True)``): same table as the reference up to the pair order
+    inside an expert, for E=128 up to 512 tokens."""
+    gen = torch.Generator(device="cuda").manual_seed(7)
+    E = 128
+    for topk, block_size, M, case in itertools.product(
+        (4, 8),
+        (16, 32, 64),
+        (1, 2, 8, 16, 17, 24, 32, 48, 64, 96, 128, 192, 256, 384, 448, 512),
+        ("random", "skewed", "one_expert_set"),
+    ):
+        _check_onewg(gen, topk, block_size, M, case)
+    # CUDA-graph capture + replay with fresh routing
+    topk_ids = (
+        torch.rand(48, E, device="cuda")
+        .topk(4, dim=1)
+        .indices.to(dtypes.i32)
+        .contiguous()
+    )
+    topk_weights = torch.rand(48, 4, device="cuda")
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        out = moe_sorting(
+            topk_ids,
+            topk_weights,
+            E,
+            4096,
+            torch.bfloat16,
+            32,
+            accumulate=False,
+            unordered=True,
+        )
+    for _ in range(3):
+        topk_ids.copy_(
+            torch.rand(48, E, device="cuda").topk(4, dim=1).indices.to(dtypes.i32)
+        )
+        g.replay()
+        ref = run_torch_moe_sorting(topk_ids, topk_weights, E, 32)
+        n = out[3][0].item()
+        assert n == ref[3][0].item()
+        assert torch.equal(
+            _onewg_pair_keys(out[0], out[1], out[2], n, 32, 4, 48, topk_weights)
+            .sort()
+            .values,
+            _onewg_pair_keys(
+                ref[0],
+                torch.where(ref[0] != (4 << 24 | 48), 1.0, 0.0),
+                ref[2],
+                n,
+                32,
+                4,
+                48,
+                torch.ones(49, 4, device="cuda"),
+            )
+            .sort()
+            .values,
+        )
+
+
+def test_moe_slots_shared_reduce():
+    """moe_slots_shared_reduce == fp32 sequential sum of the slots then the shared expert, rounded once to bf16
+    (bitwise), against a torch reference."""
+    from aiter.ops.flydsl.kernels.moe_slots_shared_reduce import moe_slots_shared_reduce
+
+    for M, topk, H in itertools.product((1, 7, 16, 33, 128, 512), (4, 6), (2048, 6144)):
+        parts = (torch.randn(M, topk, H, device="cuda") * 3).bfloat16()
+        shared = (torch.randn(M, H, device="cuda") * 3).bfloat16()
+        acc = torch.zeros(M, H, device="cuda", dtype=torch.float32)
+        for k in range(topk):
+            acc += parts[:, k].float()
+        ref = (acc + shared.float()).bfloat16()
+        out = moe_slots_shared_reduce(parts, shared)
+        assert torch.equal(
+            out, ref
+        ), f"slots+shared reduce mismatch M={M} topk={topk} H={H}"
+
+
+def test_moe_slots_shared_reduce_dropped_routes():
+    """With ``topk_ids``, a slot whose id is outside [0, E) adds zero (even if its row holds NaN); valid slots keep
+    the unmasked kernel's bits."""
+    from aiter.ops.flydsl.kernels.moe_slots_shared_reduce import moe_slots_shared_reduce
+
+    E = 128
+    for M, topk, H in itertools.product((1, 16, 128), (4,), (2048, 6144)):
+        parts = (torch.randn(M, topk, H, device="cuda") * 3).bfloat16()
+        shared = (torch.randn(M, H, device="cuda") * 3).bfloat16()
+        ids = torch.randint(0, E, (M, topk), dtype=torch.int32, device="cuda")
+        # all valid: same bits as the unmasked kernel
+        assert torch.equal(
+            moe_slots_shared_reduce(parts, shared, topk_ids=ids, num_experts=E),
+            moe_slots_shared_reduce(parts, shared),
+        )
+        bad = ids.clone()
+        bad[:, 1] = -1
+        bad[0, :] = E
+        if M > 2:
+            bad[2, 3] = 2**20
+        valid = (bad >= 0) & (bad < E)
+        poisoned = parts.clone()
+        poisoned[~valid] = float("nan")
+        acc = torch.zeros(M, H, device="cuda", dtype=torch.float32)
+        for k in range(topk):
+            acc += torch.where(valid[:, k, None], parts[:, k].float(), 0.0)
+        ref = (acc + shared.float()).bfloat16()
+        out = moe_slots_shared_reduce(poisoned, shared, topk_ids=bad, num_experts=E)
+        assert torch.equal(out, ref), f"dropped-route reduce mismatch M={M} H={H}"
+
+
 def _moe_sorting_roofline(token, topk, E, model_dim, dtype):
     """Crude roofline estimates for a memory-bound sort (not exact kernel traffic)."""
     max_num_tokens_padded = token * topk + E * BLOCK_SIZE_M - topk
@@ -192,7 +412,7 @@ def _moe_sorting_roofline(token, topk, E, model_dim, dtype):
     return flops, nbytes
 
 
-def _compare_moe_sorting_outputs(ref, out, topk, num_rows):
+def _compare_moe_sorting_outputs(ref, out, topk, num_rows, exact_ids=True):
     (
         sorted_ids_a,
         sorted_weights_a,
@@ -229,10 +449,14 @@ def _compare_moe_sorting_outputs(ref, out, topk, num_rows):
     )
     weight_mask = sorted_ids_a != (topk << 24 | num_rows)
     num_tokens_post_pad = num_tokens_post_padded_a[0].item()
+    # Exact: ids are packed (topk << 24 | token), so a relative tolerance would
+    # pass a pad id holding the wrong token.
+    exact = {"rtol": 0, "atol": 0} if exact_ids else {}
     errs["sorted_ids"] = checkAllclose(
         sorted_ids_a[:num_tokens_post_pad],
         sorted_ids_b[:num_tokens_post_pad],
         msg="sorted_ids",
+        **exact,
     )
     errs["sorted_weights"] = checkAllclose(
         sorted_weights_a[weight_mask],
@@ -250,7 +474,7 @@ def _compare_moe_sorting_outputs(ref, out, topk, num_rows):
 
 def test_moe_sorting_opus_aux_outputs(dtype, model_dim):
     """Cover auxiliary outputs on one-shot and newly multi-phase auto routes."""
-    for token, E, topk in ((7, 32, 5), (8, 256, 8), (1, 385, 7)):
+    for token, E, topk in ((7, 32, 5), (8, 256, 8), (1, 384, 6), (1, 385, 7)):
         topk_ids, topk_weights, _, _ = _build_moe_sorting_inputs(
             token,
             model_dim,
@@ -316,7 +540,7 @@ def test_moe_sorting_opus_aux_outputs(dtype, model_dim):
 
 
 def test_moe_sorting_opus_local_ids_large_expert_auto(dtype, model_dim):
-    for token, E, topk in ((8, 256, 8), (1, 385, 7)):
+    for token, E, topk in ((8, 256, 8), (1, 384, 6), (1, 385, 7)):
         topk_ids, topk_weights, _, _ = _build_moe_sorting_inputs(
             token,
             model_dim,
@@ -483,7 +707,14 @@ def test_moe_sorting(
             num_warmup=1,
             num_iters=2,
         )
-        errs = _compare_moe_sorting_outputs(ref, out, topk, topk_ids.shape[0])
+        # CK-tile's sorter still pads with the device-side count, so its ids
+        # keep the loose comparison: in composable_kernel's
+        # moe_sorting_kernel.hpp, moe_align_block_size_kernel_ex and
+        # MoeSortingMultiPhaseKernel_P3 / _P23 write `tokens`, which under
+        # LocalToken is p_local_tokens[0].
+        errs = _compare_moe_sorting_outputs(
+            ref, out, topk, topk_ids.shape[0], exact_ids=name != "ck"
+        )
         err = max(errs.values()) if errs else 0.0
         bad = {k: v for k, v in errs.items() if v}
         if bad:
@@ -914,6 +1145,11 @@ def main():
     routing_cases = args.routing_case if args.routing_case is not None else ["valid"]
 
     test_moe_sorting_opus_host_dispatch_boundaries()
+    test_moe_sorting_onewg()
+    if get_gfx_runtime() == "gfx950":  # asserts the one-workgroup path is taken
+        test_moe_sorting_onewg_table_boundary()
+    test_moe_slots_shared_reduce()
+    test_moe_slots_shared_reduce_dropped_routes()
     test_moe_sorting_opus_workspace_uses_explicit_device()
     test_moe_sorting_opus_workspace_switches_arch_policy()
     for dtype in args.dtype:

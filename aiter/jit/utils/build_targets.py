@@ -4,6 +4,7 @@
 # Pure-Python arch constants and env-driven build target resolution.
 # No torch dependency — safe to import in build scripts, gen_instances, and tests
 # that run without a GPU or a full PyTorch install.
+import functools
 import os
 import re
 
@@ -30,28 +31,53 @@ GFX_MAP = {
     19: "gfx1250-strict",
 }
 
-# Maps gfx arch to the default (SPX / full-GPU) CU count used when no live GPU is
-# present at build time (e.g. CI nodes with GPU_ARCHS set but no device visible).
-# For live GPU builds, get_cu_num() is used instead and correctly reflects the
-# actual visible CU count, including non-SPX partition modes (DPX / QPX / CPX)
-# and binned variants (e.g. MI308X is gfx942 but has fewer CUs than MI300X).
-# If building without a GPU for a binned or partitioned target, set CU_NUM
-# explicitly alongside GPU_ARCHS to override the default here.
-# Extend this table when adding support for new GPU targets.
-GFX_CU_NUM_MAP = {
-    "gfx942": 304,  # MI300X (SPX, full GPU); MI308X shares gfx942 — use CU_NUM override
-    "gfx950": 256,  # MI350
-    "gfx1100": 96,  # Radeon RX 7900 XTX
-    "gfx1101": 60,  # Radeon RX 7800 XT
-    "gfx1102": 32,  # Radeon RX 7600
-    "gfx1103": 12,  # Radeon 780M
-    "gfx1150": 16,  # Radeon 890M; set CU_NUM=12 for Radeon 880M
-    "gfx1151": 40,  # Strix Halo / Radeon 8060S
-    "gfx1200": 32,  # Radeon RX 9060 XT; set CU_NUM=28 for Radeon RX 9060
-    "gfx1201": 64,  # Radeon RX 9070 XT / Radeon AI PRO R9700
-    "gfx1250": 256,  # Gfx1250
-    "gfx1250-strict": 256,  # MI450 A0; binary-incompatible with gfx1250 (B0)
+# CU counts an explicit GPU_ARCHS build targets for each supported gfx arch, full
+# GPU first. One arch ships with several CU counts (e.g. MI308X is gfx942 but has
+# fewer CUs than MI300X), so a build keeps the tuned rows for every listed count
+# unless CU_NUM replaces them with one count for all arches. Tuned rows for
+# unlisted counts are not compiled. Extend this table when adding support for new
+# GPU targets or counts.
+GFX_CU_NUMS_MAP = {
+    "gfx942": (304, 228, 80),  # MI300X/MI325X, MI300A, MI308X
+    "gfx950": (256, 128),  # MI350X/MI355X, MI350P
+    "gfx1100": (96,),  # Radeon RX 7900 XTX
+    "gfx1101": (60,),  # Radeon RX 7800 XT
+    "gfx1102": (32,),  # Radeon RX 7600
+    "gfx1103": (12,),  # Radeon 780M
+    "gfx1150": (16, 12),  # Radeon 890M, Radeon 880M
+    "gfx1151": (40,),  # Strix Halo / Radeon 8060S
+    "gfx1200": (32, 28),  # Radeon RX 9060 XT, Radeon RX 9060
+    "gfx1201": (64,),  # Radeon RX 9070 XT / Radeon AI PRO R9700
+    "gfx1250": (256, 192, 96),
+    "gfx1250-strict": (256,),  # MI450 A0; binary-incompatible with gfx1250 (B0)
 }
+
+
+def target_num_xcds(gfx: str, cu_num: int) -> int:
+    # XCD counts for SKUs that differ from the eight-XCD default.
+    non_standard_xcds = {
+        ("gfx950", 128): 4,  # MI350P
+        ("gfx942", 80): 4,  # MI308X
+        ("gfx942", 228): 6,  # MI300A
+    }
+    target = (gfx, int(cu_num))
+    if target not in non_standard_xcds:
+        return 8
+    return non_standard_xcds[target]
+
+
+@functools.cache
+def build_num_xcds(gfx: str) -> int:
+    """Resolve and cache the target's XCD count for code generation."""
+    # Deferred: chip_info imports this module at load time.
+    try:
+        from chip_info import get_build_targets
+    except ImportError:
+        from aiter.jit.utils.chip_info import get_build_targets
+    for target_gfx, target_cu in get_build_targets():
+        if target_gfx == gfx:
+            return target_num_xcds(gfx, target_cu)
+    return 8
 
 
 # gfx1250-strict (MI450 A0) and gfx1250 (B0) are distinct build/code-object
@@ -108,7 +134,7 @@ def _parse_gpu_archs_env(gfx_env: str) -> list[str]:
     if not archs:
         raise RuntimeError(
             f"GPU_ARCHS={gfx_env!r} contains no valid architecture names after splitting on ';'. "
-            f"Known targets: {list(GFX_CU_NUM_MAP.keys())}"
+            f"Known targets: {list(GFX_CU_NUMS_MAP)}"
         )
     return archs
 
@@ -116,7 +142,9 @@ def _parse_gpu_archs_env(gfx_env: str) -> list[str]:
 def get_build_targets_env() -> list[tuple[str, int]]:
     """Resolve build targets from GPU_ARCHS env var only.  No live GPU detection.
 
-    Raises RuntimeError if GPU_ARCHS is not set or contains an unknown arch.
+    Each arch expands to every CU count GFX_CU_NUMS_MAP lists for it, or to CU_NUM
+    alone when set to a non-zero count; 0 means unset, as for get_cu_num().
+    Raises RuntimeError if GPU_ARCHS is not set or names an unknown arch.
     Intended for CI nodes, build scripts, and tests that run without a GPU.
     Use chip_info.get_build_targets() when live GPU fallback is also desired.
     """
@@ -126,16 +154,21 @@ def get_build_targets_env() -> list[tuple[str, int]]:
             "GPU_ARCHS is not set. "
             "Set GPU_ARCHS=gfx942 (or similar) to resolve build targets without a GPU."
         )
+
+    cu_num_env = os.getenv("CU_NUM")
+    cu_num = int(cu_num_env) if cu_num_env else 0
     targets = []
     for gfx in _parse_gpu_archs_env(gfx_env):
-        if gfx not in GFX_CU_NUM_MAP:
+        if gfx not in GFX_CU_NUMS_MAP:
             raise RuntimeError(
                 f"Unknown gfx '{gfx}' in GPU_ARCHS — add it to "
-                f"GFX_CU_NUM_MAP in build_targets.py. Known targets: "
-                f"{list(GFX_CU_NUM_MAP.keys())}"
+                f"GFX_CU_NUMS_MAP in build_targets.py. Known targets: "
+                f"{list(GFX_CU_NUMS_MAP)}"
             )
-        cu_num = int(os.getenv("CU_NUM", GFX_CU_NUM_MAP[gfx]))
-        targets.append((gfx, cu_num))
+        if cu_num:
+            targets.append((gfx, cu_num))
+        else:
+            targets.extend((gfx, listed) for listed in GFX_CU_NUMS_MAP[gfx])
     return targets
 
 

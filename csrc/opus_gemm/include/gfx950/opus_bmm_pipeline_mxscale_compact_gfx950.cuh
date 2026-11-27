@@ -43,8 +43,9 @@ __device__ __forceinline__ void opus_bmm_compact_runtime_body(opus_bmm_compact_k
         wave = __builtin_amdgcn_readfirstlane(tid / 64);
     const int N = k.n, K = k.k, scale_k = K / 128;
     int mt = (k.m + BM - 1) / BM, tiles = mt * (N / BN), x = __builtin_amdgcn_workgroup_id_x();
-    // Spread the token/batch tile grid over the eight XCDs.
-    int per = (tiles * k.batch + 7) / 8, gt = x % 8 * per + x / 8;
+    // Spread the token/batch tile grid over the XCDs.
+    constexpr int NUM_XCD = Traits::NUM_XCD;
+    int per = (tiles * k.batch + NUM_XCD - 1) / NUM_XCD, gt = x % NUM_XCD * per + x / NUM_XCD;
     if(gt >= tiles * k.batch)
         return;
     int rest = gt / (N / BN), batch = rest / mt, row = rest % mt * BM,
@@ -372,8 +373,9 @@ __device__ __forceinline__ void opus_bmm_compact_full_body(opus_bmm_compact_karg
         wave = __builtin_amdgcn_readfirstlane(tid / 64);
     const int N = k.n, K = k.k, scale_k = K / 128;
     int mt = (k.m + BM - 1) / BM, tiles = mt * (N / BN), x = __builtin_amdgcn_workgroup_id_x();
-    // Spread the token/batch tile grid over the eight XCDs.
-    int per = (tiles * k.batch + 7) / 8, gt = x % 8 * per + x / 8;
+    // Spread the token/batch tile grid over the XCDs.
+    constexpr int NUM_XCD = Traits::NUM_XCD;
+    int per = (tiles * k.batch + NUM_XCD - 1) / NUM_XCD, gt = x % NUM_XCD * per + x / NUM_XCD;
     if(gt >= tiles * k.batch)
         return;
     int rest = gt / (N / BN), batch = rest / mt, row = rest % mt * BM,

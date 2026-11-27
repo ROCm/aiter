@@ -26,23 +26,32 @@ class TestBuildTargetArchitecture(unittest.TestCase):
         with mock.patch.dict(os.environ, {"GPU_ARCHS": "gfx1250-strict"}, clear=True):
             self.assertEqual(get_build_targets_env(), [("gfx1250-strict", 256)])
 
-    def test_rdna_offline_build_target_defaults(self):
+    def test_rdna_offline_build_targets_cover_every_listed_cu_count(self):
         targets = {
-            "gfx1100": 96,
-            "gfx1101": 60,
-            "gfx1102": 32,
-            "gfx1103": 12,
-            "gfx1150": 16,
-            "gfx1151": 40,
-            "gfx1200": 32,
-            "gfx1201": 64,
+            "gfx1100": [96],
+            "gfx1101": [60],
+            "gfx1102": [32],
+            "gfx1103": [12],
+            "gfx1150": [16, 12],
+            "gfx1151": [40],
+            "gfx1200": [32, 28],
+            "gfx1201": [64],
         }
-        for gfx, cu_num in targets.items():
+        for gfx, cu_nums in targets.items():
             with (
                 self.subTest(gfx=gfx),
                 mock.patch.dict(os.environ, {"GPU_ARCHS": gfx}, clear=True),
             ):
-                self.assertEqual(get_build_targets_env(), [(gfx, cu_num)])
+                expected = [(gfx, cu_num) for cu_num in cu_nums]
+                self.assertEqual(get_build_targets_env(), expected)
+
+    def test_zero_cu_override_is_treated_as_unset(self):
+        with mock.patch.dict(
+            os.environ, {"GPU_ARCHS": "gfx1200", "CU_NUM": "0"}, clear=True
+        ):
+            self.assertEqual(
+                get_build_targets_env(), [("gfx1200", 32), ("gfx1200", 28)]
+            )
 
     def test_multi_arch_and_cu_override(self):
         with mock.patch.dict(
@@ -77,7 +86,7 @@ class TestBuildTargetArchitecture(unittest.TestCase):
 class TestArchTablesStayInSync(unittest.TestCase):
     """The arch tables in build_targets.py and core.py must not drift apart.
 
-    Adding a target means editing GFX_MAP, GFX_CU_NUM_MAP and core.py's
+    Adding a target means editing GFX_MAP, GFX_CU_NUMS_MAP and core.py's
     allowed_archs, and nothing ties the three together -- allowed_archs
     carried a duplicate "gfx1250" entry before gfx1250-strict was added,
     which is what that drift looks like.
@@ -103,9 +112,9 @@ class TestArchTablesStayInSync(unittest.TestCase):
             self.assertEqual(GFX_MAP[self.chip_info.get_gfx_custom_op_core()], gfx)
 
     def test_every_offline_target_resolves_through_all_three_tables(self):
-        from aiter.jit.utils.build_targets import GFX_CU_NUM_MAP
+        from aiter.jit.utils.build_targets import GFX_CU_NUMS_MAP
 
-        for gfx in GFX_CU_NUM_MAP:
+        for gfx in GFX_CU_NUMS_MAP:
             with self.subTest(gfx=gfx):
                 self._resolves_everywhere(gfx)
 
@@ -166,6 +175,21 @@ class TestClusterLaunchBuildArchs(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertTrue(self.core._cluster_launch_target(lambda: "gfx1250-strict"))
 
+    def test_gfx1250_target_follows_any_targeted_arch(self):
+        # Also gates -DUSE_NEW_UNIFIED_FRAMEWORK=0, which CK needs for gfx1250.
+        cases = {
+            "gfx1250": True,
+            "gfx942;gfx1250-strict": True,
+            "gfx942": False,
+            "gfx950": False,
+        }
+        for value, expected in cases.items():
+            with (
+                self.subTest(value=value),
+                mock.patch.dict(os.environ, {"GPU_ARCHS": value}, clear=True),
+            ):
+                self.assertEqual(self.core._targets_gfx1250(self.detect), expected)
+
 
 class TestRuntimeArchitecture(unittest.TestCase):
     def setUp(self):
@@ -179,6 +203,51 @@ class TestRuntimeArchitecture(unittest.TestCase):
 
     def tearDown(self):
         self.chip_info.get_gfx_runtime.cache_clear()
+
+    def test_selected_device_ignores_build_targets_and_tracks_current_device(self):
+        current = 0
+        devices = []
+        architectures = ("gfx942:sramecc+", "GFX1250-strict:xnack-")
+
+        def properties(device):
+            devices.append(device)
+            index = (
+                device if isinstance(device, int) else getattr(device, "index", None)
+            )
+            index = current if index is None else index
+            return type("Properties", (), {"gcnArchName": architectures[index]})()
+
+        with (
+            mock.patch.dict(os.environ, {"GPU_ARCHS": "gfx950"}),
+            mock.patch.object(self.torch.cuda, "get_device_properties", properties),
+            mock.patch.object(
+                self.chip_info,
+                "_detect_native",
+                side_effect=AssertionError("node probe"),
+            ),
+        ):
+            query = self.chip_info.get_gfx_runtime_for_device
+            self.assertEqual(query(1), "gfx1250-strict")
+            self.assertEqual(query(0), "gfx942")
+            for current in (0, 1, 0):
+                expected = ("gfx942", "gfx1250-strict")[current]
+                self.assertEqual(query(), expected)
+                self.assertEqual(query(self.torch.device("cuda")), expected)
+            device = self.torch.device("cuda:1")
+            self.assertEqual(query(device), "gfx1250-strict")
+        self.assertEqual(devices[:2], [1, 0])
+        self.assertEqual(devices[-1], device)
+
+    def test_selected_device_query_errors_propagate(self):
+        with (
+            mock.patch.object(
+                self.torch.cuda,
+                "get_device_properties",
+                side_effect=RuntimeError("device query failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "device query failed"),
+        ):
+            self.chip_info.get_gfx_runtime_for_device(1)
 
     def test_native_detection_preserves_strict_identity(self):
         # Regression lock: _detect_native must return the exact ROCr-reported

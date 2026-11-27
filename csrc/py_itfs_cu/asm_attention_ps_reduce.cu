@@ -4,6 +4,16 @@
 #include <cstddef>
 #include <limits>
 
+static int select_ps_reduce_waves(int requested_waves, int64_t output_rows, uint32_t num_cu)
+{
+    if(requested_waves != 0)
+        return requested_waves;
+    int waves = 1;
+    while(waves < 8 && output_rows * waves < num_cu)
+        waves *= 2;
+    return waves;
+}
+
 struct __attribute__((packed)) AttentionPsReduceArgs
 {
     void* output;
@@ -13,7 +23,8 @@ struct __attribute__((packed)) AttentionPsReduceArgs
     void* partial_lse;
     p2 padding2;
     void* reduce_indptr;
-    p2 padding3;
+    uint32_t split_o_format;
+    uint32_t reserved3;
     void* reduce_final_map;
     p2 padding4;
     void* reduce_partial_map;
@@ -38,6 +49,7 @@ static_assert(sizeof(AttentionPsReduceArgs) == 208);
 static_assert(offsetof(AttentionPsReduceArgs, partial_output) == 0x10);
 static_assert(offsetof(AttentionPsReduceArgs, partial_lse) == 0x20);
 static_assert(offsetof(AttentionPsReduceArgs, reduce_indptr) == 0x30);
+static_assert(offsetof(AttentionPsReduceArgs, split_o_format) == 0x38);
 static_assert(offsetof(AttentionPsReduceArgs, reduce_final_map) == 0x40);
 static_assert(offsetof(AttentionPsReduceArgs, reduce_partial_map) == 0x50);
 static_assert(offsetof(AttentionPsReduceArgs, final_lse) == 0x60);
@@ -57,8 +69,12 @@ void attention_ps_reduce(aiter_tensor_t* partial_output,
                          int max_seqlen_q,
                          aiter_tensor_t* final_output,
                          aiter_tensor_t* final_lse,
+                         int merge_waves,
                          hipStream_t stream)
 {
+    AITER_CHECK(merge_waves == 0 || merge_waves == 1 || merge_waves == 2 ||
+                    merge_waves == 4 || merge_waves == 8,
+                __func__, ": merge_waves must be 0, 1, 2, 4, or 8");
     AITER_CHECK(partial_output && partial_lse && reduce_indptr && reduce_final_map &&
                     reduce_partial_map && final_output,
                 __func__, ": explicit reduction metadata and output tensors are required");
@@ -78,12 +94,13 @@ void attention_ps_reduce(aiter_tensor_t* partial_output,
     AITER_CHECK(final_output->dtype() == AITER_DTYPE_bf16 ||
                     final_output->dtype() == AITER_DTYPE_fp16,
                 __func__, ": output must be BF16 or FP16");
+    const bool compact = partial_output->dtype() == AITER_DTYPE_bf16;
     AITER_CHECK(partial_output->dim() >= 3 && partial_output->size(-1) == 128 &&
                     partial_output->size(-2) == final_output->size(1) &&
-                    partial_output->dtype() == AITER_DTYPE_fp32 &&
+                    (partial_output->dtype() == AITER_DTYPE_fp32 || compact) &&
                     partial_lse->dtype() == AITER_DTYPE_fp32 &&
                     partial_output->numel() / 128 == partial_lse->numel(),
-                __func__, ": partial output/LSE must have matching packed FP32 layouts");
+                __func__, ": partial output and FP32 LSE must have matching packed layouts");
     AITER_CHECK(reduce_indptr->dtype() == AITER_DTYPE_i32 && reduce_indptr->dim() == 1 &&
                     reduce_indptr->size(0) >= 1 &&
                     reduce_final_map->dtype() == AITER_DTYPE_i32 &&
@@ -115,6 +132,12 @@ void attention_ps_reduce(aiter_tensor_t* partial_output,
                     partial_output->numel() / (num_heads * 128) <= size_t(max_i32) &&
                     reduce_partial_map->numel() <= size_t(max_u32 / 4),
                 __func__, ": shape exceeds the reducer's 32-bit index range");
+    if(compact)
+    {
+        const size_t rows = partial_lse->numel() / num_heads;
+        AITER_CHECK(max_seqlen_q <= 4 && rows / max_seqlen_q >= reduce_partial_map->numel(),
+                    __func__, ": compact partial buffers must cover map capacity times max_seqlen_q");
+    }
     const int64_t head_stride = final_output->stride(1);
     const int64_t query_stride = final_output->stride(0);
     AITER_CHECK(head_stride >= 128 && head_stride <= max_u32 / 2 &&
@@ -134,6 +157,7 @@ void attention_ps_reduce(aiter_tensor_t* partial_output,
     args.partial_output = partial_output->data_ptr();
     args.partial_lse = partial_lse->data_ptr();
     args.reduce_indptr = reduce_indptr->data_ptr();
+    args.split_o_format = compact ? 1u : 0u;
     args.reduce_final_map = reduce_final_map->data_ptr();
     args.reduce_partial_map = reduce_partial_map->data_ptr();
     args.final_lse = final_lse ? final_lse->data_ptr() : nullptr;
@@ -144,7 +168,9 @@ void attention_ps_reduce(aiter_tensor_t* partial_output,
     args.tile_stride = tile_groups;
     args.query_stride = query_groups;
 
-    const bool adaptive = num_heads * final_output->size(0) < num_cu;
+    const int selected_waves =
+        select_ps_reduce_waves(merge_waves, num_heads * final_output->size(0), num_cu);
+    const bool adaptive = selected_waves > 1;
     const std::string output_type =
         final_output->dtype() == AITER_DTYPE_fp16 ? "fp16" : "bf16";
     const reduceConfig* selected_config = nullptr;
@@ -152,7 +178,8 @@ void attention_ps_reduce(aiter_tensor_t* partial_output,
     {
         const auto& config = entry.second;
         if(config.arch == arch_id && config.oType == output_type &&
-           config.headDim == final_output->size(2) && config.adaptive == adaptive)
+              config.headDim == final_output->size(2) && config.adaptive == adaptive &&
+              config.waves == selected_waves)
         {
             selected_config = &config;
             break;
@@ -161,11 +188,12 @@ void attention_ps_reduce(aiter_tensor_t* partial_output,
     AITER_CHECK(selected_config != nullptr,
                 __func__, ": cannot get heuristic reduce kernel! arch:", arch_id,
                 " output_type:", output_type, " head_dim:", final_output->size(2),
-                " adaptive:", adaptive);
+                " adaptive:", adaptive, " waves:", selected_waves);
     const auto& config = *selected_config;
     static SynchronizedCache<std::string, AiterAsmKernel> implementations;
-    auto* kernel = &implementations.get_or_create(arch_id + config.knl_name, [&]() {
-        return AiterAsmKernel(config.knl_name.c_str(), config.co_name.c_str());
+    const auto name = config.knl_name + "_split_format";
+    auto* kernel = &implementations.get_or_create(arch_id + ":" + config.co_name + ":" + name, [&]() {
+        return AiterAsmKernel(name.c_str(), config.co_name.c_str());
     });
     size_t argument_size = sizeof(args);
     kernel->launch_kernel({&args, &argument_size, static_cast<int>(num_heads),

@@ -23,7 +23,7 @@ import torch.nn.functional as F
 import aiter
 from aiter import dtypes, logger
 from aiter.jit.core import AITER_CONFIG_GEMM_BF16, get_asm_dir
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
 from aiter.ops.flydsl.gemm_a16w16_policy import (
     get_flydsl_a16w16_configs,
 )
@@ -307,7 +307,11 @@ def run_flydsl_gemm_bf16(
         k_waves=config["k_waves"],
         stages=config["stages"],
         group_m=config["group_m"],
-        policy="ht" if config["use_half_tile_interleaved"] else "ft",
+        k_stagger=config.get("k_stagger", 0),
+        b_non_temporal=config.get("b_non_temporal", False),
+        policy=config.get(
+            "policy", "ht" if config["use_half_tile_interleaved"] else "ft"
+        ),
         out_dtype=otype,
     )
     if bias is not None and fused_bias is None:
@@ -322,6 +326,28 @@ def run_flydsl_gemm_bf16(
 # ---------------------------------------------------------------------------
 
 
+def _flydsl_b_non_temporal_configs(configs, mode, gfx):
+    """Select B's cache policy without changing old names or CSV columns."""
+    if mode not in ("auto", "off", "on", "both"):
+        raise ValueError(f"Invalid FlyDSL B non-temporal mode: {mode}")
+    if mode == "auto":
+        # Preserve the previous catalog, including its order and solidx values.
+        return configs
+    choices = (False, True) if mode == "both" else (mode == "on",)
+    selected = []
+    for config in configs:
+        policy = config.get(
+            "policy", "ht" if config["use_half_tile_interleaved"] else "ft"
+        )
+        if gfx == "gfx950" and policy in ("ft", "ht", "hti"):
+            selected.extend(dict(config, b_non_temporal=nt) for nt in choices)
+        elif config.get("b_non_temporal", False) in choices:
+            # Skinny/TDM do not implement BNT; band-stream requires it.
+            # Do not manufacture unsupported variants for these policies.
+            selected.append(config)
+    return selected
+
+
 @lru_cache(maxsize=1)
 def get_flydsl_bf16_catalog(
     m: int,
@@ -329,21 +355,24 @@ def get_flydsl_bf16_catalog(
     k: int,
     out_dtype: torch.dtype,
     has_bias: bool,
+    in_dtype: torch.dtype = torch.bfloat16,
+    b_non_temporal: str = "auto",
 ):
     if flydsl_hgemm_kernel_name is None:
         return []
-    fused_bias = bool(has_bias and out_dtype == torch.bfloat16)
+    fused_bias = bool(has_bias and out_dtype == in_dtype)
     configs = get_flydsl_a16w16_configs(
         m,
         n,
         k,
-        torch.bfloat16,
+        in_dtype,
         out_dtype,
         fused_bias,
     )
+    configs = _flydsl_b_non_temporal_configs(configs, b_non_temporal, get_gfx_runtime())
     kernels = {
         flydsl_hgemm_kernel_name(
-            dtype=torch.bfloat16,
+            dtype=in_dtype,
             out_dtype=out_dtype,
             config=config,
             has_bias=fused_bias,
@@ -354,7 +383,8 @@ def get_flydsl_bf16_catalog(
         (idx, name, dict(kernels[name])) for idx, name in enumerate(sorted(kernels))
     ]
     logger.info(
-        f"FlyDSL bf16 catalog size for M={m}, N={n}, K={k}: {len(catalog)} kernels"
+        f"FlyDSL bf16 catalog size for M={m}, N={n}, K={k}, "
+        f"b_non_temporal={b_non_temporal}: {len(catalog)} kernels"
     )
     return catalog
 
@@ -419,6 +449,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
         "batch": 100,
         "profile_file": "",
         "config_env_name": "AITER_CONFIG_GEMM_BF16",
+        "flydsl_b_non_temporal": "auto",
     }
 
     def __init__(self, name, keys, resultList, description=""):
@@ -465,6 +496,19 @@ class GemmA16W16Tuner(GemmCommonTuner):
             required=False,
             help="choose libtype to tune: all, asm, hipblaslt, triton, flydsl, torch, skinny, opus. "
             "hipblaslt requires --with-hipblaslt.",
+        )
+        self.parser.add_argument(
+            "--flydsl-b-non-temporal",
+            "--b-non-temporal",
+            dest="flydsl_b_non_temporal",
+            choices=("auto", "off", "on", "both"),
+            default=self.ARG_DEFAULTS["flydsl_b_non_temporal"],
+            help="FlyDSL B cache-policy candidates: auto preserves the existing "
+            "catalog; off/on select cached/non-temporal loads; both compares "
+            "both for every eligible gfx950 FT/HT tile. Policies without that "
+            "mode are excluded (on yields no candidates on non-gfx950). "
+            "This controls tuning only, not runtime CSV selection. Winning "
+            "names encode _bnt_; old names without it remain cached.",
         )
         self.parser.add_argument(
             "--with-hipblaslt",
@@ -700,7 +744,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
             k_inst = kernels.get(kid)
             if k_inst is None:
                 continue
-            if _opus_kid_rejects_shape(k_inst, M, N, K):
+            if _opus_kid_rejects_shape(k_inst, M, N, K, cu_num):
                 continue
             if _opus_kid_rejects_bias(k_inst, has_bias):
                 continue
@@ -737,13 +781,26 @@ class GemmA16W16Tuner(GemmCommonTuner):
         return tasks
 
     def _get_flydsl_tasks(
-        self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
+        self,
+        info_keys,
+        has_bias,
+        indtype,
+        outdtype,
+        scaleAB,
+        is_shuffle,
+        run_kwargs,
+        b_non_temporal="auto",
     ):
-        if scaleAB or is_shuffle or indtype != dtypes.bf16:
+        supported_dtype = indtype == dtypes.bf16 or (
+            get_gfx_runtime() == "gfx1250" and indtype == dtypes.fp16
+        )
+        if scaleAB or is_shuffle or not supported_dtype:
             return []
         M, N, K = (int(info_keys[2]), int(info_keys[3]), int(info_keys[4]))
         rtol, atol = _default_tol(outdtype)
-        flydsl_catalog = get_flydsl_bf16_catalog(M, N, K, outdtype, has_bias)
+        flydsl_catalog = get_flydsl_bf16_catalog(
+            M, N, K, outdtype, has_bias, indtype, b_non_temporal
+        )
         tasks = []
         for solidx, kernel_name, config in flydsl_catalog:
             info = (
@@ -971,7 +1028,12 @@ class GemmA16W16Tuner(GemmCommonTuner):
             if "all" in libtype or "asm" in libtype:
                 task.extend(self._get_asm_tasks(*common))
             if "all" in libtype or "flydsl" in libtype:
-                task.extend(self._get_flydsl_tasks(*common))
+                task.extend(
+                    self._get_flydsl_tasks(
+                        *common,
+                        b_non_temporal=getattr(args, "flydsl_b_non_temporal", "auto"),
+                    )
+                )
             if "all" in libtype or "skinny" in libtype:
                 task.extend(self._get_skinny_tasks(*common))
             if "all" in libtype or "torch" in libtype:

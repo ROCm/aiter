@@ -18,28 +18,10 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp8wfp8 import (
     _get_config,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils.fused_splitk import fused_splitk_workspace
 from aiter.ops.triton.utils.gemm_config_utils import clamp_num_buffers
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.utility.graph_alloc import ROUTES_INSIDE_CAPTURE, persistent_alloc
-
-# One arrival counter per output tile of a fused split-K launch.
-_SPLIT_COUNTERS = 1 << 16
-_split_counters_by_stream: dict[tuple[torch.device, int], torch.Tensor] = {}
-
-
-def _split_counters(device: torch.device) -> torch.Tensor | None:
-    """Zeroed arrival counters per (device, stream), as for the a16w16 split-K
-    semaphores; kernels re-zero what they use. None when a stream's first use
-    falls inside a capture that cannot allocate outside the graph pool."""
-    key = (device, torch.cuda.current_stream(device).cuda_stream)
-    counters = _split_counters_by_stream.get(key)
-    if counters is None:
-        if not ROUTES_INSIDE_CAPTURE and torch.cuda.is_current_stream_capturing():
-            return None
-        with persistent_alloc(device):
-            counters = torch.zeros(_SPLIT_COUNTERS, dtype=torch.int32, device=device)
-        _split_counters_by_stream[key] = counters
-    return counters
 
 
 def _split_k_partition(k: int, splits: int, step: int) -> tuple[int, int]:
@@ -47,18 +29,6 @@ def _split_k_partition(k: int, splits: int, step: int) -> tuple[int, int]:
     part = -(-k // splits)
     size = -(-part // step) * step
     return size, -(-k // size)
-
-
-def _fused_workspace(y, tiles, splits, block_m, block_n):
-    """(grid, partials, counters) for fused split-K, or None to run unfused."""
-    assert tiles <= _SPLIT_COUNTERS, "Too many output tiles for fused split-K"
-    counters = _split_counters(y.device)
-    if counters is None:
-        return None
-    partials = torch.empty(
-        tiles * splits * block_m * block_n, dtype=torch.float32, device=y.device
-    )
-    return (-(-tiles // 8) * 8 * splits,), partials, counters
 
 
 _LOGGER = AiterTritonLogger()
@@ -209,7 +179,9 @@ def gemm_afp8wfp8(
     grid_m, grid_n = triton.cdiv(M, block_m), triton.cdiv(N, block_n)
     workspace = None
     if fused:
-        workspace = _fused_workspace(y, grid_m * grid_n, num_splits, block_m, block_n)
+        workspace = fused_splitk_workspace(
+            y, grid_m * grid_n, num_splits, block_m, block_n
+        )
     if workspace is None:
         out = (
             y
@@ -310,6 +282,7 @@ def gemm_afp8wfp8(
             ws_ptr=partials,
             cnt_ptr=counters,
             cache_modifier=launch["cache_modifier"],
+            NUM_XCDS=get_num_xcds(),
             **scales,
             **launch_options,
         )
@@ -580,6 +553,7 @@ def gemm_afp8wfp8_preshuffle(
             w_scales.stride(1),
             A_SCALE_K_GROUP=x_scale_group_size,
             **config,
+            NUM_XCDS=get_num_xcds(),
         )
 
     if config["NUM_KSPLIT"] > 1:

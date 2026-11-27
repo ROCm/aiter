@@ -13,6 +13,11 @@ from torch.distributed import ProcessGroup
 import aiter as ops
 
 from ..parallel_state import in_the_same_node_as
+from .flydsl_backends import (
+    FLY_QUANTIZATIONS,
+    FlyDSLAllReduceRMSNorm,
+    FlyDSLQuickAllReduce,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +77,6 @@ MB = 1024 * 1024
 
 
 class QuickAllReduce:
-
     _SUPPORTED_WORLD_SIZES: ClassVar[list[Any]] = [2, 4, 8]
     _SUPPORTED_DTYPES: ClassVar[list[Any]] = [torch.float16, torch.bfloat16]
     # gfx1250 BF16 INT4 PullQ4 crossovers, identical in SPX and DPX. AITER CAR
@@ -115,6 +119,8 @@ class QuickAllReduce:
         unsupported.
         """
         self.disabled = True
+        self._fly_ar = None
+        self._fly_rms = None
         self._ptr = 0
         self.uses_pull_q4 = False
         self._route_selection_logged = False
@@ -194,6 +200,53 @@ class QuickAllReduce:
             return
 
         self.init_quick_all_reduce()
+        self._init_fly_backend()
+        self._init_fly_rms_backend()
+
+    def _fly_quantization(self) -> str | None:
+        """The quantization the FlyDSL backends serve, or None if they cannot."""
+        level = getattr(self, "qr_quant_level", None)
+        return (
+            None if level is None or level.name not in FLY_QUANTIZATIONS else level.name
+        )
+
+    def _init_fly_rms_backend(self):
+        """Build the quantized FlyDSL fused all-reduce+RMSNorm engines.
+
+        Every rank gets here and votes, even one whose regime FlyDSL does not
+        serve: a rank that skipped the vote would leave its peers waiting."""
+        try:
+            rms = FlyDSLAllReduceRMSNorm(
+                group=self.group,
+                device=self.device,
+                quantized=True,
+                serve=self._fly_quantization() is not None,
+            )
+        except Exception:
+            logger.warning(
+                "FlyDSL fused AR+RMSNorm (quantized) disabled: construction failed.",
+                exc_info=True,
+            )
+            return
+        if rms.disabled:
+            rms.close()
+            return
+        self._fly_rms = rms
+
+    def _init_fly_backend(self):
+        """Build the FlyDSL mesh/ring engines that will serve plain all-reduce,
+        and compile the binaries the policy routes to them before any graph
+        capture begins.
+
+        Every rank gets here and votes, even one whose regime FlyDSL does not
+        serve: a rank that skipped the vote would leave its peers waiting."""
+        fly_ar = FlyDSLQuickAllReduce(
+            self.group, self.device, quantization=self._fly_quantization()
+        )
+        if fly_ar.disabled:
+            fly_ar.close()
+            return
+        self._fly_ar = fly_ar
 
     def init_quick_all_reduce(self):
         # On RocM, bfloat16 kernels are slower than fp16
@@ -294,10 +347,21 @@ class QuickAllReduce:
         world_size = dist.get_world_size(group=self.group)
         qr_exchange_handles(self._ptr, world_size, self.group)
 
+    def _should_fly(self, inp: torch.Tensor) -> bool:
+        """Whether the FlyDSL backend can and should serve *inp*. Never raises."""
+        return self._fly_ar is not None and self._fly_ar.should_fly_ar(inp)
+
     def should_quick_allreduce(self, inp: torch.Tensor):
         """
         Check if quickreduce is available
         """
+        if self.disabled:
+            return False
+        return self._should_fly(inp) or self._should_hip(inp)
+
+    def _should_hip(self, inp: torch.Tensor) -> bool:
+        """Whether the HIP quick-reduce kernel can serve *inp*."""
+
         if self.disabled:
             return False
         if self._is_gfx1250:
@@ -339,13 +403,40 @@ class QuickAllReduce:
     def quick_all_reduce(self, inp: torch.Tensor, *, out: torch.Tensor = None):
         """Performs an out-of-place custom quick all reduce."""
         # quick allreduce doesn't require a separate graph mode,
-        # as QR uses static IPC buffer.
+        # as QR uses static IPC buffer. The same holds for the FlyDSL
+        # schedules, whose IPC inbox is likewise allocated once at init
+        # and whose served binaries are compiled at init (preload_fly_engines).
         if out is None:
             out = torch.empty_like(inp)
+        if self._should_fly(inp):
+            return self._fly_ar.fly_ar(inp, out=out)
         ops.qr_all_reduce(
             self._ptr, inp, out, self.qr_quant_level.value, self.use_fp16_kernels
         )
         return out
+
+    def should_fly_allreduce_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> bool:
+        """Whether the quantized FlyDSL fused AR+RMSNorm backend can serve
+        this call.
+        """
+        if self._fly_rms is None:
+            return False
+        return self._fly_rms.should_fly_fused_ar_rms(inp, residual_inp, weight)
+
+    def fly_allreduce_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(out, residual_out)`` on the quantized FlyDSL fused backend."""
+        return self._fly_rms.fly_fused_ar_rms(inp, residual_inp, weight, eps)
 
     def should_quick_allreduce_rmsnorm(
         self,
@@ -354,7 +445,7 @@ class QuickAllReduce:
         weight: torch.Tensor,
         hidden_dim: int,
     ):
-        if self.uses_pull_q4 or not self.should_quick_allreduce(inp):
+        if self.disabled or self.uses_pull_q4 or not self._should_hip(inp):
             return False
         if self.qr_quant_level == QuickReduceRegime.INT3:
             return False
@@ -395,6 +486,17 @@ class QuickAllReduce:
         return out, residual_out
 
     def close(self):
+        # Both backends, and not gated on self.disabled: the FlyDSL engines hold
+        # IPC inboxes opened against every peer, which have to be released
+        # before the process group goes away even if the slot is disabled.
+        for attr in ("_fly_ar", "_fly_rms"):
+            fly = getattr(self, attr, None)
+            if fly is not None:
+                try:
+                    fly.close()
+                except (AttributeError, RuntimeError):
+                    pass
+                setattr(self, attr, None)
         if getattr(self, "_ptr", None):
             if ops is not None:
                 ops.qr_destroy(self._ptr)

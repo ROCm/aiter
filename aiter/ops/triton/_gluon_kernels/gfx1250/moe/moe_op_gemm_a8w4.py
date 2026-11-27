@@ -1722,25 +1722,24 @@ def _moe_gemm_a8w4_decode(
         gl.amd.gfx1250.tdm.async_scatter(y_desc, dst, y_buffer)
         gl.amd.gfx1250.tdm.async_wait(0)
     else:
-        # TDM Store: accumulator → shared memory → global memory
-        Y += start_m.to(index_type) * stride_y_m
-        y_buffer = gl.allocate_shared_memory(
-            Y.type.element_ty,
-            shape=[BLOCK_M, OUT_BLOCK_N],
-            layout=SHARED_LAYOUT_Y,
-        )
-        y_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-            base=Y,
-            shape=(M, yN),
-            strides=(stride_y_m, stride_y_n),
-            block_shape=(BLOCK_M, OUT_BLOCK_N),
-            layout=SHARED_LAYOUT_Y,
-        )
-        y_buffer.store(out)
-        gl.amd.gfx1250.tdm.async_store(
-            y_desc, [block_id * BLOCK_M, pid_n * OUT_BLOCK_N], y_buffer
-        )
-        gl.amd.gfx1250.tdm.async_wait(0)
+        # Store the accumulator straight from registers. The tile used to go
+        # registers -> LDS (ds_store) -> TDM store; on gfx1250 that TDM store
+        # can read stale LDS (16-byte chunks of the weight tile last loaded into
+        # the aliased w_buffer slot) despite s_wait_dscnt 0 + s_barrier before
+        # it, when 3-4 of these workgroups share a WGP. Under decode load that
+        # put garbage (up to ~1e38) into a few MoE rows per million calls.
+        # buffer_store voffset is 32-bit bytes; the tile origin stays in the
+        # index_type pointer. The offset is only this tile's rows and columns.
+        OUT_LAYOUT: gl.constexpr = out.type.layout
+        tile_m = block_id * BLOCK_M
+        tile_n = pid_n * OUT_BLOCK_N
+        Y += (start_m.to(index_type) + tile_m.to(index_type)) * stride_y_m
+        Y += tile_n.to(index_type) * stride_y_n
+        in_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, OUT_LAYOUT))
+        in_n = gl.arange(0, OUT_BLOCK_N, layout=gl.SliceLayout(0, OUT_LAYOUT))
+        mask_y = ((tile_m + in_m) < M)[:, None] & ((tile_n + in_n) < yN)[None, :]
+        offs_y = in_m[:, None] * stride_y_m + in_n[None, :] * stride_y_n
+        gl.amd.gfx1250.buffer_store(out, Y, offs_y, mask=mask_y)
 
 
 def _gather_idx_dtype(gather_indx):

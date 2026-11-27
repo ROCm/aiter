@@ -772,6 +772,7 @@ struct MoeSortingKernel
                                                opus::index_t* p_reverse_sorted,
                                                const opus::index_t num_experts,
                                                const opus::index_t tokens,
+                                               const opus::index_t max_tokens,
                                                const opus::mdiv unit_size_mdiv,
                                                const opus::mdiv topk_mdiv,
                                                const opus::mdiv expert_mdiv,
@@ -1116,10 +1117,13 @@ struct MoeSortingKernel
             }
             while(e_start < e_end)
             {
+                // A pad id must be out of range for its consumers, which bound
+                // rows by the tensor's height: a device-side token count below
+                // it would make the pad a live row.
 #if OPUS_MOE_SORTING_MOCK_ID
-                p_sorted_token_ids[e_start] = MOE_SORTING_MOCK_ID(tokens, topk);
+                p_sorted_token_ids[e_start] = MOE_SORTING_MOCK_ID(max_tokens, topk);
 #else
-                p_sorted_token_ids[e_start] = tokens;
+                p_sorted_token_ids[e_start] = max_tokens;
 #endif
                 p_sorted_weights[e_start] = static_cast<WeightType>(0.0);
                 if(p_m_indices)
@@ -1175,6 +1179,7 @@ struct MoeSortingKernel
             static_cast<opus::index_t*>(kargs.p_reverse_sorted),
             kargs.num_experts,
             tokens_,
+            kargs.tokens,
             kargs.unit_size_mdiv,
             kargs.topk_mdiv,
             kargs.expert_mdiv,
@@ -1482,8 +1487,9 @@ moe_sorting_auto_is_oneshot(int tokens_, int num_experts_, int device_id_ = -1)
     if(!is_oneshot)
         return false;
 
-    // gfx950 crossover measured with E=128..255 at M>=17, E=256/257 at M>=8 and E=385 at all M.
-    bool prefer_mp = num_experts_ >= 385 || (num_experts_ >= 256 && tokens_ >= 8) ||
+    // gfx950 crossover measured with E=128..255 at M>=17, E=256/257 at M>=8,
+    // E=384 at M<8 and E=385 at all M.
+    bool prefer_mp = num_experts_ >= 384 || (num_experts_ >= 256 && tokens_ >= 8) ||
                      (num_experts_ >= 128 && tokens_ >= 17);
     return !(moe_sorting_device_is_gfx950(device_id_) && prefer_mp);
 }
@@ -2770,10 +2776,12 @@ struct MoeSortingMultiPhaseKernel_P3
 
         for(opus::index_t i = e_start + prev_cumsum + threadIdx.x; i < e_end; i += kBlockSize)
         {
+            // Out of range for consumers bounding rows by the tensor's height;
+            // see moe_align_block_size_kernel_ex.
 #if OPUS_MOE_SORTING_MOCK_ID
-            p_sorted_token_ids[i] = MOE_SORTING_MOCK_ID(tokens, kargs.topk_mdiv.divisor);
+            p_sorted_token_ids[i] = MOE_SORTING_MOCK_ID(kargs.tokens, kargs.topk_mdiv.divisor);
 #else
-            p_sorted_token_ids[i] = tokens;
+            p_sorted_token_ids[i] = kargs.tokens;
 #endif
             p_sorted_weights[i] = static_cast<WeightType>(0.0);
             if(p_m_indices)
@@ -3371,10 +3379,12 @@ struct MoeSortingMultiPhaseKernel_P23
 
             for(opus::index_t i = e_start + prev_cumsum + threadIdx.x; i < e_end; i += kBlockSize)
             {
+                // Out of range for consumers bounding rows by the tensor's
+                // height; see moe_align_block_size_kernel_ex.
 #if OPUS_MOE_SORTING_MOCK_ID
-                p_sorted_token_ids[i] = MOE_SORTING_MOCK_ID(tokens, kargs.topk_mdiv.divisor);
+                p_sorted_token_ids[i] = MOE_SORTING_MOCK_ID(kargs.tokens, kargs.topk_mdiv.divisor);
 #else
-                p_sorted_token_ids[i] = tokens;
+                p_sorted_token_ids[i] = kargs.tokens;
 #endif
                 p_sorted_weights[i] = static_cast<WeightType>(0.0);
                 if(p_m_indices)

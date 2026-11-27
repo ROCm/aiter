@@ -2,19 +2,12 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Host side of the big-M path of MegaMoeTP.forward (the kernel: compile_bigm_kernel in
 mega_moe_tp_kernel.py): MegaMoeTPBigM (the SDMA queues and hipIpc arena, buffers, per-batch
-plans, launches), the disk cache of the compiled kernels, the bf16 row gather of the fused tail.
+plans, launches), the bf16 row gather of the fused tail.
 """
 
-import ast
 import ctypes
-import hashlib
 import inspect
-import logging
 import os
-import pickle
-import re
-import stat
-import tempfile
 import time
 
 import torch
@@ -22,9 +15,8 @@ import torch.distributed as dist
 from flydsl.utils import env as fenv
 
 from aiter.jit.core import AITER_CONFIGS
-from aiter.jit.utils.chip_info import get_gfx
 
-from ....communication import SdmaComm, compile_signal_read, sdma_bitcode
+from ....communication import SdmaComm, compile_signal_read
 from ..tensor_shim import _preload_compiled, _run_compiled
 from .common import device_key, nearest, tuned_rows
 from .gemm import bigm_lds
@@ -42,185 +34,14 @@ from .mega_moe_tp_config import (
 )
 from .mega_moe_tp_kernel import compile_bigm_kernel
 
-_log = logging.getLogger("aiter")
-
 __all__ = ["MegaMoeTPBigM"]
 
 
-# ---- disk cache of the compiled big-M kernels ----
-# FlyDSL keeps kernels that link external bitcode (link_extern: the SDMA device functions here)
-# out of its disk cache -- its key does not cover the bitcode -- so every process would compile
-# every big-M variant again (~86 s each, all ranks waiting). The artifact itself pickles fine
-# (no post-load processors), so this keeps it on disk keyed by the compile arguments plus the
-# digest of everything else it is built from: the kernel's sources (mega_moe_tp_kernel.py and
-# the modules it imports from aiter.ops.flydsl.kernels), the SDMA bitcode, the FlyDSL compiler
-# (its own cache key) and the GPU arch.
-_DIGEST = None
-
-
-def _kernel_sources():
-    """mega_moe_tp_kernel.py and every module of aiter.ops.flydsl.kernels it imports, transitively
-    (relative imports, wherever in the file; MORI's bitcode is hashed itself)"""
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # .../kernels
-    todo = [os.path.join(root, "mega_moe_tp", "mega_moe_tp_kernel.py")]
-    seen = set()
-    while todo:
-        f = todo.pop()
-        if f in seen or not os.path.isfile(f):
-            continue
-        seen.add(f)
-        here = os.path.dirname(f)
-        with open(f) as fh:
-            tree = ast.parse(fh.read())
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.ImportFrom) or not node.level:
-                continue
-            base = here
-            for _ in range(node.level - 1):
-                base = os.path.dirname(base)
-            if not base.startswith(root):
-                continue
-            mods = (
-                [os.path.join(base, *node.module.split("."))]
-                if node.module
-                else [os.path.join(base, a.name) for a in node.names]
-            )
-            for m in mods:
-                todo += [m + ".py", os.path.join(m, "__init__.py")]
-    return sorted(seen)
-
-
-def _bigm_digest():
-    global _DIGEST
-    if _DIGEST is None:
-        h = hashlib.sha256(get_gfx().encode())
-        for f in _kernel_sources() + [sdma_bitcode()]:
-            with open(f, "rb") as fh:
-                h.update(fh.read())
-        try:
-            from flydsl.compiler.jit_function import _flydsl_key
-
-            h.update(_flydsl_key().encode())
-        except Exception:  # noqa: BLE001 (older / newer FlyDSL: its version instead)
-            import flydsl
-
-            h.update(str(getattr(flydsl, "__version__", "")).encode())
-        _DIGEST = h.hexdigest()
-    return _DIGEST
-
-
-def _bigm_cache_dir():
-    """FlyDSL's cache root (FLYDSL_RUNTIME_CACHE_DIR) / aiter_bigm; None when FlyDSL caching
-    is off."""
-    if not fenv.runtime.enable_cache:
-        return None
-    return os.path.join(fenv.runtime.cache_dir, "aiter_bigm")
-
-
-_WARNED = set()
-
-
-def _warn_once(key, msg, *args):
-    if key not in _WARNED:
-        _WARNED.add(key)
-        _log.warning(msg, *args)
-
-
-def _private(path):
-    """path (the cache directory or an entry) is this user's and only writable by them: a
-    pickled entry runs code when loaded, so a shared / writable-by-others cache is skipped
-    """
-    try:
-        st = os.stat(path)
-    except OSError:
-        return False
-    return st.st_uid == os.getuid() and not st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-
-
 def _bigm_cached(launch, args):
-    """Collective-free: make launch(*args)'s compiled artifact resident -- from this process's
-    memory, else the disk cache, else compiled (no kernel dispatch) and written to the disk
-    cache -- and its code object loaded."""
-    try:  # FlyDSL's in-process key of these arguments (private API: on any change, just compile)
-        launch._ensure_sig()
-        launch._ensure_cache_manager()
-        bound = launch._sig.bind(*args)
-        bound.apply_defaults()
-        ck = launch._build_full_cache_key(
-            bound.arguments, effective_hints=launch._effective_compile_hints()
-        )
-        mem = launch._mem_cache
-    except Exception:  # noqa: BLE001
-        _warn_once(
-            "api",
-            "MegaMoeTP big-M: FlyDSL's cache API changed (private names): no disk cache, "
-            "every process compiles its big-M kernels (minutes each)",
-        )
-        _preload_compiled(launch, *args)
-        return
-    if ck in mem:
-        mem[ck]._get_func_exe()
-        return
-    d = _bigm_cache_dir()
-    path = None
-    if d:
-        sig = re.sub(r" at 0x[0-9a-f]+", "", str(ck))
-        name = hashlib.sha256(
-            f"{launch._bigm_spec}|{_bigm_digest()}|{sig}".encode()
-        ).hexdigest()[:32]
-        path = os.path.join(d, f"bigm_{name}.pkl")
-        if os.path.isdir(d) and not _private(d):
-            _warn_once(
-                d,
-                "MegaMoeTP big-M: disk cache %s is not private to this user "
-                "(group / others writable or another owner): not used",
-                d,
-            )
-            path = None
-        elif os.path.isfile(path) and not _private(path):
-            path = None
-        if path and os.path.isfile(path):
-            try:
-                with open(path, "rb") as f:
-                    art = pickle.load(f)
-                art._get_func_exe()  # code object loaded here, not in the first launch
-                mem[ck] = art
-                return
-            # a stale / corrupt entry: compile again
-            except Exception as e:  # noqa: BLE001
-                _log.warning("MegaMoeTP big-M: disk cache %s unusable (%s)", path, e)
+    """Collective-free: compile launch(*args) without dispatching a kernel. FlyDSL's disk cache
+    (keyed on the traced IR and the linked SDMA bitcode) makes this a load in a warm process.
+    """
     _preload_compiled(launch, *args)
-    art = mem.get(ck)
-    if art is None:
-        return
-    art._get_func_exe()
-    _warn_spills(launch, art)
-    if path:
-        try:
-            os.makedirs(d, mode=0o700, exist_ok=True)
-            fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
-            try:
-                with os.fdopen(fd, "wb") as f:
-                    pickle.dump(art, f)
-                os.replace(tmp, path)  # atomic: concurrent ranks write the same bytes
-            except BaseException:
-                os.unlink(tmp)
-                raise
-        except Exception as e:  # noqa: BLE001
-            _log.warning("MegaMoeTP big-M: disk cache write %s failed (%s)", path, e)
-
-
-def _warn_spills(launch, art):
-    """a freshly compiled kernel that spills to scratch: its register file is exhausted (seen
-    with the waits timing out)"""
-    m_ = re.search(r"private_segment_fixed_size = (\d+)", getattr(art, "ir", "") or "")
-    if m_ and int(m_.group(1)):
-        _log.warning(
-            "MegaMoeTP big-M: kernel %s spills to scratch (%s B per lane): lower its "
-            "register use (e.g. AITER_BIGM_R8=1 in the tuned csv's opts)",
-            launch._bigm_spec[:120],
-            m_.group(1),
-        )
 
 
 _HIP = None
@@ -309,25 +130,39 @@ class MegaMoeTPBigM:
         opts=None,
         act="swiglu",
         ygather=False,
+        situ=(1.0, 1.0),
+        shared=None,
     ):
+        """shared: the shared expert's (index experts) MXFP8 (w1, w1_scale, w2, w2_scale)
+        (mega_moe_tp.shuffle_weight_mega_fp8 + e8m0_shuffle); w1 / w2 then the routed ones
+        only (experts)"""
+        self.sh8 = shared is not None
         self.H, self.I, self.E, self.K = hidden, inter, experts, topk
         self.K1, self.NE = topk + 1, experts + 1
         self.tp = dist.get_world_size(group)
         self.rank = dist.get_rank(group)
         self.Tmax = max_tokens
-        self.act = act  # the units' activation ("swiglu", "silu")
+        self.act = act  # the units' activation ("swiglu", "silu", "situv2")
+        self.situ = (float(situ[0]), float(situ[1]))  # (situv2) beta, linear beta
         self.ygather = bool(ygather)  # moe(gather=True): the "q" region holds bf16 rows
         self._plans = {}
         self.cfg = (float(eps), bool(gemma), float(swiglu_limit))
-        self.opts = tuple(sorted((opts or {}).items()))  # tuned AITER_BIGM_* options
+        opts = dict(opts or {})
+        if ygather and os.environ.get("AITER_BIGM_YDC", "1") == "1":
+            # (ar, bf16 y rows) the kernel's YD items copy every rank's gathered y rows into
+            # the caller's output (no copy after the launch)
+            opts["AITER_BIGM_YDC"] = "1"
+        self.opts = tuple(sorted(opts.items()))  # tuned AITER_BIGM_* options
         self.w = (
             w1.view(torch.uint8),
             w1_scale.view(torch.uint8),
             w2.view(torch.uint8),
             w2_scale.view(torch.uint8),
         )
+        self.wsh = tuple(t.view(torch.uint8) for t in shared) if self.sh8 else None
         H, T, K1, tp = hidden, max_tokens, self.K1, self.tp
-        RB = i8_row_bytes(H)
+        # the E (reduce-scatter) rows: int8 + scales, or bf16 (AITER_BIGM_EB, comm_dtype bf16)
+        RB = 2 * H if dict(self.opts).get("AITER_BIGM_EB") == "1" else i8_row_bytes(H)
         # the kernel's 32-bit offsets into these regions (the route rows: per chunk, _chunks)
         for what, n in (("E rows", T * RB), ("y gather rows", T * H * 2)):
             if n >= 1 << 31:
@@ -344,7 +179,20 @@ class MegaMoeTPBigM:
             "q": T * H * (2 if self.ygather else 1),
             "qs": T * 4,
         }
+        # (ar, YG8: the y gather as int8 rows) every rank's dequantized rows land here
+        self.yg8 = self.ygather and dict(self.opts).get("AITER_BIGM_YG8") == "1"
+        self.ydc = (
+            self.ygather
+            and not self.yg8
+            and dict(self.opts).get("AITER_BIGM_YDC") == "1"
+        )
         sd = self.sd = SdmaComm(group=group, num_queues=NQ, device=device)
+        # (sd.device: the resolved one -- device may be None)
+        self.ygout = (
+            torch.empty((T, H), dtype=torch.bfloat16, device=sd.device)
+            if self.yg8
+            else None
+        )
         for r_ in self.REGIONS:
             sd.reserve(r_, sizes[r_])
         # gather_rows: every rank's bf16 tail rows (not a kernel region)
@@ -395,13 +243,15 @@ class MegaMoeTPBigM:
         self.nab = self._nab()
 
     def _nab(self):
-        """the deepest A ring (dividing the GEMM1 chunk count) whose LDS (+ the kernel's
-        row-phase scratch, < 4 KiB) fits a CU"""
+        """the A ring depth (dividing the GEMM1 chunk count) whose LDS (+ the kernel's
+        persistent scratch, < 2 KiB; the plan scratch may reuse the unit's) fits a CU: 4,
+        else the deepest (below 4 nothing is in flight at the chunk wait: H 3584 -> 7)
+        """
         kch = self.H // 256
-        for n in (4, 3, 2):
+        for n in (4, 7, 6, 5, 3, 2):
             if (
                 kch % n == 0
-                and bigm_lds(UNIT_ROWS, n, self.I)["BYTES"] + 4096 <= LDS_LIMIT
+                and bigm_lds(UNIT_ROWS, n, self.I)["BYTES"] + 2048 <= LDS_LIMIT
             ):
                 return n
         raise ValueError(
@@ -494,7 +344,9 @@ class MegaMoeTPBigM:
         return int(self.ctrl[C_ERR].item())
 
     def clear_errors(self) -> None:
-        self.ctrl[C_ERR:].zero_()
+        # (the watchdog word only: the words after it persist across launches, e.g. the
+        # YDS launch number at C_ERR + 20 -- every rank's must stay in step)
+        self.ctrl[C_ERR].zero_()
 
     def error_flag(self):
         """The sticky watchdog word as a 1-element device tensor (no sync): 1 if a wait gave
@@ -517,6 +369,9 @@ class MegaMoeTPBigM:
         )
         self.sd.consumed[self._cpar].copy_(got)
         self.ctrl.zero_()
+        # (ctrl holds the YDS launch count too: it restarts, so the y gather's flags of the
+        # earlier launches -- the "qs" region, compared with that count -- must go as well)
+        self.sd.view("qs", (self.Tmax,), torch.int32).zero_()
         torch.cuda.synchronize(self.device)
         dist.barrier(group=self.sd.group)
 
@@ -540,11 +395,50 @@ class MegaMoeTPBigM:
                 "tp": self.tp,
             }
             path = AITER_CONFIGS.AITER_CONFIG_MEGA_MOE_TP_BIGM_FILE
-            tu = nearest(tuned_rows(path, key, "tokens"), T, clamp=True)
+            # rows of this comm mode (column "mode": ar / ag_rs), else the mode-less ones
+            mode = "ar" if self.ygather else "ag_rs"
+            tu = None
+            # comm_dtype "bf16" (bf16 RS / y gather: twice the wire bytes) / "int8" (int8 RS
+            # and y gather): their own rows (mode "<mode>_bf16" / "<mode>_int8") first
+            sfx = (
+                "_bf16"
+                if o.get("AITER_BIGM_EB") == "1"
+                else "_int8" if o.get("AITER_BIGM_YG8") == "1" else ""
+            )
+            if sfx:
+                tu = nearest(
+                    tuned_rows(path, {**key, "mode": mode + sfx}, "tokens"),
+                    T,
+                    clamp=True,
+                )
+            if tu is None and self.sh8 and not sfx:
+                # (the MXFP8 shared expert: its own rows, mode "<mode>_sh8", first)
+                tu = nearest(
+                    tuned_rows(path, {**key, "mode": mode + "_sh8"}, "tokens"),
+                    T,
+                    clamp=True,
+                )
+            if tu is None:
+                tu = nearest(
+                    tuned_rows(path, {**key, "mode": mode}, "tokens"), T, clamp=True
+                )
+            if tu is None:
+                tu = nearest(
+                    tuned_rows(path, {**key, "mode": ""}, "tokens"), T, clamp=True
+                )
             if tu is not None:
                 w = [int(x) for x in tu["chunks"].split(",")]
                 opts = (kv.split("=", 1) for kv in tu.get("opts", "").split(";") if kv)
                 o = {**dict(opts), **o}
+                # (the options the host sized / picked its buffers by -- the reduce-scatter
+                # row format, the y gather's format and destination -- are the host's alone:
+                # a tuned row cannot switch them under it)
+                host = dict(self.opts)
+                for k in ("AITER_BIGM_EB", "AITER_BIGM_YG8", "AITER_BIGM_YDC"):
+                    if k in host:
+                        o[k] = host[k]
+                    else:
+                        o.pop(k, None)
             else:
                 w = [1, 1] if T <= 16384 else [1, 2, 2, 1]
             if not 0 < len(w) <= CMAX or min(w) <= 0:
@@ -572,8 +466,12 @@ class MegaMoeTPBigM:
         sizes = tuple(self._split(m))
         c = self.chunks_t.get(T)
         if c is None:
-            # the kernel's 32-bit offsets of a chunk's route rows (rows * H bf16)
-            if self.tp * max(sizes) * self.K1 * self.H * 2 >= 1 << 31:
+            # the kernel's 32-bit (unsigned buffer) offsets of a chunk's route rows (rows * H
+            # bf16; R8: the scales' offset is halved signed: 2 GiB)
+            lim = 1 << (
+                31 if dict(self._plan(T)[1]).get("AITER_BIGM_R8") == "1" else 32
+            )
+            if self.tp * max(sizes) * self.K1 * self.H * 2 >= lim:
                 raise ValueError(
                     f"MegaMoeTP big-M: chunks {sizes} of {T} tokens: a chunk's route rows "
                     "exceed 32-bit offsets (more chunks: the tuned csv)"
@@ -592,14 +490,19 @@ class MegaMoeTPBigM:
             )
         return c
 
-    def set_weights(self, w1, w1_scale, w2, w2_scale):
+    def set_weights(self, w1, w1_scale, w2, w2_scale, shared=None):
         """the next launches use another layer's weights of the same shape"""
+        if (shared is not None) != self.sh8:
+            raise ValueError(
+                "MegaMoeTP big-M: the shared expert's MXFP8 weights, iff built so"
+            )
         self.w = (
             w1.view(torch.uint8),
             w1_scale.view(torch.uint8),
             w2.view(torch.uint8),
             w2_scale.view(torch.uint8),
         )
+        self.wsh = tuple(t.view(torch.uint8) for t in shared) if self.sh8 else None
 
     def _ucap(self, T):
         return unit_cap(
@@ -621,7 +524,15 @@ class MegaMoeTPBigM:
         _run_compiled(launch, *args)
 
     def moe(
-        self, x, topk_weights, topk_ids, out=None, tail=None, local=False, gather=False
+        self,
+        x,
+        topk_weights,
+        topk_ids,
+        out=None,
+        tail=None,
+        local=False,
+        gather=False,
+        full=None,
     ):
         """The MoE of every rank's tokens (ag_rs): x [m, H] bf16 (this rank's rows, global
         rows rank * m + i), topk_weights f32 / topk_ids int32 [m, K1] (the shared expert E in
@@ -661,7 +572,15 @@ class MegaMoeTPBigM:
             )
         if mp == m:
             if gather:
-                ya = self._moe(x, topk_weights, topk_ids, None, None, local, gather)
+                # full: (x, topk_weights, topk_ids) of the replicated batch [tp * m] (ar):
+                # every rank quantizes every row itself, no input / routing gather
+                if self.ydc and out is not None and full is not None:
+                    return self._moe(
+                        x, topk_weights, topk_ids, out, None, local, gather, full
+                    )
+                ya = self._moe(
+                    x, topk_weights, topk_ids, None, None, local, gather, full
+                )
                 if out is not None:
                     _kcopy(out, ya)
                 return ya if out is None else out
@@ -715,8 +634,8 @@ class MegaMoeTPBigM:
         """the kernel variant (compile_bigm_kernel's tailq) of a moe() call"""
         return 3 if gather else 0 if not tail else 2 if local else 1
 
-    def _io_launch(self, m, tailq):
-        """the kernel of m (a multiple of PAD) local rows"""
+    def _io_launch(self, m, tailq, xl=False):
+        """the kernel of m (a multiple of PAD) local rows (xl: from the replicated batch)"""
         T = m * self.tp
         eps, gemma, lim = self.cfg
         w_, opts = self._plan(T)
@@ -736,6 +655,10 @@ class MegaMoeTPBigM:
             opts=opts,
             tailq=tailq,
             act=self.act,
+            situ_beta=self.situ[0],
+            situ_linear_beta=self.situ[1],
+            xl=xl,
+            sh8=self.sh8,
         )
 
     def io_rows_per_kernel(self, lo, hi):
@@ -752,7 +675,7 @@ class MegaMoeTPBigM:
         the disk cache, split over the ranks -- rank r compiles every tp-th -- so a cold cache
         costs about one compile, not one per kernel; the moe() warm-ups then load them. No-op
         without a disk cache."""
-        if not _bigm_cache_dir():
+        if not fenv.runtime.enable_cache:
             return
         mine = [m for i, m in enumerate(rows) if i % self.tp == self.rank]
         for m in mine:
@@ -764,17 +687,38 @@ class MegaMoeTPBigM:
             _bigm_cached(launch, (0,) * (n - 1) + (torch.cuda.current_stream(),))
         dist.barrier(group=self.sd.group)
 
-    def _moe(self, x, topk_weights, topk_ids, out, tail, local, gather=False):
+    def ygout_bf16(self, T):
+        """(YDC, no caller output) an internal [T, H] bf16 output"""
+        if getattr(self, "_ygb", None) is None or self._ygb.shape[0] < T:
+            self._ygb = torch.empty(
+                (T, self.H), dtype=torch.bfloat16, device=self.device
+            )
+        return self._ygb[:T]
+
+    def _moe(
+        self, x, topk_weights, topk_ids, out, tail, local, gather=False, full=None
+    ):
         """moe() of m (a multiple of PAD) rows"""
         m = x.shape[0]
         T = m * self.tp
         w1, w1s, w2, w2s = self.w
         y = self.normed[:m] if out is None else out
+        if gather and self.yg8:
+            y = self.ygout[:T]
         if tail is not None:
             res_in, res_out, norm_w = tail
         else:
             res_in, res_out, norm_w = x, self.resout, x
-        launch = self._io_launch(m, self.tailq(tail is not None, local, gather))
+        tq = self.tailq(tail is not None, local, gather)
+        xl = full is not None and tq == 3
+        # (YDC: compiled into the replicated-batch kernels only) the YD items write every
+        # rank's rows to the caller's [T, H] output
+        ydc = gather and self.ydc and xl
+        if ydc:
+            y = out if out is not None else self.ygout_bf16(T)
+        launch = self._io_launch(m, tq, xl)
+        if xl:  # (the kernel reads rank r's rows at r * m)
+            x, topk_weights, topk_ids = full
         chunks = self._chunks(T)  # (first: it may grow the unit table)
         self.ctrl[:BIGM_CTRL_INTS].zero_()
         self._run(
@@ -801,6 +745,7 @@ class MegaMoeTPBigM:
                 w1s.data_ptr(),
                 w2.data_ptr(),
                 w2s.data_ptr(),
+                *((t.data_ptr() for t in self.wsh) if self.sh8 else (0, 0, 0, 0)),
                 self.ctrl.data_ptr(),
                 chunks.data_ptr(),
                 self.rank,
@@ -812,6 +757,8 @@ class MegaMoeTPBigM:
         )
         self._cpar ^= 1  # (the next launch reads what this one's GW wrote)
         if gather:
+            if self.yg8 or ydc:
+                return y
             return self.sd.view("q", (T, self.H), torch.bfloat16)
         if tail is None:
             return y

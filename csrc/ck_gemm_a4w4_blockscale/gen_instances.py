@@ -271,20 +271,36 @@ aiter_tensor_t&
 def get_tune_dict(tune_dict_csv):
     if os.path.exists(tune_dict_csv):
         df = pd.read_csv(tune_dict_csv)
-        # The a4w4 tuned CSV mixes CK kernels and ASM kernels in one file with
-        # no libtype column.  The Python dispatcher in
-        # aiter/ops/gemm_op_a4w4.py routes ASM rows by
-        # kernelName.startswith("_ZN") (mangled C++ symbol of the ASM kernel);
-        # apply the same filter here so the CK codegen sees only CK rows and
-        # build_tune_dict's strict validation stays effective on genuine CK
-        # references.
-        df = df[~df["kernelName"].astype(str).str.startswith("_ZN")]
-        return build_tune_dict(
-            df,
+        # Other backends share the CSV but must never enter the CK registry.
+        external = ("_ZN", "triton_", "flydsl_")
+        ck_rows = df[~df["kernelName"].astype(str).str.startswith(external)]
+        registry = build_tune_dict(
+            ck_rows,
             default_kernels_dict,
             kernels_list,
             kernels_by_name=kernels_by_name,
         )
+        # A foreign row can retain its old CK choice for unsupported calls.
+        # Collect that registry separately: identical shape keys must not hide
+        # another CK instance before the name-keyed header is emitted.
+        if "fallbackKernelName" in df.columns:
+            fallback = df.copy()
+            fallback["kernelName"] = (
+                fallback["fallbackKernelName"].fillna("").astype(str)
+            )
+            fallback = fallback[
+                (fallback["kernelName"] != "")
+                & (fallback["kernelName"] != "0")
+                & ~fallback["kernelName"].str.startswith(external)
+            ]
+            extra = build_tune_dict(
+                fallback,
+                {},
+                kernels_list,
+                kernels_by_name=kernels_by_name,
+            )
+            registry.update({k.name: k for k in extra.values()})
+        return registry
     return default_kernels_dict
 
 

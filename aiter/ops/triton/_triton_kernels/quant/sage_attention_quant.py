@@ -1395,6 +1395,7 @@ _sage_quant_repr = make_kernel_repr(
     "sage_quant_kernel",
     [
         "SEQLEN_K_PADDED",
+        "QUANTIZE_V",
         "INT8_MAX",
         "D",
         "BLK_Q",
@@ -1455,7 +1456,7 @@ def sage_quant_kernel(
     SEQLEN_Q,
     SEQLEN_K,
     SEQLEN_K_PADDED: tl.constexpr,
-    FP8_MAX: tl.constexpr,
+    QUANTIZE_V: tl.constexpr,
     INT8_MAX: tl.constexpr,
     D: tl.constexpr,
     BLK_Q: tl.constexpr,
@@ -1528,8 +1529,9 @@ def sage_quant_kernel(
             INT8_MAX,
             offs_kn[:, None] < SEQLEN_K,
         )
-    else:
-        # V
+    elif QUANTIZE_V:
+        # V, only when it is quantized (FP8). A 16-bit V is passed through by
+        # the wrapper, which then launches no V programs.
         _pid = pid - (q_task_count + k_task_count)
         off_blk, off_h, off_b = pid_grid_3d(_pid, K_NUM_BLKS, K_HEAD, BATCH)
         offs_kn = off_blk * BLK_K + offs_blk_k
