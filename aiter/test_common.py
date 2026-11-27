@@ -11,6 +11,7 @@ import torch
 import torch.profiler as tpf
 
 from aiter import logger
+from aiter.utility.measure import flush_llc, llc_bytes, llc_flush_buffer
 
 pd.set_option("display.max_rows", 200)
 ## debug ##
@@ -58,26 +59,46 @@ def perftest(
     def decorator(func):
         def wrapper(*args, **kwargs):
             num = num_rotate_args
-            if num < 1:
+            cold = num < 1
+            pristine = None
+            if cold:
+                warn_if_unrotatable(func, args, kwargs)
                 gpu_id = torch.cuda.current_device()
+                # Before free memory is read, so the copies leave room for it.
+                llc_flush_buffer(gpu_id)
+                free_memory = torch.cuda.mem_get_info(gpu_id)[0]
+                if 2 * _device_tensor_bytes(args, kwargs) <= free_memory:
+                    pristine = copy.deepcopy((args, kwargs))
                 iter_used_memory, inputSize, _, _ = device_memory_profiling(
                     func, *args, **kwargs
                 )
 
-                properties = torch.cuda.get_device_properties(gpu_id)
                 free_memory = torch.cuda.mem_get_info(gpu_id)[0]
+                if pristine is not None:
+                    free_memory += _device_tensor_bytes(*pristine)
+                # The flush colds the first pass; a 2 x LLC ring keeps later passes cold.
                 cache_size = min(
-                    getattr(properties, "L2_cache_size", 4096 * 1024) * 64 * 128,
+                    2 * llc_bytes(gpu_id),
                     (free_memory - iter_used_memory + inputSize) * 0.9,
                 )
                 cache_size = max(cache_size, 0)
                 num = int((cache_size + inputSize - 1) // inputSize)
             num = min(num, num_iters)
 
-            rotate_args = [
-                (copy.deepcopy(args), copy.deepcopy(kwargs)) for _ in range(num - 1)
-            ] + [(args, kwargs)]
-            run_iters(num_warmup, func, *args, **kwargs)
+            rotate_args = input_copies(args, kwargs, num, pristine, num_iters)
+            del pristine
+            # Warm up on every copy so none is first used inside the timed loop, then
+            # (auto mode) flush_llc below re-colds the cache before timing:
+            #
+            #   warm-up   c0 c1 .. cN    every copy pays its first-use cost here
+            #   flush                    evicts what the warm-up left in the LLC
+            #   timed     c0 c1 .. cN    no first use, cold cache
+            #
+            # Warming only the caller's inputs would time each copy's first use.
+            num_warmup_calls = num_warmup
+            if len(rotate_args) > 1:
+                num_warmup_calls = max(num_warmup, len(rotate_args))
+            run_iters_rotate(num_warmup_calls, func, rotate_args)
             torch.cuda.synchronize()
             if int(os.environ.get("AITER_LOG_MORE", "0")) or use_cuda_event:
                 latencies = []
@@ -94,6 +115,9 @@ def perftest(
                 if use_cuda_event:
                     return data, avg
 
+            if cold:
+                flush_llc(gpu_id)
+                torch.cuda.synchronize()
             with tpf.profile(
                 activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
                 profile_memory=False,
@@ -115,6 +139,9 @@ def perftest(
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     data = run_iters_rotate(num_iters, func, rotate_args)
+                if cold:
+                    flush_llc(gpu_id)
+                    torch.cuda.synchronize()
                 with tpf.profile(
                     activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
                     profile_memory=True,
@@ -184,16 +211,7 @@ def benchmark():
 
 def device_memory_profiling(func, *args, **kwargs):
     gpu_id = torch.cuda.current_device()
-    inputSize = (
-        sum(
-            [
-                el.nbytes
-                for el in args
-                if isinstance(el, torch.Tensor) and el.device.index == gpu_id
-            ]
-        )
-        + 1
-    )
+    inputSize = _device_tensor_bytes(args, kwargs, gpu_id) + 1
     torch.cuda.reset_peak_memory_stats(gpu_id)
     cuda_memory_before = (
         torch.cuda.mem_get_info(gpu_id)[1] - torch.cuda.mem_get_info(gpu_id)[0]
@@ -228,6 +246,59 @@ def run_iters(num_iters, func, *args, **kwargs):
     for _ in range(num_iters):
         data = func(*args, **kwargs)
     return data
+
+
+def _device_tensor_bytes(args, kwargs, device_index=None):
+    """Bytes of the GPU tensors in `args` and `kwargs`, each tensor counted once.
+
+    `device_index=None` counts every GPU; otherwise only tensors on that device.
+    """
+    tensors = {
+        id(t): t
+        for t in (*args, *kwargs.values())
+        if isinstance(t, torch.Tensor)
+        and t.is_cuda
+        and device_index in (None, t.device.index)
+    }
+    return sum(t.nbytes for t in tensors.values())
+
+
+_warned_unrotatable = set()
+
+
+def warn_if_unrotatable(func, args, kwargs):
+    """Warn once per function when it gets no GPU tensors, since perftest cannot copy them."""
+    if _device_tensor_bytes(args, kwargs):
+        return
+    code = getattr(func, "__code__", None)
+    name = getattr(func, "__qualname__", type(func).__name__)
+    if code is not None:
+        name = f"{name} ({code.co_filename}:{code.co_firstlineno})"
+    key = name if code is None else code
+    if key in _warned_unrotatable:
+        return
+    _warned_unrotatable.add(key)
+    logger.warning(
+        f"perftest: {name} takes no GPU tensors, so its inputs cannot be rotated "
+        "and are timed warm. Pass the tensors as arguments, or num_rotate_args=1 "
+        "to time without rotation."
+    )
+
+
+def input_copies(args, kwargs, num, pristine=None, num_iters=None):
+    """`num` input sets: `num - 1` deep copies and the caller's own `(args, kwargs)`.
+
+    Each copy is one deepcopy of both, taken from `pristine` (copied before `func` first ran)
+    when given. The caller's set sits where call `num_iters - 1` of an `i % num` loop reads,
+    or last when `num_iters` is None.
+    """
+    if num < 2:
+        return [(args, kwargs)]
+    source = (args, kwargs) if pristine is None else pristine
+    first = [] if pristine is None else [pristine]
+    copies = first + [copy.deepcopy(source) for _ in range(num - 1 - len(first))]
+    slot = num - 1 if num_iters is None else (num_iters - 1) % num
+    return copies[:slot] + [(args, kwargs)] + copies[slot:]
 
 
 def run_iters_rotate(num_iters, func, rotate_args):
