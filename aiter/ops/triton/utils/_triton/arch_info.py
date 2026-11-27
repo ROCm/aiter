@@ -1,7 +1,38 @@
+import os
+
 import triton
+
+_KFD_NODES = "/sys/class/kfd/kfd/topology/nodes"
+
+
+def _probe_kfd_arch():
+    # KFD sysfs gives the arch without starting HIP, so the process can still
+    # fork. Use it only when all GPUs have one arch, because then the device
+    # order and the visible devices do not change the result.
+    if os.environ.get("TRITON_OVERRIDE_ARCH") or os.environ.get(
+        "HSA_OVERRIDE_GFX_VERSION"
+    ):
+        return None
+    archs = set()
+    try:
+        for node in os.listdir(_KFD_NODES):
+            with open(os.path.join(_KFD_NODES, node, "properties")) as f:
+                props = dict(line.split() for line in f if line.strip())
+            ver = int(props.get("gfx_target_version", 0))
+            if ver:
+                archs.add(f"gfx{ver // 10000}{ver // 100 % 100}{ver % 100:x}")
+    except (OSError, ValueError):
+        return None
+    # The sysfs version cannot tell gfx1250 from gfx1250-strict.
+    if len(archs) != 1 or "gfx1250" in archs:
+        return None
+    return archs.pop()
 
 
 def _probe_arch():
+    arch = _probe_kfd_arch()
+    if arch is not None:
+        return arch
     try:
         return triton.runtime.driver.active.get_current_target().arch
     except RuntimeError:
