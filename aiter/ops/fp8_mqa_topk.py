@@ -24,7 +24,7 @@ import torch
 from torch import Tensor
 
 from ..jit.core import compile_ops
-from ..jit.utils.chip_info import get_gfx
+from ..jit.utils.chip_info import get_gfx_runtime
 
 MD_NAME = "module_fp8_mqa_topk"
 
@@ -36,8 +36,13 @@ MAX_TOPK = 512
 
 def is_supported(num_heads: int, head_dim: int) -> bool:
     """True when this kernel can run this shape on this device."""
+    # The live GPU, not get_gfx(): a multi-arch package (GPU_ARCHS="gfx942;gfx950")
+    # makes get_gfx() report the last listed arch on every device, and the
+    # non-gfx950 device pass of the kernels is a __builtin_trap() stub.
     return (
-        get_gfx() in SUPPORTED_GFX and num_heads == NUM_HEADS and head_dim == HEAD_DIM
+        get_gfx_runtime() in SUPPORTED_GFX
+        and num_heads == NUM_HEADS
+        and head_dim == HEAD_DIM
     )
 
 
@@ -105,7 +110,7 @@ def fp8_mqa_topk(
 
     Workspace (allocated per call): about M * (N / 8 + 32 KiB * SplitN) + 512 * N bytes.
     """
-    gfx = get_gfx()
+    gfx = get_gfx_runtime()
     if gfx not in SUPPORTED_GFX:
         raise RuntimeError(
             f"fp8_mqa_topk (HIP) supports {SUPPORTED_GFX} only, got {gfx}; "

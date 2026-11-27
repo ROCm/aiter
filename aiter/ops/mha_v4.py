@@ -436,8 +436,8 @@ def mha_v4_kv_tile_for_q_tile(q_tile: int, operands=None, mode=None) -> int:
 
     operands is what mha_v4_operands() builds -- the three formats, their three scale modes and V's
     packing, which together are what picks a manifest row. It matters because an arch need not
-    serve every geometry in every precision: gfx942 has 256x64 rows for FP8 and INT8/FP8 only, so
-    asking without operands says 256x64 exists and asking with BF16 ones says it does not. The
+    serve every geometry in every precision: gfx950 has 256x128 rows for FP8 but not for BF16, so
+    asking without operands says 256x128 exists and asking with BF16 ones says it does not. The
     scale modes are part of it and not an over-specification, since the FP8 and MXFP8 rows take
     the same three formats and differ only there.
 
@@ -585,9 +585,9 @@ def mha_v4_ragged_kv(operands, mode, block_tile=None) -> bool:
     than none -- and the ragged rows make it unnecessary.
 
     operands is what mha_v4_operands() builds and mode one of MHA_V4_BLOCK_SPARSE_MODES. Neither
-    is optional, because the capability belongs to one row: every gfx950 block-sparse and Sol-Attn
-    row is ragged, and gfx942 has no ragged row at all. block_tile defaults to the
-    geometry these operands dispatch at, as mha_v4_block_tile() answers it.
+    is optional, because the capability belongs to one row: every gfx942 and gfx950 block-sparse
+    and Sol-Attn row is ragged today, but a row may not be. block_tile defaults to the geometry these
+    operands dispatch at, as mha_v4_block_tile() answers it.
     """
     q_tile, kv_tile = (
         mha_v4_block_tile(operands, mode) if block_tile is None else tuple(block_tile)
@@ -1618,13 +1618,14 @@ def _sol_attn_triple(
 def _lse_unsupported(
     q_format: AttentionFormat, v_format: AttentionFormat
 ) -> Optional[str]:  # noqa: UP045
-    """Why MHA v4 cannot export the LSE for these operands, or None if it can."""
+    """Why MHA v4 cannot export the LSE for these operands, or None if it can.
+
+    Individual rows still declare the store in the manifest, which the launcher checks against the
+    row it dispatches: a row without it would leave the allocated buffer looking like valid data.
+    """
     arch = get_gfx()
-    if arch != "gfx950":
-        # The gfx942 objects do carry the epilogue, but they predate the frozen-max correction
-        # and their LSE has never been compared against torch.logsumexp. O never reads LSE, so
-        # passing every output test says nothing about it. Lift this once MI300 is measured.
-        return f"MHA v4 LSE is not validated on {arch} yet"
+    if arch not in ("gfx942", "gfx950"):
+        return f"MHA v4 LSE is not implemented on {arch}"
     if (q_format, v_format) not in _LSE_CAPABLE_QV:
         return (
             f"MHA v4 LSE is not implemented for Q={q_format.name} "
@@ -1634,7 +1635,7 @@ def _lse_unsupported(
 
 
 def _check_lse_capable(q_format: AttentionFormat, v_format: AttentionFormat) -> None:
-    """Reject LSE where the exported value has not been measured."""
+    """Reject LSE where MHA v4 has no manifest-backed implementation."""
     reason = _lse_unsupported(q_format, v_format)
     if reason is not None:
         raise NotImplementedError(reason)
@@ -1666,14 +1667,15 @@ def _varlen_capable(q_format: AttentionFormat, v_format: AttentionFormat) -> boo
     Asks the live GPU, as the launcher dispatches on it, not get_gfx(), which follows GPU_ARCHS.
     """
     return (
-        arch_info.get_arch() == "gfx950" and (q_format, v_format) in _VARLEN_CAPABLE_QV
+        arch_info.get_arch() in ("gfx942", "gfx950")
+        and (q_format, v_format) in _VARLEN_CAPABLE_QV
     )
 
 
 def _check_varlen_capable(q_format: AttentionFormat, v_format: AttentionFormat) -> None:
     """Reject per-batch key lengths on rows whose code object ignores them."""
     arch = get_gfx()
-    if arch != "gfx950":
+    if arch not in ("gfx942", "gfx950"):
         raise NotImplementedError(
             f"MHA v4 per-batch key lengths are not implemented on {arch} yet"
         )
@@ -2885,7 +2887,8 @@ def mha_v4(
     or ``[B, Qtiles, KVtiles]`` (broadcast heads). Its geometry is ``block_tile``,
     defaulting to the geometry this call's own operands dispatch at: 256x64 on
     gfx950 for BF16 and BF16/FP8, 256x128 there for everything else, 256x64 on
-    gfx942. gfx950 also accepts 64x64 for finer routing. Ask
+    gfx942. Both also accept 64x64 for finer routing, gfx942 in FP8, I8/FP8, BF16 and
+    BF16/FP8. Ask
     mha_v4_block_tiles() with this call's operands rather than assuming: a
     geometry need not exist in every precision. Sparse LUT rows are one
     per query head; K/V addressing uses the GQA ratio. A row may select nothing:
@@ -2903,8 +2906,9 @@ def mha_v4(
     and merged by their LSE, for grids too small to fill the GPU: a short sequence with few
     heads. ``"auto"`` picks the count with mha_v4_kv_splits() and falls back to 1 wherever
     splitting is unsupported. Operands are quantized once, before the split, so per-tensor
-    scales stay global. For BF16, BF16/FP8, INT8/FP8 and FP8/FP8 operands wherever MHA v4
-    exports their LSE (gfx950 today), without ``block_mask`` or ``seqlens_k``. The ranges are
+    scales stay global. For BF16, BF16/FP8, INT8/FP8 and FP8/FP8 operands whose dense row
+    exports the LSE (every row on gfx942 and gfx950), without ``block_mask`` or ``seqlens_k``.
+    The ranges are
     equal when the count divides the key length; otherwise the last one takes the remainder,
     which needs operands that take per-batch key lengths (all four on gfx950), and any others
     need a count that divides it. A count is at most the key length over the KV tile of the

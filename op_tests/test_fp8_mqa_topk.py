@@ -27,7 +27,7 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.fp8_mqa_logits import fp8_mqa_logits as hip_logits
 from aiter.ops.fp8_mqa_topk import fp8_mqa_topk
 from aiter.ops.triton.attention.fp8_mqa_logits import fp8_mqa_logits as triton_logits
@@ -174,7 +174,7 @@ def test_fp8_mqa_topk(s_q, s_k, k, window, data):
         + s_q * k * 4  # top-k indices
     )
 
-    ret = {"gfx": get_gfx()}
+    ret = {"gfx": get_gfx_runtime()}
     for name, (time_fn, grade_fn) in candidates.items():
         _, us = run_perftest(time_fn)
         out = grade_fn().clone()
@@ -211,8 +211,9 @@ def test_fp8_mqa_topk(s_q, s_k, k, window, data):
 
 
 def main():
-    if get_gfx() not in SUPPORTED_GFX:
-        aiter.logger.warning("fp8_mqa_topk unsupported on %s; skipping", get_gfx())
+    gfx = get_gfx_runtime()
+    if gfx not in SUPPORTED_GFX:
+        aiter.logger.warning("fp8_mqa_topk unsupported on %s; skipping", gfx)
         return
 
     parser = argparse.ArgumentParser(

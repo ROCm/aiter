@@ -18,6 +18,7 @@ from flydsl.runtime.device import get_rocm_arch
 from mori.shmem import mori_shmem_create_tensor
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+from aiter.ops.flydsl.aot_launch import aot_factory
 
 from ..communication_ops_host_utils import build_p2p_table
 from .communication_ops_utils import GeometryTuningTable
@@ -26,7 +27,7 @@ from .flydsl_dispatch_combine_intranode_kernel import (
     make_dispatch_jit,
 )
 from .kernels_common import ceildiv
-from .tensor_shim import _preload_compiled
+from .tensor_shim import _compile_and_keep, _preload_compiled
 
 # Reject unsupported token dtypes at construction, not deep in JIT codegen.
 _SUPPORTED_TOK_DTYPES = (
@@ -60,6 +61,22 @@ def _zeroed_sym(shape, dtype):
     t = mori_shmem_create_tensor(shape, dtype)
     t.zero_()
     return t
+
+
+@aot_factory("mega_moe_combine")
+@functools.cache
+def _fused_combine_launcher(**kwargs):
+    return make_combine_jit(**kwargs)
+
+
+def _make_combine_jit(**kwargs):
+    """``make_combine_jit(**kwargs)``. A combine after the fused GEMM2
+    (``skip_stage1``: MegaMoE's, which ``aiter.aot.flydsl.mega_moe``
+    prebuilds) is its AOT cache's launch handle instead: pass it to
+    ``_compile_and_keep`` or ``_preload_compiled`` only."""
+    if kwargs["skip_stage1"]:
+        return _fused_combine_launcher.lazy(**kwargs)
+    return make_combine_jit(**kwargs)
 
 
 # Launch-geometry tuned CSV lives under ``aiter/configs/`` and is resolved via
@@ -1388,7 +1405,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
         std = (self._fx_disp_tok_map, self._fx_disp_out_wts)
         compiled = cache.get(key)
         if compiled is None:
-            cache[key] = flyc.compile(
+            cache[key] = _compile_and_keep(
                 fn,
                 fx.Int64(inp_ptr),
                 *fixed,
@@ -1514,7 +1531,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
         )
         fn = self._comb_jit_cache.get(key)
         if fn is None:
-            fn = make_combine_jit(
+            fn = _make_combine_jit(
                 rank=cfg.rank,
                 npes=cfg.world_size,
                 experts_per_token=cfg.num_experts_per_token,
@@ -1524,8 +1541,8 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 warp_num_per_block=wpb,
                 data_type=c_dtype,
                 enable_weights=bool(enable_weights),
-                enable_std_moe=cfg.enable_std_moe,
-                zero_copy=cfg.zero_copy,
+                enable_std_moe=bool(cfg.enable_std_moe),
+                zero_copy=bool(cfg.zero_copy),
                 skip_stage1=bool(skip_stage1),
                 fp8_direct_cast=bool(fp8_dc),
                 blockwise_fp8_transport=bool(blockwise_fp8),
@@ -1663,7 +1680,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
         )
         fn = self._comb_jit_cache.get(key)
         if fn is None:
-            fn = make_combine_jit(
+            fn = _make_combine_jit(
                 rank=cfg.rank,
                 npes=cfg.world_size,
                 experts_per_token=cfg.num_experts_per_token,
@@ -1673,8 +1690,8 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 warp_num_per_block=warp_num,
                 data_type=c_dtype,
                 enable_weights=bool(enable_weights),
-                enable_std_moe=cfg.enable_std_moe,
-                zero_copy=cfg.zero_copy,
+                enable_std_moe=bool(cfg.enable_std_moe),
+                zero_copy=bool(cfg.zero_copy),
                 skip_stage1=True,
                 fp8_direct_cast=bool(fp8_dc),
                 blockwise_fp8_transport=bool(blockwise_fp8),
