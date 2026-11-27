@@ -1,0 +1,66 @@
+{
+  "_comment": [
+    "gfx950 bf16 grouped GEMMs (the DeepGEMM interfaces) on the 4-wave pipeline,",
+    "include/gfx950/opus_gemm_pipeline_a16w16_grouped_gfx950.cuh. READ BY opus_gemm_grouped_common.py.",
+    "Built offline: gen_co/build_co.py --arch gfx950 --family a16w16_grouped (AGPR-pinning LLVM).",
+    "",
+    "Per-entry fields:",
+    "  kid   local kid of the grouped entries (opus_gemm_grouped.cu): m_grouped 0-9, k_grouped 10-19.",
+    "  kind  m_grouped : opus_gemm_a16w16_grouped_launch (fwd / dgrad, contiguous or masked), one kernel",
+    "                    with tiles 256 / 192 / 128 rows high picked per group by its rows;",
+    "                    images <name>_nt (B [G, N, K]) / <name>_nn (B [G, K, N]).",
+    "        k_grouped : opus_gemm_a16w16_k_grouped_launch (wgrad), TN; images <name>_tn (bf16 C) /",
+    "                    <name>_tn_f32 (fp32 C), each with the plan kernel <image>_plan.",
+    "  tile  [B_M, B_N]; m_grouped B_M 256 (the largest tile), k_grouped {128, 256}; B_N in {128, 256}."
+  ],
+  "gfx950": [
+    {
+      "kid": 0,
+      "kind": "m_grouped",
+      "tile": [
+        256,
+        256
+      ]
+    },
+    {
+      "kid": 1,
+      "kind": "m_grouped",
+      "tile": [
+        256,
+        128
+      ]
+    },
+    {
+      "kid": 10,
+      "kind": "k_grouped",
+      "tile": [
+        256,
+        256
+      ]
+    },
+    {
+      "kid": 11,
+      "kind": "k_grouped",
+      "tile": [
+        256,
+        128
+      ]
+    },
+    {
+      "kid": 12,
+      "kind": "k_grouped",
+      "tile": [
+        128,
+        256
+      ]
+    },
+    {
+      "kid": 13,
+      "kind": "k_grouped",
+      "tile": [
+        128,
+        128
+      ]
+    }
+  ]
+}

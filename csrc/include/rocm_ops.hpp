@@ -310,6 +310,31 @@ namespace py = pybind11;
           py::arg("kid"),                     \
           py::arg("split_k"));
 
+#define OPUS_GEMM_A16W16_GROUPED_LAUNCH_PYBIND \
+    m.def("opus_gemm_a16w16_grouped_launch",   \
+          &opus_gemm_a16w16_grouped_launch,    \
+          "opus_gemm_a16w16_grouped_launch",   \
+          py::arg("XQ"),                       \
+          py::arg("WQ"),                       \
+          py::arg("Y"),                        \
+          py::arg("group"),                    \
+          py::arg("workspace"),                \
+          py::arg("kid"),                      \
+          py::arg("masked"));
+
+#define OPUS_GEMM_A16W16_K_GROUPED_LAUNCH_PYBIND \
+    m.def("opus_gemm_a16w16_k_grouped_launch",   \
+          &opus_gemm_a16w16_k_grouped_launch,    \
+          "opus_gemm_a16w16_k_grouped_launch",   \
+          py::arg("XQ"),                         \
+          py::arg("WQ"),                         \
+          py::arg("Y"),                          \
+          py::arg("grouped_layout"),             \
+          py::arg("C"),                          \
+          py::arg("workspace"),                  \
+          py::arg("kid"),                        \
+          py::arg("seg_len"));
+
 #define OPUS_GEMM_A8W8_LAUNCH_PYBIND     \
     m.def("opus_gemm_a8w8_launch",       \
           &opus_gemm_a8w8_launch,        \
