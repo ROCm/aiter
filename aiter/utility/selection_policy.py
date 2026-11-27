@@ -17,11 +17,13 @@ import contextlib
 import math
 
 from aiter.utility.tune_result import (
+    POWER_SAMPLE_COLUMN,
     attach_power_columns,
     candidate_beats,
     measure_all_accurate,
     normalize_select,
     power_columns,
+    power_sample_of,
     selection_rank,
     sort_frame_for_selection,
     stage_energy,
@@ -37,20 +39,23 @@ class SelectionPolicy:
     def __reduce__(self):
         return (make_policy, (self.name,))
 
-    def rank(self, us, watts=float("nan")):
+    def rank(self, us, watts=float("nan"), power_sample=None):
         """Sort key for one candidate. Lower is better."""
-        return selection_rank(us, watts, self.measures_power)
+        return selection_rank(us, watts, self.measures_power, power_sample)
 
     def rank_of(self, candidate):
-        """Sort key for a dict or attribute-style candidate with ``us``/``watts``."""
+        """Sort key for a candidate with ``us``/``watts`` and optional ``power_sample``."""
         if isinstance(candidate, dict):
-            return self.rank(
-                candidate.get("us", float("nan")),
-                candidate.get("watts", float("nan")),
-            )
+            field = candidate.get
+        else:
+
+            def field(name, default):
+                return getattr(candidate, name, default)
+
         return self.rank(
-            getattr(candidate, "us", float("nan")),
-            getattr(candidate, "watts", float("nan")),
+            field("us", float("nan")),
+            field("watts", float("nan")),
+            field(POWER_SAMPLE_COLUMN, None),
         )
 
     def beats(self, current, challenger, latency_margin_us: float = 0.0) -> bool:
@@ -108,8 +113,10 @@ class SelectionPolicy:
     def record(self, target: dict, key, call, device_index=None, kernel_us=None):
         """Store the power sample for ``call`` under ``target[key]`` when measuring.
 
-        Latency mode leaves ``target`` untouched, so a latency result frame
-        never gains a ``watts`` column.
+        For ``key="watts"`` the sampling method also goes to
+        ``target["power_sample"]``; any other key keeps it on the stored
+        ``PowerReading``. Latency mode leaves ``target`` untouched, so a
+        latency result frame never gains a ``watts`` column.
         """
 
     def attach_columns(self, frame, results):
@@ -136,6 +143,7 @@ class PowerSelectionPolicy(SelectionPolicy):
     measures_power = True
 
     def measure(self, call, device_index=None, kernel_us=None) -> float:
+        """Package watts while ``call`` runs, as a ``PowerReading`` with its ``sample``."""
         from aiter.utility.package_power import measure_kernel
 
         return measure_kernel(call, device_index=device_index, kernel_us=kernel_us)
@@ -152,17 +160,22 @@ class PowerSelectionPolicy(SelectionPolicy):
         )
 
     def record(self, target: dict, key, call, device_index=None, kernel_us=None):
-        target[key] = self.measure(call, device_index=device_index, kernel_us=kernel_us)
+        reading = self.measure(call, device_index=device_index, kernel_us=kernel_us)
+        target[key] = reading
+        if key == "watts":
+            target[POWER_SAMPLE_COLUMN] = power_sample_of(reading)
 
     def attach_columns(self, frame, results):
         return attach_power_columns(frame, results)
 
     def result_metrics(self, result, tflops):
         watts, tflops_per_w = power_columns(result, tflops)
-        return (
-            {"watts": [watts]},
-            f", watts={watts} W, tflops_per_w={tflops_per_w} TFLOPS/W",
+        sample = getattr(result, POWER_SAMPLE_COLUMN, "") or ""
+        text = (
+            f", watts={watts} W ({sample or 'unmeasured'}), "
+            f"tflops_per_w={tflops_per_w} TFLOPS/W"
         )
+        return {"watts": [watts], POWER_SAMPLE_COLUMN: [sample]}, text
 
     def watt_text(self, watts) -> str:
         try:

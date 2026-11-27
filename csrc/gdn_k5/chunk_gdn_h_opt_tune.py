@@ -274,6 +274,7 @@ def case_to_tuned_row(
             watts_f = float("nan")
         if math.isfinite(watts_f):
             row["watts"] = round(watts_f, 3)
+            row["power_sample"] = getattr(watts, "sample", "")
     return row
 
 
@@ -537,7 +538,9 @@ class K5BvTuner(TunerCommon):
             return []
         frame = pd.DataFrame(list(emitted.values()))
         columns = [
-            col for col in list(self.columns) + ["watts"] if col in frame.columns
+            col
+            for col in list(self.columns) + ["watts", "power_sample"]
+            if col in frame.columns
         ]
         return frame.loc[:, columns].to_dict("records")
 
@@ -565,12 +568,14 @@ class K5BvTuner(TunerCommon):
     def result_to_csv(self, results, file, concat=False):
         old_tunedf = self.get_tuned_gemm_list(file)
         saved_columns = self.columns
-        if (
-            isinstance(results, pd.DataFrame)
-            and "watts" in results.columns
-            and "watts" not in self.columns
-        ):
-            self.columns = list(self.columns) + ["watts"]
+        if isinstance(results, pd.DataFrame):
+            power_extras = [
+                col
+                for col in ("watts", "power_sample")
+                if col in results.columns and col not in self.columns
+            ]
+            if power_extras:
+                self.columns = list(self.columns) + power_extras
         try:
             for col in self.columns:
                 if col not in old_tunedf.columns:
