@@ -51,7 +51,6 @@ skip_tests=(
     "op_tests/multigpu_tests/bench_mega_moe_v2.py"
     "op_tests/multigpu_tests/bench_attention_a2a.py"
     "op_tests/multigpu_tests/test_mega_moe_tp.py"
-    "op_tests/multigpu_tests/test_mega_moe_v2.py"
     "op_tests/multigpu_tests/test_megamoe_internode.py"
     "op_tests/multigpu_tests/test_wide_ep_moe.py"
     "op_tests/multigpu_tests/test_dispatch_combine.py"
@@ -193,6 +192,36 @@ for file in "${sharded_files[@]}"; do
                     fi
                     exec torchrun --standalone --nproc_per_node=4 "$test_file" \
                         --models m3 glm5 --tokens 256 512 1024 2048
+                '
+                _ "$file"
+            )
+            ;;
+        op_tests/multigpu_tests/test_mega_moe_v2.py)
+            {
+                echo "Running MegaMoE V2 routes suite (DeepSeek-V4-Pro and V4.1-Flash EP8) on 8 GPUs when supported"
+            } | tee -a latest_test.log
+            # The staged, small-input and large-input routes as production builds
+            # them: accuracy against the fp32 reference and the staged route, layer
+            # rebinding, CUDA graph replay. Needs an 8-XCD gfx950 and mori.
+            test_cmd=(
+                timeout 60m
+                bash -c '
+                    set -euo pipefail
+                    test_file=$1
+                    arch=$(python3 -c \
+                        "from aiter.jit.utils.chip_info import get_gfx; print(get_gfx())")
+                    ngpu=$(python3 -c "import torch; print(torch.cuda.device_count())")
+                    if [[ "$arch" != "gfx950" || "$ngpu" -lt 8 ]]; then
+                        echo "Skipping $test_file: requires 8 gfx950 GPUs, got $ngpu x $arch"
+                        exit 0
+                    fi
+                    if ! python3 -c "import mori" 2>/dev/null; then
+                        echo "Skipping $test_file: mori is not installed"
+                        exit 0
+                    fi
+                    torchrun --standalone --nproc_per_node=8 "$test_file" --suite routes
+                    exec torchrun --standalone --nproc_per_node=8 "$test_file" --suite routes \
+                        --network v41_flash
                 '
                 _ "$file"
             )
