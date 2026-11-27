@@ -24,7 +24,8 @@
 #include <string>
 
 // The kids this binary can launch, as ';'-joined "family/gfx/cu_num/kid".
-// Generated from the same set as the dispatch tables.
+// Generated from the dispatch-table routes, per device namespace: gfx1250 and
+// gfx1250-strict list only the kids that have device code for that device.
 std::string opus_compiled_kids()
 {
   return OPUS_COMPILED_KIDS;

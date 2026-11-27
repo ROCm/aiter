@@ -8,9 +8,11 @@ tuned row can therefore pass the Python registry checks and still name a kid
 that this binary lacks, and the C++ launcher then raises ``kid N is not
 compiled in the current OPUS module`` inside the serving process.
 
-The codegen embeds the exact compiled ``family/gfx/cu_num/kid`` set in the
-binary (``opus_compiled_kids()``), so a prebuilt module carries its own
-manifest. Callers that select a *tuned* kid ask :func:`tuned_kid_is_compiled`
+The codegen embeds a per-device launchability manifest of ``family/gfx/cu_num/kid``
+keys in the binary (``opus_compiled_kids()``), so a prebuilt module carries its
+own. It is derived from the selected routes (the sidecar), with a separate
+``gfx1250-strict`` namespace and without kids that have no device code. Callers
+that select a *tuned* kid ask :func:`tuned_kid_is_compiled`
 and fall back to their next candidate when it answers ``False``. An exact
 caller-chosen kid is not filtered: it still reaches the launcher and its error.
 
