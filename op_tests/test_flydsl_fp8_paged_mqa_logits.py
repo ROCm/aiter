@@ -747,7 +747,10 @@ def _check_fp8_paged_mqa_logits_big_cache(batch, kv_len, kv_block_size):
             Preshuffle=True,
             KVBlockSize=kv_block_size,
         )
-    _grade(ref, out, "flydsl: paged big_cache")
+    err = _grade(ref, out, "flydsl: paged big_cache")
+    # Single-element FP8 MFMA vs fp32 ReLU-boundary rounding can slightly exceed
+    # checkAllclose(atol=5.0) (~6.1e-5); a wrong 64-token page fails >= 64/16384 (~3.9e-3).
+    assert err < 1e-3, f"paged big_cache mismatch fraction: {err}"
 
 
 @benchmark()
