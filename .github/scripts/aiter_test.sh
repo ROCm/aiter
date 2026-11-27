@@ -198,7 +198,7 @@ for file in "${sharded_files[@]}"; do
             ;;
         op_tests/multigpu_tests/test_mega_moe_v2.py)
             {
-                echo "Running MegaMoE V2 routes suite (DeepSeek-V4-Pro and V4.1-Flash EP8) on 8 GPUs when supported"
+                echo "Running MegaMoE V2 routes suite (DeepSeek-V4-Pro, V4.1-Flash EP8 A8W4 / A4W4) on 8 GPUs when supported"
             } | tee -a latest_test.log
             # The staged, small-input and large-input routes as production builds
             # them: accuracy against the fp32 reference and the staged route, layer
@@ -220,8 +220,10 @@ for file in "${sharded_files[@]}"; do
                         exit 0
                     fi
                     torchrun --standalone --nproc_per_node=8 "$test_file" --suite routes
-                    exec torchrun --standalone --nproc_per_node=8 "$test_file" --suite routes \
+                    torchrun --standalone --nproc_per_node=8 "$test_file" --suite routes \
                         --network v41_flash
+                    exec torchrun --standalone --nproc_per_node=8 "$test_file" --suite routes \
+                        --network v41_flash --quant a4w4
                 '
                 _ "$file"
             )
