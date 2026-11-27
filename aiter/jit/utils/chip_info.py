@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import sys
+from typing import NamedTuple
 
 from build_targets import (
     GFX_MAP,
@@ -21,6 +22,14 @@ from hip_runtime import (
     load_hip_runtime,
 )
 from torch_guard import torch_compile_guard
+
+try:
+    from torch.compiler import assume_constant_result
+except ImportError:  # no torch, as in some build environments
+
+    def assume_constant_result(fn):
+        return fn
+
 
 logger = logging.getLogger("aiter")
 
@@ -297,47 +306,473 @@ def get_gfx_list() -> list[str]:
     return gfxs
 
 
-def _parse_cu_num_rocminfo(output: str) -> list[int]:
-    devices = re.split(r"Agent\s*\d+", output)
-    gpu_compute_units: list[int] = []
-    for device in devices:
-        for line in device.split("\n"):
-            if "Device Type" in line and line.find("GPU") != -1:
-                match = re.search(r"Compute Unit\s*:\s*(\d+)", device)
-                if match:
-                    gpu_compute_units.append(int(match.group(1)))
-                break
-    return gpu_compute_units
+class PartitionInfo(NamedTuple):
+    """Compute partition and CU counts of one logical GPU.
+
+    The partition fields are None when the source cannot report them.
+    partition_inferred is True when amdsmi reports no partition and the mode
+    and number of partitions come from the CU count of the full chip.
+    """
+
+    gfx: str
+    cu_num: int
+    full_chip_cu_num: int | None
+    compute_partition: str | None
+    memory_partition: str | None
+    num_partitions: int | None
+    partition_inferred: bool = False
 
 
-@torch_compile_guard()
-def get_cu_num_custom_op() -> int:
-    cu_num = int(os.getenv("CU_NUM", "0"))
-    if cu_num == 0:
-        if IS_WINDOWS:
-            import torch
+def _amdsmi_value(value):
+    """amdsmi returns "N/A" for a value that the device does not report."""
+    return None if value == "N/A" else value
 
-            props = torch.cuda.get_device_properties(0)
-            gfx = props.gcnArchName.split(":", 1)[0]
-            return torch_processor_count_to_cu(gfx, props.multi_processor_count)
-        try:
-            output = _gpu_info_output()
-            gpu_compute_units = _parse_cu_num_rocminfo(output)
-        except Exception as e:  # noqa: BLE001  blanket catch is intentional here
-            raise RuntimeError(
-                f"Get GPU Compute Unit from {_GPU_INFO_TOOL} failed {e!s}"
+
+def _amdsmi_call(amdsmi, name: str, *args):
+    """Result of an amdsmi function, or None.
+
+    The result is None when the device does not report the value, or when
+    the installed amdsmi is too old to have the function.
+    """
+    func = getattr(amdsmi, name, None)
+    if func is None:
+        return None
+    try:
+        return func(*args)
+    except amdsmi.AmdSmiException:
+        return None
+
+
+def _amdsmi_partition(amdsmi, handle) -> tuple:
+    """(mode, memory mode, number of partitions) that one handle reports."""
+    profile = _amdsmi_call(
+        amdsmi, "amdsmi_get_gpu_accelerator_partition_profile", handle
+    )
+    if profile is not None:
+        profile = profile["partition_profile"]
+        mode = _amdsmi_value(profile["profile_type"])
+        num_partitions = _amdsmi_value(profile["num_partitions"])
+    else:
+        mode = _amdsmi_call(amdsmi, "amdsmi_get_gpu_compute_partition", handle)
+        num_partitions = None
+    nps = _amdsmi_call(amdsmi, "amdsmi_get_gpu_memory_partition", handle)
+    return _amdsmi_value(mode) or None, _amdsmi_value(nps) or None, num_partitions
+
+
+# CU count of the full chip, by (PCI device ID, revision ID). The IDs and names
+# are from data/amdgpu.ids of libdrm. The CU counts are from the ROCm GPU
+# specifications, and 80 for MI308X.
+_FULL_CHIP_CU_NUM = {
+    (0x74A0, 0x00): 228,  # MI300A
+    (0x74A1, 0x00): 304,  # MI300X
+    (0x74A2, 0x00): 80,  # MI308X
+    (0x74A2, 0xA1): 304,  # MI300X
+    (0x74A5, 0x00): 304,  # MI325X
+    (0x74B5, 0x00): 304,  # MI300X VF
+    (0x74B6, 0x00): 80,  # MI308X
+    (0x74B6, 0xA1): 304,  # MI300X
+    (0x74B9, 0x00): 304,  # MI325X VF
+    (0x75A0, 0x00): 256,  # MI350X
+    (0x75A3, 0x00): 256,  # MI355X
+    (0x75A8, 0x00): 128,  # MI350P
+    (0x75B0, 0x00): 256,  # MI350X VF
+    (0x75B3, 0x00): 256,  # MI355X VF
+    (0x75B8, 0x00): 128,  # MI350P VF
+}
+_PARTITION_MODES = {1: "SPX", 2: "DPX", 4: "QPX", 8: "CPX"}
+
+
+def _pci_id(value) -> int | None:
+    try:
+        return int(value, 16) if isinstance(value, str) else int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _inferred_partition(asic: dict, cu_num: int) -> tuple[str, int] | None:
+    """(mode, number of partitions) of a GPU that does not report its partition.
+
+    An SR-IOV VF guest, or a container that sees only a secondary partition,
+    gets N/A for the mode. A compute partition has an equal share of the CUs
+    of its chip, so a GPU with 1/2, 1/4 or 1/8 of the CUs of its full chip is
+    a partition, and a GPU with all of them is in SPX mode. A GPU of an
+    unknown device ID gets no mode.
+    """
+    full_cu_num = _FULL_CHIP_CU_NUM.get(
+        (_pci_id(asic.get("device_id")), _pci_id(asic.get("rev_id")))
+    )
+    if not full_cu_num or not cu_num or full_cu_num % cu_num:
+        return None
+    mode = _PARTITION_MODES.get(full_cu_num // cu_num)
+    return (mode, full_cu_num // cu_num) if mode else None
+
+
+_SYSFS_DRM = "/sys/class/drm"
+
+
+def _render_device(render_minor) -> str | None:
+    """Name of the device that owns a render node: a PCI address or amdgpu_xcp_<n>."""
+    if render_minor is None:
+        return None
+    path = os.path.join(_SYSFS_DRM, f"renderD{render_minor}", "device")
+    return os.path.basename(os.path.realpath(path)) if os.path.exists(path) else None
+
+
+def _amdsmi_gpus() -> list[tuple[str, PartitionInfo]]:
+    """(UUID, PartitionInfo) of every GPU amdsmi reports, in HIP order.
+
+    One amdsmi handle is one KFD node, that is one compute partition. Its CU
+    count is the CU count of the partition, the value HIP reports. KFD gives
+    each partition an equal share of the CUs of the chip. Partition 0 owns the
+    render node of the PCI device. A secondary partition owns the render node
+    of an amdgpu_xcp platform device, and KFD gives it the address of its GPU
+    with the partition index as the PCI function. Only such a partition takes
+    a field that it does not report from partition 0 of its GPU. Separate PCI
+    functions, for example SR-IOV VFs, never share fields. A GPU that still
+    has no mode and no number of partitions gets them from the CU count of
+    its full chip (see _inferred_partition).
+    """
+    import amdsmi
+
+    amdsmi.amdsmi_init()
+    try:
+        gpus = []
+        for index, handle in enumerate(amdsmi.amdsmi_get_processor_handles()):
+            enum = _amdsmi_call(amdsmi, "amdsmi_get_gpu_enumeration_info", handle) or {}
+            gpus.append(
+                (
+                    enum.get("hip_id", index),
+                    enum.get("hip_uuid", ""),
+                    amdsmi.amdsmi_get_gpu_device_bdf(handle).lower(),
+                    _render_device(enum.get("drm_render")),
+                    amdsmi.amdsmi_get_gpu_asic_info(handle),
+                    _amdsmi_partition(amdsmi, handle),
+                )
             )
-        if not gpu_compute_units:
-            raise RuntimeError(f"No GPU Compute Unit found in {_GPU_INFO_TOOL} output.")
-        assert len(set(gpu_compute_units)) == 1
-        cu_num = gpu_compute_units[0]
-    return cu_num
+    finally:
+        amdsmi.amdsmi_shut_down()
+    if not gpus:
+        raise RuntimeError("amdsmi reports no GPU")
+    partition0 = {bdf: fields for _, _, bdf, dev, _, fields in gpus if dev == bdf}
+    result = []
+    for _, uuid, bdf, dev, asic, fields in sorted(gpus, key=lambda gpu: gpu[0]):
+        if dev is not None and dev.startswith("amdgpu_xcp"):
+            gpu_fields = partition0.get(bdf[:-1] + "0", (None, None, None))
+            fields = tuple(own or gpu for own, gpu in zip(fields, gpu_fields))
+        mode, nps, num_partitions = fields
+        cu_num = int(asic["num_compute_units"])
+        inferred = None
+        if mode is None and num_partitions is None:
+            inferred = _inferred_partition(asic, cu_num)
+        if inferred:
+            mode, num_partitions = inferred
+            logger.info(
+                "GPU %s (%s, device ID %s) reports no compute partition; "
+                "it has %d of the %d CUs of the full chip, so it is in %s mode",
+                bdf,
+                asic.get("market_name"),
+                asic.get("device_id"),
+                cu_num,
+                cu_num * num_partitions,
+                mode,
+            )
+        info = PartitionInfo(
+            gfx=str(asic["target_graphics_version"]).lower(),
+            cu_num=cu_num,
+            full_chip_cu_num=cu_num * num_partitions if num_partitions else None,
+            compute_partition=mode,
+            memory_partition=nps,
+            num_partitions=num_partitions,
+            partition_inferred=inferred is not None,
+        )
+        result.append((uuid, info))
+    return result
+
+
+def _rocminfo_gpus() -> list[tuple[str, PartitionInfo]]:
+    """(UUID, PartitionInfo) of every GPU agent rocminfo reports.
+
+    rocminfo applies ROCR_VISIBLE_DEVICES itself and cannot report partitions.
+    """
+    gpus = []
+    for block in re.split(
+        r"^\s*Agent\s+\d+\s*$", _gpu_info_output(), flags=re.MULTILINE
+    ):
+        fields = dict(
+            re.findall(
+                r"^  (Name|Uuid|Device Type|Compute Unit):\s+(\S+)", block, re.MULTILINE
+            )
+        )
+        if fields.get("Device Type") == "GPU" and "Compute Unit" in fields:
+            info = PartitionInfo(
+                fields["Name"].lower(),
+                int(fields["Compute Unit"]),
+                None,
+                None,
+                None,
+                None,
+            )
+            gpus.append((fields.get("Uuid", ""), info))
+    return gpus
 
 
 @functools.lru_cache(maxsize=1)
-def get_cu_num():
-    cu_num = get_cu_num_custom_op()
+def _query_node_gpus() -> tuple[list[tuple[str, PartitionInfo]], bool, str | None]:
+    try:
+        return _amdsmi_gpus(), True, None
+    except Exception as e:  # noqa: BLE001  amdsmi can be missing or unsupported
+        logger.debug("amdsmi partition query failed (%s), using %s", e, _GPU_INFO_TOOL)
+    try:
+        return _rocminfo_gpus(), False, None
+    except Exception as e:  # noqa: BLE001  blanket catch is intentional here
+        return [], False, f"Get GPU Compute Unit from {_GPU_INFO_TOOL} failed {e!s}"
+
+
+def _node_gpus() -> tuple[list[tuple[str, PartitionInfo]], bool]:
+    """The GPUs of the node and whether amdsmi reported them.
+
+    The amdsmi session is the expensive part, so the query runs once per
+    process, also when it fails. Without amdsmi, rocminfo gives the GPUs.
+    """
+    gpus, from_amdsmi, error = _query_node_gpus()
+    if error:
+        raise RuntimeError(error)
+    return gpus, from_amdsmi
+
+
+def _rocr_visible(uuids: list[str]) -> list[int]:
+    """KFD GPU indices left by ROCR_VISIBLE_DEVICES, as ROCr parses it."""
+    env = os.environ.get("ROCR_VISIBLE_DEVICES")
+    if env is None:
+        return list(range(len(uuids)))
+    visible: list[int] = []
+    for token in env.split(",")[: len(uuids)]:
+        token = token.strip().upper()
+        if token.startswith("G"):
+            hits = [i for i, uuid in enumerate(uuids) if uuid.upper().startswith(token)]
+            if not 5 <= len(token) <= 20 or len(hits) != 1:
+                break
+            index = hits[0]
+        else:
+            try:
+                index = int(token, 0)
+            except ValueError:
+                break
+        if not 0 <= index < len(uuids) or index in visible:
+            break
+        visible.append(index)
+    return visible
+
+
+def _hip_visible(visible: list[int], uuids: list[str]) -> list[int]:
+    """Narrow ROCr-visible indices by HIP_VISIBLE_DEVICES or CUDA_VISIBLE_DEVICES."""
+    env = os.environ.get("HIP_VISIBLE_DEVICES") or os.environ.get(
+        "CUDA_VISIBLE_DEVICES"
+    )
+    if not env:
+        return visible
+    selected: list[int] = []
+    for token in env.split(","):
+        if "GPU-" in token:
+            token = next(
+                (str(i) for i, index in enumerate(visible) if token in uuids[index]),
+                token,
+            )
+        if (
+            not token.isdigit()
+            or str(int(token)) != token
+            or int(token) >= len(visible)
+        ):
+            break
+        if visible[int(token)] not in selected:
+            selected.append(visible[int(token)])
+    return selected
+
+
+def _current_device() -> int:
+    """HIP ordinal of the current device, without initializing HIP."""
+    torch = sys.modules.get("torch")
+    if torch is not None and torch.cuda.is_initialized():
+        return torch.cuda.current_device()
+    return 0
+
+
+def _visible_gpus() -> list[PartitionInfo]:
+    """PartitionInfo of every GPU visible to HIP, in HIP order.
+
+    The GPUs are selected by ROCR_VISIBLE_DEVICES and then HIP_VISIBLE_DEVICES
+    or CUDA_VISIBLE_DEVICES, as ROCr and HIP do, so HIP is not initialized.
+    """
+    gpus, from_amdsmi = _node_gpus()
+    uuids = [uuid for uuid, _ in gpus]
+    visible = _rocr_visible(uuids) if from_amdsmi else list(range(len(gpus)))
+    return [gpus[i][1] for i in _hip_visible(visible, uuids)]
+
+
+def get_partition_info(device: int | None = None) -> PartitionInfo:
+    """Compute partition and CU counts of a logical GPU, from amdsmi.
+
+    device is a HIP ordinal and defaults to the current device (see
+    get_cu_num). Without amdsmi, rocminfo gives the CU count and the
+    partition fields are None. CU_NUM overrides cu_num.
+    """
+    if device is None:
+        device = _current_device()
+    gpus = _visible_gpus()
+    if not 0 <= device < len(gpus):
+        raise RuntimeError(
+            f"GPU {device} is not visible: {len(gpus)} of "
+            f"{len(_node_gpus()[0])} GPUs are visible."
+        )
+    info = gpus[device]
+    cu_override = int(os.getenv("CU_NUM", "0"))
+    return info._replace(cu_num=cu_override) if cu_override else info
+
+
+@torch_compile_guard()
+def get_cu_num_custom_op(device: int | None = None) -> int:
+    cu_num = int(os.getenv("CU_NUM", "0"))
+    if cu_num == 0:
+        if device is None:
+            device = _current_device()
+        if IS_WINDOWS:
+            import torch
+
+            props = torch.cuda.get_device_properties(device)
+            gfx = props.gcnArchName.split(":", 1)[0]
+            return torch_processor_count_to_cu(gfx, props.multi_processor_count)
+        cu_num = get_partition_info(device).cu_num
     return cu_num
+
+
+@functools.cache
+def _cu_num(device: int) -> int:
+    return get_cu_num_custom_op(device)
+
+
+@functools.lru_cache(maxsize=1)
+@assume_constant_result
+def _shared_cu_num() -> int | None:
+    """The CU count of every visible GPU, or None if they differ."""
+    if IS_WINDOWS:
+        return None
+    cu_override = int(os.getenv("CU_NUM", "0"))
+    cu_nums = {cu_override or info.cu_num for info in _visible_gpus()}
+    return cu_nums.pop() if len(cu_nums) == 1 else None
+
+
+def get_cu_num() -> int:
+    """CU count of the current device, cached per device.
+
+    When all visible GPUs have the same CU count, that count is returned
+    without a device query. Otherwise the current device is the current
+    device of torch once torch has initialized CUDA, and device 0 before
+    that. HIP is not initialized here. A process that calls this before it
+    selects its device gets the CU count of device 0.
+    """
+    cu_num = _shared_cu_num()
+    if cu_num is None:
+        cu_num = _cu_num(_current_device())
+    return cu_num
+
+
+def _clear_cu_num_cache() -> None:
+    _shared_cu_num.cache_clear()
+    _cu_num.cache_clear()
+    _tuned_cu_nums_of_device.cache_clear()
+    _shared_tuned_cu_nums.cache_clear()
+
+
+get_cu_num.cache_clear = _clear_cu_num_cache
+
+
+@functools.cache
+def _tuned_cu_nums_of_device(device: int) -> tuple[int, ...]:
+    """get_tuned_cu_nums() of one HIP device; empty without partition info."""
+    try:
+        info = get_partition_info(device)
+    except Exception as e:  # noqa: BLE001  no partition info: exact rows only
+        logger.debug("no partition info for GPU %d (%s)", device, e)
+        return ()
+    if (info.num_partitions or 0) > 1 and info.full_chip_cu_num not in (
+        None,
+        info.cu_num,
+    ):
+        return (info.cu_num, info.full_chip_cu_num)
+    return (info.cu_num,)
+
+
+@functools.lru_cache(maxsize=1)
+@assume_constant_result
+def _shared_tuned_cu_nums() -> tuple[int, ...] | None:
+    """The tuned CU counts of every visible GPU, or None if they differ."""
+    try:
+        num_gpus = len(_visible_gpus())
+    except Exception:  # noqa: BLE001  no GPU info: the current device decides
+        return None
+    cu_nums = {_tuned_cu_nums_of_device(device) for device in range(num_gpus)}
+    return cu_nums.pop() if len(cu_nums) == 1 else None
+
+
+def get_tuned_cu_nums(
+    cu_num: int | None = None, device: int | None = None
+) -> tuple[int, ...]:
+    """CU counts whose tuned rows serve a lookup for cu_num, in lookup order.
+
+    A compute partition (DPX, QPX, CPX) has an equal share of the CUs of its
+    chip. Its lookups use its own CU count, then the CU count of the full
+    chip, which has the same gfx. Other GPUs, such as MI308X or MI300A, use
+    only their own CU count. A cu_num other than the CU count of the device
+    also uses only itself.
+
+    device is a HIP ordinal and defaults to the current device, as for
+    get_cu_num(). When all visible GPUs have the same CU counts, a lookup
+    does not query the device.
+
+    The CU counts are the inner loop of a lookup. For each shape that a table
+    tries, in its own order (exact shape, then padded or nearest shapes), the
+    lookup tries these CU counts in turn. Thus an exact-shape row of the full
+    chip comes before a padded-shape row of the partition. Tables whose rows
+    set CU or CTA counts of cross-GPU kernels (MegaMoE, comm_fused_moe) keep
+    the exact CU count.
+    """
+    if device is not None:
+        cu_nums = _tuned_cu_nums_of_device(int(device))
+    else:
+        cu_nums = _shared_tuned_cu_nums()
+        if cu_nums is None:
+            cu_nums = _tuned_cu_nums_of_device(_current_device())
+    if cu_num is None:
+        return cu_nums or (get_cu_num(),)
+    if cu_nums and int(cu_num) == cu_nums[0]:
+        return cu_nums
+    return (int(cu_num),)
+
+
+def find_tuned_cu_row(
+    tuned, key, gfx: str, cu_num: int, source: str, device: int | None = None
+):
+    """tuned[key(cu)] for the first CU count of get_tuned_cu_nums() that has one.
+
+    For tables with one shape key. source names the table in the log line of
+    a fallback. None when no CU count has a row.
+    """
+    for tuned_cu in get_tuned_cu_nums(cu_num, device):
+        row = tuned.get(key(tuned_cu))
+        if row is not None:
+            if tuned_cu != cu_num:
+                log_tuned_cu_fallback(source, gfx, cu_num, tuned_cu)
+            return row
+    return None
+
+
+@functools.cache
+def log_tuned_cu_fallback(source: str, gfx: str, cu_num: int, tuned_cu: int):
+    """Log once that source serves a gfx partition of cu_num CUs with tuned_cu rows."""
+    logger.info(
+        f"{source}: no row for some shapes on the {cu_num}-CU {gfx} partition; "
+        f"using the rows tuned for the full chip ({tuned_cu} CUs)"
+    )
 
 
 _CDNA4_CUS_PER_XCD = 32
@@ -395,8 +830,9 @@ def get_build_targets() -> list[tuple[str, int]]:
          every CU count in GFX_CU_NUMS_MAP unless CU_NUM is set.
       2. GPU_ARCHS unset, empty/whitespace, or "native" -> call get_gfx()
          (GPU_ARCHS-aware; falls back to rocminfo/hipinfo when GPU_ARCHS is
-         unset) and get_cu_num(), which correctly reflect partition mode and
-         binned variants.
+         unset) and get_tuned_cu_nums(), which correctly reflect partition
+         mode and binned variants. A compute partition also gets the full
+         chip, whose rows its lookups fall back to.
       3. Neither -> raise RuntimeError with a clear message.
     """
     gpu_archs = os.getenv("GPU_ARCHS")
@@ -407,7 +843,8 @@ def get_build_targets() -> list[tuple[str, int]]:
     try:
         # get_gfx() is intentional here -- this is a build-time path; get_gfx_runtime()
         # would fail in CI environments without a live GPU.
-        return [(get_gfx(), get_cu_num())]
+        gfx = get_gfx()
+        return [(gfx, cu_num) for cu_num in get_tuned_cu_nums(get_cu_num())]
     except Exception as e:
         raise RuntimeError(
             "No GPU detected and GPU_ARCHS is not set to an explicit target. "
