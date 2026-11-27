@@ -145,10 +145,16 @@ def sol_q_abs_max(
     reads the first and sol_tilt_factors the second; build them once and pass the pair to both.
     For the block-scaled rows the maxima are taken in the kernel's basis: q_scale, (batch, seqlen,
     heads, d / 32) E8M0, dequantizes an MXFP8 Q's codes, and rotate takes a packed row's unrotated
-    source Q through the packers' rotation: hd128, on each 128-channel half at hd256.
+    source Q through the packers' rotation: hd128, on each 128-channel half at hd256. The two
+    exclude each other: an MXFP8 Q's codes are already rotated.
     """
     _check_unit_stride("q", q)
     batch, seqlen, heads, d = q.shape
+    if rotate and q_scale is not None:
+        raise ValueError(
+            "q_scale dequantizes an MXFP8 Q's codes, which its quantizer already rotated; rotate "
+            "takes an unrotated BF16 source: pass one or the other"
+        )
     if rotate and d not in (128, 256):
         raise ValueError(f"the packers' rotation is hd128 or hd256, got head dim {d}")
     if q_scale is not None and (
@@ -160,10 +166,7 @@ def sol_q_abs_max(
         )
     if rotate and d == 256:
         halves = sol_q_abs_max(
-            q.unflatten(-1, (2, 128)).flatten(2, 3),
-            q_tile,
-            None if q_scale is None else q_scale.unflatten(-1, (2, -1)).flatten(2, 3),
-            rotate=True,
+            q.unflatten(-1, (2, 128)).flatten(2, 3), q_tile, rotate=True
         )
         return halves[0].view(batch, -1, heads, d), halves[1].view(batch, heads, d)
     tiles = -(-seqlen // q_tile)

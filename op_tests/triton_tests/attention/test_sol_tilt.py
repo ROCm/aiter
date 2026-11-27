@@ -603,6 +603,14 @@ def test_rotated_hd256_q_abs_max_rotates_each_half():
     assert torch.equal(heads, tiles.amax(dim=1))
 
 
+@pytest.mark.parametrize("head_dim", [HEAD_DIM, 256])
+def test_q_abs_max_refuses_a_scaled_q_with_rotate(head_dim):
+    """An MXFP8 Q's codes are already rotated, so rotate takes only an unrotated BF16 source."""
+    kwargs, _ = make_q_abs_max_inputs("mxfp8", q_tile=64, head_dim=head_dim)
+    with pytest.raises(ValueError, match="pass one or the other"):
+        sol_q_abs_max(**{**kwargs, "rotate": True})
+
+
 @pytest.mark.parametrize(
     "kind, head_dim",
     [

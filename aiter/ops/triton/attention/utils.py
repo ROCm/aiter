@@ -859,10 +859,12 @@ def sol_prepare(
     q: (batch, seqlen_q, nheads_q, d), any dtype; only used for routing, which is scale invariant,
         so the stored fp8 Q can be passed directly. A packed MXFP4 or MXFP6 Q cannot: its codes
         are neither element addressable nor even d wide, so pass its pre-quantization tensor.
-        Scale invariance is what makes the two interchangeable, and the packers' Hadamard
-        rotation is orthogonal, so it leaves the proxy alone too. An MXFP8 Q is addressable at
-        either head dim, but its codes are not proportional to Q, since the E8M0 scale varies per
-        token and channel group; pass its scale as q_scale.
+        Scale invariance is what makes the two interchangeable. Q and K must still be in one
+        basis, and the MX quantizers rotate before they quantize: an addressable MX K routes on
+        its rotated codes, a packed K on its unrotated k_source. So with an addressable MXFP8 K,
+        pass the MXFP8 Q's codes and its scale as q_scale, since the E8M0 scale varies per token
+        and channel group and the codes alone are not proportional to Q. With a packed K, hd256
+        MXFP8 included, pass Q's unrotated pre-quantization tensor and no q_scale.
     k_quant: (batch, seqlen_k, nheads_kv, d) already quantized, typically fp8 e4m3.
     v_quant: (batch, seqlen_k, nheads_kv, d_v) already quantized.
     beta: routing threshold, tau = mean_j(proxy) + beta * population_std_j(proxy). Pass this to
@@ -921,7 +923,8 @@ def sol_prepare(
         softmax_scale / m for an MXFP8 Q quantized with the multiplier m folded in. A float or a
         one-element tensor, so a device-side descale needs no host read.
     q_scale: Q's E8M0 1x32 scale image, (batch, seqlen_q, nheads_q, d // 32) uint8, for an
-        MXFP8 Q. Routing then scores Q dequantized; nothing else reads Q.
+        MXFP8 Q. Routing then scores Q dequantized; nothing else reads Q. Not with
+        k_packed_format: the dequantized codes are rotated and a packed K's routing is not.
     k_shift: (batch, nheads_kv, d), the vector a packed K's quantizer subtracted from every token
         (the `mean` its quantize_*_k took, for K smoothing). The stored codes are of
         k_source - k_shift, so pooling subtracts it from k_source's block means to match; the
@@ -1029,6 +1032,11 @@ def sol_prepare(
     if q_scale is not None and (q_scale.dim() != 4 or q_scale.shape[:3] != q.shape[:3]):
         raise ValueError(
             "q_scale must be Q's E8M0 1x32 scale image, (batch, seqlen_q, nheads_q, d // 32)"
+        )
+    if q_scale is not None and k_packed_format is not None:
+        raise ValueError(
+            "q_scale dequantizes an MXFP8 Q's codes, which its quantizer rotated, and a packed K "
+            "routes on its unrotated k_source: pass Q's pre-quantization tensor without q_scale"
         )
     if k_shift is not None:
         if k_packed_format is None:
