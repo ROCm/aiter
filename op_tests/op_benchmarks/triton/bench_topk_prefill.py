@@ -17,13 +17,15 @@ from op_tests.triton_tests.topk.test_topk_prefill_gluon import (
     generate_topk_prefill_inputs,
 )
 
+# K3.1 prefill: 8192-token chunks; the chunk ending at ctx has rows of lengths ctx - 8191 .. ctx
 KIMI_K31_SHAPES = [
-    ("causal", 5461, 24576),
     ("causal", 8192, 8192),
+    ("causal", 8192, 16384),
     ("causal", 8192, 32768),
     ("causal", 8192, 65536),
-    ("causal", 4096, 131072),
-    ("causal", 1024, 262143),
+    ("causal", 8192, 131072),
+    ("causal", 8192, 262143),
+    ("causal", 5461, 24576),
     ("packed", 8192, 2048),
 ]
 
@@ -57,14 +59,12 @@ def run_benchmark(args):
 
     @triton.testing.perf_report([benchmark])
     def bench_topk_prefill(layout, rows, ctx, dist, topk, metric, **kwargs):
-        def inputs():
-            return generate_topk_prefill_inputs(dist, layout, rows, ctx, k=topk)
-
         bencher = RotatingBufferBench.from_dict(
             get_rot_bufs_kwargs(args) | get_do_bench_graph_kwargs(args)
         )
         pool = bencher.build_pool(
-            [inputs], [["logits", "row_starts", "row_ends", "indices"]]
+            [lambda: generate_topk_prefill_inputs(dist, layout, rows, ctx, k=topk)],
+            [["logits", "row_starts", "row_ends", "indices"]],
         )
         time_ms = bencher.bench(lambda **kw: top_k_per_row_prefill(**kw, k=topk))
         if metric == "time":
@@ -92,7 +92,19 @@ def main():
     parser.add_argument("--ctx", type=int, default=32768, help="Context length")
     parser.add_argument(
         "--dist",
-        choices=["random", "relu_sparse", "few_values", "all_equal", "nan_rows"],
+        choices=[
+            "random",
+            "relu_sparse",
+            "few_values",
+            "all_equal",
+            "nan_rows",
+            "zeros50",
+            "bf16",
+            "signed_zeros",
+            "inf",
+            "ascending",
+            "recency",
+        ],
         default="random",
         help="Logit value distribution",
     )
