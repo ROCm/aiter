@@ -4448,6 +4448,10 @@ def flash_attn_varlen_a8w8_m32x8(
     needs no separate merge pass; a sequence with no keys in this launch keeps its rows
     untouched. A row whose ``lse`` is -inf has no prior state and its ``out`` is not read.
 
+    ``persistent``: None takes the persistent split-KV launch for unmasked calls
+    (``AITER_FMHA_A8W8_PERSISTENT=0`` disables it) and the grid launch for causal or
+    windowed ones; True / False force either.
+
     ``window_size`` is ``(left, right)`` sliding-window bounds, ``-1`` meaning infinite
     on that side; ``causal`` forces ``right=0``. Only finiteness is baked into the kernel
     (compile-time ``mask_left``/``mask_right``), so one variant serves any magnitude.
@@ -4575,7 +4579,13 @@ def flash_attn_varlen_a8w8_m32x8(
 
     one_kv_tile = _pick_one_kv_tile(max_seqlen_k, qk_hdim, v_hdim, kv_dtype_str)
     if persistent is None:
-        persistent = os.environ.get("AITER_FMHA_A8W8_PERSISTENT", "1") != "0"
+        # Masked calls are scheduled but never KV-split, and that schedule loses
+        # to the grid on long sequences.
+        persistent = (
+            os.environ.get("AITER_FMHA_A8W8_PERSISTENT", "1") != "0"
+            and not mask_left
+            and not mask_right
+        )
     if (
         persistent
         and not one_kv_tile
