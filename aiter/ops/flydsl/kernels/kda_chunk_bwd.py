@@ -2484,6 +2484,25 @@ def compile_intra_mfma(
             lds_st(s_b, tid, _sel(tid < nvalid, bb, _zero()))
         gpu.barrier()
 
+        # Each thread owns the CPT contiguous columns from c0: 16-byte row I/O.
+        c0 = seg * CPT
+        f32 = fx.Float32
+
+        def row_in(t, num):
+            return _ldv(_view3(t, hk, BT, H * K, K, num), rc, c0, CPT, num)
+
+        def row_out(t, vals, num):
+            _stv(_view3(t, hk, BT, H * K, K, num), r, c0, vals, num)
+
+        # The epilogue's row inputs are issued up front: their latency hides
+        # behind the sub-chunk products instead of stalling the tail.
+        dq_row = row_in(dq, f32)
+        dk_row = row_in(dk, f32)
+        dg_row = row_in(dg, f32)
+        if const_expr(l2norm_qk):
+            qr_row = row_in(q_raw, RKN)
+            kr_row = row_in(k_raw, RKN)
+
         if const_expr(not safe_gate):
             # Rows are read as b128: each thread owns CPT contiguous columns.
             g_r = _lds_row(s_g, r * LDG + seg * CPT, CPT, fx.Float32)
@@ -2678,21 +2697,10 @@ def compile_intra_mfma(
         db_r = _row_sum(db_r, RL)
         b_dk2 = [b_dk2[e] * beta_r for e in range_constexpr(CPT)]
 
-        # Each thread owns the CPT contiguous columns from c0: 16-byte row I/O.
-        c0 = seg * CPT
-        f32 = fx.Float32
-
-        def row_in(t, num):
-            return _ldv(_view3(t, hk, BT, H * K, K, num), rc, c0, CPT, num)
-
-        def row_out(t, vals, num):
-            _stv(_view3(t, hk, BT, H * K, K, num), r, c0, vals, num)
-
         b_dg2 = [q_r[e] * b_dq2[e] for e in range_constexpr(CPT)]
-        dq_row = row_in(dq, f32)
         b_dq2 = [b_dq2[e] + dq_row[e] for e in range_constexpr(CPT)]
         if const_expr(l2norm_qk):
-            b_dq2 = l2norm_bwd(row_in(q_raw, RKN), b_dq2)
+            b_dq2 = l2norm_bwd(qr_row, b_dq2)
         if rv:
             row_out(dq2, b_dq2, OKN)
 
@@ -2723,14 +2731,12 @@ def compile_intra_mfma(
                 res = yield acc
             dkt = _results(res, CPT)
 
-        dg_row = row_in(dg, f32)
-        dk_row = row_in(dk, f32)
         dk_out = []
         for e in range_constexpr(CPT):
             b_dg2[e] = b_dg2[e] + (b_dk2[e] - dkt[e]) * k_r[e] + dg_row[e]
             dk_out.append(b_dk2[e] + dk_row[e] + dkt[e])
         if const_expr(l2norm_qk):
-            dk_out = l2norm_bwd(row_in(k_raw, RKN), dk_out)
+            dk_out = l2norm_bwd(kr_row, dk_out)
         if rv:
             row_out(dk2, dk_out, OKN)
             row_out(dg2, b_dg2, f32)
