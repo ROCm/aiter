@@ -52,7 +52,7 @@ def compiled_opus_kids() -> frozenset[str] | None:
     return frozenset(key for key in raw.split(";") if key)
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _warn_uncompiled_kid(key: str) -> None:
     family, gfx, cu_num, kid = key.split("/")
     tuner = "opus_gemm_tune.py" if family == "a16w16" else "opus_gemm_a8w8_tune.py"
