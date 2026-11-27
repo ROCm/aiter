@@ -489,6 +489,7 @@ def test_op_call_matches_what_legacy_passes_to_the_custom_op(monkeypatch):
         max_tokens_per_rank=14,
         world_size=15,
         combine_quant_bits=8,
+        post_norm_combine=False,
     )
     for extra in (
         {},

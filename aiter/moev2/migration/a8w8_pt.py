@@ -69,6 +69,7 @@ _UNSUPPORTED_ARGS = (
     "linear_beta",
     "w1_global_scale",
     "w2_global_scale",
+    "post_gemm2_rms_weight",
 )
 
 
