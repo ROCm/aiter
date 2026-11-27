@@ -236,6 +236,7 @@ def benchmark_gmm(
     grid_dim: int | None = None,
     work_stealing: bool = False,
     output: bool = False,
+    backend: str = "triton",
 ) -> None:
     assert gmm_type in GMM_TYPES, "Invalid GMM type."
     assert metric in METRICS, "Invalid benchmark metric."
@@ -249,7 +250,7 @@ def benchmark_gmm(
     has_grid_dim: bool = gmm_type != "nptgmm" and grid_dim is not None
     has_work_stealing: bool = gmm_type == "gmm" and work_stealing
     triton_provider_desc: list[str] = [
-        "triton",
+        backend,
         gmm_type,
         # data types
         f"i{in_dtype_str}",
@@ -352,6 +353,7 @@ def benchmark_gmm(
             }
             if gmm_type == "gmm":
                 extra_kwargs["work_stealing"] = work_stealing
+                extra_kwargs["backend"] = backend
             elif gmm_type == "ptgmm" or gmm_type == "nptgmm":
                 extra_kwargs["accumulate"] = accumulate
             if has_grid_dim:
@@ -464,6 +466,14 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
         raise argparse.ArgumentError(
             None,
             "M, K, N, and G must be either all provided or all absent",
+        )
+
+    if args.backend == "gluon" and (
+        args.gmm_type != "gmm" or args.grid_dim is not None or args.work_stealing
+    ):
+        raise argparse.ArgumentError(
+            None,
+            "--backend gluon only supports --gmm-type gmm without --grid-dim or --work-stealing",
         )
 
     if args.unif_group_sizes and args.num_group_sizes != 1:
@@ -619,6 +629,7 @@ def main() -> None:
         grid_dim=args.grid_dim,
         work_stealing=args.work_stealing,
         output=args.o,
+        backend=args.backend or "triton",  # shared --backend: auto -> None
     )
 
 

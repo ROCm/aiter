@@ -9,6 +9,10 @@ dispatch_emit(cg, k, **kwargs).  Adding a new arch (e.g. gfx1250) = one new
 file + one new import; entry point itself is arch-agnostic.
 """
 
+import importlib.util
+import os
+import sys
+
 WARP_SIZE = 64
 
 # Paired gfx942 kernels (nosplit_tag -> splitk_tag) share one <Traits, Kargs> template.
@@ -64,6 +68,23 @@ _SPLITK_WORKSPACE_TYPES = {
     "bf16_t": ("bf16_t", "__bf16", "AITER_DTYPE_bf16"),
     "fp32_t": ("fp32_t", "float", "AITER_DTYPE_fp32"),
 }
+
+
+def add_aiter_utils_to_sys_path():
+    """Put aiter/jit/utils on sys.path without running the aiter package, so its
+    modules import standalone. Returns the directory, or None without aiter."""
+
+    # locates, does not execute
+    spec = importlib.util.find_spec("aiter")
+    if spec is None or not spec.submodule_search_locations:
+        return None
+
+    locs = spec.submodule_search_locations
+    utils_dir = os.path.join(next(iter(locs)), "jit", "utils")
+    if utils_dir not in sys.path:
+        sys.path.insert(0, utils_dir)
+
+    return utils_dir
 
 
 _WRITTEN_PATHS = set()
@@ -180,7 +201,6 @@ def dispatch_emit(cg, k, **kwargs):
     fn = EMIT_REGISTRY.get(key)
     if fn is None:
         raise KeyError(
-            f"No emit registered for {key}. "
-            f"Available: {sorted(EMIT_REGISTRY.keys())}"
+            f"No emit registered for {key}. Available: {sorted(EMIT_REGISTRY.keys())}"
         )
     return fn(cg, k, **kwargs)

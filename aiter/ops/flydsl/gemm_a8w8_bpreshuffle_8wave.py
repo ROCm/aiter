@@ -12,6 +12,7 @@ import torch
 from torch import Tensor
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+from aiter.ops.flydsl.aot_launch import aot_factory
 
 # Fixed by the kernel: MFMA_Scale(16, 16, 128) over a 128-deep K tile.
 BLOCK_K = 128
@@ -105,6 +106,7 @@ def _validate(
             )
 
 
+@aot_factory("gemm_a8w8_fp8_8wave")
 @functools.lru_cache(maxsize=1024)
 def compile_8wave_gemm(
     *,

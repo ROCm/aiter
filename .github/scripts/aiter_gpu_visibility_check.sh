@@ -20,6 +20,20 @@ find_rocm_smi() {
     return 1
 }
 
+find_amd_smi() {
+    for candidate in amd-smi /opt/rocm/bin/amd-smi; do
+        if command -v "${candidate}" >/dev/null 2>&1; then
+            command -v "${candidate}"
+            return 0
+        fi
+        if [[ -x "${candidate}" ]]; then
+            echo "${candidate}"
+            return 0
+        fi
+    done
+    return 1
+}
+
 count_rocm_smi_gpus() {
     local rocm_smi="$1"
     local output_file
@@ -41,10 +55,35 @@ count_rocm_smi_gpus() {
     fi
 }
 
+run_amd_smi_xgmi_check() {
+    local amd_smi="$1"
+
+    echo
+    echo "AMD-SMI XGMI check:"
+    echo "amd-smi command: ${amd_smi}"
+
+    set +e
+    "${amd_smi}" xgmi 2>&1
+    local status=$?
+    set -e
+
+    if [[ "${status}" -ne 0 ]]; then
+        echo "::warning::${amd_smi} xgmi exited with status ${status}"
+    fi
+}
+
 if rocm_smi="$(find_rocm_smi)"; then
     count_rocm_smi_gpus "${rocm_smi}"
 else
     echo "::warning::rocm-smi/rocmsmi was not found in the test container"
+fi
+
+if [[ "${AITER_GPU_VISIBILITY_CHECK_XGMI:-}" == "1" ]]; then
+    if amd_smi="$(find_amd_smi)"; then
+        run_amd_smi_xgmi_check "${amd_smi}"
+    else
+        echo "::warning::amd-smi was not found in the test container; skipping XGMI check"
+    fi
 fi
 
 python3 - <<'PY'

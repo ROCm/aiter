@@ -47,8 +47,8 @@
 //   The helpers below (async_load_fence / s_waitcnt_vmcnt / block_sync_lds)
 //   are the building blocks; pipeline.hpp sequences them around each tile.
 
-typedef int v4i __attribute__((ext_vector_type(4)));
-typedef int v2i __attribute__((ext_vector_type(2)));
+typedef unsigned int v4i __attribute__((ext_vector_type(4)));
+typedef unsigned int v2i __attribute__((ext_vector_type(2)));
 
 // LDS pointer type: address_space(3) is the AMDGPU shared-memory space. The
 // buffer_load...lds builtin requires its destination to be such a pointer.

@@ -9,7 +9,8 @@ the upper-layer framework selects the backend explicitly:
 
 * ``causal_conv1d_split_qkv_triton_fn``      -- 1D per-token kernel (portable; any width).
 * ``causal_conv1d_split_qkv_triton_tile_fn`` -- 2D-tiled kernel (vectorized over both
-  feature and token axes; requires conv width in {2, 3, 4}).
+  feature and token axes; requires conv width in {2, 3, 4}). For x with unit channel
+  stride and conv width 4 it runs a sliding-window kernel instead.
 
 The other backends live in their own namespaces:
 
@@ -23,6 +24,8 @@ The ``@triton.jit`` kernels themselves live in
 concatenation ``[Q | K | V]`` (``dim == 2*k_dim + v_dim``).
 """
 
+import os
+
 import torch
 import triton
 
@@ -31,7 +34,11 @@ from aiter.ops.triton._triton_kernels.gated_delta_net.prefill.causal_conv1d_fwd_
     PAD_SLOT_ID,
     _causal_conv1d_fwd_split_qkv_kernel,
     _causal_conv1d_fwd_split_qkv_tile_kernel,
+    _causal_conv1d_fwd_split_qkv_window_kernel,
 )
+from aiter.ops.triton.utils.conv_config_utils import get_conv_config, has_conv_config
+from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.plugin import route as _route
 
 __all__ = [
     "PAD_SLOT_ID",
@@ -162,6 +169,10 @@ def _build_chunk_schedule(
     return tot, batch_ptr, tco
 
 
+# Routed on this public entry, the one KDA's vLLM prefill imports. The op name
+# drops the backend: a provider serves the split conv, not this Triton tiling,
+# so block_m, block_n and num_warps are hints it may ignore.
+@_route(op="causal_conv1d_split_qkv")
 def causal_conv1d_split_qkv_triton_tile_fn(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -189,7 +200,36 @@ def causal_conv1d_split_qkv_triton_tile_fn(
     Returns contiguous (q, k, v) of shapes [cu_seqlen, k_dim] / [cu_seqlen, v_dim].
 
     preserve_input_dtype: return q/k/v in x's dtype to match vLLM
+
+    Channel-contiguous x with conv width 4 runs the sliding-window kernel (tuned config; block_m, block_n,
+    num_warps and metadata unused). AITER_CONV1D_SPLIT_QKV_WINDOW=0 turns it off.
+
+    Contract for a provider: returns three new tensors (q, k, v) in x's dtype
+    when ``preserve_input_dtype`` else in ``conv_states``' dtype, and writes
+    ``conv_states`` in place -- each sequence's line ``cache_indices[i]`` ends
+    holding its last ``width - 1`` inputs, read first when
+    ``has_initial_state[i]``. A ``cache_indices`` entry equal to
+    ``pad_slot_id`` marks a padded sequence: its state line is neither read
+    nor written and its q/k/v rows are left unwritten. ``metadata`` only memoizes AITER's own chunk schedule; a provider
+    reads ``query_start_loc`` instead.
     """
+    window_config = _window_config(x, weight, conv_states, k_dim, v_dim, pad_slot_id)
+    if window_config is not None:
+        return _causal_conv1d_split_qkv_window(
+            window_config,
+            x,
+            weight,
+            bias,
+            conv_states,
+            query_start_loc,
+            k_dim,
+            v_dim,
+            cache_indices,
+            has_initial_state,
+            activation,
+            pad_slot_id,
+            x.dtype if preserve_input_dtype else conv_states.dtype,
+        )
     # Cast back only when asked; a no-op when cache and activations share a dtype
     out_dtype = x.dtype if preserve_input_dtype else conv_states.dtype
     x = x.to(conv_states.dtype)
@@ -303,8 +343,8 @@ def causal_conv1d_split_qkv_triton_tile_fn(
         key.stride(0),
         value.stride(1),
         value.stride(0),
-        0,  # stride_block_m (APC only)
-        pad_slot_id,
+        0,  # stride_block_m
+        PAD_SLOT_ID if pad_slot_id is None else pad_slot_id,
         HAS_BIAS=bias is not None,
         KERNEL_WIDTH=width,
         SILU_ACTIVATION=activation in ["silu", "swish"],
@@ -313,6 +353,7 @@ def causal_conv1d_split_qkv_triton_tile_fn(
         NP2_STATELEN=np2_statelen,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
+        QKV_ALIGNED=k_dim % BLOCK_N == 0 and v_dim % BLOCK_N == 0,
         num_warps=num_warps,
         num_stages=1,
     )
@@ -321,3 +362,107 @@ def causal_conv1d_split_qkv_triton_tile_fn(
         key.to(out_dtype),
         value.to(out_dtype),
     )
+
+
+_WINDOW_CONFIG_NAME = "CAUSAL_CONV1D_SPLIT_QKV"
+
+
+def _window_config(x, weight, conv_states, k_dim, v_dim, pad_slot_id) -> dict | None:
+    """Window kernel config, or None if it does not apply"""
+    dim, cu_seqlen = x.shape
+    if (
+        os.environ.get("AITER_CONV1D_SPLIT_QKV_WINDOW", "1") == "0"
+        or not has_conv_config(_WINDOW_CONFIG_NAME)
+        or pad_slot_id is None
+        or weight.dim() != 2
+        or weight.shape[1] != 4
+        # Taps are loaded as contiguous [dim, 4] rows
+        or not weight.is_contiguous()
+        or x.stride(0) != 1
+        # The kernel assumes stride_x > 0; broadcast (stride 0) x takes the 2D path
+        or x.stride(1) < 1
+        # State must hold x exactly
+        or conv_states.dtype not in (x.dtype, torch.float32)
+        or dim != 2 * k_dim + v_dim
+        # 32-bit row offsets
+        or (cu_seqlen + 3) * x.stride(1) + dim >= 2**31
+    ):
+        return None
+    config = get_conv_config(_WINDOW_CONFIG_NAME, M=cu_seqlen)
+    # Shrink BD until it divides q, k and v; keep R * BD
+    while (k_dim % config["BD"] or v_dim % config["BD"]) and config["BD"] > 64:
+        config["BD"] //= 2
+        config["R"] *= 2
+    if k_dim % config["BD"] or v_dim % config["BD"]:
+        return None
+    return config
+
+
+def _causal_conv1d_split_qkv_window(
+    config,
+    x,
+    weight,
+    bias,
+    conv_states,
+    query_start_loc,
+    k_dim,
+    v_dim,
+    cache_indices,
+    has_initial_state,
+    activation,
+    pad_slot_id,
+    out_dtype,
+):
+    """Window path of ``causal_conv1d_split_qkv_triton_tile_fn``"""
+    dim, cu_seqlen = x.shape
+    n_seq = query_start_loc.numel() - 1
+    out = torch.empty(cu_seqlen * dim, dtype=out_dtype, device=x.device)
+    q = out[: cu_seqlen * k_dim].view(cu_seqlen, k_dim)
+    k = out[cu_seqlen * k_dim : 2 * cu_seqlen * k_dim].view(cu_seqlen, k_dim)
+    v = out[2 * cu_seqlen * k_dim :].view(cu_seqlen, v_dim)
+    if cu_seqlen == 0 or n_seq == 0:
+        return q, k, v
+    if cache_indices is None:
+        cache_indices = torch.arange(n_seq, dtype=torch.int32, device=x.device)
+    if has_initial_state is None:
+        has_initial_state = torch.zeros(n_seq, dtype=torch.bool, device=x.device)
+
+    # Smallest sequence-start vector that fits, up to SEQ_VEC
+    config["SEQ_VEC"] = min(config["SEQ_VEC"], max(16, triton.next_power_of_2(n_seq)))
+    block_r, block_d = config["R"], config["BD"]
+    num_warps = config.pop("num_warps")
+    num_xcds = get_num_xcds()
+    n_blocks = dim // block_d
+    n_tiles = triton.cdiv(cu_seqlen, block_r * config["BC"])
+    # Head programs, padded to a multiple of NUM_XCDS so tiles keep their XCD
+    n_head_programs = (
+        triton.cdiv(triton.cdiv(n_seq, block_r) * n_blocks, num_xcds) * num_xcds
+    )
+    _causal_conv1d_fwd_split_qkv_window_kernel[(n_head_programs + n_tiles * n_blocks,)](
+        x,
+        weight,
+        bias,
+        conv_states,
+        cache_indices,
+        has_initial_state,
+        query_start_loc,
+        out,
+        n_seq,
+        cu_seqlen,
+        x.stride(1),
+        conv_states.stride(0),
+        conv_states.stride(1),
+        conv_states.stride(2),
+        cache_indices.stride(0),
+        pad_slot_id,
+        n_tiles,
+        n_head_programs,
+        KD=k_dim,
+        VD=v_dim,
+        HAS_BIAS=bias is not None,
+        SILU=activation in ("silu", "swish"),
+        NUM_XCDS=num_xcds,
+        num_warps=num_warps,
+        **config,
+    )
+    return q, k, v

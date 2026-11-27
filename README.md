@@ -130,6 +130,8 @@ pip install -r requirements.txt
 
 AITER includes Triton-based operators that require Triton from AMD PyPI, with the correct version selected based on your ROCm installation. For an editable installation, run the install script before `pip install -e .` as shown above.
 
+The script installs triton 3.9.0 from `pypi.amd.com`, so it needs Python 3.11 or newer and network access to that index. On Python 3.10 it prints a reminder and keeps the Triton you already have; if the index cannot be reached or has no build for your Python and ROCm, it exits without changing your Triton.
+
 To keep an existing compatible Triton installation, skip the script and set:
 
 ```bash
@@ -189,7 +191,10 @@ For more details, see [docs/triton_comms.md](docs/triton_comms.md).
 ## Contributing
 
 See [CONTRIBUTE.md](CONTRIBUTE.md) for setup, code style, testing and the PR
-process. One rule up front: **a pull request changes one kernel backend**:
+process. To find who to contact for a pull request, see [CONTACTS.md](CONTACTS.md);
+to help review, see [REVIEWERS.md](REVIEWERS.md).
+
+One rule up front: **a pull request changes one kernel backend**:
 Triton/Gluon (Triton and Gluon count as one), HIP, ASM, CK, OPUS or FlyDSL.
 Work that spans two backends is two PRs; when one cannot land without the
 other, open them as

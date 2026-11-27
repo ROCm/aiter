@@ -2307,7 +2307,7 @@ def check_mxfp4_reject():
             page16,
             {},
             {"skip_index_branch": True},
-            "index_cache_dtype='mxfp4' requires the sparse insert mode",
+            "index_cache_dtype='mxfp4'/'nvfp4' requires the sparse insert mode",
         ),
         # the case holds 2 pages of 128 tokens, the index cache 1
         "kv_mxfp4_few_index_pages": (

@@ -35,6 +35,7 @@ def compile_moe_gemm1(
     activation="silu",
     swiglu_limit=None,
     fused_down_clear=False,
+    has_num_local_tokens=False,
 ):
     TILE_K = 64
     act_quant_type, swiglu_limit = validate_gemm_options(
@@ -50,6 +51,8 @@ def compile_moe_gemm1(
         assert K % 256 == 0, "batch1 Gate/Up requires K divisible by 256"
     if fused_down_clear:
         assert alg == "batch1" and K % 8 == 0
+    # The sorted algorithms bound the rows in moe_sorting.
+    assert not has_num_local_tokens or alg == "batch1"
 
     if alg == "splitk":
         assert (
@@ -220,10 +223,12 @@ def compile_moe_gemm1(
                     acc.append(_swiglu_oai(gate[j], up[j]))
             else:
                 log2_exp1 = -1.4426950408889634
-                gate_log2 = gate * log2_exp1
                 for j in range_constexpr(gate.numel):
-                    tmp = rocdl.exp2(T.f32, _raw(gate_log2[j]))
-                    acc.append((gate[j] * rocdl.rcp(T.f32, 1.0 + tmp)) * up[j])
+                    g, u = gate[j], up[j]
+                    if const_expr(bool(swiglu_limit)):
+                        g, u = _clamp_gateup(g, u)
+                    tmp = rocdl.exp2(T.f32, _raw(g * log2_exp1))
+                    acc.append((g * rocdl.rcp(T.f32, 1.0 + tmp)) * u)
             acc = Vec.from_elements(acc, fx.Float32)
             c_frag_bf16[None, None, i].store(_f32_to_bf16(acc))
 
@@ -258,6 +263,8 @@ def compile_moe_gemm1(
                     if const_expr(activation == "swiglu"):
                         acc.append(_swiglu_oai(g, u))
                     else:
+                        if const_expr(bool(swiglu_limit)):
+                            g, u = _clamp_gateup(g, u)
                         tmp = rocdl.exp2(T.f32, _raw(g * log2_exp1))
                         acc.append((g * rocdl.rcp(T.f32, 1.0 + tmp)) * u)
                 acc = Vec.from_elements(acc, fx.Float32)
@@ -271,7 +278,7 @@ def compile_moe_gemm1(
         )
         element_num = 16 // (p_weight.dtype.width // 8)
         return fx.make_view(
-            p_weight + fx.Int64(expert_id * N * K),
+            p_weight + fx.Int64(expert_id) * N * K,
             fx.composition(
                 fx.make_layout(
                     ((16, N // 16), (element_num, K // element_num)),
@@ -739,6 +746,7 @@ def compile_moe_gemm1(
         p_topk_ids: fx.Pointer,
         p_clear_output: fx.Pointer,
         p_w_scale: fx.Pointer,
+        p_num_local_tokens: fx.Pointer,
     ):
         tid = gpu.thread_idx.x
         blk_n = gpu.block_idx.x
@@ -754,6 +762,10 @@ def compile_moe_gemm1(
             p_weight = fx.recast_iter(fx.Uint8, fxh._as_ptr(p_weight))
         arg_p_expert_ids = fx.recast_iter(fx.Int32, fxh._as_ptr(p_topk_ids))
         expert_id = arg_p_expert_ids[route_idx]
+        if const_expr(has_num_local_tokens):
+            # Rows at and past the count (CUDA-graph padding) run no route.
+            num_rows = fx.recast_iter(fx.Int32, fxh._as_ptr(p_num_local_tokens))[0]
+            expert_id = (fx.Int32(batch_idx) < num_rows).select(expert_id, fx.Int32(-1))
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         contiguous_n = min(64, BLOCK_TILE_SIZE_N // 2)
 
@@ -1046,6 +1058,7 @@ def compile_moe_gemm1(
         p_topk_ids: fx.Pointer,
         p_clear_output: fx.Pointer,
         p_w_scale: fx.Pointer,
+        p_num_local_tokens: fx.Pointer,
         task_num: fx.Int32,
         stream: fx.Stream,
     ):
@@ -1054,7 +1067,13 @@ def compile_moe_gemm1(
         batch_size = task_num // TOPK
         # Other launchers take the routing weights in the p_clear_output position.
         moe_2stage_gateup_batch1(
-            p_input, p_weight, p_output, p_topk_ids, p_clear_output, p_w_scale
+            p_input,
+            p_weight,
+            p_output,
+            p_topk_ids,
+            p_clear_output,
+            p_w_scale,
+            p_num_local_tokens,
         ).launch(
             grid=(num_n_blocks, TOPK, batch_size),
             block=(256, 1, 1),

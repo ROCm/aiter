@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import enum
+import functools
 import logging
 import sys
 from itertools import product
@@ -41,15 +42,19 @@ import torch
 import triton
 
 from aiter.ops.triton.fusions.mhc import mhc, mhc_post
-from aiter.ops.triton.utils.mhc_config_utils import hip_post_dispatch_block
 from aiter.test_common import checkAllclose
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     print_vgpr,
+)
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
 )
 from op_tests.triton_tests.utils.mhc_ref import (
     generate_mhc_inputs,
@@ -135,8 +140,6 @@ def get_benchmark_configs(args):
 
     Ms = [2**i for i in range(10, 15)]
     n = 4
-    # --with-hip: C=512 is excluded because the greedy post dispatcher selects
-    # block=512 and then fails the kernel's hidden_size >= residual_block * 2 check.
     Cs = [1280, 2560, 4096, 7168]
     return sorted(product(Ms, [n], Cs), key=lambda x: (x[2], x[0]))
 
@@ -267,160 +270,35 @@ class _MhcHandler:
     def vgpr_msg(self) -> str:
         return f"Retrieving VGPR usage for mhc {self.op} Triton kernels..."
 
-    def setup_call(
+    def correctness_check(
         self,
-        params: dict[str, int],
+        entry: dict[str, Any],
+        triton_fn,
+        hip_fn,
         args: argparse.Namespace,
-        dtype: torch.dtype,
-    ) -> dict[str, Any]:
+        params: dict[str, int],
+    ) -> None:
         op = self.op
-        M = params["M"]
+        M, C = params["M"], params["C"]
         n = self.POST_N if op == "post" else params["n"]
-        C = params["C"]
-        sinkhorn_iters = args.sinkhorn_iters
-        if op == "post":
-            torch.manual_seed(0)
-
-        x, phi, alpha_pre, alpha_post, alpha_res, bias, _ = generate_mhc_inputs(
-            M, n, C, dtype
-        )
-
-        flops, mem_bytes = _compute_metrics(
-            op,
-            M,
-            n=n,
-            C=C,
-            sinkhorn_iters=sinkhorn_iters,
-            elem_bytes=x.element_size(),
-        )
-
-        def _call_triton_pre():
-            return mhc(
-                x,
-                phi,
-                alpha_pre,
-                alpha_post,
-                alpha_res,
-                bias,
-                n,
-                hc_pre_eps=1e-6,
-                sinkhorn_iters=sinkhorn_iters,
-            )
-
-        if op == "post":
-            h_post, h_res, layer_input = _call_triton_pre()
-            residual = x.view(M, n, C)
-
-        if op == "pre":
-            triton_fn = _call_triton_pre
-
-        elif op == "post":
-
-            def triton_fn():
-                return mhc_post(None, layer_input, residual, h_post, h_res)
-
-        else:  # e2e
-
-            def triton_fn():
-                hp, hr, li = _call_triton_pre()
-                return mhc_post(None, li, x.view(M, n, C), hp, hr, None)
-
-        hip_fn = None
-        check_payload = None
-        if args.with_hip:
-            residual_b, fn_hip, hc_scale, hc_base = _triton_to_hip_pre_inputs(
-                x, phi, alpha_pre, alpha_post, alpha_res, bias, n
-            )
-            hip_dev = torch.device(residual_b.device)
-
-            # All HIP mhc_pre invocations share these kwargs.
-            def _call_aiter_pre():
-                return _aiter.mhc_pre(
-                    residual_b,
-                    fn_hip,
-                    hc_scale,
-                    hc_base,
-                    rms_eps=1e-6,
-                    hc_pre_eps=1e-6,
-                    hc_sinkhorn_eps=0.0,
-                    hc_post_mult_value=2.0,
-                    sinkhorn_repeat=sinkhorn_iters,
-                )
-
-            if op == "pre":
-
-                def hip_fn():
-                    with hip_dev:
-                        return _call_aiter_pre()
-
-            elif op == "post":
-                with hip_dev:
-                    post_mix_hip, comb_mix_hip, layer_input_hip = _call_aiter_pre()
-                out_hip = torch.empty(M, n, C, dtype=dtype, device=residual_b.device)
-
-                def hip_fn():
-                    with hip_dev:
-                        _aiter.mhc_post(
-                            out_hip,
-                            layer_input_hip,
-                            residual_b,
-                            post_mix_hip,
-                            comb_mix_hip,
-                        )
-                        return out_hip
-
-                check_payload = (
-                    x.view(M, n, C),
-                    phi,
-                    alpha_pre,
-                    alpha_post,
-                    alpha_res,
-                    bias,
-                    n,
-                    sinkhorn_iters,
-                )
-            else:  # e2e
-                out_hip = torch.empty(M, n, C, dtype=dtype, device=residual_b.device)
-
-                def hip_fn():
-                    with hip_dev:
-                        pm, cm, li_h = _call_aiter_pre()
-                        _aiter.mhc_post(out_hip, li_h, residual_b, pm, cm)
-                        return out_hip
-
-                check_payload = (
-                    x.view(M, n, C),
-                    phi,
-                    alpha_pre,
-                    alpha_post,
-                    alpha_res,
-                    bias,
-                    n,
-                    sinkhorn_iters,
-                )
-
-        return {
-            "triton_fn": triton_fn,
-            "hip_fn": hip_fn,
-            "metrics": (flops, mem_bytes),
-            "check_payload": check_payload,
-        }
-
-    def correctness_check(self, setup: dict[str, Any], params: dict[str, int]) -> None:
-        if setup["hip_fn"] is None:
-            return
-        op = self.op
         if op == "pre":
             _assert_triton_matches_hip(
                 "pre",
-                setup["triton_fn"](),
-                setup["hip_fn"](),
+                triton_fn(**entry),
+                hip_fn(**entry),
                 M=params["M"],
                 n=params["n"],
                 C=params["C"],
             )
             return
-        xl, phi, ap, apo, ar, bs, n_, si = setup["check_payload"]
+        xl = entry["x"].view(M, n, C)
+        phi, ap, apo, ar, bs = (
+            entry["phi"],
+            entry["alpha_pre"],
+            entry["alpha_post"],
+            entry["alpha_res"],
+            entry["bias"],
+        )
         _, x_l_plus_1, _, _ = mhc_e2e_ref(
             xl,
             phi,
@@ -428,12 +306,12 @@ class _MhcHandler:
             apo,
             ar,
             bs,
-            n_,
+            n,
             hc_pre_eps=1e-6,
-            sinkhorn_iters=si,
+            sinkhorn_iters=args.sinkhorn_iters,
         )
-        t_out = setup["triton_fn"]()
-        h_out = setup["hip_fn"]()
+        t_out = triton_fn(**entry)
+        h_out = hip_fn(**entry)
         t_vs_ref = (t_out.float() - x_l_plus_1).abs().max().item()
         h_vs_ref = (h_out.float() - x_l_plus_1).abs().max().item()
         if op == "post":
@@ -498,12 +376,197 @@ def _triton_to_hip_pre_inputs(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
     return residual, fn_hip, hc_scale, hc_base
 
 
+_MHC_POOL_FIELDS = [
+    "x",
+    "phi",
+    "alpha_pre",
+    "alpha_post",
+    "alpha_res",
+    "bias",
+    "h_post",
+    "h_res",
+    "layer_input",
+    "residual",
+    "residual_b",
+    "fn_hip",
+    "hc_scale",
+    "hc_base",
+    "post_mix_hip",
+    "comb_mix_hip",
+    "layer_input_hip",
+    "out_hip",
+]
+
+
+def _generate_mhc_pool_entry(op, with_hip, dtype, M, n, C, sinkhorn_iters):
+    """Build one full mHC input set (+ HIP conversion), one untimed call ahead
+    of time for ops that need another op's output as their input. Setup only,
+    not measured.
+    """
+    x, phi, alpha_pre, alpha_post, alpha_res, bias, _ = generate_mhc_inputs(
+        M, n, C, dtype
+    )
+
+    h_post = h_res = layer_input = residual = None
+    if op == "post":
+        h_post, h_res, layer_input = mhc(
+            x,
+            phi,
+            alpha_pre,
+            alpha_post,
+            alpha_res,
+            bias,
+            n,
+            hc_pre_eps=1e-6,
+            sinkhorn_iters=sinkhorn_iters,
+        )
+        residual = x.view(M, n, C)
+
+    residual_b = fn_hip = hc_scale = hc_base = None
+    post_mix_hip = comb_mix_hip = layer_input_hip = out_hip = None
+    if with_hip:
+        residual_b, fn_hip, hc_scale, hc_base = _triton_to_hip_pre_inputs(
+            x, phi, alpha_pre, alpha_post, alpha_res, bias, n
+        )
+        if op in ("post", "e2e"):
+            hip_dev = torch.device(residual_b.device)
+            with hip_dev:
+                post_mix_hip, comb_mix_hip, layer_input_hip = _aiter.mhc_pre(
+                    residual_b,
+                    fn_hip,
+                    hc_scale,
+                    hc_base,
+                    rms_eps=1e-6,
+                    hc_pre_eps=1e-6,
+                    hc_sinkhorn_eps=0.0,
+                    hc_post_mult_value=2.0,
+                    sinkhorn_repeat=sinkhorn_iters,
+                )
+                out_hip = torch.empty(M, n, C, dtype=dtype, device=residual_b.device)
+
+    return (
+        x,
+        phi,
+        alpha_pre,
+        alpha_post,
+        alpha_res,
+        bias,
+        h_post,
+        h_res,
+        layer_input,
+        residual,
+        residual_b,
+        fn_hip,
+        hc_scale,
+        hc_base,
+        post_mix_hip,
+        comb_mix_hip,
+        layer_input_hip,
+        out_hip,
+    )
+
+
+def _make_mhc_kernel_fns(op, n, sinkhorn_iters):
+    """Parameterized triton/hip kernel callables for RotatingBufferBench.bench.
+
+    Argument names match a rotating-buffer pool entry's keys (``**_``
+    absorbs the ones a given op does not need).
+    """
+
+    def triton_fn(
+        x,
+        phi,
+        alpha_pre,
+        alpha_post,
+        alpha_res,
+        bias,
+        h_post,
+        h_res,
+        layer_input,
+        residual,
+        **_,
+    ):
+        if op == "pre":
+            return mhc(
+                x,
+                phi,
+                alpha_pre,
+                alpha_post,
+                alpha_res,
+                bias,
+                n,
+                hc_pre_eps=1e-6,
+                sinkhorn_iters=sinkhorn_iters,
+            )
+        if op == "post":
+            return mhc_post(None, layer_input, residual, h_post, h_res)
+        # e2e
+        hp, hr, li = mhc(
+            x,
+            phi,
+            alpha_pre,
+            alpha_post,
+            alpha_res,
+            bias,
+            n,
+            hc_pre_eps=1e-6,
+            sinkhorn_iters=sinkhorn_iters,
+        )
+        return mhc_post(None, li, x.view(x.shape[0], n, -1), hp, hr, None)
+
+    def hip_fn(
+        residual_b,
+        fn_hip,
+        hc_scale,
+        hc_base,
+        post_mix_hip,
+        comb_mix_hip,
+        layer_input_hip,
+        out_hip,
+        **_,
+    ):
+        hip_dev = torch.device(residual_b.device)
+
+        def _call_aiter_pre():
+            return _aiter.mhc_pre(
+                residual_b,
+                fn_hip,
+                hc_scale,
+                hc_base,
+                rms_eps=1e-6,
+                hc_pre_eps=1e-6,
+                hc_sinkhorn_eps=0.0,
+                hc_post_mult_value=2.0,
+                sinkhorn_repeat=sinkhorn_iters,
+            )
+
+        if op == "pre":
+            with hip_dev:
+                return _call_aiter_pre()
+        if op == "post":
+            with hip_dev:
+                _aiter.mhc_post(
+                    out_hip, layer_input_hip, residual_b, post_mix_hip, comb_mix_hip
+                )
+                return out_hip
+        # e2e
+        with hip_dev:
+            pm, cm, li_h = _call_aiter_pre()
+            _aiter.mhc_post(out_hip, li_h, residual_b, pm, cm)
+            return out_hip
+
+    return triton_fn, hip_fn
+
+
 def _create_benchmark_kernel(args, operation):
     """Build a perf_report-decorated bench function for one op."""
     handler = _OP_HANDLERS[operation]
     dtype = arg_to_torch_dtype[args.dtype]
 
     config = _get_benchmark_config(args, operation)
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
 
     benchmark = triton.testing.Benchmark(
         x_names=config["x_names"],
@@ -522,21 +585,45 @@ def _create_benchmark_kernel(args, operation):
 
     @triton.testing.perf_report([benchmark])
     def bench_mhc_kernel(provider, **benchmark_params):
-        setup = handler.setup_call(benchmark_params, args, dtype)
-        triton_fn = setup["triton_fn"]
-        hip_fn = setup["hip_fn"]
-        flops, mem_bytes = setup["metrics"]
+        M = benchmark_params["M"]
+        n = handler.POST_N if operation == "post" else benchmark_params["n"]
+        C = benchmark_params["C"]
+        sinkhorn_iters = args.sinkhorn_iters
 
-        if args.with_hip and hip_fn is not None:
+        pool_gen = functools.partial(
+            _generate_mhc_pool_entry,
+            operation,
+            args.with_hip,
+            dtype,
+            M,
+            n,
+            C,
+            sinkhorn_iters,
+        )
+        rot_bufs = bencher.build_pool([pool_gen], [_MHC_POOL_FIELDS])
+        triton_fn, hip_fn = _make_mhc_kernel_fns(operation, n, sinkhorn_iters)
+
+        flops, mem_bytes = _compute_metrics(
+            operation,
+            M,
+            n=n,
+            C=C,
+            sinkhorn_iters=sinkhorn_iters,
+            elem_bytes=rot_bufs[0]["x"].element_size(),
+        )
+
+        if args.with_hip:
             config_key = tuple(benchmark_params[k] for k in handler.x_names)
             if config_key not in _checked_configs:
-                handler.correctness_check(setup, benchmark_params)
+                handler.correctness_check(
+                    rot_bufs[0], triton_fn, hip_fn, args, benchmark_params
+                )
                 _checked_configs.add(config_key)
 
         backend = "hip" if provider.startswith("hip_") else "triton"
         fn = hip_fn if backend == "hip" else triton_fn
 
-        ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
+        ms = bencher.bench(fn)
 
         return _metric_from_provider(provider).compute(ms, flops, mem_bytes)
 
@@ -632,26 +719,6 @@ def parse_args() -> argparse.Namespace:
             "(The '_triton+hip' suffix is appended when --with-hip is set.)"
         ),
     )
-    parser.add_argument(
-        "--warmup",
-        type=int,
-        default=25,
-        help=(
-            "Warmup iterations passed to triton.testing.do_bench (default: "
-            "25). Increase for sub-50us kernels where the default produces "
-            "noisy timings; decrease to speed up sweeps over large shapes."
-        ),
-    )
-    parser.add_argument(
-        "--rep",
-        type=int,
-        default=100,
-        help=(
-            "Measurement iterations passed to triton.testing.do_bench "
-            "(default: 100). The reported time is the median over rep "
-            "iterations."
-        ),
-    )
 
     args = parser.parse_args()
 
@@ -743,17 +810,15 @@ def _validate_with_hip_pre(args) -> None:
 
 def _validate_with_hip_post(args) -> None:
     """Validate --with-hip args for mhc_post; raises AssertionError on failure."""
+    # Imported here: aiter.ops.mhc needs the HIP side of aiter, which a
+    # Triton-only install (AITER_TRITON_ONLY=1) does not import.
+    from aiter.ops.mhc import mhc_post_supported
+
     arch_id = _aiter_chip_info.get_gfx()
     for M_, n_, C_ in get_benchmark_configs(args):
-        block = hip_post_dispatch_block(C_, arch_id)
-        assert block is not None, (
-            f"--with-hip requires C (hidden_size) divisible by 256 "
-            f"(got C={C_} for M={M_}, n={n_}). aiter.mhc_post dispatches with "
-            f"residual_block in {{256, 512, 1024}}."
-        )
-        assert C_ >= 2 * block, (
-            f"--with-hip on {arch_id} selects residual_block={block} for C={C_}; "
-            f"requires hidden_size >= {2 * block} (got C={C_} for M={M_}, n={n_})."
+        assert mhc_post_supported(C_, n_, torch.bfloat16, arch_id), (
+            f"--with-hip: aiter.mhc_post does not run hidden_size {C_} "
+            f"(hc_mult {n_}) on {arch_id} (see mhc_post_supported); got M={M_}."
         )
 
 
@@ -789,6 +854,7 @@ def main():
 
     args = parse_args()
     handler = _OP_HANDLERS[args.op]
+    torch.manual_seed(0)
 
     _validate_with_hip(args, operation=args.op)
 

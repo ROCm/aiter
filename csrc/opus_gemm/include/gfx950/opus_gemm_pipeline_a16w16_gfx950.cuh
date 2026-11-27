@@ -214,48 +214,27 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
         int blocks_per_cycle = nXCD * C;
         int tid_per_group = W * num_tiles_n;
         int limit = (total_wgs / blocks_per_cycle) * blocks_per_cycle;
-        if (xy >= limit) {
-            // Swizzle covers new_xy ∈ [0, limit) contiguously. Within that,
-            // (limit / tid_per_group) groups are full; the remainder lands in
-            // a partial last group covering (covered_cols) complete tn
-            // columns. The original fallback `xy/num_tiles_n` jumps row-major
-            // from xy without accounting for those holes, dropping the
-            // (partial_first_row..end, covered_cols..num_tiles_n) rectangle.
-            int full_groups = limit / tid_per_group;
-            int covered_cols = (limit - full_groups * tid_per_group) / W;
-            int partial_first_row = full_groups * W;
-            int partial_row_extent = num_tiles_m - partial_first_row;
-            if (partial_row_extent > W) partial_row_extent = W;
-            int f = xy - limit;
-            int remaining_in_partial =
-                (partial_row_extent > 0)
-                    ? (num_tiles_n - covered_cols) * partial_row_extent
-                    : 0;
-            if (f < remaining_in_partial) {
-                tile_m_id = partial_first_row + (f % partial_row_extent);
-                tile_n_id = covered_cols + (f / partial_row_extent);
-            } else {
-                int g = f - remaining_in_partial;
-                tile_m_id = (partial_first_row + partial_row_extent) + g / num_tiles_n;
-                tile_n_id = g % num_tiles_n;
-            }
-        } else {
+        // The swizzle permutes each full cycle of blocks_per_cycle
+        // workgroups; the tail past limit keeps its index, so the group
+        // mapping below still covers every tile.
+        int new_xy = xy;
+        if (xy < limit) {
             int xcd = xy % nXCD;
             int local = xy / nXCD;
             int chunk_idx = local / C;
             int pos = local % C;
-            int new_xy = xcd * C + chunk_idx * blocks_per_cycle + pos;
-            int group_id = new_xy / tid_per_group;
-            int first_row = group_id * W;
-            int win_h = num_tiles_m - first_row;
-            if (win_h > W) win_h = W;
-            int l = new_xy % tid_per_group;
-            tile_m_id = first_row + (l % win_h);
-            tile_n_id = l / win_h;
-            if (tile_n_id >= num_tiles_n) {
-                tile_m_id = xy / num_tiles_n;
-                tile_n_id = xy % num_tiles_n;
-            }
+            new_xy = xcd * C + chunk_idx * blocks_per_cycle + pos;
+        }
+        int group_id = new_xy / tid_per_group;
+        int first_row = group_id * W;
+        int win_h = num_tiles_m - first_row;
+        if (win_h > W) win_h = W;
+        int l = new_xy % tid_per_group;
+        tile_m_id = first_row + (l % win_h);
+        tile_n_id = l / win_h;
+        if (tile_n_id >= num_tiles_n) {
+            tile_m_id = xy / num_tiles_n;
+            tile_n_id = xy % num_tiles_n;
         }
     } else {
         tile_m_id = wgid / num_tiles_n;

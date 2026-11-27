@@ -25,36 +25,18 @@ inline __device__ void opus_moe_stage2_tile_ids(int wgid,
         const int blocks_per_cycle = nXCD * C;
         const int tiles_per_group = W * num_tiles_n;
         const int limit = (total_wgs / blocks_per_cycle) * blocks_per_cycle;
-        if(wgid >= limit)
+        // The swizzle permutes each full cycle of blocks_per_cycle workgroups;
+        // the tail past limit keeps its index, so the group mapping below still
+        // covers every tile.
+        int swizzled = wgid;
+        if(wgid < limit)
         {
-            const int full_groups = limit / tiles_per_group;
-            const int covered_cols = (limit - full_groups * tiles_per_group) / W;
-            const int partial_first_row = full_groups * W;
-            int partial_row_extent = num_tiles_m - partial_first_row;
-            if(partial_row_extent > W)
-                partial_row_extent = W;
-            const int tail = wgid - limit;
-            const int partial_tiles =
-                (partial_row_extent > 0) ? (num_tiles_n - covered_cols) * partial_row_extent
-                                         : 0;
-            if(tail < partial_tiles)
-            {
-                tile_m_id = partial_first_row + (tail % partial_row_extent);
-                tile_n_id = covered_cols + (tail / partial_row_extent);
-                return;
-            }
-
-            const int rest = tail - partial_tiles;
-            tile_m_id = partial_first_row + partial_row_extent + rest / num_tiles_n;
-            tile_n_id = rest % num_tiles_n;
-            return;
+            const int xcd = wgid % nXCD;
+            const int local = wgid / nXCD;
+            const int chunk_idx = local / C;
+            const int pos = local % C;
+            swizzled = xcd * C + chunk_idx * blocks_per_cycle + pos;
         }
-
-        const int xcd = wgid % nXCD;
-        const int local = wgid / nXCD;
-        const int chunk_idx = local / C;
-        const int pos = local % C;
-        const int swizzled = xcd * C + chunk_idx * blocks_per_cycle + pos;
         const int group_id = swizzled / tiles_per_group;
         const int first_row = group_id * W;
         int win_h = num_tiles_m - first_row;

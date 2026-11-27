@@ -93,6 +93,104 @@ def _run_allreduce_case(rankID, tp_size, case_idx, shape, dtype, withGraph, grap
     return {"us": us, "err": checkAllclose(ref, out, msg=msg)}
 
 
+def _run_all_gather_lastdim_add_case(
+    rankID, tp_size, case_idx, shape, dtype, withGraph, graphs
+):
+    """Check ``all_gather_lastdim_add`` against ``cat(shards, -1) + add_b [+ add_c]``
+    with atol=rtol=0: the kernel rounds to ``dtype`` after each add, like the
+    unfused sequence."""
+    rows, n = shape
+    gen = torch.Generator(device="cuda").manual_seed(case_idx)
+
+    def make_shards():
+        return [
+            torch.randn((rows, n), dtype=dtype, device="cuda", generator=gen)
+            for _ in range(tp_size)
+        ]
+
+    shards = make_shards()
+    full = (rows, n * tp_size)
+    add_b = torch.randn(full, dtype=dtype, device="cuda", generator=gen)
+    add_c = torch.randn(full, dtype=dtype, device="cuda", generator=gen)
+    x = shards[rankID]
+    ca = get_tp_group().device_communicator.ca_comm
+    msg = f"test_all_gather_lastdim_add: rank={rankID} {shape=} {dtype=} {withGraph=}"
+
+    if case_idx == 0 and not withGraph:
+        assert ca.should_custom_ag_lastdim_add(x), msg
+        assert not ca.should_custom_ag_lastdim_add(x.float()), msg
+        assert not ca.should_custom_ag_lastdim_add(x[:, :4]), msg
+        assert not ca.should_custom_ag_lastdim_add(x.view(-1)), msg
+        empty = ca.all_gather_lastdim_add(x[:0], add_b[:0])
+        assert empty.shape == (0, n * tp_size), msg
+        flat = torch.empty(add_b.numel() + 1, dtype=dtype, device="cuda")
+        misaligned = flat[1:].view(full)
+        bad = {
+            "alias": {"add_b": add_b, "out": add_b},
+            "misaligned out": {"add_b": add_b, "out": misaligned},
+            "wrong shape": {"add_b": add_b[:, :-8]},
+        }
+        for tag, kw in bad.items():
+            try:
+                ca.all_gather_lastdim_add(x, **kw)
+            except AssertionError:
+                continue
+            raise AssertionError(f"{msg} accepted {tag}")
+
+    def check(out, out_b, shards, tag):
+        gathered = torch.cat(shards, dim=-1)
+        err = checkAllclose(
+            gathered + add_b + add_c, out, rtol=0, atol=0, msg=f"{msg} {tag}"
+        )
+        err_b = checkAllclose(
+            gathered + add_b, out_b, rtol=0, atol=0, msg=f"{msg} {tag} add_c=None"
+        )
+        return max(err, err_b)
+
+    if withGraph:
+
+        def capture(*adds):
+            graph = torch.cuda.CUDAGraph()
+            with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+                out = ca.all_gather_lastdim_add(x, *adds)
+            out.fill_(0)
+            graphs.append((graph, x, *adds, out))
+            return graph, out
+
+        graph, out = capture(add_b, add_c)
+        graph_b, out_b = capture(add_b)
+
+        @perftest()
+        def run_ca():
+            graph.replay()
+
+        _, us = run_ca()
+        graph_b.replay()
+        torch.cuda.synchronize()
+        err = check(out, out_b, shards, "replay")
+
+        # Peers read x in place, so every rank must be done replaying first.
+        dist.barrier()
+        shards = make_shards()
+        x.copy_(shards[rankID])
+        graph.replay()
+        graph_b.replay()
+        torch.cuda.synchronize()
+        err = max(err, check(out, out_b, shards, "replay after input update"))
+    else:
+
+        @perftest()
+        def run_ca(x):
+            return ca.all_gather_lastdim_add(x, add_b, add_c)
+
+        out, us = run_ca(x)
+        out_b = ca.all_gather_lastdim_add(x, add_b)
+        err = check(out, out_b, shards, "eager")
+
+    print(f"{msg} {us:>8.2f}")
+    return {"us": us, "err": err}
+
+
 def allreduce_custom_sweep(
     tp_size,
     pp_size,
@@ -101,6 +199,7 @@ def allreduce_custom_sweep(
     dtype,
     withGraph=False,
     distributed_init_method: str | None = None,
+    case_fn=_run_allreduce_case,
 ):
     """Run every shape on one rank inside a single distributed init.
 
@@ -126,7 +225,7 @@ def allreduce_custom_sweep(
 
     graphs = []
     results = [
-        _run_allreduce_case(rankID, tp_size, case_idx, shape, dtype, withGraph, graphs)
+        case_fn(rankID, tp_size, case_idx, shape, dtype, withGraph, graphs)
         for case_idx, shape in enumerate(shapes)
     ]
 
@@ -140,7 +239,9 @@ def allreduce_custom_sweep(
     return results
 
 
-def test_allreduce_custom(tp_size, pp_size, shapes, dtype, withGraph=False):
+def test_allreduce_custom(
+    tp_size, pp_size, shapes, dtype, withGraph=False, case_fn=_run_allreduce_case
+):
     """Sweep ``shapes`` on one TP group and return one summary row per shape."""
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
@@ -149,7 +250,16 @@ def test_allreduce_custom(tp_size, pp_size, shapes, dtype, withGraph=False):
         rets = [
             pool.apply_async(
                 allreduce_custom_sweep,
-                args=(tp_size, pp_size, rank, shapes, dtype, withGraph, init_method),
+                args=(
+                    tp_size,
+                    pp_size,
+                    rank,
+                    shapes,
+                    dtype,
+                    withGraph,
+                    init_method,
+                    case_fn,
+                ),
             )
             for rank in range(tp_size)
         ]
@@ -301,6 +411,36 @@ _LL128_MIXED_SIZES = {
 # owning block (16, 32 and 1 blocks) from one call to the next.
 _LL_GFX1250_MIXED_SIZES = [32000, 32768, 512]
 
+# Back-to-back gfx1250 messages (fp32 elements) on the Lamport two-shot, fused
+# and split, and the LL one-shot: 1.15, 0.36, 4.59, 3.91 and 7.81 MB, and 2.62
+# and 6.39 MB, whose numel is 4 mod 8, so no world size cuts them into whole
+# 16-byte packs a chunk (ragged chunks). fp32 takes the LL one-shot only at TP2
+# up to 1 MiB (0.36 MB) and the two-shot everywhere else: split at TP2 from 2 to
+# 4 MiB (2.62 and 3.91 MB), at TP4 from 4 to 8 MiB (4.59, 6.39 and 7.81 MB) and
+# at TP8 up to 4 MiB (0.36, 1.15, 2.62 and 3.91 MB), fused elsewhere.
+# The LL kernel keeps its own scratch and state; the split and fused two-shot
+# share the Lamport inbox and its rounds, split in blocks of 3 x 32 to 2 x 480
+# lanes and fused in blocks of 256 and 512, so a pack's owning block changes
+# from one call to the next. A chunk ends in a partial wave of packs (lanes that
+# only re-arm) for the ragged sizes everywhere, for 3.91 MB at TP4 and TP8, and
+# for 0.36 and 7.81 MB at TP8. fp32, so that the expected bits depend on the
+# order the ranks are summed in (see rank_order).
+_AR2S_GFX1250_MIXED_SIZES = [
+    40 * 7168,
+    25 * 3584,
+    160 * 7168,
+    545 * 1792,
+    545 * 3584,
+    655_364,
+    1_597_444,
+]
+
+# gfx1250 all-reduces whose output is their input (fp32 elements): 0.36 MB,
+# 0.79 MB, 1.57 MB, 3.67 MB and 3.91 MB. All five take the one-shot LL (the
+# meta-buffer path has no two-shot), with 256-thread and 512-thread waves and
+# with 2 and 4 packets a sender.
+_LL_GFX1250_INPLACE_SIZES = [25 * 3584, 192 * 1024, 384 * 1024, 896 * 1024, 545 * 1792]
+
 
 def _is_gfx1250() -> bool:
     return (
@@ -335,7 +475,17 @@ def _start_queue_evictions(stop):
 
 
 def _allreduce_mixed_size_regression(
-    rank, tp_size, sizes, iterations, distributed_init_method, stop, name, check_every
+    rank,
+    tp_size,
+    sizes,
+    iterations,
+    distributed_init_method,
+    stop,
+    name,
+    check_every,
+    vary_inputs=False,
+    rank_order=False,
+    inplace=False,
 ):
     from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
 
@@ -349,9 +499,32 @@ def _allreduce_mixed_size_regression(
     generator = torch.Generator().manual_seed(2026)
     inputs, refs = [], []
     for n in sizes:
+        if rank_order:
+            # Random fp32 partials: most of their sums round differently in
+            # another order, so the expected bits pin the order 0..n-1 that
+            # every custom all-reduce sums ranks in.
+            x = torch.randn((tp_size, n), generator=generator)
+            ref = x[0].clone()
+            for peer in range(1, tp_size):
+                ref += x[peer]
+            inputs.append(x[rank].to(device))
+            refs.append(ref.to(device))
+            continue
         x = torch.randint(-8, 9, (tp_size, n), generator=generator, dtype=torch.int16)
         inputs.append(x[rank].to(device, torch.bfloat16))
         refs.append(x.sum(dim=0, dtype=torch.float32).to(device, torch.bfloat16))
+    # With vary_inputs, rounds cycle through x, -x, 2x and -2x (all exact). A
+    # missed re-arm leaves a pack the line it got d calls back: d = 2 for the LL
+    # one-shot's two banks, 3 for the two-shot's reduce-scatter (three buffers),
+    # 1 for its all-gather (re-armed as it is read). Where k sizes reach the
+    # pack, that is the same size's line from d / k rounds back when k divides
+    # d, and another size's line otherwise. One to three rounds back is another
+    # of the four variants, so a stale line never carries the bits now
+    # expected.
+    variants = [(inputs, refs)]
+    if vary_inputs:
+        for factor in (-1, 2, -2):
+            variants.append(([x * factor for x in inputs], [r * factor for r in refs]))
     # Opt-in: how the evictions behave depends on the host's KFD driver.
     evict = os.environ.get("AITER_TEST_LL128_EVICT") == "1"
     # Rank 1 reads the peer slots that a faster rank's next call overlaps.
@@ -360,7 +533,15 @@ def _allreduce_mixed_size_regression(
     dist.barrier()
     done = torch.cuda.Event()
     for iteration in range(iterations):
-        outs = [ca_comm.custom_all_reduce(x, use_new=True) for x in inputs]
+        round_inputs, round_refs = variants[iteration % len(variants)]
+        if inplace:
+            # The output overwrites the input as the peers' lines arrive, so a
+            # rank that publishes after that sends its partly reduced output.
+            outs = [x.clone() for x in round_inputs]
+            for x in outs:
+                ca_comm.all_reduce(x, out=x)
+        else:
+            outs = [ca_comm.custom_all_reduce(x, use_new=True) for x in round_inputs]
         if iteration % check_every != check_every - 1:
             continue
         done.record()
@@ -374,7 +555,7 @@ def _allreduce_mixed_size_regression(
                 stop.set()
                 deadline, evicting = time.time() + 60, False
             time.sleep(0.001)
-        for n, out, ref in zip(sizes, outs, refs):
+        for n, out, ref in zip(sizes, outs, round_refs):
             context = f"{name} {rank=} {iteration=} numel={n}"
             torch.testing.assert_close(
                 out,
@@ -415,12 +596,133 @@ def test_allreduce_ll_gfx1250_mixed_size_regression(tp_size, iterations=1000):
     # lines. Check every round so the early stale reads are not skipped.
     if not _is_gfx1250():
         return
+    # bf16 up to the Lamport range takes the Lamport kernels; with the Lamport
+    # cap at 0 (inherited by the spawned ranks) these sizes stay on LL
+    env = "AITER_CUSTOM_AR_LAMPORT_RMS_MAX_SIZE"
+    saved = os.environ.get(env)
+    os.environ[env] = "0"
+    try:
+        _run_mixed_size_regression(
+            tp_size, _LL_GFX1250_MIXED_SIZES, iterations, "gfx1250 LL", 1
+        )
+    finally:
+        if saved is None:
+            os.environ.pop(env, None)
+        else:
+            os.environ[env] = saved
+
+
+def test_allreduce_2s_gfx1250_mixed_size_regression(tp_size, iterations=200):
+    # Mixing the Lamport two-shot, fused and split, with the one-shot LL, and
+    # two-shot launches of different block sizes and ragged chunks, must neither
+    # accept a stale line nor overwrite a slower peer's unread one, and both
+    # must sum the ranks in order 0..n-1.
+    if not _is_gfx1250() or tp_size not in (2, 4, 8):
+        return
     _run_mixed_size_regression(
-        tp_size, _LL_GFX1250_MIXED_SIZES, iterations, "gfx1250 LL", 1
+        tp_size,
+        _AR2S_GFX1250_MIXED_SIZES,
+        iterations,
+        "gfx1250 two-shot",
+        1,
+        vary_inputs=True,
+        rank_order=True,
     )
 
 
-def _run_mixed_size_regression(tp_size, sizes, iterations, name, check_every):
+def test_allreduce_ll_gfx1250_inplace_regression(tp_size, iterations=200):
+    # An LL all-reduce whose output aliases its input must publish this rank's
+    # input before any reduced value lands there.
+    if not _is_gfx1250():
+        return
+    _run_mixed_size_regression(
+        tp_size,
+        _LL_GFX1250_INPLACE_SIZES,
+        iterations,
+        "gfx1250 LL in-place",
+        1,
+        vary_inputs=True,
+        rank_order=True,
+        inplace=True,
+    )
+
+
+# Lamport two-shot sizes (fp32 elements): 2.75 MB, split at TP2 and TP8 and
+# fused at TP4, and 6.42 MB, split at TP4 and fused at TP2 and TP8.
+_AR2S_GFX1250_SENTINEL_SIZES = [96 * 7168, 224 * 7168]
+
+
+def _allreduce_2s_sentinel_payload(rank, tp_size, distributed_init_method):
+    from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
+
+    torch.cuda.set_device(rank)
+    device = torch.device(f"cuda:{rank}")
+    dist.init_process_group(
+        "gloo", world_size=tp_size, rank=rank, init_method=distributed_init_method
+    )
+    ca_comm = CustomAllreduce(dist.group.WORLD, device)
+    try:
+        assert not ca_comm.disabled, "The sentinel check requires custom allreduce"
+        for n in _AR2S_GFX1250_SENTINEL_SIZES:
+            # Rank 0's words in its own chunk (the owner's sum) and in rank 1's
+            # (a pushed contribution) carry the sentinel's bits.
+            nan_at = [0, n // tp_size + 1]
+            x = torch.ones(n, dtype=torch.float32, device=device)
+            if rank == 0:
+                x.view(torch.int32)[nan_at] = -1
+            out = ca_comm.custom_all_reduce(x, use_new=True)
+            done = torch.cuda.Event()
+            done.record()
+            deadline = time.time() + 30
+            while not done.query():
+                if time.time() > deadline:
+                    logger.error(f"{rank=} two-shot hang on a sentinel word, numel={n}")
+                    os._exit(1)
+                time.sleep(0.001)
+            out = out.cpu()
+            assert torch.isnan(out[nan_at]).all(), (n, out[nan_at])
+            rest = torch.ones(n, dtype=torch.bool)
+            rest[nan_at] = False
+            assert torch.all(out[rest] == tp_size), n
+            # Every rank holds the same bits, the NaNs' included.
+            bits = out.view(torch.int32)
+            every = [torch.empty_like(bits) for _ in range(tp_size)]
+            dist.all_gather(every, bits)
+            for peer, peer_bits in enumerate(every):
+                assert torch.equal(peer_bits, bits), (
+                    f"{rank=} numel={n}: rank {peer}'s output bits differ at "
+                    f"{(peer_bits != bits).nonzero().flatten()[:8].tolist()}"
+                )
+        if rank == 0:
+            logger.info("two-shot sentinel payload passed: TP%d", tp_size)
+    finally:
+        ca_comm.close()
+        dist.destroy_process_group()
+
+
+def test_allreduce_2s_gfx1250_sentinel_payload(tp_size):
+    # A payload word with the bits of the two-shot's sentinel must neither
+    # stall its receiver nor reach the ranks as different NaNs.
+    if not _is_gfx1250() or tp_size not in (2, 4, 8):
+        return
+    torch.multiprocessing.spawn(
+        _allreduce_2s_sentinel_payload,
+        args=(tp_size, get_distributed_init_method(get_ip(), get_open_port())),
+        nprocs=tp_size,
+        join=True,
+    )
+
+
+def _run_mixed_size_regression(
+    tp_size,
+    sizes,
+    iterations,
+    name,
+    check_every,
+    vary_inputs=False,
+    rank_order=False,
+    inplace=False,
+):
     torch.multiprocessing.spawn(
         _allreduce_mixed_size_regression,
         args=(
@@ -431,7 +733,71 @@ def _run_mixed_size_regression(tp_size, sizes, iterations, name, check_every):
             torch.multiprocessing.get_context("spawn").Event(),
             name,
             check_every,
+            vary_inputs,
+            rank_order,
+            inplace,
         ),
+        nprocs=tp_size,
+        join=True,
+    )
+
+
+def _allreduce_plain_cutoff(rank, tp_size, distributed_init_method):
+    import aiter as ops
+    from aiter.dist.device_communicators.custom_all_reduce import (
+        _GFX1250_PLAIN_AR_MAX_SIZE,
+        CustomAllreduce,
+    )
+
+    torch.cuda.set_device(rank)
+    device = torch.device(f"cuda:{rank}")
+    dist.init_process_group(
+        "gloo", world_size=tp_size, rank=rank, init_method=distributed_init_method
+    )
+    ca_comm = CustomAllreduce(dist.group.WORLD, device)
+    try:
+        assert not ca_comm.disabled, "The cutoff check requires custom allreduce"
+        cut = ca_comm._plain_ar_max_size
+        default = _GFX1250_PLAIN_AR_MAX_SIZE.get(tp_size)
+        if (
+            _is_gfx1250()
+            and default is not None
+            and os.environ.get("AITER_CUSTOM_AR_MAX_SIZE", "") == ""
+        ):
+            assert cut == min(default, ops.ll_ar_max_bytes_gfx1250(tp_size)), cut
+            assert cut < ca_comm._car_max_size, (cut, ca_comm._car_max_size)
+        else:
+            assert cut == ca_comm._car_max_size, (cut, ca_comm._car_max_size)
+        # Plain all-reduce takes the custom kernels up to the cutoff and RCCL
+        # above it; the fused paths keep should_custom_ar.
+        sizes = [n for n in (cut - 16, cut, cut + 16) if n > 0]
+        plain = [
+            ca_comm.should_custom_plain_ar(torch.empty(n, dtype=torch.uint8))
+            for n in sizes
+        ]
+        assert plain == [n <= cut for n in sizes], (sizes, plain)
+        fused = [
+            ca_comm.should_custom_ar(torch.empty(n, dtype=torch.uint8)) for n in sizes
+        ]
+        assert fused == [n <= ca_comm._car_max_size for n in sizes], (sizes, fused)
+        # A rank that took the other path would leave its peers waiting.
+        choices = [None] * tp_size
+        dist.all_gather_object(choices, (cut, plain))
+        assert all(c == choices[0] for c in choices), choices
+        if rank == 0:
+            logger.info("plain all-reduce cutoff: TP%d, %d bytes", tp_size, cut)
+    finally:
+        ca_comm.close()
+        dist.destroy_process_group()
+
+
+def test_allreduce_plain_cutoff(tp_size):
+    # With AITER_CUSTOM_AR_MAX_SIZE unset, gfx1250 plain all-reduce at TP2, TP4
+    # and TP8 stops at the measured RCCL crossover; elsewhere it keeps the AR
+    # cutoff.
+    torch.multiprocessing.spawn(
+        _allreduce_plain_cutoff,
+        args=(tp_size, get_distributed_init_method(get_ip(), get_open_port())),
         nprocs=tp_size,
         join=True,
     )
@@ -516,10 +882,19 @@ parser.add_argument(
     help="single shape override, e.g. -s 128,8192 (default: swept size list)",
 )
 parser.add_argument(
+    "--op",
+    type=str,
+    nargs="*",
+    choices=["all_reduce", "all_gather_lastdim_add"],
+    default=["all_reduce", "all_gather_lastdim_add"],
+    help="collectives to sweep (default: all_reduce all_gather_lastdim_add)",
+)
+parser.add_argument(
     "--regression",
     action="store_true",
     help="run only the correctness checks: tail (eager and graph), LL128 and "
-    "gfx1250 LL mixed sizes",
+    "gfx1250 LL mixed sizes, the gfx1250 two-shot mixed sizes, gfx1250 in "
+    "place, the two-shot's sentinel payload, and the plain all-reduce cutoff",
 )
 parser.add_argument(
     "--iterations",
@@ -560,6 +935,10 @@ if __name__ == "__main__":
                 if tp <= args.tp_size:
                     test_allreduce_ll128_mixed_size_regression(tp)
             test_allreduce_ll_gfx1250_mixed_size_regression(args.tp_size)
+            test_allreduce_2s_gfx1250_mixed_size_regression(args.tp_size)
+            test_allreduce_ll_gfx1250_inplace_regression(args.tp_size)
+            test_allreduce_2s_gfx1250_sentinel_payload(args.tp_size)
+            test_allreduce_plain_cutoff(args.tp_size)
     if args.regression:
         raise SystemExit(0)
     with_graph = args.mode == "graph"
@@ -567,10 +946,32 @@ if __name__ == "__main__":
         l_shape = [args.shape]
     else:
         l_shape = gen_sizes(dtype)
-    df = pd.DataFrame(
-        test_allreduce_custom(args.tp_size, 1, l_shape, dtype, withGraph=with_graph)
-    )
+    rows = []
+    if "all_reduce" in args.op:
+        rows += test_allreduce_custom(
+            args.tp_size, 1, l_shape, dtype, withGraph=with_graph
+        )
+    if "all_gather_lastdim_add" in args.op and dtype in (dtypes.bf16, dtypes.fp16):
+        # [rows, n] per-rank shards; Kimi-K3 TP8 uses n=896 (up-proj) and the
+        # vocab shard for logits.
+        ag_shapes = (
+            [args.shape]
+            if args.shape is not None and len(args.shape) == 2
+            else [(1, 896), (8, 896), (64, 896), (256, 896), (8, 20480)]
+        )
+        for row in test_allreduce_custom(
+            args.tp_size,
+            1,
+            ag_shapes,
+            dtype,
+            withGraph=with_graph,
+            case_fn=_run_all_gather_lastdim_add_case,
+        ):
+            row["op"] = "all_gather_lastdim_add"
+            rows.append(row)
+    df = pd.DataFrame(rows)
     show_cols = [
+        "op",
         "tp_size",
         "shape",
         "dtype",
