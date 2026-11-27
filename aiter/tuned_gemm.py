@@ -190,6 +190,15 @@ def get_GEMM_A16W16_tuned_config(
                         "recognized by the current catalog; falling back to next candidate."
                     )
                     config = None
+                elif not _get_flydsl_gemm_kernels().flydsl_hgemm_policy_runs_on(
+                    flydsl_config["policy"], runtime_gfx
+                ):
+                    # e.g. a gfx1250-strict runtime borrowing a gfx1250 TDM row.
+                    logger.warning(
+                        f"FlyDSL kernel '{config['kernelName']}' from tuned config does not "
+                        f"run on {runtime_gfx}; falling back to next candidate."
+                    )
+                    config = None
             if config is None:
                 continue
             # OPUS resolves kernel ids for the exact arch, so a borrowed gfx1250

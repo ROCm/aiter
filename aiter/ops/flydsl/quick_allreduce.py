@@ -10,6 +10,9 @@ they are named for the topology of each lap instead:
 
 * ``"mesh"`` the default: fanout to all N-1 peers, twice.
 * ``"ring"`` 2(N-1) single-destination hops.
+* ``"pull"`` (``FlyQuickAllReduceRMSNorm`` only) exact bf16 rows read in place
+  from the ranks' CUDA-graph-registered inputs: no codec, no ladder
+  (``pull_allreduce_rmsnorm``).
 
 Super-tile ST∈{1,8} on the mesh, ST∈{1,8,16,32} on the ring. INT4 nibble,
 INT5 nibble+1-bit plane, or INT6 bit-plane pair, all with group-16 E5M2
@@ -21,6 +24,7 @@ on ``(arch, link, world_size)`` in ``allreduce_policy``.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 import logging
@@ -40,17 +44,23 @@ from .allreduce_policy import (
     MESH_CODECS,
     MIN_BATCH_BLOCKS,
     PAD_MASK_MAX_BYTES,
+    PULL_CODECS,
     RING_SUPER_TILES,
     RS_CODECS,
     SUPER_TILES,
     FusedTwoShotRung,
+    NoPolicyError,
     TwoShotRung,
+    Window,
     default_codecs,
     fused_mesh_st_ladder,
+    fused_pull_hiddens,
+    fused_pull_ladder,
     fused_qr_row_atoms,
     fused_ring_st_ladder,
     mesh_st_ladder,
     quantized_floor,
+    resolve_fused_policy,
     resolve_link,
     ring_st_ladder,
     select_rung,
@@ -90,6 +100,7 @@ from .kernels.comm.quick_allreduce_ring import (
 from .kernels.comm.transport import (
     ATOMS,
     WAVE,
+    WORLD,
     has_release_fence,
 )
 from .kernels.tensor_shim import _run_compiled
@@ -143,6 +154,11 @@ class _Algorithm:
     has_divisor: bool = False
     # Whether the schedule carries one wire format on both laps (the mesh).
     single_codec: bool = False
+    # Whether the schedule reads the ranks' inputs in place (registered CUDA-graph
+    # inputs, bf16 on the wire) instead of exchanging packets through an inbox.
+    # Such a schedule is fused-only: it has no plain kernel, no ladder and no
+    # super-tile, and ``FlyQuickAllReduceRMSNorm`` hands it to its own engine.
+    registered: bool = False
     # ``(block, world_size, codec) -> bytes``: LDS of one plain workgroup, to
     # bound the persistent grid by LDS residency as well as by VGPRs; None
     # when the VGPR table is the tighter bound for every codec.
@@ -186,6 +202,10 @@ def _build_mesh(
     )
 
 
+def _no_ladder(**_):
+    return ()
+
+
 ALGORITHMS = {
     "mesh": _Algorithm(
         name="mesh",
@@ -208,6 +228,17 @@ ALGORITHMS = {
         ag_codecs=AG_CODECS,
         st_ladder=ring_st_ladder,
         fused_st_ladder=fused_ring_st_ladder,
+    ),
+    "pull": _Algorithm(
+        name="pull",
+        build=None,
+        super_tiles=(),
+        rs_codecs=PULL_CODECS,
+        ag_codecs=PULL_CODECS,
+        st_ladder=_no_ladder,
+        fused_st_ladder=_no_ladder,
+        single_codec=True,
+        registered=True,
     ),
 }
 
@@ -324,6 +355,10 @@ class FlyQuickAllReduce:
                 f"algorithm must be one of {tuple(ALGORITHMS)}, got {algorithm!r}"
             )
         algo = ALGORITHMS[algorithm]
+        if algo.registered:
+            raise ValueError(
+                f"algorithm={algorithm!r} is fused-only: use FlyQuickAllReduceRMSNorm"
+            )
         link = resolve_link(link)
         rs_codec, ag_codec = _resolve_codecs(algo, int(world_size), rs_codec, ag_codec)
         _validate_ipc_process_group(
@@ -535,8 +570,8 @@ class FlyQuickAllReduce:
             Int32(num_tiles),
             Int64(inp_ptr),
             Int64(out_ptr),
-            Int64(int(eng._gpu_peer_ptrs)),
-            Int64(int(eng._colors)),
+            *(Int64(p) for p in eng.peer_args(WORLD)),
+            Int64(eng.colors_ptr()),
             Int32(self._grid_x(num_tiles, eng.super_tile, eng.grid)),
             *((Float32(divisor),) if self._algo.has_divisor else ()),
             stream,
@@ -797,6 +832,21 @@ class FlyQuickAllReduceRMSNorm:
             owner="FlyQuickAllReduceRMSNorm",
         )
         arch = require_arch(owner="FlyQuickAllReduceRMSNorm")
+        if algo.registered:
+            self._init_registered(
+                group=group,
+                device=device,
+                rank=rank,
+                world_size=world_size,
+                algorithm=algorithm,
+                rs_codec=rs_codec,
+                ag_codec=ag_codec,
+                link=link,
+                arch=arch,
+                min_bytes=min_bytes,
+                max_bytes=max_bytes,
+            )
+            return
         if grid_cap is not None and int(grid_cap) < 1:
             raise ValueError(f"grid_cap must be positive, got {grid_cap}")
 
@@ -877,6 +927,107 @@ class FlyQuickAllReduceRMSNorm:
             self.close()
             raise
 
+    #: The engine of a registered schedule (``algorithm="pull"``), which has
+    #: none of the inbox / ladder / geometry state below; ``None`` otherwise.
+    _registered_engine = None
+
+    def _init_registered(
+        self,
+        *,
+        group,
+        device,
+        rank,
+        world_size,
+        algorithm,
+        rs_codec,
+        ag_codec,
+        link,
+        arch,
+        min_bytes,
+        max_bytes,
+    ):
+        """A schedule that reads registered inputs in place: it keeps its own
+        engine (``pull_allreduce_rmsnorm``) behind this class's methods. Its
+        wire is bf16 (``rs_codec == ag_codec == "bf16"``), so there is no
+        quantization floor, ladder, super-tile or inbox geometry."""
+        from .pull_allreduce_rmsnorm import PullAllReduceRMSNorm
+
+        self.group = group
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self.algorithm = algorithm
+        self.link = link
+        self.rs_codec = rs_codec
+        self.ag_codec = ag_codec
+        self.inbox_memory = "uncached"
+        self.arch = arch
+        self.supports_mxfp4 = False
+        # The window and the rungs come from the fused policy. An explicit
+        # ``min_bytes`` / ``max_bytes`` (inclusive) moves the window as the
+        # ``AITER_FLY_AR_FUSED_PULL_{MIN,MAX}_BYTES`` overrides do.
+        row = resolve_fused_policy(world_size=int(world_size), arch=arch, link=link)
+        window = row.pull_window()
+        if window is None:
+            raise NoPolicyError(
+                f"the pull schedule is disabled on {arch}/{link}/TP{world_size}"
+            )
+        if min_bytes is not None or max_bytes is not None:
+            window = Window(
+                window.min if min_bytes is None else int(min_bytes),
+                window.max if max_bytes is None else int(max_bytes) + 1,
+            )
+        self.min_bytes = window.min
+        self.max_bytes = None if window.max is None else window.max - 1
+        self._by_cfg = {}
+        self._registered_engine = PullAllReduceRMSNorm(
+            group=group,
+            device=device,
+            rank=rank,
+            world_size=world_size,
+            window=window,
+            ladders={
+                h: fused_pull_ladder(
+                    world_size=int(world_size), link=link, arch=arch, hidden=h
+                )
+                for h in fused_pull_hiddens(
+                    world_size=int(world_size), link=link, arch=arch
+                )
+            },
+        )
+        self.device = self._registered_engine.device
+
+    def capture(self):
+        """Context manager around every graph capture, on every rank, for a
+        registered schedule: the calls recorded inside have their inputs
+        registered when it exits. A schedule that does not read the inputs in
+        place has nothing to register."""
+        if self._registered_engine is None:
+            return contextlib.nullcontext()
+        return self._registered_engine.capture()
+
+    def accepts(
+        self,
+        inp,
+        residual_in,
+        weight,
+        gemma_norm: bool = False,
+        out=None,
+        residual_out=None,
+    ) -> bool:
+        """Whether ``allreduce_rmsnorm`` would serve this call now (``out`` / ``residual_out`` are the
+        caller's destinations, if any). Never raises.
+
+        The mesh and the ring serve any call their geometry has a build for. A
+        registered schedule serves only ``gemma_norm`` calls recorded inside
+        ``capture()`` on a graph capture, for the widths and rows its tiers
+        cover."""
+        eng = self._registered_engine
+        if eng is None:
+            return True
+        return bool(gemma_norm) and eng.accepts(
+            inp, residual_in, weight, out, residual_out
+        )
+
     # -- engine construction -------------------------------------------------
 
     @functools.cached_property
@@ -890,6 +1041,8 @@ class FlyQuickAllReduceRMSNorm:
         only on state fixed at construction.
         """
         hidden = int(hidden)
+        if self._registered_engine is not None:
+            return self._registered_engine.supports_hidden(hidden)
         got = self._supports_hidden.get(hidden)
         if got is None:
             got = self._supports_hidden[hidden] = bool(
@@ -1008,6 +1161,8 @@ class FlyQuickAllReduceRMSNorm:
 
     def pads_hidden(self, hidden: int) -> int:
         """``h_pad`` this width runs at, or hidden dim when it needs no padding."""
+        if self._registered_engine is not None:
+            return int(hidden)
         return self._geom_for(int(hidden))[2]
 
     def _grid_for(
@@ -1123,6 +1278,8 @@ class FlyQuickAllReduceRMSNorm:
     @property
     def inbox_bytes(self) -> int:
         """IPC inbox bytes this object holds on this rank, across every engine."""
+        if self._registered_engine is not None:
+            return self._registered_engine.buf_bytes
         return sum(eng.buf_bytes for eng, _ in self._by_cfg.values())
 
     @property
@@ -1300,8 +1457,8 @@ class FlyQuickAllReduceRMSNorm:
             Int32(num_tiles),
             Int64(inp_ptr),
             Int64(out_ptr),
-            Int64(int(eng._gpu_peer_ptrs)),
-            Int64(int(eng._colors)),
+            *(Int64(p) for p in eng.peer_args(WORLD)),
+            Int64(eng.colors_ptr()),
             Int32(self._grid_x(num_tiles, spec["super_tile"], eng.grid)),
             Int64(res_in_ptr),
             Int64(res_out_ptr),
@@ -1448,6 +1605,20 @@ class FlyQuickAllReduceRMSNorm:
         stream,
         mxfp4,
     ):
+        if self._registered_engine is not None:
+            if mxfp4 is not None:
+                raise ValueError("the pull schedule has no MXFP4 output")
+            if not gemma_norm:
+                raise ValueError("the pull schedule normalizes with Gemma's 1 + weight")
+            return self._registered_engine.allreduce_rmsnorm(
+                inp,
+                residual_in,
+                weight,
+                eps,
+                out=out,
+                residual_out=residual_out,
+                stream=stream,
+            )
         if out is None:
             out = torch.empty_like(inp)
         if residual_out is None:
@@ -1509,6 +1680,9 @@ class FlyQuickAllReduceRMSNorm:
         inside a HIP graph capture.
         """
         hidden = int(hidden)
+        if self._registered_engine is not None:
+            self._registered_engine.preload(hidden, payload_range=payload_range)
+            return
         self._build_hidden(hidden, mxfp4)
         if payload_range is None:
             keys = [
@@ -1530,6 +1704,9 @@ class FlyQuickAllReduceRMSNorm:
     def variant(self, hidden: int, nbytes: int, mxfp4: bool = False) -> str:
         """``<jit symbol>/g<grid>/x<grid_x>`` for this (hidden, payload)."""
         hidden = int(hidden)
+        if self._registered_engine is not None:
+            rows = max(1, int(nbytes) // (2 * hidden))
+            return f"pull:{self._registered_engine.tier_name(rows)}"
         num_tiles = max(1, -(-int(nbytes) // self._tile_bytes(hidden)))
         eng, spec = self._by_cfg[self._pick_cfg(hidden, int(nbytes), num_tiles, mxfp4)]
         grid_x = self._grid_x(num_tiles, spec["super_tile"], eng.grid)
@@ -1541,6 +1718,10 @@ class FlyQuickAllReduceRMSNorm:
         return int(nbytes) >= self.min_bytes
 
     def close(self):
+        if self._registered_engine is not None:
+            self._registered_engine.close()
+            self._registered_engine = None
+            return
         engines = getattr(self, "_by_cfg", None)
         if not engines:
             return

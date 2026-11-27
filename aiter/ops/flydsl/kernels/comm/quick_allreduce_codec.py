@@ -509,14 +509,22 @@ def _clamp_f32(x, lo, hi):
 
 
 def _quant_atom_fp16(codec, atom, enc_pk):
-    """Quantize 8 fp16 into this codec's planes, as packed i32 words."""
+    """Quantize 8 fp16 into this codec's planes, as packed i32 words.
+
+    Rounds with the fp16 magic number ``w + (1024 + bias)``: the sum lies in
+    ``[1024, 2048)``, where the fp16 ulp is 1, and ``1024 + bias`` is even, so
+    the add rounds half to even like ``roundeven`` and leaves
+    ``roundeven(w) + bias`` in the low mantissa bits.
+    """
     q = []
     lo = _splat_f16x2(fx.Float16(codec.qmin))
     hi = _splat_f16x2(fx.Float16(codec.qmax))
-    bias = fx.Vector.filled(2, fx.Int16(codec.bias), fx.Int16)
+    magic = _splat_f16x2(fx.Float16(1024.0 + codec.bias))
+    code_mask = (1 << codec.bits) - 1
+    codes = fx.Int32(code_mask | (code_mask << 16))
     for i in range_constexpr(4):
         w = fx.min(fx.maxnumf(_f16x2(atom[i]) * enc_pk, lo), hi)
-        q.append(_i32(fx.roundeven(w).to(fx.Int16) + bias))
+        q.append(_i32(w + magic) & codes)
     if codec.n_words_per_thread == 1:
         return (_pack_fields(q, 4),)
     # Every code is masked here. In INT4 each field already fills its whole
