@@ -2185,6 +2185,17 @@ class CustomAllreduce:
         from aiter.ops.flydsl.moe_deferred_tail import _log_once
 
         operands = tail.k5_operands()
+        if tail.gemm2 is not None:
+            # The tail carries its GEMM2 launch (8-row decode): GEMM2 + tail +
+            # all-reduce + norm in one launch, or GEMM2 launched here as it was.
+            from aiter.ops.flydsl.moe_deferred_tail import fused_tail
+
+            got = fused_tail(
+                self, tail, operands, res_inp, w, eps, gemma_norm, lamport_order, fp8_out
+            )
+            if got is not None:
+                return got
+            tail.run_gemm2()
         if operands is None:
             return None
         g, rows_t, w_t, add = operands
