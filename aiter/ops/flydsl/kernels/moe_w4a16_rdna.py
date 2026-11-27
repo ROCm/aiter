@@ -92,14 +92,23 @@ def _expert_stride_dwords(t: torch.Tensor) -> int:
     return t.stride(0) * t.element_size() // 4
 
 
+def _require(cond, msg: str) -> None:
+    """Input validation that also holds under ``python -O``: the buffer
+    resources are not bounds checked, so a bad input reads or writes out of
+    bounds instead of failing."""
+    if not cond:
+        raise ValueError(msg)
+
+
 def _check_coef(coef: torch.Tensor, K: int, group: int, pairs: bool) -> None:
+    _require(coef.dtype == torch.float16, "coefficients are packed float16")
     stride = _tile_stride(_coef_tile_dwords(K, group, pairs))
-    assert coef.size(-1) * coef.element_size() == stride * 4, "coefficient layout"
+    _require(coef.size(-1) * coef.element_size() == stride * 4, "coefficient layout")
 
 
 def _check_w(w: torch.Tensor, K: int) -> None:
-    assert w.dtype == torch.int32, "weights are packed int32"
-    assert w.size(-1) == _tile_stride(_w_tile_dwords(K)), "weight layout"
+    _require(w.dtype == torch.int32, "weights are packed int32")
+    _require(w.size(-1) == _tile_stride(_w_tile_dwords(K)), "weight layout")
 
 
 def row_lds_bytes(K: int, group: int) -> int:
@@ -208,8 +217,16 @@ def pack_w4a16_weights(
     """
     E, N, K = q.shape
     G = scale.shape[2]
+    # Values outside a nibble would spill into the neighbouring ones.
+    _require(int(q.min()) >= 0 and int(q.max()) <= 15, "q must be in 0..15")
+    if zp is not None:
+        _require(zp.shape == scale.shape, "zp must have the shape of scale")
+        _require(int(zp.min()) >= 0 and int(zp.max()) <= 15, "zp must be in 0..15")
     tiles = N // TILE_N
-    assert N % TILE_N == 0 and K % G == 0 and (K // G) % 16 == 0
+    _require(
+        N % TILE_N == 0 and K % G == 0 and (K // G) % 16 == 0,
+        "N a multiple of 64, group size a multiple of 16 dividing K",
+    )
     # [E, tile, rn, lane, kstep, dword, half, pair] -> nibble at 4 * pair + 16 * half
     qv = q.to(torch.int64).view(E, tiles, REG_N, 16, K // 16, 2, 4, 2)
     pair = torch.arange(4, device=q.device).view(4, 1)
@@ -254,7 +271,10 @@ def _build_gemm(
 
     from aiter.ops.flydsl.kernels import buffer_ops
 
-    assert K % group == 0 and group % 16 == 0 and N % TILE_N == 0
+    _require(
+        K % group == 0 and group % 16 == 0 and N % TILE_N == 0,
+        "group size a multiple of 16 dividing K, N a multiple of 64",
+    )
     out_type = fx.Float16 if fp16 else fx.BFloat16
     n_groups = K // group
     steps = group // 16  # WMMA K-steps per group
@@ -473,7 +493,10 @@ def _build_gemm_row(
 
     from aiter.ops.flydsl.kernels import buffer_ops
 
-    assert K % group == 0 and group % 16 == 0 and N % TILE_N == 0
+    _require(
+        K % group == 0 and group % 16 == 0 and N % TILE_N == 0,
+        "group size a multiple of 16 dividing K, N a multiple of 64",
+    )
     out_type = fx.Float16 if fp16 else fx.BFloat16
     n_groups = K // group
     steps = group // 16
@@ -488,7 +511,7 @@ def _build_gemm_row(
     c_expert *= 2
     out_reg = REG_N // 2 if silu_mul else REG_N
     n_out = N // 2 if silu_mul else N
-    assert row_lds_bytes(K, group) <= lds_capacity_bytes(), "row kernel LDS"
+    _require(row_lds_bytes(K, group) <= lds_capacity_bytes(), "row kernel LDS")
     allocator = SmemAllocator(None, arch=get_rocm_arch(), global_sym_name="moe_row")
     # One wave per workgroup: workgroups of several waves (and their larger
     # LDS allocation) cost up to 5% of a decode step. Declaring the block
@@ -663,9 +686,12 @@ def _build_gemm_reduce(
 
     from aiter.ops.flydsl.kernels import buffer_ops
 
-    assert K % group == 0 and group % 16 == 0 and N % TILE_N == 0
+    _require(
+        K % group == 0 and group % 16 == 0 and N % TILE_N == 0,
+        "group size a multiple of 16 dividing K, N a multiple of 64",
+    )
     out_type = fx.Float16 if fp16 else fx.BFloat16
-    assert top_k <= MAX_REDUCE_ROWS
+    _require(top_k <= MAX_REDUCE_ROWS, "top_k above MAX_REDUCE_ROWS")
     n_groups = K // group
     steps = group // 16
     n_ksteps = K // 16
@@ -678,7 +704,7 @@ def _build_gemm_reduce(
     c_tile = 2 * _tile_stride(_coef_tile_dwords(K, group, coef_pairs))
     c_expert *= 2
     x_dwords = top_k * k_dwords
-    assert reduce_lds_bytes(K, top_k) <= lds_capacity_bytes(), "reduce kernel LDS"
+    _require(reduce_lds_bytes(K, top_k) <= lds_capacity_bytes(), "reduce kernel LDS")
     allocator = SmemAllocator(None, arch=get_rocm_arch(), global_sym_name="moe_x")
     allocator.ptr = x_dwords * 4
     name = _kernel_name("reduce", K, N, group, coef_pairs, False, fp16)

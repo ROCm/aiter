@@ -25,11 +25,13 @@ from aiter.ops.flydsl.moe_w4a16_rdna import (
     ROW_PATH_MAX_TOKENS,
     TILE_N,
     flydsl_rdna_moe,
+    flydsl_rdna_moe_gemm,
     flydsl_rdna_moe_path,
     flydsl_rdna_moe_supported,
     gate_up_tile_order,
     pack_w4a16_weights,
     pad_expert_stride,
+    topk_weighted_sum,
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -48,11 +50,13 @@ MODEL_SHAPES = [
 # (hidden, intermediate, experts, top_k, group_size) off the default dispatch:
 # GEMM1 of the row kernel needs 68 KiB of LDS (grouped path at 1 token), the
 # top-k-sum kernel 128 KiB (row GEMM2 + topk_weighted_sum), and top_k above
-# MAX_REDUCE_ROWS.
+# MAX_REDUCE_ROWS, an odd top_k and top_k = 1.
 EDGE_SHAPES = [
     (2048, 2048, 8, 8, 2048),
     (2048, 8192, 8, 8, 128),
     (2048, 512, 16, 10, 128),
+    (2048, 512, 16, 3, 128),
+    (2048, 512, 16, 1, 128),
 ]
 
 
@@ -104,6 +108,7 @@ def test_flydsl_moe_w4a16_rdna(
     fused_silu,
     dtype,
     invalid_routes=False,
+    padded=True,
 ):
     device = "cuda"
     torch.manual_seed(0)
@@ -115,17 +120,20 @@ def test_flydsl_moe_w4a16_rdna(
         order = gate_up_tile_order(2 * inter, device)
         q1, s1 = q1[:, order], s1[:, order]
         zp1 = None if zp1 is None else zp1[:, order]
-    w1, c1 = map(pad_expert_stride, pack_w4a16_weights(q1, s1, zp1))
-    w2, c2 = map(pad_expert_stride, pack_w4a16_weights(q2, s2, zp2))
+    pad = pad_expert_stride if padded else (lambda t: t)
+    w1, c1 = map(pad, pack_w4a16_weights(q1, s1, zp1))
+    w2, c2 = map(pad, pack_w4a16_weights(q2, s2, zp2))
 
     x = torch.randn((tokens, hidden), dtype=dtype, device=device)
     logits = torch.randn((tokens, experts), dtype=torch.float32, device=device)
     topk_weights, topk_ids = torch.softmax(logits, dim=-1).topk(top_k)
     topk_ids = topk_ids.to(torch.int32)
     if invalid_routes:
-        # As in an engine warm-up: the last route of every token and all
-        # routes of token 0 have no expert; their weights stay nonzero.
-        topk_ids[:, -1] = -1
+        # As in an engine warm-up: all routes of token 0 and, with more than
+        # one route, the last route of every token have no expert; their
+        # weights stay nonzero.
+        if top_k > 1:
+            topk_ids[:, -1] = -1
         topk_ids[0] = -1
     path = flydsl_rdna_moe_path(
         tokens, hidden, inter, top_k, group_size, topk_weights.dtype
@@ -145,7 +153,8 @@ def test_flydsl_moe_w4a16_rdna(
         gate, up = gate_up.float().chunk(2, dim=-1)
         out.copy_(F.silu(gate) * up)
 
-    out = torch.empty((tokens, hidden), dtype=dtype, device=device)
+    # NaN, so rows the op does not write fail the finite check.
+    out = torch.full((tokens, hidden), torch.nan, dtype=dtype, device=device)
     workspace = torch.full(
         (tokens * top_k * (3 * inter + hidden),), torch.nan, dtype=dtype, device=device
     )
@@ -207,7 +216,8 @@ def check_rejects_raw_pointer_misuse():
     weights = torch.ones((2, top_k), dtype=torch.float32, device="cuda")
     out = torch.empty((2, hidden), dtype=dtypes.bf16, device="cuda")
     ws = torch.empty(2 * top_k * (3 * inter + hidden), dtype=dtypes.bf16, device="cuda")
-    args = (w1, c1, w2, c2, weights, ids, ws, group, experts, inter)
+    args = (w1, c1, w2, c2, weights, ids, ws, group, experts, inter, None)
+    args += (False, False)
     strided = torch.randn((2, 2 * hidden), dtype=x.dtype, device="cuda")[:, :hidden]
     cases = (
         ("contiguous", out, strided, ws),
@@ -215,15 +225,55 @@ def check_rejects_raw_pointer_misuse():
         ("dtype", out, x.half(), ws),
         ("workspace dtype", out.half(), x.half(), ws),
         ("shape", out[:, :TILE_N].contiguous(), x, ws),
+        ("w1/w2_pairs required", out, x, ws),
     )
     for msg, bad_out, bad_x, bad_ws in cases:
         bad_args = args[:6] + (bad_ws,) + args[7:]
+        if msg.endswith("required"):
+            bad_args = bad_args[:-2]
         try:
             flydsl_rdna_moe(bad_out, bad_x, *bad_args)
-        except AssertionError as e:
+        except ValueError as e:
             assert msg in str(e), e
         else:
             raise AssertionError(f"flydsl_rdna_moe accepted: {msg}")
+    # No tokens: nothing to launch.
+    flydsl_rdna_moe(out[:0], x[:0], *args[:4], weights[:0], ids[:0], *args[6:])
+    # The other public entry points.
+    gate_up = torch.empty((2 * top_k, 2 * inter), dtype=x.dtype, device="cuda")
+    odd = torch.zeros((experts, c1[0].numel() + 1), dtype=c1.dtype, device="cuda")
+    odd = odd[:, : c1[0].numel()].view(c1.shape)
+    calls = (
+        (
+            "x_row_div",
+            lambda: flydsl_rdna_moe_gemm(
+                gate_up, x, w1, c1, None, ids.view(-1), None, 0, group, coef_pairs=False
+            ),
+        ),
+        (
+            "dword aligned",
+            lambda: flydsl_rdna_moe_gemm(
+                gate_up,
+                x,
+                w1,
+                odd,
+                None,
+                ids.view(-1),
+                None,
+                top_k,
+                group,
+                coef_pairs=False,
+            ),
+        ),
+        ("one output row", lambda: topk_weighted_sum(out[:1], gate_up, weights)),
+    )
+    for msg, call in calls:
+        try:
+            call()
+        except ValueError as e:
+            assert msg in str(e), e
+        else:
+            raise AssertionError(f"accepted: {msg}")
 
 
 def main():
@@ -239,22 +289,22 @@ def main():
         "-d",
         "--dtype",
         type=dtypes.str2Dtype,
-        nargs="*",
+        nargs="+",
         default=[dtypes.bf16, dtypes.fp16],
     )
     parser.add_argument(
         "-t",
         "--tokens",
         type=int,
-        nargs="*",
+        nargs="+",
         default=[1, 2, ROW_PATH_MAX_TOKENS, ROW_PATH_MAX_TOKENS + 1, 64, 512],
     )
-    parser.add_argument("-g", "--group_size", type=int, nargs="*", default=[32, 128])
+    parser.add_argument("-g", "--group_size", type=int, nargs="+", default=[32, 128])
     parser.add_argument(
-        "-z", "--zero_points", type=dtypes.str2bool, nargs="*", default=[False, True]
+        "-z", "--zero_points", type=dtypes.str2bool, nargs="+", default=[False, True]
     )
     parser.add_argument(
-        "-f", "--fused_silu", type=dtypes.str2bool, nargs="*", default=[True, False]
+        "-f", "--fused_silu", type=dtypes.str2bool, nargs="+", default=[True, False]
     )
     args = parser.parse_args()
     check_rejects_raw_pointer_misuse()
@@ -274,18 +324,33 @@ def main():
             # Both GEMMs need K to be a multiple of the group size.
             if shape[0] % group_size == 0 and shape[1] % group_size == 0
         ]
+        # Routes of id -1 (with zero points), the edge shapes (also with zero
+        # points and a separate activation) and weights without the padded
+        # expert stride.
         rows += [
             test_flydsl_moe_w4a16_rdna(
-                tokens, *shape, group_size, False, fused_silu, dtype, invalid
+                tokens, *shape, group, invalid, fused_silu, dtype, invalid, padded
             )
-            for (*shape, group_size), tokens, fused_silu, invalid in itertools.chain(
-                itertools.product(
-                    [(*MODEL_SHAPES[0], 128)],
-                    [1, ROW_PATH_MAX_TOKENS, ROW_PATH_MAX_TOKENS + 1, 64],
-                    [True, False],
-                    [True],
-                ),
-                itertools.product(EDGE_SHAPES, [1, 64], [True], [False, True]),
+            for (*shape, group), tokens, fused_silu, invalid, padded in (
+                list(
+                    itertools.product(
+                        [(*MODEL_SHAPES[0], 128)],
+                        [1, ROW_PATH_MAX_TOKENS, ROW_PATH_MAX_TOKENS + 1, 64],
+                        [True, False],
+                        [True],
+                        [True],
+                    )
+                )
+                + list(
+                    itertools.product(
+                        EDGE_SHAPES, [1, 64], [True, False], [False, True], [True]
+                    )
+                )
+                + list(
+                    itertools.product(
+                        [(*MODEL_SHAPES[0], 128)], [1, 64], [True], [False], [False]
+                    )
+                )
             )
         ]
         logger.info(
