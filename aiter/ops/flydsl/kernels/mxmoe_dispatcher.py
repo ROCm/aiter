@@ -251,7 +251,8 @@ def compile_gemm2_a4w4_port(
     a_slot_alias = aStages <= kStages
     lds_bytes = max(c_lds_bytes, aStages * slot_bytes)
     if g2_es is not None:
-        es_a_bytes = (INTER_MAX // BK) * slot_bytes + ES_TAIL_BYTES
+        aStages = INTER_MAX // BK
+        es_a_bytes = aStages * slot_bytes + ES_TAIL_BYTES
         lds_bytes = c_lds_bytes + 2 * es_a_bytes
     # _ldspa: the bf16 scatter epilogue writes C through LDS with 16-byte nt stores.
     g2_scatter_lds_pairs = bool(g2_scatter_lds_pairs)
