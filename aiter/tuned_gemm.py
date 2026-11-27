@@ -350,7 +350,21 @@ def get_GEMM_A16W16_config(
                 default_config["solidx"] = 0
         log_tuned_config_miss(
             "a16w16",
-            (gfx, cu_num, N, K, bias, dtype, otype, scaleAB, bpreshuffle),
+            (
+                gfx,
+                cu_num,
+                N,
+                K,
+                bias,
+                dtype,
+                otype,
+                scaleAB,
+                bpreshuffle,
+                # The default depends on M (skinny for small M, else torch), so
+                # a different fallback for the same N/K is logged again.
+                default_config["libtype"],
+                default_config["solidx"],
+            ),
             f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, {bpreshuffle=}, not found tuned config on {gfx} cu_num = {cu_num} in {AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE}, will use default config! using {default_config['libtype']} solution:{default_config['solidx']}",
         )
         return default_config

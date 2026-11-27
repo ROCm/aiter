@@ -2804,7 +2804,16 @@ def get_mxfp8_gemm_config(
         return config
     log_tuned_config_miss(
         "a8w8_mxfp8",
-        (tuned_file, gfx, N, K, str(b_intype), int(bool(a_preshuffle)), str(dtype)),
+        (
+            tuned_file,
+            gfx,
+            N,
+            K,
+            str(b_intype),
+            int(bool(a_preshuffle)),
+            str(dtype),
+            splitk,  # normalized; an explicit split changes which rows validate
+        ),
         f"shape is M:{M}, N:{N}, K:{K}, b_intype:{b_intype}, a_preshuffle:{a_preshuffle}, "
         f"not found usable exact/padded-M config in {tuned_file}, will use default config!",
     )

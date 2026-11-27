@@ -145,6 +145,7 @@ def list_test_files(repo_root: Path, test_type: str) -> list[str]:
             "op_tests/tuning_tests/test_csv_validation.py",
             "op_tests/tuning_tests/test_config_shape_collision.py",
             "op_tests/tuning_tests/test_mixed_mxfp_tuning.py",
+            "op_tests/tuning_tests/test_tuned_config_miss_log.py",
         ):
             if (repo_root / rel_path).is_file():
                 files.add(rel_path)
