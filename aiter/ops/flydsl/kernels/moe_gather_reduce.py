@@ -47,6 +47,7 @@ of ``grouped_out`` go through one flat descriptor at a dword offset rather than
 a freshly built per-row descriptor.
 """
 
+import functools
 import struct
 
 import flydsl.compiler as flyc
@@ -54,6 +55,7 @@ import flydsl.expr as fx
 from flydsl.expr import gpu, ptrtoint, range_constexpr
 from flydsl.expr.typing import Int32, T
 
+from aiter.ops.flydsl.aot_launch import aot_factory
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.kernels_common import format_kernel_name
 from aiter.ops.flydsl.kernels.tensor_shim import (
@@ -99,6 +101,8 @@ def _pack_pair_from_f32(acc_lo, acc_hi, out_dtype):
     return lo_i32 | (hi_i32 << 16)
 
 
+@aot_factory("moe_gather_reduce")
+@functools.cache
 def build_moe_gather_reduce_module(
     model_dim: int,
     topk: int,

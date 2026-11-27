@@ -275,19 +275,21 @@ def flydsl_grouped_gemm_a8w4_masked(
                 f"keep the scale plane cache-line aligned, got N={N}"
             )
     ep_row_map_tensor = ep_row_map if ep_row_map is not None else out
+    # Constexpr launch arguments: the AOT cache compares them by value, where
+    # True and 1 differ, so each has one type whatever the caller passed.
     gemm_spec = (
-        K,
-        tile_m,
-        tile_n,
-        tile_k,
-        m_warp,
-        n_warp,
-        out_is_f16,
-        num_buffers,
-        a_is_fp4,
+        int(K),
+        int(tile_m),
+        int(tile_n),
+        int(tile_k),
+        int(m_warp),
+        int(n_warp),
+        int(out_is_f16),
+        int(num_buffers),
+        int(a_is_fp4),
     )
-    route_spec = (n_experts, stage1_act, has_bias)
-    quant_spec = (stage1_quant_out, quant_wmma_rep)
+    route_spec = (int(n_experts), int(stage1_act), int(has_bias))
+    quant_spec = (int(stage1_quant_out), int(quant_wmma_rep))
     tdm_spec = (
         cluster_n,
         cluster_m,

@@ -3560,7 +3560,8 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
         build_moe_fused_quant_preshuffle_route_ksplit_module,
     )
 
-    return build_moe_fused_quant_preshuffle_route_ksplit_module(
+    # The handle of the AOT cache entry: a hit never builds the kernel.
+    return build_moe_fused_quant_preshuffle_route_ksplit_module.lazy(
         feat_dim=feat_dim,
         wmma_rep=wmma_rep,
         quant_mode=quant_mode,
