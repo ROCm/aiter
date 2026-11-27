@@ -101,6 +101,7 @@ from aiter.moev2.segments.sort import (  # noqa: F401
     _aux_uses_opus,
     _empty_bf16,
     _flydsl_moe_sorting,
+    _flydsl_moe_sorting_onewg,
     _moe_prepare_unsorted_input,
     _moe_sorting_impl,
     _mxfp4_aux_instance_supported,
@@ -1769,6 +1770,15 @@ def _fused_moe_impl(
             f"a16w16 block_size_M={block_size_M} does not match kernel tile "
             f"{metadata.block_m}; moe_sorting and both gemm tiles share this size"
         )
+    if any(getattr(t, "a8w4_gfx942_layout", False) for t in (w1, w1_scale)) and not any(
+        k in _a16w16_kn1 for k in ("pertokenMXfp4Fp8_g1u1_novs_situv2", "_g942")
+    ):
+        raise ValueError(
+            "W1 / W1 scale are relaid for the gfx942 a8w4 stage 1 "
+            "(a8w4_gfx942_layout), which only the gfx942 1-stage asm kernel reads, "
+            f"but stage 1 is {_a16w16_kn1 or metadata.stage1}; "
+            "is AITER_SITUV2_A8W4=1 set?"
+        )
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
     if _stage2_override is not None and (
         metadata.run_1stage or metadata.full_impl is not None
@@ -2555,6 +2565,19 @@ def fused_moe_1stage(
     intermediate_pad: int = 0,
 ):
     asm_mode = AsmMoeMode(flat)
+    if "pertokenMXfp4Fp8_g1u1_novs_situv2" in kernelName:
+        if block_size_M != 32:
+            raise ValueError(f"{kernelName} needs block_size_M=32, got {block_size_M}")
+        # same shape and dtype as the a16w4 preshuffle; only the tag tells them apart
+        _w1_relaid = tuple(
+            getattr(t, "a8w4_gfx942_layout", False) for t in (w1, w1_scale)
+        )
+        if not all(_w1_relaid):
+            raise ValueError(
+                f"the gfx942 asm kernel {kernelName} reads W1 and W1 scale relaid by "
+                "shuffle_weight_a8w4_gfx942 / shuffle_scale_a8w4_gfx942 (tagged "
+                f"a8w4_gfx942_layout); got tags (w1, w1_scale) = {_w1_relaid}"
+            )
     if quant_type == QuantType.No and activation == ActivationType.Silu and not isG1U1:
         # pure bf16
         aiter.fmoe(
@@ -2594,10 +2617,28 @@ def fused_moe_1stage(
             activation,
         )
     else:
+        token_num = hidden_states.shape[0]
+        mxfp8_sorted = (
+            "pertokenMXfp4Fp8_g1u1_novs_situv2" in kernelName
+            and quant_type == QuantType.per_1x32
+            and q_dtype_a == dtypes.fp8
+            and hidden_states.dtype in (dtypes.bf16, dtypes.fp16)
+        )
         if xbf16:
             # xquant happens inside the asm kernel for per_1x128
             a1 = hidden_states
             a1_scale = torch.empty(0, device="cuda")
+        elif mxfp8_sorted:
+            a1, a1_scale = fused_dynamic_mxfp8_quant_moe_sort(
+                hidden_states,
+                sorted_ids=sorted_ids,
+                num_valid_ids=num_valid_ids,
+                token_num=token_num,
+                topk=topk,
+                block_size=block_size_M,
+                num_rows=num_local_tokens,
+                sorted_weights=sorted_weights,
+            )
         else:
             quant_func = get_quant(quant_type)
             if hidden_states.dtype != q_dtype_a:
@@ -2621,14 +2662,14 @@ def fused_moe_1stage(
                     )
                     a1_scale = scale_t
 
-        token_num = hidden_states.shape[0]
         E, model_dim, _inter_dim = get_inter_dim(w1.shape, w2.shape)
         if quant_type == QuantType.per_1x32:
             # FLAT per_1x32 kernels are always xbf16: X stays bf16 and is
             # dynamic-quantized to MXFP4 inside the kernel, so there is no host
             # activation e8m0 scale to pack. Only the (not-yet-enabled) non-flat
-            # pre-quantized fp4 path carries a host scale that needs sorting.
-            if not xbf16:
+            # pre-quantized fp4 path and pre-quantized fp8 x for the gfx942 asm
+            # kernel carry a host scale that needs sorting.
+            if not xbf16 and not mxfp8_sorted:
                 a1_scale = mxfp4_moe_sort_fwd(
                     a1_scale,
                     sorted_ids=sorted_ids,
@@ -4920,7 +4961,8 @@ def get_2stage_cfgs(
                     "preshuffled weight layout"
                 )
             if gate_mode != GateMode.SEPARATED or gate_up_interleave is True:
-                raise ValueError("SiTUv2 A16W4 requires separated preshuffled weights")
+                raise ValueError("SiTUv2 MXFP4 requires separated preshuffled weights")
+        if is_shuffled and "pertokenMXfp4Fp8_g1u1_novs_situv2" not in kn1:
             cfg = None
             logger.warning(
                 "[fused_moe] discarding 1-stage SiTUv2 ASM config for preshuffled "
@@ -4932,7 +4974,7 @@ def get_2stage_cfgs(
         ):
             raise ValueError(
                 "1-stage SiTUv2 ASM has fixed beta=4 and linear_beta=25; "
-                "use separated preshuffled weights for runtime betas"
+                "runtime betas need a two-stage config for this shape"
             )
 
     if (
@@ -5221,8 +5263,8 @@ def get_2stage_cfgs(
             f"{keys} in {tune_file}"
         )
 
-    # Asm 1-stage kernels exist for Silu/Gelu and for gfx950 MXFP4 SiTUv2 and
-    # SwiGLU OAI FLAT.
+    # Asm 1-stage kernels exist for Silu/Gelu, gfx950 MXFP4 SiTUv2, gfx942
+    # MXFP8 x MXFP4 SiTUv2 and SwiGLU OAI FLAT.
     if (
         cfg is not None
         and cfg.get("run_1stage", False)
@@ -5277,6 +5319,27 @@ def get_2stage_cfgs(
             logger.warning(
                 f"[fused_moe] discarding SwiGLU OAI 1-stage asm config for {keys}: "
                 f"unsupported {unsupported}; using default heuristics"
+            )
+
+    # The gfx942 MXFP8 x MXFP4 asm kernel is SiTUv2 only and has no bias or
+    # stage-2 scatter input.
+    if (
+        cfg is not None
+        and cfg.get("run_1stage", False)
+        and "pertokenMXfp4Fp8_g1u1_novs_situv2" in str(cfg.get("kernelName1", ""))
+    ):
+        unsupported = None
+        if activation != ActivationType.Situv2:
+            unsupported = f"activation {activation}"
+        elif has_stage1_bias or has_stage2_bias:
+            unsupported = "per-expert bias"
+        elif has_stage2_scatter:
+            unsupported = "stage2_scatter"
+        if unsupported is not None:
+            cfg = None
+            logger.warning(
+                f"[fused_moe] discarding gfx942 MXFP8 x MXFP4 1-stage asm config "
+                f"for {keys}: unsupported {unsupported}; using default heuristics"
             )
 
     use_non_temporal_load = False

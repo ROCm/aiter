@@ -11,6 +11,11 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+#include <type_traits>
+
 #include "aiter_dispatch.h"
 #include "aiter_stream.h"
 #include "aiter_opus_plus.h"
@@ -23,6 +28,69 @@ namespace fused_qknorm_idxrqknorm_ops {
 constexpr int kHeadDim = 128;
 constexpr int kNumLanes = 32;
 constexpr int kElemsPerLane = kHeadDim / kNumLanes;
+
+// ---- lane exchanges inside a 32-lane logical warp ----------------------------------------------
+// __shfl_xor lowers to ds_bpermute (an LDS-pipe round trip per exchange). On gfx950 the xor-1/2/4/8
+// partners are a DPP modifier of the consuming VALU op and xor-16 is v_permlane16_swap, so the
+// norm / amax butterflies and the RoPE partner exchange cost a few cycles each instead of ~100.
+// Technique of amd-kernels' norm_rope_nvfp4_insert; the lane map and the arithmetic are the
+// shuffle version's.
+template <int M>
+__device__ __forceinline__ float xorLane(float x)
+{
+#if defined(__gfx950__)
+    const int v = __builtin_bit_cast(int, x);
+    int r;
+    if constexpr(M == 1)
+        r = __builtin_amdgcn_update_dpp(v, v, 0xB1, 0xF, 0xF, false); // quad_perm [1,0,3,2]
+    else if constexpr(M == 2)
+        r = __builtin_amdgcn_update_dpp(v, v, 0x4E, 0xF, 0xF, false); // quad_perm [2,3,0,1]
+    else if constexpr(M == 4) // banks 1,3 take lane-4 (row_shr:4), banks 0,2 lane+4 (row_shl:4)
+        r = __builtin_amdgcn_update_dpp(
+            __builtin_amdgcn_update_dpp(v, v, 0x114, 0xF, 0xA, false), v, 0x104, 0xF, 0x5, false);
+    else if constexpr(M == 8)
+        r = __builtin_amdgcn_update_dpp(v, v, 0x128, 0xF, 0xF, false); // row_ror:8
+    else
+        return __shfl_xor(x, M, 32);
+    return __builtin_bit_cast(float, r);
+#else
+    return __shfl_xor(x, M, 32);
+#endif
+}
+
+// Sum over the 32 lanes (all five xor steps). The xor-16 step is commutative, so the unordered
+// permlane16_swap pair is summed as is; the steps run in the order of warpReduceSum (16, 8, 4, 2,
+// 1), so the result is bit-identical to it.
+template <bool kBuiltin = false>
+__device__ __forceinline__ float warpSum32(float x)
+{
+#if defined(__gfx950__)
+    if constexpr(kBuiltin)
+    {
+        // the same swap as an asm that is not volatile: the scheduler may interleave and merge it
+        // with other work (the builtin folds the two results of swap(v, v) into one register)
+        unsigned a = __builtin_bit_cast(unsigned, x), b = a;
+        asm("s_nop 1\n\tv_permlane16_swap_b32 %0, %1\n\ts_nop 1" : "+v"(a), "+v"(b));
+        x = __builtin_bit_cast(float, a) + __builtin_bit_cast(float, b);
+    }
+    else
+    {
+        // v_permlane16_swap of x with itself leaves (row 0/2 value, row 1/3 value) in the two
+        // registers of every lane. Inline asm: the compiler folds the two-result builtin to a
+        // single register.
+        unsigned a = __builtin_bit_cast(unsigned, x), b = a;
+        asm volatile("s_nop 1\n\tv_permlane16_swap_b32 %0, %1\n\ts_nop 1" : "+v"(a), "+v"(b));
+        x = __builtin_bit_cast(float, a) + __builtin_bit_cast(float, b);
+    }
+#else
+    x += __shfl_xor(x, 16, 32);
+#endif
+    x += xorLane<8>(x);
+    x += xorLane<4>(x);
+    x += xorLane<2>(x);
+    x += xorLane<1>(x);
+    return x;
+}
 
 __device__ __forceinline__ float warpReduceSum(float val)
 {
@@ -173,33 +241,73 @@ __device__ __forceinline__ void storeCacheElemsStrided(const scalar_t* __restric
     }
 }
 
+// What a lane reads from global memory for the norm and the rope: its kElemsPerLane norm weights
+// and the cos / sin pair of each of its dims. They stay in the storage type (converting would
+// make the loader wait for the loads), so a caller issues them together with the row's and
+// converts when it computes. The loads are unconditional, so the compiler cannot fold them into
+// the branches that use them: a lane without rotated dims reads (and ignores) a valid pair.
 template <typename scalar_t>
-__device__ __forceinline__ void normAndRope(
-    float (&elems)[kElemsPerLane],
-    int lane_id,
-    float eps,
-    const scalar_t* __restrict__ weight,
-    bool do_rope,
-    int rotary_dim,
-    const scalar_t* __restrict__ cos_ptr,
-    bool apply_norm)
+struct NormRopeOperands
 {
-    if(apply_norm)
+    scalar_t w[kElemsPerLane];
+    scalar_t c[kElemsPerLane];
+    scalar_t s[kElemsPerLane];
+};
+
+template <typename scalar_t>
+__device__ __forceinline__ void loadNormWeights(const scalar_t* __restrict__ weight,
+                                                int lane_id,
+                                                NormRopeOperands<scalar_t>& ops)
+{
+#pragma unroll
+    for(int i = 0; i < kElemsPerLane; ++i)
     {
-        float sumsq = 0.0f;
+        ops.w[i] = weight[lane_id * kElemsPerLane + i];
+    }
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ void loadRopeOperands(const scalar_t* __restrict__ cos_sin_cache,
+                                                 int64_t pos,
+                                                 int lane_id,
+                                                 int rotary_dim,
+                                                 NormRopeOperands<scalar_t>& ops)
+{
+    const int half   = rotary_dim / 2;
+    const int dim0   = lane_id * kElemsPerLane;
+    const int i_base = min(dim0 < half ? dim0 : dim0 - half, half - kElemsPerLane);
+    const scalar_t* cos_ptr = cos_sin_cache + pos * rotary_dim;
+    const scalar_t* sin_ptr = cos_ptr + half;
 #pragma unroll
-        for(int i = 0; i < kElemsPerLane; ++i)
-        {
-            sumsq += elems[i] * elems[i];
-        }
-        sumsq = warpReduceSum(sumsq);
-        const float rms_rcp = rsqrtf(sumsq / static_cast<float>(kHeadDim) + eps);
+    for(int i = 0; i < kElemsPerLane; ++i)
+    {
+        ops.c[i] = cos_ptr[i_base + i];
+        ops.s[i] = sin_ptr[i_base + i];
+    }
+}
+
+// RMSNorm (with the (1 + weight) form) and partial NeoX RoPE of one row, on the operands
+// loadNormWeights / loadRopeOperands read.
+template <typename scalar_t, bool kBuiltinSwap = false>
+__device__ __forceinline__ void normAndRope(float (&elems)[kElemsPerLane],
+                                            int lane_id,
+                                            float eps,
+                                            const NormRopeOperands<scalar_t>& ops,
+                                            bool do_rope,
+                                            int rotary_dim)
+{
+    float sumsq = 0.0f;
 #pragma unroll
-        for(int i = 0; i < kElemsPerLane; ++i)
-        {
-            const int dim = lane_id * kElemsPerLane + i;
-            elems[i] = elems[i] * rms_rcp * (1.0f + static_cast<float>(weight[dim]));
-        }
+    for(int i = 0; i < kElemsPerLane; ++i)
+    {
+        sumsq += elems[i] * elems[i];
+    }
+    sumsq = warpSum32<kBuiltinSwap>(sumsq);
+    const float rms_rcp = rsqrtf(sumsq / static_cast<float>(kHeadDim) + eps);
+#pragma unroll
+    for(int i = 0; i < kElemsPerLane; ++i)
+    {
+        elems[i] = elems[i] * rms_rcp * (1.0f + static_cast<float>(ops.w[i]));
     }
 
     if(do_rope)
@@ -211,18 +319,17 @@ __device__ __forceinline__ void normAndRope(
         if(in_rope)
         {
             const bool first_half = dim0 < half;
-            const int i_base = first_half ? dim0 : dim0 - half;
             const int partner_lane = first_half ? (dim0 + half) / kElemsPerLane
                                                 : (dim0 - half) / kElemsPerLane;
-            const scalar_t* sin_ptr = cos_ptr + half;
 #pragma unroll
             for(int i = 0; i < kElemsPerLane; ++i)
             {
-                const float c = static_cast<float>(cos_ptr[i_base + i]);
-                const float s = static_cast<float>(sin_ptr[i_base + i]);
-                const float partner = __shfl(elems[i], partner_lane, 32);
-                elems[i] = first_half ? elems[i] * c - partner * s
-                                      : elems[i] * c + partner * s;
+                const float c       = static_cast<float>(ops.c[i]);
+                const float s       = static_cast<float>(ops.s[i]);
+                // rotary_dim 64 (MiniMax-M3): partner_lane == lane ^ 8, a row_ror:8 DPP move
+                const float partner = rotary_dim == 64 ? xorLane<8>(elems[i])
+                                                       : __shfl(elems[i], partner_lane, 32);
+                elems[i] = first_half ? elems[i] * c - partner * s : elems[i] * c + partner * s;
             }
         }
     }
@@ -307,8 +414,9 @@ __device__ __forceinline__ void storeMxfp4Row(uint8_t* __restrict__ cache,
 
 // ---- NVFP4 row write (index K, main K/V) -----------------------------------------------
 // e2m1 data + one e4m3 scale per 16 elements (4 lanes), no per-token scale. The arithmetic is
-// integer/compare arithmetic (see the torch reference in op_tests/test_fused_qknorm_nvfp4.py),
-// not a hardware convert, so the bytes are the same on every arch. Pages:
+// that of the torch reference in op_tests/test_fused_qknorm_nvfp4.py, written as integer/compare
+// routines (nv*Int) and, on gfx950, as the same conversions in hardware; the bytes are the same
+// on every arch. Pages:
 //   index page, 9216 B : [128 tok x 64 B e2m1][128 tok x 8 B e4m3]
 //   KV page, 2*nkv*9216 B : [K: nkv x 8192 B data | nkv x 1024 B scale][V: same]
 //     K data  t*64 + d/2           K scale in MFMA lane order (nvKScaleOff)
@@ -321,7 +429,7 @@ constexpr int kNvHeadSide      = kNvHeadData + kNvHeadScale;  // 9216 == an inde
 constexpr int kNvIndexPage     = kNvHeadSide;
 
 // e4m3fn byte of x in [0, 448], round to nearest even.
-__device__ __forceinline__ uint32_t nvE4m3Byte(float x)
+__device__ __forceinline__ uint32_t nvE4m3ByteInt(float x)
 {
     const uint32_t bits   = __builtin_bit_cast(uint32_t, x);
     const uint32_t normal = ((bits + 0x7FFFFu + ((bits >> 20) & 1u)) >> 20) - 960u;
@@ -331,7 +439,7 @@ __device__ __forceinline__ uint32_t nvE4m3Byte(float x)
     return x >= 0.015625f ? normal : sub;
 }
 
-__device__ __forceinline__ float nvE4m3Value(uint32_t byte)
+__device__ __forceinline__ float nvE4m3ValueInt(uint32_t byte)
 {
     const uint32_t e = byte >> 3, m = byte & 7u;
     return e > 0 ? __builtin_bit_cast(float, ((e + 120u) << 23) | (m << 20))
@@ -339,7 +447,7 @@ __device__ __forceinline__ float nvE4m3Value(uint32_t byte)
 }
 
 // e2m1 code (sign in bit 3): nearest grid value, ties to the even code.
-__device__ __forceinline__ uint32_t nvE2m1Code(float y)
+__device__ __forceinline__ uint32_t nvE2m1CodeInt(float y)
 {
     const float a = fabsf(y);
     const int mag = (a > 0.25f) + (a >= 0.75f) + (a > 1.25f) + (a >= 1.75f) + (a > 2.5f) +
@@ -347,10 +455,106 @@ __device__ __forceinline__ uint32_t nvE2m1Code(float y)
     return static_cast<uint32_t>(mag) | ((__builtin_bit_cast(uint32_t, y) >> 31) << 3);
 }
 
-// One lane's kElemsPerLane elements (already scalar_t-rounded) -> codes + the group's scale byte.
+// The same three on gfx950's converts (RNE, the same grids), which are a few instructions each
+// instead of a compare / select chain. They give the same bytes as the integer routines for every
+// input of the quantizer below: the e2m1 code on all 2^32 fp32 bit patterns, the e4m3 byte on all
+// of [0, 448], the e4m3 value on every byte it is given (0 .. 0x7E). op_tests/test_fused_qknorm_nvfp4.py
+// checks the kernel against a torch oracle. The integer routines stay as the other arches' path.
+// Like them, the quantizer needs gs > 0 (a negative scale gives a negative sf, which is outside
+// the e4m3 byte's [0, 448] and where the two differ).
+#if defined(__gfx950__)
+
+// x in [0, 448] (the mask drops the sign of -0). Past 448 the convert gives NaN.
+__device__ __forceinline__ uint32_t nvE4m3ByteHw(float x)
+{
+    int w = 0;
+    w     = __builtin_amdgcn_cvt_pk_fp8_f32(x, 0.0f, w, 0);
+    return static_cast<uint32_t>(w) & 0x7Fu;
+}
+
+__device__ __forceinline__ float nvE4m3ValueHw(uint32_t byte)
+{
+    return __builtin_amdgcn_cvt_f32_fp8(static_cast<int>(byte), 0);
+}
+
+// Four e2m1 codes as nibbles, element 0 lowest. The convert gives a NaN the largest magnitude;
+// the integer code gives it magnitude 0 (every compare is false), so a NaN is first replaced by
+// the zero of its sign. Infinities saturate to the largest magnitude in both.
+__device__ __forceinline__ uint32_t nvE2m1PackHw(const float (&y)[kElemsPerLane])
+{
+    float t[kElemsPerLane];
+#pragma unroll
+    for(int i = 0; i < kElemsPerLane; ++i)
+    {
+        t[i] = y[i] != y[i] ? __builtin_bit_cast(float, __builtin_bit_cast(uint32_t, y[i]) &
+                                                            0x80000000u)
+                            : y[i];
+    }
+    uint32_t w = 0;
+    w          = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(w, t[0], t[1], 1.0f, 0);
+    w          = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(w, t[2], t[3], 1.0f, 1);
+    return w & 0xFFFFu;
+}
+#endif
+
+__device__ __forceinline__ uint32_t nvE4m3Byte(float x)
+{
+#if defined(__gfx950__)
+    return nvE4m3ByteHw(x);
+#else
+    return nvE4m3ByteInt(x);
+#endif
+}
+
+__device__ __forceinline__ float nvE4m3Value(uint32_t byte)
+{
+#if defined(__gfx950__)
+    return nvE4m3ValueHw(byte);
+#else
+    return nvE4m3ValueInt(byte);
+#endif
+}
+
+// Four e2m1 codes of y as nibbles, element 0 lowest.
+__device__ __forceinline__ uint32_t nvE2m1Pack(const float (&y)[kElemsPerLane])
+{
+#if defined(__gfx950__)
+    return nvE2m1PackHw(y);
+#else
+    return nvE2m1CodeInt(y[0]) | (nvE2m1CodeInt(y[1]) << 4) | (nvE2m1CodeInt(y[2]) << 8) |
+           (nvE2m1CodeInt(y[3]) << 12);
+#endif
+}
+
+// Correctly rounded 1/d without the denormal-mode switching and ~25-instruction expansion of
+// __fdiv_rn: v_rcp_f32 refined by two FMA Newton steps. Identical to __fdiv_rn(1, d) over every
+// positive normal fp32 (2^31 patterns, exhaustive on gfx950); outside [2^-100, 2^100] (and for 0 /
+// inf / nan) it falls back to __fdiv_rn.
+__device__ __forceinline__ float rcpRN(float d)
+{
+#if !defined(__gfx950__)
+    return __fdiv_rn(1.0f, d);
+#else
+    const float a = fabsf(d);
+    if(!(a >= 0x1p-100f && a <= 0x1p100f))
+    {
+        return __fdiv_rn(1.0f, d);
+    }
+    float r        = __builtin_amdgcn_rcpf(d);
+    const float e  = fmaf(-d, r, 1.0f);
+    r              = fmaf(r, e, r);
+    const float e2 = fmaf(-d, r, 1.0f);
+    return fmaf(r, e2, r);
+#endif
+}
+
+// One lane's kElemsPerLane elements (already scalar_t-rounded) -> its four codes as nibbles
+// (element 0 lowest) + the group's scale byte.
+template <bool kPf = false>
 __device__ __forceinline__ uint32_t nvQuantLane(const float (&v)[kElemsPerLane],
                                                 float gs,
-                                                uint32_t (&code)[kElemsPerLane])
+                                                uint32_t& packed,
+                                                float rgs = 0.0f) // kPf: rcpRN(gs), hoisted
 {
     float amax = 0.0f;
 #pragma unroll
@@ -358,34 +562,30 @@ __device__ __forceinline__ uint32_t nvQuantLane(const float (&v)[kElemsPerLane],
     {
         amax = fmaxf(amax, fabsf(v[i]));
     }
-#pragma unroll
-    for(int mask = 1; mask < kNvLanesPerGroup; mask <<= 1)
-    {
-        amax = fmaxf(amax, __shfl_xor(amax, mask, 32));
-    }
+    static_assert(kNvLanesPerGroup == 4, "the xor-1/2 exchanges below span one group");
+    amax = fmaxf(amax, xorLane<1>(amax));
+    amax = fmaxf(amax, xorLane<2>(amax));
     const float one_sixth = 0.1666666716337204f; // float32(1/6), as the torch reference
-    const float sf        = fminf(amax * one_sixth * __fdiv_rn(1.0f, gs), 448.0f);
+    const float sf        = fminf(amax * one_sixth * (kPf ? rgs : rcpRN(gs)), 448.0f);
     const uint32_t sbyte  = nvE4m3Byte(sf);
     const float sv        = nvE4m3Value(sbyte);
-    const float quant     = sv != 0.0f ? __fdiv_rn(1.0f, sv * gs) : 0.0f;
+    const float quant     = sv != 0.0f ? rcpRN(sv * gs) : 0.0f;
+    float y[kElemsPerLane];
 #pragma unroll
     for(int i = 0; i < kElemsPerLane; ++i)
     {
-        code[i] = nvE2m1Code(v[i] * quant);
+        y[i] = v[i] * quant;
     }
+    packed = nvE2m1Pack(y);
     return sbyte;
-}
-
-__device__ __forceinline__ uint16_t nvPackBytes(const uint32_t (&code)[kElemsPerLane])
-{
-    return static_cast<uint16_t>(code[0] | (code[1] << 4) | (code[2] << 8) | (code[3] << 12));
 }
 
 // token-major data (low nibble = even element); the callers write the scale bytes.
 __device__ __forceinline__ void
-nvStoreRowData(uint8_t* __restrict__ data_row, int lane_id, const uint32_t (&code)[kElemsPerLane])
+nvStoreRowData(uint8_t* __restrict__ data_row, int lane_id, uint32_t packed)
 {
-    *reinterpret_cast<uint16_t*>(data_row + lane_id * (kElemsPerLane / 2)) = nvPackBytes(code);
+    *reinterpret_cast<uint16_t*>(data_row + lane_id * (kElemsPerLane / 2)) =
+        static_cast<uint16_t>(packed);
 }
 
 // K scale byte offset (MFMA lane order) of token pos, group g, inside a head's scale region.
@@ -397,45 +597,49 @@ __device__ __forceinline__ int nvKScaleOff(int pos, int g)
 }
 
 // Index-K row of token `pos` in a 9216 B page (main K uses storeNvfp4KRow).
-template <typename scalar_t>
+template <typename scalar_t, bool kRound = true, bool kPf = false>
 __device__ __forceinline__ void storeNvfp4IndexRow(uint8_t* __restrict__ page,
                                                    int pos,
                                                    const float (&elems)[kElemsPerLane],
-                                                   int lane_id)
+                                                   int lane_id,
+                                                   float rgs = 0.0f)
 {
     float v[kElemsPerLane];
 #pragma unroll
     for(int i = 0; i < kElemsPerLane; ++i)
     {
-        v[i] = static_cast<float>(static_cast<scalar_t>(elems[i]));
+        // kRound = false: the caller passes values already rounded to scalar_t
+        v[i] = kRound ? static_cast<float>(static_cast<scalar_t>(elems[i])) : elems[i];
     }
-    uint32_t code[kElemsPerLane];
-    const uint32_t sb = nvQuantLane(v, 1.0f, code);
-    nvStoreRowData(page + pos * (kHeadDim / 2), lane_id, code);
+    uint32_t packed;
+    const uint32_t sb = nvQuantLane<kPf>(v, 1.0f, packed, rgs);
+    nvStoreRowData(page + pos * (kHeadDim / 2), lane_id, packed);
     if(lane_id % kNvLanesPerGroup == 0)
     {
         page[kNvHeadData + pos * (kHeadDim / 16) + lane_id / kNvLanesPerGroup] = sb;
     }
 }
 
-template <typename scalar_t>
+template <typename scalar_t, bool kRound = true, bool kPf = false>
 __device__ __forceinline__ void storeNvfp4KRow(uint8_t* __restrict__ page,
                                                int nkv,
                                                int head,
                                                int pos,
                                                float gs,
                                                const float (&elems)[kElemsPerLane],
-                                               int lane_id)
+                                               int lane_id,
+                                               float rgs = 0.0f)
 {
     float v[kElemsPerLane];
 #pragma unroll
     for(int i = 0; i < kElemsPerLane; ++i)
     {
-        v[i] = static_cast<float>(static_cast<scalar_t>(elems[i]));
+        // kRound = false: the caller passes values already rounded to scalar_t
+        v[i] = kRound ? static_cast<float>(static_cast<scalar_t>(elems[i])) : elems[i];
     }
-    uint32_t code[kElemsPerLane];
-    const uint32_t sb = nvQuantLane(v, gs, code);
-    nvStoreRowData(page + head * kNvHeadData + pos * (kHeadDim / 2), lane_id, code);
+    uint32_t packed;
+    const uint32_t sb = nvQuantLane<kPf>(v, gs, packed, rgs);
+    nvStoreRowData(page + head * kNvHeadData + pos * (kHeadDim / 2), lane_id, packed);
     if(lane_id % kNvLanesPerGroup == 0)
     {
         page[nkv * kNvHeadData + head * kNvHeadScale +
@@ -443,7 +647,7 @@ __device__ __forceinline__ void storeNvfp4KRow(uint8_t* __restrict__ page,
     }
 }
 
-// V of token `pos` alone: its nibble of each element's word, atomic and/or (other tokens of the
+// V of token `pos` alone: its nibble of each element's word, atomic xor (other tokens of the
 // octet, in this or another warp, share the word).
 template <typename scalar_t>
 __device__ __forceinline__ void storeNvfp4VToken(uint8_t* __restrict__ page,
@@ -451,23 +655,31 @@ __device__ __forceinline__ void storeNvfp4VToken(uint8_t* __restrict__ page,
                                                  int head,
                                                  int pos,
                                                  float gs,
-                                                 const scalar_t* __restrict__ row,
+                                                 const scalar_t (&row)[kElemsPerLane],
                                                  int lane_id)
 {
-    float v[kElemsPerLane];
-    loadElems(row + lane_id * kElemsPerLane, v);
-    uint32_t code[kElemsPerLane];
-    const uint32_t sb = nvQuantLane(v, gs, code);
-    uint32_t* words   = reinterpret_cast<uint32_t*>(page + nkv * kNvHeadSide + head * kNvHeadData +
+    uint32_t* words = reinterpret_cast<uint32_t*>(page + nkv * kNvHeadSide + head * kNvHeadData +
                                                   (pos / 8) * 512) +
                       lane_id * kElemsPerLane;
     const int shift = ((pos % 8) / 2) * 8 + (pos % 2) * 4;
-#pragma unroll
-    for(int i = 0; i < kElemsPerLane; ++i)
-    {
-        atomicAnd(words + i, ~(0xFu << shift));
-        atomicOr(words + i, code[i] << shift);
-    }
+    const uint4 old = *reinterpret_cast<const uint4*>(words); // in flight during the quantization
+    float v[kElemsPerLane];
+    loadElems(row, v);
+    uint32_t packed;
+    const uint32_t sb = nvQuantLane(v, gs, packed);
+    // The nibble of token `pos` is written by this token only (a slot is written once per call), so
+    // one xor of (old ^ new) << shift per word lands it without disturbing the other tokens'
+    // nibbles of the octet (they flip disjoint bits, and xors commute): two 64-bit atomics per lane
+    // instead of 4 x (and + or). `old` is a plain load issued before the quantization; only its own
+    // nibble is used, and no other token changes that nibble.
+    const uint32_t d0 = ((((old.x >> shift) ^ (packed >> 0)) & 0xFu) << shift);
+    const uint32_t d1 = ((((old.y >> shift) ^ (packed >> 4)) & 0xFu) << shift);
+    const uint32_t d2 = ((((old.z >> shift) ^ (packed >> 8)) & 0xFu) << shift);
+    const uint32_t d3 = ((((old.w >> shift) ^ (packed >> 12)) & 0xFu) << shift);
+    using u64 = unsigned long long;
+    u64* w64  = reinterpret_cast<u64*>(words);
+    atomicXor(w64, static_cast<u64>(d0) | (static_cast<u64>(d1) << 32));
+    atomicXor(w64 + 1, static_cast<u64>(d2) | (static_cast<u64>(d3) << 32));
     if(lane_id % kNvLanesPerGroup == 0)
     {
         page[nkv * (kNvHeadSide + kNvHeadData) + head * kNvHeadScale +
@@ -620,17 +832,30 @@ __global__ void fusedQKNormIdxrQKNormKernel(
         store_ptr = q_out + static_cast<int64_t>(token_idx) * nq * kHeadDim + slot * kHeadDim;
     }
 
-    int64_t mapped_slot = -1;
+    // The row and slot_mapping are loaded here, before the V branch, which uses both: the loads
+    // are in flight while the rest of the loads (position, norm weight, cos / sin) issue below,
+    // not chained behind them. V reuses `raw` so that the compiler keeps the row load here
+    // instead of sinking it past the branch into the non-V path.
+    scalar_t raw[kElemsPerLane];
+#pragma unroll
+    for(int i = 0; i < kElemsPerLane; ++i)
+    {
+        raw[i] = row_ptr[dim_base + i];
+    }
+
+    int64_t slot_val = -1;
+    bool has_slot    = false;
     if constexpr(kInsertKV)
     {
         if constexpr(kProcessIndex)
         {
-            mapped_slot = is_ik ? index_slot_mapping[token_idx]
-                                : ((is_k || is_v) ? slot_mapping[token_idx] : -1);
+            slot_val = (is_ik ? index_slot_mapping : slot_mapping)[token_idx];
+            has_slot = is_ik || is_k || is_v;
         }
         else
         {
-            mapped_slot = (is_k || is_v) ? slot_mapping[token_idx] : -1;
+            slot_val = slot_mapping[token_idx];
+            has_slot = is_k || is_v;
         }
     }
 
@@ -638,6 +863,7 @@ __global__ void fusedQKNormIdxrQKNormKernel(
     {
         if(is_v)
         {
+            const int64_t mapped_slot = has_slot ? slot_val : -1;
             if constexpr(kKvFp4)
             {
                 if constexpr(kNvfp4)
@@ -654,7 +880,7 @@ __global__ void fusedQKNormIdxrQKNormKernel(
                                                    head,
                                                    static_cast<int>(mapped_slot % kNvTokens),
                                                    *v_scale,
-                                                   row_ptr,
+                                                   raw,
                                                    lane_id);
                     }
                 }
@@ -662,7 +888,7 @@ __global__ void fusedQKNormIdxrQKNormKernel(
                 {
                     // MXFP4 main V: the raw row, one e8m0 per 32 elements (8 lanes).
                     float velems[kElemsPerLane];
-                    loadElems(row_ptr + dim_base, velems);
+                    loadElems(raw, velems);
                     storeMxfp4Row<scalar_t>(reinterpret_cast<uint8_t*>(kv_cache_v),
                                             mapped_slot,
                                             v_s_block,
@@ -734,11 +960,18 @@ __global__ void fusedQKNormIdxrQKNormKernel(
         }
     }
 
-    float elems[kElemsPerLane];
-    loadElems(row_ptr + dim_base, elems);
+    // Past the V branch every warp has a norm weight and rotates. All the loads of the norm and
+    // the rope are issued together, none behind a condition (which the compiler would fold into
+    // the code that uses them, waiting for each right after issuing it): position, weight, then
+    // cos / sin once the position is back. They stay in the storage type until they are used.
+    NormRopeOperands<scalar_t> ops;
     const int64_t pos = positions[token_idx];
-    const scalar_t* cos_ptr = cos_sin_cache + pos * rotary_dim;
-    normAndRope(elems, lane_id, eps, norm_w, do_rope, rotary_dim, cos_ptr, norm_w != nullptr);
+    loadNormWeights(norm_w, lane_id, ops);
+    loadRopeOperands(cos_sin_cache, pos, lane_id, rotary_dim, ops);
+    float elems[kElemsPerLane];
+    loadElems(raw, elems);
+    normAndRope(elems, lane_id, eps, ops, do_rope, rotary_dim);
+    const int64_t mapped_slot = has_slot ? slot_val : -1;
 
     if constexpr(kInsertKV)
     {
@@ -920,6 +1153,716 @@ __global__ void fusedQKNormIdxrQKNormKernel(
     }
 }
 
+// ---- NVFP4 prefill insert ------------------------------------------------------------------
+// The generic kernel above runs one 32-lane warp per (token, head): a 256-thread block is 8 such
+// warps, each of which loads its own position / slot / norm weight / cos-sin pair and (for V) its
+// own token's nibbles with two 64-bit atomics per lane. For the MiniMax-M3 TP4 head set
+// (16 q / 1 kv / 1 index heads, head_dim 128, rotary 64) at prefill sizes that per-warp overhead
+// bounds the kernel, not the arithmetic. This variant keeps the arithmetic (it calls the same
+// normAndRope / nvQuantLane / store helpers) and changes the work mapping, after amd-kernels'
+// norm_rope_nvfp4_insert (Apache-2.0):
+//   * a wave64 takes ONE head (or the V head) of 2 * TP tokens: lanes 0..31 token 2t, lanes 32..63
+//     token 2t + 1 of every pair t, so 19 + TP waves cover 2 * TP tokens instead of 10 * 2 * TP
+//     half-waves, and the per-wave setup is paid once per 2 * TP tokens;
+//   * positions and slots of the wave's tokens are scalar loads (the wave's token window is
+//     wave-uniform), the global K / V scales too;
+//   * cos / sin: one 8 B vector load per lane serves two token pairs (lanes 0..15 of a half fetch
+//     pair 2j's cache row, lanes 16..31 pair 2j + 1's; a lane holds cos or sin of its dims and
+//     takes the other from the lane 8 apart, the second pair from the lane 16 apart);
+//   * V: the first token of a RUN (consecutive rows with consecutive slots inside one octet of 8)
+//     quantizes the run's rows and writes the octet's words once. A run that covers its whole
+//     octet is stored plainly (no other token can write that octet: slots are distinct); a shorter
+//     run xors its own nibbles in, as the generic path does per token. Runs are found from the
+//     slots alone, so any slot pattern with distinct slots is correct: a call that is not
+//     run-shaped (decode, scattered slots) degenerates to one-token runs, i.e. the generic
+//     path's work, with no host check.
+// gfx950 only (permlane16 / DPP); the host launches it for that head set only.
+constexpr int kPfNQ  = 16;
+constexpr int kPfNKV = 1;
+constexpr int kPfNIQ = 1;
+constexpr int kPfRot = 64;
+constexpr int kPfNR  = kPfNQ + kPfNKV + 1 + kPfNIQ;                       // norm + rope waves
+constexpr int kPfRow = (kPfNQ + 2 * kPfNKV + kPfNIQ + 1) * kHeadDim;      // qkv row, elements
+constexpr int kPfBlockWaves = 4;
+
+// lane l ^ 16 of the 32-lane half (v_permlane16_swap of v with itself: a = row 0 / 2 value, b =
+// row 1 / 3 value in every lane)
+__device__ __forceinline__ uint32_t pfXor16(uint32_t v, bool hi16)
+{
+    uint32_t a = v, b = v;
+    asm("s_nop 1\n\tv_permlane16_swap_b32 %0, %1\n\ts_nop 1" : "+v"(a), "+v"(b));
+    return hi16 ? a : b;
+}
+
+__device__ __forceinline__ uint32_t pfXor8(uint32_t v)
+{
+    return __builtin_bit_cast(uint32_t, xorLane<8>(__builtin_bit_cast(float, v)));
+}
+
+// qkv rows through a buffer descriptor: tokens past the end read as zero (no clamping of the
+// token index), and the 32-bit lane offset / wave-uniform row offset split keeps the address math
+// in SGPRs. 0x00020000 is the gfx9 descriptor word 3 (raw 32-bit-offset buffer).
+__device__ __forceinline__ uint2 pfLoadRow(__amdgpu_buffer_rsrc_t rsrc, int voff, int soff)
+{
+    const auto v = __builtin_amdgcn_raw_buffer_load_b64(rsrc, voff, soff, 0);
+    return make_uint2(v[0], v[1]);
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ void pfUnpack(uint2 v, scalar_t (&o)[kElemsPerLane])
+{
+    static_assert(sizeof(scalar_t) * kElemsPerLane == sizeof(uint2), "4 x 16-bit lane row");
+    __builtin_memcpy(o, &v, sizeof(v));
+}
+
+// Four fp32 -> four bf16 as 2 x v_cvt_pk_bf16_f32 (RNE; the same bits as the software
+// float -> hip_bfloat16 rounding of the generic kernel for every finite input, and a NaN stays a
+// NaN). `r` gets the rounded values back as fp32.
+typedef unsigned pfU32x2 __attribute__((ext_vector_type(2)));
+typedef float pfF2 __attribute__((ext_vector_type(2)));
+typedef __bf16 pfBf2 __attribute__((ext_vector_type(2)));
+
+__device__ __forceinline__ uint2 pfPackBf16(const float (&e)[kElemsPerLane], float (&r)[kElemsPerLane])
+{
+    const pfBf2 lo = __builtin_convertvector(pfF2{e[0], e[1]}, pfBf2);
+    const pfBf2 hi = __builtin_convertvector(pfF2{e[2], e[3]}, pfBf2);
+    const uint32_t l = __builtin_bit_cast(uint32_t, lo), h = __builtin_bit_cast(uint32_t, hi);
+    r[0] = __builtin_bit_cast(float, l << 16);
+    r[1] = __builtin_bit_cast(float, l & 0xFFFF0000u);
+    r[2] = __builtin_bit_cast(float, h << 16);
+    r[3] = __builtin_bit_cast(float, h & 0xFFFF0000u);
+    return make_uint2(l, h);
+}
+
+// The quantizer of nvQuantLane without the branch of rcpRN: the reciprocal is the two-step FMA
+// refinement only, and `bad` is set when its input is outside the range where that is exact (the
+// caller then redoes the rows with nvQuantLane). Lets the scheduler interleave the 8 rows of a run.
+__device__ __forceinline__ uint32_t pfQuantLaneFast(const float (&v)[kElemsPerLane],
+                                                    float gs,
+                                                    float rgs,
+                                                    uint32_t& packed,
+                                                    bool& bad)
+{
+    float amax = 0.0f;
+#pragma unroll
+    for(int i = 0; i < kElemsPerLane; ++i)
+    {
+        amax = fmaxf(amax, fabsf(v[i]));
+    }
+    amax = fmaxf(amax, xorLane<1>(amax));
+    amax = fmaxf(amax, xorLane<2>(amax));
+    const float one_sixth = 0.1666666716337204f;
+    const float sf        = fminf(amax * one_sixth * rgs, 448.0f);
+    const uint32_t sbyte  = nvE4m3Byte(sf);
+    const float sv        = nvE4m3Value(sbyte);
+    const float d         = sv * gs;
+    const float a         = fabsf(d);
+    bad |= sv != 0.0f && !(a >= 0x1p-100f && a <= 0x1p100f);
+    float r        = __builtin_amdgcn_rcpf(d);
+    const float e  = fmaf(-d, r, 1.0f);
+    r              = fmaf(r, e, r);
+    const float e2 = fmaf(-d, r, 1.0f);
+    r              = fmaf(r, e2, r);
+    const float quant = sv != 0.0f ? r : 0.0f;
+    float y[kElemsPerLane];
+#pragma unroll
+    for(int i = 0; i < kElemsPerLane; ++i)
+    {
+        y[i] = v[i] * quant;
+    }
+    packed = nvE2m1Pack(y);
+    return sbyte;
+}
+
+// A run of `len` (<= NR) V rows of one head, tokens tok.., slots slot.. (consecutive, one octet).
+template <typename scalar_t, int NR>
+__device__ __forceinline__ void pfVRun(__amdgpu_buffer_rsrc_t qkv_rsrc,
+                                       int h2,
+                                       int tok,
+                                       int slot,
+                                       int len,
+                                       int hl,
+                                       float gs,
+                                       float rgs,
+                                       uint8_t* __restrict__ page)
+{
+    const int p0       = slot & 7;
+    const int pos0     = slot & (kNvTokens - 1);
+    const bool full    = len == 8; // implies p0 == 0
+    uint2 rows[NR];
+#pragma unroll
+    for(int r = 0; r < NR; ++r)
+    {
+        // row tok + r: the wave-uniform part (tok - h2 + r) rows in the SGPR offset
+        rows[r] = pfLoadRow(qkv_rsrc,
+                            h2 * kPfRow * 2 + (kPfNQ + kPfNKV) * kHeadDim * 2 + hl * 8,
+                            (tok - h2 + r) * kPfRow * 2);
+    }
+    uint32_t* words = reinterpret_cast<uint32_t*>(page + kPfNKV * kNvHeadSide +
+                                                  (pos0 / 8) * 512) +
+                      hl * kElemsPerLane;
+    uint8_t* sbytes = page + kPfNKV * (kNvHeadSide + kNvHeadData) +
+                      (hl / kNvLanesPerGroup) * kNvTokens + (pos0 & ~7);
+    const bool leader = hl % kNvLanesPerGroup == 0;
+    uint4 old         = make_uint4(0, 0, 0, 0);
+    if(!full)
+    {
+        old = *reinterpret_cast<const uint4*>(words); // in flight during the quantization
+    }
+    uint32_t w[kElemsPerLane] = {0, 0, 0, 0};
+    uint32_t sc[2]            = {0, 0};
+    if constexpr(NR == 8)
+    {
+        if(full)
+        {
+            // a whole octet: eight rows without guards or branches, so that they interleave
+            bool bad = false;
+#pragma unroll
+            for(int r = 0; r < 8; ++r)
+            {
+                scalar_t raw[kElemsPerLane];
+                pfUnpack(rows[r], raw);
+                float v[kElemsPerLane];
+                loadElems(raw, v);
+                uint32_t packed;
+                const uint32_t sb = pfQuantLaneFast(v, gs, rgs, packed, bad);
+#pragma unroll
+                for(int i = 0; i < kElemsPerLane; ++i)
+                {
+                    w[i] |= ((packed >> (4 * i)) & 0xFu) << (4 * r);
+                }
+                sc[r / 4] |= sb << ((r % 4) * 8);
+            }
+            if(__builtin_amdgcn_ballot_w64(bad))
+            {
+                // a scale product outside [2^-100, 2^100] (never for sane scales): the exact path
+                for(int i = 0; i < kElemsPerLane; ++i)
+                {
+                    w[i] = 0;
+                }
+                sc[0] = sc[1] = 0;
+#pragma unroll
+                for(int r = 0; r < 8; ++r)
+                {
+                    scalar_t raw[kElemsPerLane];
+                    pfUnpack(rows[r], raw);
+                    float v[kElemsPerLane];
+                    loadElems(raw, v);
+                    uint32_t packed;
+                    const uint32_t sb = nvQuantLane<true>(v, gs, packed, rgs);
+#pragma unroll
+                    for(int i = 0; i < kElemsPerLane; ++i)
+                    {
+                        w[i] |= ((packed >> (4 * i)) & 0xFu) << (4 * r);
+                    }
+                    sc[r / 4] |= sb << ((r % 4) * 8);
+                }
+            }
+            *reinterpret_cast<uint4*>(words) = make_uint4(w[0], w[1], w[2], w[3]);
+            if(leader)
+            {
+                uint32_t* sp = reinterpret_cast<uint32_t*>(sbytes);
+                sp[0]        = sc[0];
+                sp[1]        = sc[1];
+            }
+            return;
+        }
+    }
+#pragma unroll
+    for(int r = 0; r < NR; ++r)
+    {
+        if(r < len)
+        {
+            scalar_t raw[kElemsPerLane];
+            pfUnpack(rows[r], raw);
+            float v[kElemsPerLane];
+            loadElems(raw, v);
+            uint32_t packed;
+            const uint32_t sb = nvQuantLane<true>(v, gs, packed, rgs);
+            const int sh      = (p0 + r) * 4;
+#pragma unroll
+            for(int i = 0; i < kElemsPerLane; ++i)
+            {
+                w[i] |= ((packed >> (4 * i)) & 0xFu) << sh;
+            }
+            if constexpr(NR == 8)
+            {
+                sc[r / 4] |= sb << ((r % 4) * 8);
+            }
+            if(!full && leader)
+            {
+                sbytes[p0 + r] = static_cast<uint8_t>(sb);
+            }
+        }
+    }
+    if(full)
+    {
+        *reinterpret_cast<uint4*>(words) = make_uint4(w[0], w[1], w[2], w[3]);
+        if(leader)
+        {
+            uint32_t* sp = reinterpret_cast<uint32_t*>(sbytes);
+            sp[0]        = sc[0];
+            sp[1]        = sc[1];
+        }
+    }
+    else
+    {
+        // xor of (old ^ new) over this run's nibbles only; other runs of the octet flip other bits
+        const uint32_t mask = ((1u << (4 * len)) - 1u) << (4 * p0);
+        using u64           = unsigned long long;
+        u64* w64            = reinterpret_cast<u64*>(words);
+        const u64 d01 = static_cast<u64>((old.x ^ w[0]) & mask) |
+                        (static_cast<u64>((old.y ^ w[1]) & mask) << 32);
+        const u64 d23 = static_cast<u64>((old.z ^ w[2]) & mask) |
+                        (static_cast<u64>((old.w ^ w[3]) & mask) << 32);
+        atomicXor(w64, d01);
+        atomicXor(w64 + 1, d23);
+    }
+}
+
+template <typename scalar_t, int TP>
+__global__ __launch_bounds__(kPfBlockWaves * 64) void fusedNvfp4InsertPrefillKernel(
+    const scalar_t* __restrict__ qkv,
+    scalar_t* __restrict__ q_out,
+    opus::fp8_t* __restrict__ index_q_out,
+    const scalar_t* __restrict__ q_norm_w,
+    const scalar_t* __restrict__ k_norm_w,
+    const scalar_t* __restrict__ iq_norm_w,
+    const scalar_t* __restrict__ ik_norm_w,
+    const scalar_t* __restrict__ cos_sin_cache,
+    const int64_t* __restrict__ positions,
+    const int64_t* __restrict__ slot_mapping,
+    const int64_t* __restrict__ index_slot_mapping,
+    uint8_t* kv_cache,
+    uint8_t* index_cache,
+    const float* __restrict__ k_scale,
+    const float* __restrict__ v_scale,
+    float eps,
+    int n,
+    int64_t kv_stride)
+{
+#if defined(__gfx950__)
+    constexpr int S   = kPfNR + TP; // waves per 2 * TP tokens
+    constexpr int TPW = 2 * TP;
+    const int wave    = __builtin_amdgcn_readfirstlane(threadIdx.x >> 6);
+    const int wid     = blockIdx.x * kPfBlockWaves + wave;
+    const int group   = wid / S;
+    const int s       = wid - group * S;
+    const int tok0    = group * TPW;
+    if(tok0 >= n)
+    {
+        return;
+    }
+    const int lane = threadIdx.x & 63;
+    const int hl   = lane & 31;
+    const int h2   = lane >> 5;
+    const bool hi16 = (hl & 16) != 0;
+    const int dim0  = hl * kElemsPerLane;
+    const auto qkv_rsrc = __builtin_amdgcn_make_buffer_rsrc(
+        const_cast<scalar_t*>(qkv), static_cast<short>(0), n * kPfRow * 2, 0x00020000);
+
+    if(s < kPfNR)
+    {
+        const bool is_q  = s < kPfNQ;
+        const bool is_k  = s == kPfNQ;
+        const bool is_ik = s == kPfNQ + 1;
+        // head column of the qkv row: q s, k nq, index-q nq + 2 nkv, index-k nq + 2 nkv + niq
+        const int col = is_q ? s : is_k ? kPfNQ : is_ik ? kPfNQ + 2 * kPfNKV + kPfNIQ
+                                                        : kPfNQ + 2 * kPfNKV;
+        const scalar_t* nw = is_q ? q_norm_w : is_k ? k_norm_w : is_ik ? ik_norm_w : iq_norm_w;
+
+        // every load of the wave first
+        uint2 xr[TP];
+#pragma unroll
+        for(int t = 0; t < TP; ++t)
+        {
+            xr[t] = pfLoadRow(qkv_rsrc,
+                              h2 * kPfRow * 2 + col * kHeadDim * 2 + hl * 8,
+                              (tok0 + 2 * t) * kPfRow * 2);
+        }
+        // positions / slots: two tokens (16 B) per scalar load, the pair start clamped so that the
+        // load stays inside the arrays (tokens past n are computed from the last pair and masked)
+        const int pn = n >= 2 ? n - 2 : 0;
+        uint32_t pos_t[TP];
+        int slot_t[TP];
+#pragma unroll
+        for(int t = 0; t < TP; ++t)
+        {
+            const int pi = min(tok0 + 2 * t, pn);
+            const uint4 pp = *reinterpret_cast<const uint4*>(positions + pi);
+            asm volatile("" ::"s"(pp.y), "s"(pp.w)); // keep one s_load_dwordx4
+            const int e    = min(tok0 + 2 * t + h2 - pi, 1);
+            pos_t[t]       = (e ? pp.z : pp.x);
+        }
+        if(is_k || is_ik)
+        {
+            const int64_t* sm = is_k ? slot_mapping : index_slot_mapping;
+#pragma unroll
+            for(int t = 0; t < TP; ++t)
+            {
+                const int pi   = min(tok0 + 2 * t, pn);
+                const uint4 pp = *reinterpret_cast<const uint4*>(sm + pi);
+                const int e    = min(tok0 + 2 * t + h2 - pi, 1);
+                // sm is int64: pp.x/pp.z are the low words of the two slots, pp.y/pp.w the high
+                // words. A negative int64 slot is padding and must be skipped exactly as the
+                // generic kernel does (slot_mapping[token_idx] < 0); its sign lives entirely in
+                // the high word, so a slot is "skip" iff its high word is negative. Keep the low
+                // word as the (int32) slot index only for non-negative slots.
+                const int lo   = e ? pp.z : pp.x;
+                const int hi   = e ? pp.w : pp.y;
+                slot_t[t]      = (hi < 0) ? -1 : lo;
+            }
+        }
+        else
+        {
+#pragma unroll
+            for(int t = 0; t < TP; ++t)
+            {
+                slot_t[t] = -1;
+            }
+        }
+        const uint2 wv = *reinterpret_cast<const uint2*>(nw + dim0);
+        // cos / sin of two token pairs per 8 B load (see the header comment)
+        uint2 cw[TP], sw[TP];
+        const bool first = hl < kPfRot / 2 / kElemsPerLane;
+#pragma unroll
+        for(int j = 0; j < TP / 2; ++j)
+        {
+            // (a select between two array elements would index a private array by lane, which
+            // the compiler promotes to LDS addressed through the dispatch packet: the opaque
+            // moves keep the two positions in registers)
+            uint32_t pa = pos_t[2 * j], pb = pos_t[2 * j + 1];
+            asm("" : "+v"(pa), "+v"(pb));
+            const uint32_t p_ld = hi16 ? pb : pa;
+            uint2 own           = *reinterpret_cast<const uint2*>(
+                cos_sin_cache + static_cast<int64_t>(p_ld) * kPfRot + (hl & 15) * kElemsPerLane);
+#pragma unroll
+            for(int pair = 0; pair < 2; ++pair)
+            {
+                if(pair == 1)
+                {
+                    own.x = pfXor16(own.x, hi16);
+                    own.y = pfXor16(own.y, hi16);
+                }
+                const uint2 oth = make_uint2(pfXor8(own.x), pfXor8(own.y));
+                cw[2 * j + pair] = first ? own : oth;
+                sw[2 * j + pair] = first ? oth : own;
+            }
+        }
+
+        float elems[TP][kElemsPerLane];
+        uint2 outw[TP];
+#pragma unroll
+        for(int t = 0; t < TP; ++t)
+        {
+            NormRopeOperands<scalar_t> ops;
+            __builtin_memcpy(ops.w, &wv, sizeof(wv));
+            __builtin_memcpy(ops.c, &cw[t], sizeof(uint2));
+            __builtin_memcpy(ops.s, &sw[t], sizeof(uint2));
+            scalar_t raw[kElemsPerLane];
+            pfUnpack(xr[t], raw);
+            loadElems(raw, elems[t]);
+            normAndRope<scalar_t, true>(elems[t], hl, eps, ops, true, kPfRot);
+            outw[t] = pfPackBf16(elems[t], elems[t]);
+        }
+
+        if(is_q)
+        {
+#pragma unroll
+            for(int t = 0; t < TP; ++t)
+            {
+                const int tk = tok0 + 2 * t + h2;
+                if(tk < n)
+                {
+                    // non-temporal: q / index-q are read once, by the next GEMM, and should not
+                    // evict the cache lines the insert is still using
+                    __builtin_nontemporal_store(
+                        pfU32x2{outw[t].x, outw[t].y},
+                        reinterpret_cast<pfU32x2*>(q_out + static_cast<int64_t>(tk) * kPfNQ * kHeadDim +
+                                                   s * kHeadDim + dim0));
+                }
+            }
+        }
+        else if(!is_k && !is_ik) // index-q
+        {
+#pragma unroll
+            for(int t = 0; t < TP; ++t)
+            {
+                const int tk = tok0 + 2 * t + h2;
+                if(tk < n)
+                {
+                    // the generic path's unit-scale e4m3 convert of each element, as one dword
+                    int w = 0;
+                    w     = __builtin_amdgcn_cvt_pk_fp8_f32(elems[t][0], elems[t][1], w, 0);
+                    w     = __builtin_amdgcn_cvt_pk_fp8_f32(elems[t][2], elems[t][3], w, 1);
+                    __builtin_nontemporal_store(
+                        w,
+                        reinterpret_cast<int*>(index_q_out + static_cast<int64_t>(tk) * kHeadDim +
+                                               dim0));
+                }
+            }
+        }
+        else if(is_k)
+        {
+            const float gs  = *k_scale;
+            const float rgs = rcpRN(gs);
+#pragma unroll
+            for(int t = 0; t < TP; ++t)
+            {
+                const int tk = tok0 + 2 * t + h2;
+                if(tk < n && slot_t[t] >= 0)
+                {
+                    storeNvfp4KRow<scalar_t, false, true>(kv_cache + static_cast<int64_t>(slot_t[t] >> 7) * kv_stride,
+                                             kPfNKV,
+                                             0,
+                                             slot_t[t] & (kNvTokens - 1),
+                                             gs,
+                                             elems[t],
+                                             hl,
+                                             rgs);
+                }
+            }
+        }
+        else // index-k
+        {
+#pragma unroll
+            for(int t = 0; t < TP; ++t)
+            {
+                const int tk = tok0 + 2 * t + h2;
+                if(tk < n && slot_t[t] >= 0)
+                {
+                    storeNvfp4IndexRow<scalar_t, false, true>(
+                        index_cache + static_cast<int64_t>(slot_t[t] >> 7) * kNvIndexPage,
+                        slot_t[t] & (kNvTokens - 1),
+                        elems[t],
+                        hl,
+                        1.0f);
+                }
+            }
+        }
+    }
+    else
+    {
+        // V wave: one token per half. Lane k (0..8) of a half holds the slot of token tok - 1 + k;
+        // a token continues its predecessor's run when its slot is the predecessor's + 1 inside
+        // one octet.
+        const int tok  = tok0 + 2 * (s - kPfNR) + h2;
+        const int widx = tok - 1 + hl;
+        const bool wv  = (hl < 9) & (widx >= 0) & (widx < n);
+        // slot_mapping is int64: read the full slot so a negative (padding) slot is skipped exactly
+        // as the generic kernel does (slot_mapping[token_idx] < 0). `a` stays a 32-bit low word for
+        // the DPP run-length exchange below, but is forced to -1 when the token is out of range or
+        // the full int64 slot is negative (its sign lives in the high word).
+        const int64_t a64 = slot_mapping[wv ? widx : 0];
+        int a             = (!wv || a64 < 0) ? -1 : static_cast<int>(a64);
+        const int ap   = __builtin_amdgcn_update_dpp(-1, a, 0x111, 0xF, 0xF, false); // row_shr:1
+        const bool cont =
+            (hl >= 1) & (hl <= 8) & (a >= 0) & (ap >= 0) & (a == ap + 1) & ((a & 7) != 0);
+        const uint64_t votes = __builtin_amdgcn_ballot_w64(cont);
+        const uint32_t cb    = static_cast<uint32_t>(votes >> (h2 * 32)) & 0x1FFu;
+        const int a_lo       = __builtin_amdgcn_readlane(a, 1);
+        const int a_hi       = __builtin_amdgcn_readlane(a, 33);
+        const int slot       = h2 ? a_hi : a_lo;
+        const float gs       = *v_scale;
+        const float rgs      = rcpRN(gs);
+        const int len        = 1 + __builtin_ctz(~(cb >> 2));
+        if(slot >= 0 && !(cb & 2u))
+        {
+            uint8_t* page = kv_cache + static_cast<int64_t>(slot >> 7) * kv_stride;
+            if(len <= 4)
+            {
+                pfVRun<scalar_t, 4>(qkv_rsrc, h2, tok, slot, len, hl, gs, rgs, page);
+            }
+            else
+            {
+                pfVRun<scalar_t, 8>(qkv_rsrc, h2, tok, slot, len, hl, gs, rgs, page);
+            }
+        }
+    }
+#endif // __gfx950__
+}
+
+// Tokens from which the prefill variant is used (read once; AITER_FUSED_QKNORM_NVFP4_PREFILL_MIN_TOKENS
+// overrides it, a value above any call size keeps the generic kernel).
+constexpr int kPfDefaultMinTokens = 2;
+
+static int pfMinTokens()
+{
+    static const int v = [] {
+        const char* e = std::getenv("AITER_FUSED_QKNORM_NVFP4_PREFILL_MIN_TOKENS");
+        return e != nullptr ? std::atoi(e) : kPfDefaultMinTokens;
+    }();
+    return v;
+}
+
+// The prefill variant's wave loads/stores of the norm weights and cos/sin cache use uint2 (8 B)
+// accesses whose base must itself be 8 B aligned (the per-lane offset `dim0` is always a multiple
+// of kElemsPerLane * sizeof(scalar_t), i.e. 8 B, so only the tensor's own storage_offset can break
+// alignment, e.g. a bf16 view sliced at an odd element offset).
+static bool pfPtrAligned8(const void* p)
+{
+    return (reinterpret_cast<uintptr_t>(p) % 8) == 0;
+}
+
+static bool pfDeviceIsGfx950()
+{
+    constexpr int kMaxDev = 64;
+    static std::atomic<int> cache[kMaxDev]; // 0 unknown, 1 gfx950, 2 other
+    int dev = 0;
+    if(hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= kMaxDev)
+    {
+        return false;
+    }
+    int c = cache[dev].load(std::memory_order_relaxed);
+    if(c == 0)
+    {
+        c = get_gpu_arch() == "gfx950" ? 1 : 2;
+        cache[dev].store(c, std::memory_order_relaxed);
+    }
+    return c == 1;
+}
+
+// The launch itself (no gating): TP4 head set, bf16, e4m3 index_q_out, gfx950.
+template <typename scalar_t>
+static void pfLaunch(const scalar_t* qkv,
+                     scalar_t* q_out,
+                     opus::fp8_t* index_q_fp8_out,
+                     const scalar_t* q_norm_w,
+                     const scalar_t* k_norm_w,
+                     const scalar_t* iq_norm_w,
+                     const scalar_t* ik_norm_w,
+                     const scalar_t* cos_sin_cache,
+                     const int64_t* positions,
+                     const int64_t* slot_mapping,
+                     const int64_t* index_slot_mapping,
+                     uint8_t* kv_cache,
+                     uint8_t* index_cache,
+                     const float* k_scale,
+                     const float* v_scale,
+                     float eps,
+                     int num_tokens,
+                     int64_t kv_stride,
+                     hipStream_t stream)
+{
+    // token pairs per wave: two below 3072 tokens (more, smaller waves hide the latency of the
+    // few-wave calls), four above (fewer waves, less scalar setup per token; eight pairs measured
+    // slower everywhere)
+    const bool two = num_tokens < 3072;
+    const auto go  = [&](auto tp_c) {
+        constexpr int TP = decltype(tp_c)::value;
+        const int64_t waves =
+            static_cast<int64_t>((num_tokens + 2 * TP - 1) / (2 * TP)) * (kPfNR + TP);
+        const int grid = static_cast<int>((waves + kPfBlockWaves - 1) / kPfBlockWaves);
+        fusedNvfp4InsertPrefillKernel<scalar_t, TP><<<grid, kPfBlockWaves * 64, 0, stream>>>(
+            qkv,
+            q_out,
+            index_q_fp8_out,
+            q_norm_w,
+            k_norm_w,
+            iq_norm_w,
+            ik_norm_w,
+            cos_sin_cache,
+            positions,
+            slot_mapping,
+            index_slot_mapping,
+            kv_cache,
+            index_cache,
+            k_scale,
+            v_scale,
+            eps,
+            num_tokens,
+            kv_stride);
+    };
+    if(two)
+    {
+        go(std::integral_constant<int, 2>{});
+    }
+    else
+    {
+        go(std::integral_constant<int, 4>{});
+    }
+}
+
+// The kernel addresses qkv through a buffer descriptor whose byte extent and row offsets are 32-bit
+// ints: larger calls run the generic kernel (64-bit row addresses).
+constexpr int kPfMaxTokens = INT32_MAX / (kPfRow * 2);
+
+// Launches the prefill variant when this call is one it takes: gfx950, the TP4 head set, bf16,
+// bf16 q_out + e4m3 index_q_out, from pfMinTokens() to kPfMaxTokens tokens. Returns false (nothing launched)
+// otherwise, and the caller runs the generic kernel.
+template <typename scalar_t>
+static bool launchNvfp4Prefill(const scalar_t* qkv,
+                               scalar_t* q_out,
+                               opus::fp8_t* index_q_fp8_out,
+                               const scalar_t* q_norm_w,
+                               const scalar_t* k_norm_w,
+                               const scalar_t* iq_norm_w,
+                               const scalar_t* ik_norm_w,
+                               const scalar_t* cos_sin_cache,
+                               const int64_t* positions,
+                               const int64_t* slot_mapping,
+                               const int64_t* index_slot_mapping,
+                               uint8_t* kv_cache,
+                               uint8_t* index_cache,
+                               const float* k_scale,
+                               const float* v_scale,
+                               float eps,
+                               int rotary_dim,
+                               int num_tokens,
+                               int nq,
+                               int nkv,
+                               int niq,
+                               int64_t kv_stride,
+                               bool process_index,
+                               bool insert_kv,
+                               const opus::fp8_t* q_fp8_out,
+                               hipStream_t stream)
+{
+    if constexpr(!std::is_same_v<scalar_t, hip_bfloat16>)
+    {
+        return false;
+    }
+    else
+    {
+        if(!process_index || !insert_kv || q_out == nullptr || q_fp8_out != nullptr ||
+           index_q_fp8_out == nullptr || nq != kPfNQ || nkv != kPfNKV || niq != kPfNIQ ||
+           rotary_dim != kPfRot || num_tokens < 2 || num_tokens < pfMinTokens() ||
+           num_tokens > kPfMaxTokens || !pfDeviceIsGfx950())
+        {
+            return false;
+        }
+        // A norm weight or the cos/sin cache can be a contiguous view with an odd storage_offset
+        // (e.g. sliced at element 1): shape/dtype/contiguity checks upstream do not catch that, but
+        // it breaks the uint2 loads below. Decline to the generic kernel instead of risking a
+        // misaligned load.
+        if(!pfPtrAligned8(q_norm_w) || !pfPtrAligned8(k_norm_w) || !pfPtrAligned8(iq_norm_w) ||
+           !pfPtrAligned8(ik_norm_w) || !pfPtrAligned8(cos_sin_cache))
+        {
+            return false;
+        }
+        pfLaunch<scalar_t>(qkv,
+                           q_out,
+                           index_q_fp8_out,
+                           q_norm_w,
+                           k_norm_w,
+                           iq_norm_w,
+                           ik_norm_w,
+                           cos_sin_cache,
+                           positions,
+                           slot_mapping,
+                           index_slot_mapping,
+                           kv_cache,
+                           index_cache,
+                           k_scale,
+                           v_scale,
+                           eps,
+                           num_tokens,
+                           kv_stride,
+                           stream);
+        return true;
+    }
+}
+
 template <typename scalar_t,
           typename cache_t,
           typename index_cache_t,
@@ -1086,6 +2029,40 @@ void launchFusedQKNormIdxrQKNorm(
 
     if constexpr(kKvFp4)
     {
+        if constexpr(kNvfp4)
+        {
+            // MiniMax-M3 TP4 prefill: the wave-per-head-of-2*TP-tokens variant (falls through to
+            // the generic kernel when the call is not one it takes)
+            if(launchNvfp4Prefill<scalar_t>(qkv,
+                                            q_out,
+                                            index_q_fp8_out,
+                                            q_norm_w,
+                                            k_norm_w,
+                                            iq_norm_w,
+                                            ik_norm_w,
+                                            cos_sin_cache,
+                                            positions,
+                                            slot_mapping,
+                                            index_slot_mapping,
+                                            reinterpret_cast<uint8_t*>(kv_cache_k),
+                                            reinterpret_cast<uint8_t*>(index_cache),
+                                            k_scale,
+                                            v_scale,
+                                            eps,
+                                            rotary_dim,
+                                            num_tokens,
+                                            nq,
+                                            nkv,
+                                            niq,
+                                            k_s_block,
+                                            process_index,
+                                            insert_kv,
+                                            q_fp8_out,
+                                            stream))
+            {
+                return;
+            }
+        }
         // FP4 (MXFP4/NVFP4) main KV: sparse insert only, pages are not shuffled and carry no
         // fp32 per-token scales.
         if(process_index)
@@ -1390,18 +2367,18 @@ static void fused_qknorm_idxrqknorm_impl(
         if(nvfp4_kv_cache)
         {
             // [num_pages, 2 * num_kv_heads * 9216] uint8, K side then V side; kv_cache_k and
-            // kv_cache_v are the same pages. The page stride (bytes) may be wider; 4 B aligned
-            // for the 32-bit V words.
+            // kv_cache_v are the same pages. The page stride (bytes) may be wider; 16 B aligned
+            // for the 16 B V loads and the 64-bit V nibble atomics.
             AITER_CHECK(block_size == kNvTokens,
                         "kv_cache_dtype='nvfp4' pages hold 128 tokens: block_size must be 128");
             AITER_CHECK(
                 kv_cache_k->dtype() == AITER_DTYPE_u8 && kv_cache_v->dtype() == AITER_DTYPE_u8 &&
                     kv_cache_k->data_ptr() == kv_cache_v->data_ptr() && kv_cache_k->dim() == 2 &&
                     kv_cache_k->size(1) == 2 * nkv * kNvHeadSide && kv_cache_k->stride(1) == 1 &&
-                    kv_cache_k->stride(0) % 4 == 0 && kv_cache_k->data_ptr() != nullptr &&
-                    reinterpret_cast<uintptr_t>(kv_cache_k->data_ptr()) % 4 == 0,
+                    kv_cache_k->stride(0) % 16 == 0 && kv_cache_k->data_ptr() != nullptr &&
+                    reinterpret_cast<uintptr_t>(kv_cache_k->data_ptr()) % 16 == 0,
                 "nvfp4 kv_cache_k and kv_cache_v must be the same uint8 "
-                "[num_pages, 2 * num_kv_heads * 9216] pages (4 B aligned)");
+                "[num_pages, 2 * num_kv_heads * 9216] pages (16 B aligned)");
             // A page stride below the page size (e.g. an expanded view, stride 0) would alias
             // distinct pages.
             AITER_CHECK(kv_cache_k->size(0) <= 1 || kv_cache_k->stride(0) >= kv_cache_k->size(1),
@@ -1978,6 +2955,83 @@ void fused_qknorm_idxrqknorm(
                                                 v_scale,
                                                 asm_layout,
                                                 skip_index_branch);
+}
+
+
+// The NVFP4 insert (decode and prefill) for a caller that has already validated its operands (the
+// Python front checks dtypes, shapes, strides, devices): raw device pointers and the stream, no
+// aiter_tensor_t marshalling. One entry for every token count: the launcher picks the prefill
+// variant from pfMinTokens() tokens and the generic (decode) kernel below that. The head set is the
+// TP4 one (16 q / 1 kv / 1 index heads, rotary 64, block_size 128), bf16 qkv, e4m3 index_q_out.
+// This entry itself only checks num_tokens and the device arch below: it does NOT re-validate
+// dtypes, shapes, strides, alignment or devices, so a call that bypasses the Python front
+// (_nvfp4_raw_front in aiter/ops/fused_qknorm_idxrqknorm.py) with unvalidated pointers is unsafe.
+void fused_qknorm_nvfp4_raw(int64_t qkv,
+                            int64_t q_out,
+                            int64_t index_q_out,
+                            int64_t q_norm_weight,
+                            int64_t k_norm_weight,
+                            int64_t index_q_norm_weight,
+                            int64_t index_k_norm_weight,
+                            int64_t cos_sin_cache,
+                            int64_t positions,
+                            int64_t slot_mapping,
+                            int64_t index_slot_mapping,
+                            int64_t kv_cache,
+                            int64_t index_cache,
+                            int64_t k_scale,
+                            int64_t v_scale,
+                            int64_t num_tokens,
+                            int64_t kv_page_stride_bytes,
+                            double eps,
+                            int64_t stream)
+{
+    using namespace fused_qknorm_idxrqknorm_ops;
+    using T  = hip_bfloat16;
+    using Dt = vllm::Fp8KVCacheDataType;
+    AITER_CHECK(num_tokens >= 1 && pfDeviceIsGfx950(), "nvfp4 insert: gfx950 and at least 1 token");
+    auto* kv = reinterpret_cast<uint8_t*>(kv_cache);
+    launchFusedQKNormIdxrQKNorm<T, uint8_t, uint8_t, Dt::kAuto, Dt::kAuto, true, true, true>(
+        reinterpret_cast<T*>(qkv),
+        reinterpret_cast<T*>(q_out),
+        nullptr,
+        reinterpret_cast<opus::fp8_t*>(index_q_out),
+        reinterpret_cast<const T*>(q_norm_weight),
+        reinterpret_cast<const T*>(k_norm_weight),
+        reinterpret_cast<const T*>(index_q_norm_weight),
+        reinterpret_cast<const T*>(index_k_norm_weight),
+        reinterpret_cast<const T*>(cos_sin_cache),
+        reinterpret_cast<const int64_t*>(positions),
+        reinterpret_cast<const int64_t*>(slot_mapping),
+        reinterpret_cast<const int64_t*>(index_slot_mapping),
+        kv,
+        kv, // K and V share the pages
+        reinterpret_cast<uint8_t*>(index_cache),
+        reinterpret_cast<float*>(k_scale),
+        reinterpret_cast<float*>(v_scale),
+        static_cast<float>(eps),
+        kPfRot,
+        static_cast<int>(num_tokens),
+        kPfNQ,
+        kPfNKV,
+        kPfNIQ,
+        128, // block_size
+        0,   // x (asm_layout only)
+        0,   // max_kv_tokens (page-128 fp8 scales only)
+        kv_page_stride_bytes,
+        0,
+        0,
+        kv_page_stride_bytes,
+        0,
+        0,
+        true,  // has_index
+        true,  // process_index
+        true,  // insert_kv
+        false, // per_token_kv_scale
+        false, // static_kv_scale
+        false, // asm_layout
+        reinterpret_cast<hipStream_t>(stream),
+        nullptr);
 }
 
 } // namespace aiter
