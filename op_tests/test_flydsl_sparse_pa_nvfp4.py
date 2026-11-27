@@ -1392,23 +1392,28 @@ def check_overlap_rejected():
     seq_lens, ql, width = [1000, 700], 1, 64
     c = make_case(seq_lens, [ql] * 2, 1, 16, seed=3)
     rows = c["q"].shape[0]
-    scores = torch.randn(1, rows, width, device="cuda")
-    call = lambda topk, **kw: sparse_pa_nvfp4_decode(
+    # index_score heads must equal topk_idx heads (hkv), so each case pairs the writable
+    # topk_idx with a matching index_score; it must then be refused by the overlap guard
+    # itself (not by the earlier head-count check), so we assert the overlap error.
+    scores1 = torch.randn(1, rows, width, device="cuda")
+    scores2 = torch.randn(2, rows, width, device="cuda")
+    call = lambda topk, score: sparse_pa_nvfp4_decode(
         c["q"], c["cache"], topk, c["bt"], c["seq_lens"], SM_SCALE, None,
-        c["k_scale"], c["v_scale"], query_len=ql, splits=1, **kw,
+        c["k_scale"], c["v_scale"], query_len=ql, splits=1,
+        index_score=score, index_max_seq_len=max(seq_lens),
     )  # fmt: skip
     ids = torch.zeros(1, 1, TOPK, dtype=torch.int32, device="cuda")
-    select_kw = {"index_score": scores, "index_max_seq_len": max(seq_lens)}
+    heads = torch.zeros(1, rows, TOPK, dtype=torch.int32, device="cuda")
     ok = True
-    for name, topk in (
-        ("rows expanded", ids.expand(1, rows, TOPK)),
-        ("heads expanded", torch.zeros(1, rows, TOPK, dtype=torch.int32, device="cuda").expand(2, rows, TOPK)),
+    for name, topk, score in (
+        ("rows expanded", ids.expand(1, rows, TOPK), scores1),
+        ("heads expanded", heads.expand(2, rows, TOPK), scores2),
     ):  # fmt: skip
         try:
-            call(topk, **select_kw)
+            call(topk, score)
             refused = False
-        except ValueError:
-            refused = True
+        except ValueError as e:
+            refused = "must not overlap" in str(e)
         print(f"{'PASS' if refused else 'FAIL'}  overlap refused: {name}")
         ok &= refused
     return ok
