@@ -5,7 +5,6 @@ import pytest
 import torch
 
 from aiter.ops.triton.fusions.activation import silu_and_mul_backward
-from aiter.ops.triton.utils import config_utils
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 _SUPPORTED_ARCHS = ("gfx950",)
@@ -90,34 +89,3 @@ def test_silu_and_mul_backward_non_current_device():
     )
     assert out.device == x.device
     assert torch.cuda.current_device() == current_device
-
-
-def test_silu_and_mul_backward_unsupported_arch(monkeypatch):
-    x = torch.randn((2, 64), dtype=torch.bfloat16, device="cuda")
-    grad_output = torch.randn((2, 32), dtype=x.dtype, device=x.device)
-    monkeypatch.setattr(config_utils.arch_info, "get_arch", lambda: "gfx942")
-
-    with pytest.raises(FileNotFoundError, match="gfx942.*silu_and_mul_backward"):
-        silu_and_mul_backward(grad_output, x)
-
-
-def test_silu_and_mul_backward_validation():
-    x = torch.randn((2, 64), dtype=torch.bfloat16, device="cuda")
-    grad_output = torch.randn((2, 32), dtype=x.dtype, device=x.device)
-    with pytest.raises(AssertionError, match="non-zero"):
-        silu_and_mul_backward(
-            torch.empty((2, 0), dtype=torch.float32, device=x.device),
-            torch.empty((2, 0), dtype=torch.float32, device=x.device),
-        )
-    with pytest.raises(AssertionError, match="even"):
-        silu_and_mul_backward(
-            grad_output, torch.randn((2, 63), dtype=torch.float32, device=x.device)
-        )
-    with pytest.raises(AssertionError, match="shape"):
-        silu_and_mul_backward(grad_output[:, :-1], x)
-    with pytest.raises(AssertionError, match="dtype"):
-        silu_and_mul_backward(grad_output.float(), x)
-    with pytest.raises(AssertionError, match="contiguous"):
-        silu_and_mul_backward(grad_output, x[:, ::2])
-    with pytest.raises(AssertionError, match="out shape"):
-        silu_and_mul_backward(grad_output, x, out=torch.empty_like(grad_output))

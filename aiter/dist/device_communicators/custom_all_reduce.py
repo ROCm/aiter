@@ -20,7 +20,7 @@ import functools
 import os
 import pickle
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import timedelta
 from typing import Any, ClassVar, NamedTuple
 
@@ -39,6 +39,7 @@ from aiter.utility.dtypes import fp8
 
 from .flydsl_backends import (
     FlyDSLAllReduceRMSNorm,
+    FlyDSLPullAllReduceRMSNorm,
     all_ranks_agree,
     all_ranks_agree_on_plan,
     preload_fly_engines,
@@ -376,7 +377,8 @@ def _runtime_gfx() -> str | None:
 #   AITER_CUSTOM_AG_MAX_SIZE  all-gather per-rank input.    Default
 #                             max_size / (2 * world_size), i.e. 128 MiB at
 #                             world_size 4 with the default 1 GiB max_size.
-#   AITER_CUSTOM_RS_MAX_SIZE  reduce-scatter input bytes.   Default 64 MiB.
+#   AITER_CUSTOM_RS_MAX_SIZE  reduce-scatter input bytes.   Default 64 MiB;
+#                             256 MiB for a first-dim split on gfx950.
 #
 # All three ops stage their input in the registered input pool on the copy-in
 # path, so none can exceed the pool. How that pool is sized depends on the arch
@@ -395,6 +397,10 @@ def _runtime_gfx() -> str | None:
 #            capped there, and inputs above the cap fall back to RCCL.
 _DEFAULT_CAR_MAX_SIZE = 8192 * 8192
 _DEFAULT_CRS_MAX_SIZE = 8192 * 8192
+# First-dim split on gfx950. Timed on MI355X, bf16, up to 256 MiB: the eager
+# copy-in path is ahead of RCCL at TP2 / TP4 and level with it at TP8 from
+# 192 MiB up; a registered input is ahead at every world size.
+_GFX950_CRS_FIRST_DIM_MAX_SIZE = 4 * 8192 * 8192
 _CAR_MAX_SIZE_ENV = "AITER_CUSTOM_AR_MAX_SIZE"
 _CAG_MAX_SIZE_ENV = "AITER_CUSTOM_AG_MAX_SIZE"
 _CRS_MAX_SIZE_ENV = "AITER_CUSTOM_RS_MAX_SIZE"
@@ -472,10 +478,12 @@ class _CustomSizes(NamedTuple):
     rs: int
     # Whether AITER_CUSTOM_AR_MAX_SIZE set ar.
     ar_set: bool = False
+    # RS cutoff for a first-dim split; rs unless the arch has its own default.
+    rs_first_dim: int = 0
 
 
 def _resolve_custom_sizes(
-    is_gfx1250: bool, world_size: int, max_size: int
+    is_gfx1250: bool, world_size: int, max_size: int, gfx: str | None = None
 ) -> _CustomSizes:
     """Resolve the input-pool size and the AR / AG / RS cutoffs from the env.
 
@@ -549,7 +557,10 @@ def _resolve_custom_sizes(
     for name, v in requested:
         if v == 0:
             logger.info("%s=0: that op always falls back to RCCL.", name)
-    return _CustomSizes(pool, ar, ar_prefill, ag, rs, ar_set)
+    rs_first_dim = rs
+    if gfx == "gfx950" and not rs_set:
+        rs_first_dim = min(_GFX950_CRS_FIRST_DIM_MAX_SIZE, pool)
+    return _CustomSizes(pool, ar, ar_prefill, ag, rs, ar_set, rs_first_dim)
 
 
 def _resolve_plain_ar_max_size(
@@ -1511,7 +1522,9 @@ class CustomAllreduce:
         # op's cutoff run on the custom kernels; larger ones fall back to RCCL.
         # Set by AITER_CUSTOM_{AR,AG,RS}_MAX_SIZE; on gfx1250 the pool grows to
         # hold the largest one set. See _resolve_custom_sizes.
-        sizes = _resolve_custom_sizes(self._is_gfx1250, world_size, max_size)
+        sizes = _resolve_custom_sizes(
+            self._is_gfx1250, world_size, max_size, _runtime_gfx()
+        )
         self.max_size = sizes.pool
         self._car_max_size = sizes.ar
         self._car_prefill_max_size = sizes.ar_prefill
@@ -1523,9 +1536,10 @@ class CustomAllreduce:
         )
         self._cag_max_size = sizes.ag
         self._crs_max_size = sizes.rs
+        self._crs_first_dim_max_size = sizes.rs_first_dim
         logger.info(
             "Custom allreduce rank %d: input pool %d bytes; cutoffs AR %d "
-            "(prefill %d, plain %d), AG %d, RS %d bytes.",
+            "(prefill %d, plain %d), AG %d, RS %d (first dim %d) bytes.",
             rank,
             sizes.pool,
             sizes.ar,
@@ -1533,6 +1547,7 @@ class CustomAllreduce:
             self._plain_ar_max_size,
             sizes.ag,
             sizes.rs,
+            sizes.rs_first_dim,
         )
         # Custom-AR lower size bound (bytes): inputs at or below this fall back
         # to RCCL. Default 0 (no lower bound). Overridable via
@@ -1557,6 +1572,8 @@ class CustomAllreduce:
         self._init_fly_oneshot()
         self._fly_rms = None
         self._init_fly_rms()
+        self._fly_pull = None
+        self._init_fly_pull()
 
         # Rows a source the gfx1250 DCP merge takes, 0 where it does not run
         # (see custom_dcp_merge).
@@ -1587,6 +1604,49 @@ class CustomAllreduce:
             rms.close()
             return
         self._fly_rms = rms
+
+    def _init_fly_pull(self):
+        """Build the exact Gemma all-reduce + RMSNorm on graph-registered
+        inputs (``AITER_FLY_AR_PULL=1``).
+
+        Like ``_init_fly_rms``, the construction votes, so it is not gated on
+        the local setting here."""
+        if self.disabled:
+            return
+        try:
+            pull = FlyDSLPullAllReduceRMSNorm(group=self.group, device=self.device)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "FlyDSL pull AR+Gemma RMSNorm disabled: construction failed.",
+                exc_info=True,
+            )
+            return
+        if pull.disabled:
+            pull.close()
+            return
+        self._fly_pull = pull
+
+    def should_fly_pull_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> bool:
+        """Whether the pull Gemma fused AR+RMSNorm serves this call: only
+        inside a graph capture entered through ``capture()``. Never raises."""
+        if getattr(self, "_fly_pull", None) is None:
+            return False
+        return self._fly_pull.should_fly_pull_rms(inp, residual_inp, weight)
+
+    def fly_pull_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(out, residual_out)`` of the pull Gemma fused AR+RMSNorm."""
+        return self._fly_pull.fly_pull_rms(inp, residual_inp, weight, eps)
 
     def _init_fly_oneshot(self):
         """Build the FlyDSL exact one-shot that fronts small plain all-reduces,
@@ -2186,7 +2246,22 @@ class CustomAllreduce:
         try:
             self._IS_CAPTURING = True
             try:
-                yield
+                # The pull schedule reads the graph's inputs in place: it
+                # registers them when the capture ends, the same IPC export the
+                # registered custom-allreduce path uses. Only take that path when
+                # _agree_capture_path() (above) agreed to it on every rank: when
+                # expandable_segments is on or the host opted out
+                # (enable_register_for_capturing=False, e.g. ATOM's PIECEWISE
+                # graphs), self._register_for_capturing is False and pull must
+                # decline every call instead of registering unexportable
+                # pointers, exactly like the registered path does.
+                fly_pull = getattr(self, "_fly_pull", None)
+                with (
+                    fly_pull.capture()
+                    if fly_pull is not None and self._register_for_capturing
+                    else nullcontext()
+                ):
+                    yield
             finally:
                 self._IS_CAPTURING = False
             # A failed capture is discarded; registering its buffers would
@@ -2935,7 +3010,9 @@ class CustomAllreduce:
         if not self._has_gather_scatter_kernel():
             return False
         # AITER_CUSTOM_RS_MAX_SIZE; the AR cutoffs do not apply.
-        if not self._fits_custom_size(inp, self._crs_max_size):
+        first_dim = dim in (0, -inp.dim())
+        max_size = self._crs_first_dim_max_size if first_dim else self._crs_max_size
+        if not self._fits_custom_size(inp, max_size):
             return False
         if not is_weak_contiguous(inp):
             return False
@@ -4133,6 +4210,8 @@ class CustomAllreduce:
         self._fly_oneshot = None
         _close_quietly(getattr(self, "_fly_rms", None))
         self._fly_rms = None
+        _close_quietly(getattr(self, "_fly_pull", None))
+        self._fly_pull = None
         if getattr(self, "_ptr", 0):
             try:
                 self._ops_dispose(self._ptr)

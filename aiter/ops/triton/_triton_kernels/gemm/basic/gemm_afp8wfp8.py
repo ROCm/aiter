@@ -8,6 +8,10 @@ from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
     pid_grid,
     remap_xcd,
 )
+from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
+    _sum_splits_on_xcd,
+    _tile_on_xcd,
+)
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
@@ -309,45 +313,6 @@ _gemm_afp8wfp8_packed_repr = make_kernel_repr(
         "LAUNCH_OPTIONS",
     ],
 )
-
-
-@triton.jit
-def _tile_on_xcd(N: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, SPLITS: tl.constexpr):
-    """(pid_m, pid_n, tile, split) of a 1D grid, all splits of a tile on one XCD.
-
-    CTAs go to XCDs by pid % 8, a multiple of every gfx950 XCD count.
-    """
-    pid = tl.program_id(0)
-    tile = (pid // 8 // SPLITS) * 8 + pid % 8
-    grid_n: tl.constexpr = (N + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N
-    return tile // grid_n, tile % grid_n, tile, pid // 8 % SPLITS
-
-
-@triton.jit
-def _sum_splits_on_xcd(
-    partial, c_ptrs, mask, slot, counter, split, SPLITS: tl.constexpr
-):
-    """The tile's last CTA to arrive sums its splits in split order.
-
-    The splits share one XCD's L2, so a completed store is visible without an
-    agent-scope release and its L2 writeback.
-    """
-    BM: tl.constexpr = partial.shape[0]
-    BN: tl.constexpr = partial.shape[1]
-    local = tl.arange(0, BM)[:, None] * BN + tl.arange(0, BN)[None, :]
-    tl.store(slot + split * BM * BN + local, partial)
-    # debug_barrier is a bare s_barrier: drain this wave's stores first.
-    tl.inline_asm_elementwise(
-        "s_waitcnt vmcnt(0)", "=v,v", [split], dtype=tl.int32, is_pure=False, pack=1
-    )
-    tl.debug_barrier()
-    if tl.atomic_add(counter, 1, sem="acq_rel", scope="cta") == SPLITS - 1:
-        total = tl.zeros((BM, BN), tl.float32)
-        for s in tl.static_range(SPLITS):
-            # .cv skips this CU's L1, which never saw the other splits.
-            total += tl.load(slot + s * BM * BN + local, cache_modifier=".cv")
-        tl.store(c_ptrs, total.to(c_ptrs.dtype.element_ty), mask)
-        tl.store(counter, 0)
 
 
 @triton.jit(repr=_gemm_afp8wfp8_packed_repr, do_not_specialize=["M"])

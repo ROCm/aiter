@@ -988,33 +988,54 @@ __global__ void __launch_bounds__(512, 1) allgather_lastdim(RankData* _dp,
 // Each non-first-dim case has a vectorized kernel (pack 16B per thread) and a
 // naive fallback for shapes that cannot be vectorized along the inner dim.
 //
+// Block size of reduce_scatter_split_first_dim, timed on MI355X over 256 ... 1024.
+// TP8: 512 is the fastest. TP4: 512 is up to 10% slower at 7-14 MiB; 320 is
+// within 1% of 256 above that and the closest to the old kernel below. TP2:
+// within 2% across them.
+constexpr int rs_first_dim_threads(int ngpus) { return ngpus == 4 ? 320 : 512; }
+
 // reduce_scatter, scatter on first dim.
 // Note: `range` is the per-rank packed element count, i.e. total_elems / (ngpus * pack_size).
 // cond: total_elems % (ngpus * pack_size) == 0
+// One group of threads per peer loads a pack into LDS and group 0 sums, as in
+// stage 1 of cross_device_reduce_2stage: a thread keeps one remote load in
+// flight, not ngpus.
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1) reduce_scatter_split_first_dim(
     RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int range)
 {
-    int tid                 = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride              = blockDim.x * gridDim.x;
     constexpr int pack_size = 16 / sizeof(T);
+    constexpr int tnum_gpu  = rs_first_dim_threads(ngpus) / ngpus;
     using P                 = typename opus::vector_t<T, pack_size>;
     using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
+    int warp_id             = threadIdx.x / tnum_gpu;
+    int lane_id             = threadIdx.x % tnum_gpu;
+    int stride              = gridDim.x * tnum_gpu;
+    __shared__ P tmp_smem[tnum_gpu * ngpus];
+    // Keep the sum order independent of the reduce-scatter owner.
+    const P* src = (const P*)_dp->ptrs[warp_id] + rank * range;
     const P* ptrs[ngpus];
 #pragma unroll
     for(int i = 0; i < ngpus; i++)
     {
-        // Keep the sum order independent of the reduce-scatter owner.
-        ptrs[i] = (const P*)_dp->ptrs[i];
+        ptrs[i] = tmp_smem + i * tnum_gpu;
     }
     start_sync<ngpus>(sg, self_sg, rank);
 
-    for(int idx = tid; idx < range; idx += stride)
+    for(int base = blockIdx.x * tnum_gpu; base < range; base += stride)
     {
-        int load_index  = rank * range + idx;
-        int store_index = idx;
-        *(reinterpret_cast<P*>(result) + store_index) =
-            packed_reduce<P, ngpus, A>(ptrs, load_index);
+        int idx       = base + lane_id;
+        bool in_range = idx < range;
+        if(in_range)
+        {
+            tmp_smem[threadIdx.x] = src[idx];
+        }
+        __syncthreads();
+        if(warp_id == 0 && in_range)
+        {
+            *(reinterpret_cast<P*>(result) + idx) = packed_reduce<P, ngpus, A>(ptrs, lane_id);
+        }
+        __syncthreads();
     }
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
@@ -5944,8 +5965,11 @@ void dispatchReduceScatter(hipStream_t stream, T* input, T* output,
     case ReduceScatterSplitDim::kFirst: {
         // Python guarantees k % (ngpus * pack_size) == 0 here.
         int range = k / (world_size_ * pack_size);
-        dim3 block(512);
-        dim3 grid(std::min(kGridCap, (range + 511) / 512));
+        // each block reduces threads / world_size packs per round
+        int threads = rs_first_dim_threads(world_size_);
+        int lanes   = threads / world_size_;
+        dim3 block(threads);
+        dim3 grid(std::min(kGridCap, (range + lanes - 1) / lanes));
         switch(world_size_)
         {
         case 8:

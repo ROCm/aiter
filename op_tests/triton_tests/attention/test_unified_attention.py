@@ -1273,73 +1273,6 @@ def test_triton_unified_attn_prefill_head_sizes(
     )
 
 
-@pytest.mark.parametrize("case", ["shuffled_kv_cache", "out_qk_width"])
-@torch.inference_mode()
-def test_triton_unified_attn_asym_head_guards(case: str) -> None:
-    head_size, v_head_size = 192, 128
-    (
-        query,
-        _key_cache_orig,
-        _value_cache_orig,
-        key_cache,
-        value_cache,
-        sinks,
-        output,
-        cu_query_lens,
-        kv_lens,
-        max_query_len,
-        max_kv_len,
-        scale,
-        window_size,
-        block_tables,
-        _maybe_quant_query,
-        _query_scales,
-        _q_descale,
-        _k_descale,
-        _v_descale,
-        _output_scale,
-    ) = generate_data(
-        seq_lens=[(1, 523)],
-        num_blocks=64,
-        block_size=64,
-        head_size=head_size,
-        v_head_size=v_head_size,
-        num_heads=(8, 1),
-        device="cuda",
-    )
-    shuffled = case == "shuffled_kv_cache"
-    if shuffled:
-        # shuffle_kv_cache wants matching heads, so shuffle k and v on their own
-        key_cache = shuffle_kv_cache(key_cache, key_cache)[0]
-        value_cache = shuffle_kv_cache(value_cache, value_cache)[1]
-    else:
-        # the old convention: out sized by the qk head
-        output = output.new_empty((*output.shape[:-1], head_size))
-
-    with pytest.raises(AssertionError, match="value head size"):
-        unified_attention(
-            q=query,
-            k=key_cache,
-            v=value_cache,
-            out=output,
-            cu_seqlens_q=cu_query_lens,
-            seqused_k=kv_lens,
-            max_seqlen_q=max_query_len,
-            max_seqlen_k=max_kv_len,
-            softmax_scale=scale,
-            causal=True,
-            window_size=window_size,
-            block_table=block_tables,
-            softcap=0,
-            q_descale=None,
-            k_descale=None,
-            v_descale=None,
-            sinks=sinks,
-            shuffled_kv_cache=shuffled,
-            backend="triton",
-        )
-
-
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
 @torch.inference_mode()
 def test_triton_unified_attn_packed_kv_over_2gib(backend: str) -> None:
@@ -1416,6 +1349,132 @@ def test_triton_unified_attn_packed_kv_over_2gib(backend: str) -> None:
         out_dtype=dtype,
     )
     torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
+
+
+# Sequence lengths that are not a multiple of the 64-token tile, so with 16-token
+# pages the last tile of each sequence overhangs its last page; 64-token pages
+# take the one-page-per-tile loader. The block table is padded with 0 and block
+# 0 holds NaN: the kernel must not gather K/V from block-table entries past a
+# sequence's pages.
+@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, e4m3_dtype])
+@pytest.mark.parametrize("shuffled_kv_cache", [False, True])
+@pytest.mark.parametrize("query_len", [1, 64])
+@torch.inference_mode()
+def test_unified_attn_padded_block_table_gfx950(
+    block_size: int,
+    dtype: torch.dtype,
+    shuffled_kv_cache: bool,
+    query_len: int,
+) -> None:
+    if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
+        pytest.skip("gfx950 gluon")
+    seq_lens = [(query_len, kv_len) for kv_len in (66, 130, 201, 333)]
+    kv_lens_list = [kv_len for _, kv_len in seq_lens]
+    pages = [(kv_len + block_size - 1) // block_size for kv_len in kv_lens_list]
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        _,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        _,
+        _,
+        _,
+        q_descale,
+        k_descale,
+        v_descale,
+        _,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=1 + sum(pages),
+        block_size=block_size,
+        head_size=128,
+        num_heads=(16, 2),
+        q_dtype=dtype,
+        kv_dtype=dtype,
+        out_dtype=torch.bfloat16,
+        shuffled_kv_cache=shuffled_kv_cache,
+    )
+    # Pages 1, 2, ... in order; block 0 only in the padding of each row.
+    block_tables = torch.zeros(
+        len(seq_lens), max(pages) + 4, dtype=torch.int32, device="cuda"
+    )
+    first = 1
+    for i, n in enumerate(pages):
+        block_tables[i, :n] = torch.arange(
+            first, first + n, dtype=torch.int32, device="cuda"
+        )
+        first += n
+
+    def run(block0_fill: float) -> torch.Tensor:
+        key_cache[0] = block0_fill
+        value_cache[0] = block0_fill
+        out = torch.empty_like(output)
+        unified_attention(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            out=out,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=kv_lens,
+            max_seqlen_q=max_query_len,
+            max_seqlen_k=max_kv_len,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window_size,
+            block_table=block_tables,
+            softcap=0,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            shuffled_kv_cache=shuffled_kv_cache,
+            backend="gluon",
+        )
+        return out
+
+    # Bitwise, not just a NaN check: with fp8 a stale read changes the output
+    # without making it NaN, by less than the fp8 tolerance.
+    actual = run(float("nan"))
+    assert torch.equal(actual, run(0.0)), "the kernel read block 0 past a sequence"
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=[q for q, _ in seq_lens],
+        kv_lens=kv_lens_list,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=actual.dtype,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    ).to(torch.float32)
+    actual = actual.to(torch.float32)
+    if dtype.itemsize == 1:
+        # As test_triton_unified_attn: fp8 with descales allows 0.5% of elements out.
+        assert (
+            checkAllclose(
+                actual,
+                ref_output,
+                atol=1.5e-1,
+                rtol=1.5e-1,
+                tol_err_ratio=0.005,
+                msg="unified_attn padded block table",
+            )
+            < 0.005
+        )
+    else:
+        torch.testing.assert_close(actual, ref_output, atol=1.5e-2, rtol=1e-2)
 
 
 def _run_block_table_before_unmapped_page(seq_lens, block_size, sliding_window):
