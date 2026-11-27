@@ -51,6 +51,9 @@ ARCH_KV_BLOCK_SIZES = {"gfx950": [64], "gfx1250": [8, 16, 64]}
 INDEX_DIM = HEAD_DIM + 4
 MAX_NN = 8
 WIDE_MAX_MODEL_LEN = 1 << 20
+# One FP8 MFMA vs fp32 ReLU-boundary outlier (~6.1e-5) is tolerated; a wrong
+# 64-token page mismatches at least 64/16384 (~3.9e-3).
+BIG_CACHE_MAX_MISMATCH = 1e-3
 # probe_1079 decode (bs64): 44362 × 64-token pages, output stride 258048.
 PROBE_NUM_BLOCKS = 44362
 PROBE_MAX_MODEL_LEN = 258048
@@ -748,9 +751,7 @@ def _check_fp8_paged_mqa_logits_big_cache(batch, kv_len, kv_block_size):
             KVBlockSize=kv_block_size,
         )
     err = _grade(ref, out, "flydsl: paged big_cache")
-    # Single-element FP8 MFMA vs fp32 ReLU-boundary rounding can slightly exceed
-    # checkAllclose(atol=5.0) (~6.1e-5); a wrong 64-token page fails >= 64/16384 (~3.9e-3).
-    assert err < 1e-3, f"paged big_cache mismatch fraction: {err}"
+    assert err < BIG_CACHE_MAX_MISMATCH, f"paged big_cache mismatch fraction: {err}"
 
 
 @benchmark()
@@ -777,9 +778,13 @@ def _bench_fp8_paged_mqa_logits_big_cache(batch, kv_len, kv_block_size):
     flops, nbytes = _roofline(
         batch, 1, kv_len, inp.context_lens, inp.q_fp8, inp.weights, out
     )
-    return _time_candidates(
+    ret = _time_candidates(
         {"flydsl": (flydsl, out)}, ref, flops, nbytes, "paged big_cache"
     )
+    assert (
+        ret["flydsl err"] < BIG_CACHE_MAX_MISMATCH
+    ), f"paged big_cache mismatch fraction: {ret['flydsl err']}"
+    return ret
 
 
 @pytest.mark.parametrize("batch,kv_len,kv_block_size", [(1, 8192, 64)])
