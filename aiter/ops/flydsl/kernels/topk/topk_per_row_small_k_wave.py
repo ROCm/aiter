@@ -30,7 +30,6 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import rocdl as _rocdl_ops
-from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -123,6 +122,10 @@ def cand_dwords(strips: int) -> int:
 SEL_DWORDS = 4 * TOPK  # LDS dwords of one row's running top 16 (``sel``)
 
 
+# A module-level device helper: its dynamic ifs / whiles need the AST rewrite to become scf ops. ``flyc.jit``
+# applies that rewrite, and when called inside a kernel's trace (below) it inlines the rewritten body into the
+# kernel's IR rather than emitting a separate launchable.
+@flyc.jit
 def row_top16(
     strips,
     lane,
@@ -408,11 +411,6 @@ def row_top16(
         lane,
         mask=lane < TOPK,
     )
-
-
-# A module-level helper is not rewritten with the kernel that calls it: its dynamic ifs / whiles become scf ops only
-# through the kernel's rewriter, applied here by hand.
-row_top16 = ASTRewriter.transform(row_top16)
 
 
 def build_topk_per_row_small_k_wave_module(strips: int, full_rows: bool):
