@@ -44,8 +44,8 @@ from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import ReductionOp, T
 
 from .pa_decode.op_gemm import Gfx1250Gemm
-from .pa_decode.op_mxfp8 import E8M0_ONE, MxFp8Groups
 from .pa_decode.op_lds import Gfx1250Memory, _gptr
+from .pa_decode.op_mxfp8 import E8M0_ONE, MxFp8Groups
 from .pa_decode.pipeline_nvfp4 import (
     _E4M3_ONE,
     _MERGE_OUT,
@@ -86,7 +86,7 @@ class _Lds(Gfx1250Memory):
     class _T:
         kv_dtype = fx.BFloat16
 
-    def __init__(self, base):  # noqa: D107 -- no PaDecodeContext here
+    def __init__(self, base):
         self.base = base
         self.t = self._T
 
@@ -110,17 +110,17 @@ def _layout(tq, nb):
     # scales (2 dwords), padded to 80 B so the operand reads stay 16 B aligned.
     qterms = counts + 16
     total = qterms + tq * QUERY_TERMS * WAVE * Q_LANE_BYTES
-    return dict(
-        ring=ring,
-        merge=merge,
-        keys=keys,
-        uidx=uidx,
-        upage=upage,
-        ubound=ubound,
-        counts=counts,
-        qterms=qterms,
-        total=(total + 15) // 16 * 16,
-    )
+    return {
+        "ring": ring,
+        "merge": merge,
+        "keys": keys,
+        "uidx": uidx,
+        "upage": upage,
+        "ubound": ubound,
+        "counts": counts,
+        "qterms": qterms,
+        "total": (total + 15) // 16 * 16,
+    }
 
 
 _CACHE = {}
@@ -323,7 +323,7 @@ def compile_pa_sparse_prefill_nvfp4(
             )
         return fx.Vector.from_elements(out, dtype=fx.Float32)
 
-    def row_softmax(m, l, q, k_tiles, bias):  # noqa: E741 -- the softmax sum
+    def row_softmax(m, l, q, k_tiles, bias):
         """One row's online-softmax step over this wave's 32 tokens of the page
         (the decode wave tile's arithmetic): (new max, rescale, P operand, sum)."""
         raw = []

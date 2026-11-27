@@ -27,10 +27,14 @@ from .kernels.pa_sparse_prefill_nvfp4 import (
 )
 from .kernels.pa_sparse_prefill_nvfp4_v2 import (
     TILE_ROWS as TILE_ROWS_V2,
+)
+from .kernels.pa_sparse_prefill_nvfp4_v2 import (
     compile_pa_sparse_prefill_nvfp4_v2,
 )
 from .kernels.pa_sparse_prefill_nvfp4_v3 import (
     TILE_ROWS as TILE_ROWS_V3,
+)
+from .kernels.pa_sparse_prefill_nvfp4_v3 import (
     compile_pa_sparse_prefill_nvfp4_v3,
 )
 from .kernels.tensor_shim import _run_compiled, ptr_arg

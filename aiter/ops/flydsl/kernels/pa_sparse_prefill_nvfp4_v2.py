@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
+# ruff: noqa: B023
+# (B023: the kernel body's closures over loop variables are traced and called inside the
+# iteration that defines them, so each sees that iteration's values.)
 
 """gfx1250 NVFP4 sparse-prefill attention with K/V reuse, rows batched in pairs.
 
@@ -49,7 +52,6 @@ from .pa_decode.op_lds import _gptr
 from .pa_decode.op_mxfp8 import E8M0_ONE, MxFp8Groups
 from .pa_decode.pipeline_nvfp4 import (
     _E4M3_ONE,
-    _attr,
     _MERGE_OUT,
     _PLANE_K,
     _PLANE_KS,
@@ -59,13 +61,14 @@ from .pa_decode.pipeline_nvfp4 import (
     _SROW,
     _TOKENS,
     WAVE_SLOT_BYTES,
+    _attr,
     _e8m0_pow2,
     _f32_bits,
     _pow2,
     _wmma_scale16,
 )
 from .pa_decode.traits import LOG2E
-from .pa_sparse_prefill_nvfp4 import _Lds, _bound_stride, _layout
+from .pa_sparse_prefill_nvfp4 import _bound_stride, _layout, _Lds
 from .utils import rcp_f32
 
 WAVE = 32
@@ -962,7 +965,7 @@ def compile_pa_sparse_prefill_nvfp4_v2(
                 raw = raw + _bound_mask(bound, warp, half)
             return raw
 
-        def rebase(ref, l, acc, m):  # noqa: E741 -- the softmax sum
+        def rebase(ref, l, acc, m):
             """Move the reference when a head's maximum ``m`` passed it by 2**rb."""
             if const_expr(rb == 0):
                 grow = m > ref
@@ -976,7 +979,7 @@ def compile_pa_sparse_prefill_nvfp4_v2(
                 )
                 corr = fx.Float32(fx.exp2(ref - safe, fastmath="afn"))
                 acc = _rescale(acc, corr)
-                l = l * corr  # noqa: E741
+                l = l * corr
                 ref = new_ref
             return ref, l, acc
 
@@ -1185,18 +1188,18 @@ def compile_pa_sparse_prefill_nvfp4_v2(
                     maxes.append(_head_max(raw, unit))
                 cur, refs_p = [], []
                 for i, t in enumerate(ts):
-                    ref, l = rows_state[i * 10], rows_state[i * 10 + 1]  # noqa: E741
+                    ref, l = rows_state[i * 10], rows_state[i * 10 + 1]
                     acc = list(rows_state[i * 10 + 2 : i * 10 + 10])
                     if const_expr(all_rows):
                         # A row that did not select the page (on this wave) runs
                         # against a +inf reference: no rebase, P = 0, state kept.
                         sel = bounds[t] > lo
                         ref_in = sel.select(ref, fx.Float32(float("inf")))
-                        ref_out, l, acc = rebase(ref_in, l, acc, maxes[i])  # noqa: E741
+                        ref_out, l, acc = rebase(ref_in, l, acc, maxes[i])
                         refs_p.append(ref_out)
                         ref = sel.select(ref_out, ref)
                     else:
-                        ref, l, acc = rebase(ref, l, acc, maxes[i])  # noqa: E741
+                        ref, l, acc = rebase(ref, l, acc, maxes[i])
                         refs_p.append(ref)
                     cur.append([ref, l, acc])
                 ps, totals = [], []
