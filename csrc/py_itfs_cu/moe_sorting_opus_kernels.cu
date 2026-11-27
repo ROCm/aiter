@@ -33,12 +33,15 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
                           std::optional<aiter_tensor_t> m_indices,
                           std::optional<aiter_tensor_t> reverse_sorted)
 {
+    aiter_detail::AiterThrowGuard throw_guard;
     AITER_CHECK(topk_weights.dtype() == AITER_DTYPE_fp32,
                 "topk_weights must be FP32 (float32)");
 
     auto dtype_str = AiterDtype_to_str(topk_ids.dtype());
     int num_tokens = topk_ids.size(0);
     int topk       = topk_ids.size(1);
+    // the sorted ids keep the topk slot in 8 bits
+    AITER_CHECK(topk <= 256, "moe_sorting_opus: topk ", topk, " is not supported (max 256)");
 
     if(local_topk_ids.has_value())
     {
@@ -66,12 +69,11 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
 
     void* ws_ptr = workspace.has_value() ? workspace.value().data_ptr() : nullptr;
 
-    moe_sorting_opus(
+    const float status = moe_sorting_opus(
         {
             dtype_str,
             "fp32",
             local_expert_mask.has_value(),
-            true,
             dispatch_policy
         },
         {topk_ids.data_ptr(),
@@ -94,6 +96,9 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
          static_cast<int>(moe_buf.size(-1)),
          static_cast<int>(moe_buf.element_size())},
         {stream});
+    // a negative status means no kernel was launched: the outputs are unwritten
+    AITER_CHECK(status >= 0, "moe_sorting_opus: unsupported configuration (tokens ", num_tokens,
+                ", experts ", num_experts, ", topk ", topk, ", index type ", dtype_str, ")");
 }
 
 namespace aiter::mxfp4_moe {
