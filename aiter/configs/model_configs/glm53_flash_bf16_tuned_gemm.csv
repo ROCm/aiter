@@ -1,5 +1,5 @@
 gfx,cu_num,M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle,libtype,solidx,splitK,us,kernelName,err_ratio,tflops,bw
-gfx950,256,180,160,4096,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,59,8,6.7388,flydsl_hgemm_abf16_wbf16_bf16_t32x16x64x3_ks8_w2x1x1_bias0_ktail0_gm0_pft_gfx950,0.0,35.01,421.87
+gfx950,256,180,160,4096,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,6144,6,5.7554,flydsl_hgemm_abf16_wbf16_bf16_t32x32x64x8_ks6_w2x2x1_bias0_ktail0_gm0_pft_gfx950,0.0,40.99,493.95
 gfx950,256,186,160,4096,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,63,8,6.6542,flydsl_hgemm_abf16_wbf16_bf16_t32x16x64x3_ks8_w2x1x1_bias0_ktail0_gm0_pft_gfx950,0.0,36.64,434.91
 gfx950,256,1272,160,4096,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,574,1,11.8166,flydsl_hgemm_abf16_wbf16_bf16_t32x16x128x5_ks1_w1x1x2_bias0_ktail0_gm4_pft_gfx950,0.0049,141.09,1027.2
 gfx950,256,7052,160,4096,False,torch.bfloat16,torch.bfloat16,False,False,torch,0,0,27.3605,native,0.0,337.83,2241.82
@@ -148,7 +148,7 @@ gfx950,256,11276,4096,1536,False,torch.bfloat16,torch.bfloat16,False,False,asm,1
 gfx950,256,11276,4096,2048,False,torch.bfloat16,torch.bfloat16,False,False,asm,10,1,158.9959,_ZN5aiter24bf16gemm_bf16_tn_256x256E,0.0,1189.84,976.99
 gfx950,256,8,19360,4096,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,220,1,32.1529,flydsl_hgemm_abf16_wbf16_bf16_t16x96x256x2_ks1_w1x2x2_bias0_ktail0_gm0_pft_gfx950,0.0,39.46,4944.27
 gfx950,256,14,19360,4096,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,29.5604,auto,0.0,75.11,5387.4
-gfx950,256,40,19360,4096,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,291,1,35.1491,flydsl_hgemm_abf16_wbf16_bf16_t48x96x64x4_ks1_w1x2x1_bias0_ktail0_gm0_pft_gfx950,0.0,180.48,4565.51
+gfx950,256,40,19360,4096,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,6585,1,27.3235,flydsl_hgemm_abf16_wbf16_bf16_t64x80x64x4_ks1_w1x1x2_bias0_ktail0_gm0_stg3_bnt_pft_gfx950,0.0,232.18,5873.10
 gfx950,256,42,19360,4096,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,600,1,35.3476,flydsl_hgemm_abf16_wbf16_bf16_t48x96x64x5_ks1_w1x2x1_bias0_ktail0_gm0_pft_gfx950,0.0,188.45,4542.53
 gfx950,256,44,19360,4096,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,600,1,35.5389,flydsl_hgemm_abf16_wbf16_bf16_t48x96x64x5_ks1_w1x2x1_bias0_ktail0_gm0_pft_gfx950,0.0,196.36,4520.72
 gfx950,256,50,19360,4096,False,torch.bfloat16,torch.bfloat16,False,False,torch,0,0,34.457,native,0.0,230.14,4670.83
