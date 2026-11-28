@@ -2282,22 +2282,22 @@ def _get_compiled_contiguous_psum_remap():
 
 
 @functools.cache
-def _get_compiled_route_psum_fused():
+def _get_compiled_route_psum_fused(block: int):
     """Compile and cache the single-TG fused route+atomic+psum+remap kernel."""
     from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
         build_moe_route_psum_fused_module,
     )
 
-    return build_moe_route_psum_fused_module()
+    return build_moe_route_psum_fused_module(block)
 
 
 # One workgroup handles every route. NUMEL is advisory -- the route sweep is
 # grid-stride, so a larger count is correct but stops being worth fusing; on
 # gfx1250 the split launches catch up at about 2.5K routes.
 # EXPERTS is a hard limit, enforced below: the scan and the LDS route counter
-# are both one slot per lane.
+# are both one slot per lane, and the widest build is 1024 lanes.
 _FUSED_ROUTE_PSUM_MAX_NUMEL = 2048
-_FUSED_ROUTE_PSUM_MAX_EXPERTS = 512
+_FUSED_ROUTE_PSUM_MAX_EXPERTS = 1024
 
 
 def fused_route_psum_remap(
@@ -2330,7 +2330,7 @@ def fused_route_psum_remap(
     masked_m = torch.empty(experts, dtype=torch.int32, device=device)
     starts = torch.empty(experts, dtype=torch.int32, device=device)
     psum = torch.empty(experts, dtype=torch.int32, device=device)
-    launch = _get_compiled_route_psum_fused()
+    launch = _get_compiled_route_psum_fused(512 if experts <= 512 else 1024)
     _run_compiled(
         launch,
         ptr_arg(topk_ids.to(torch.int32).reshape(-1)),

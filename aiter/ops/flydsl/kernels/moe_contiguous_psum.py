@@ -68,6 +68,21 @@ class _RoutePsumStorage:
     lds1: fx.Array[fx.Int32, MAX_EXPERTS_PER_BLOCK, 16]
 
 
+# The fused route+psum kernel keeps one expert per lane, so an E past one
+# 512-lane block takes the 1024-lane build. Qwen3.8 appends its shared expert
+# as expert 512 (E = 513).
+MAX_FUSED_ROUTE_EXPERTS = 1024
+
+
+@fx.struct
+class _RoutePsumStorageWide:
+    """:class:`_RoutePsumStorage` sized for the 1024-lane build."""
+
+    cnt: fx.Array[fx.Int32, MAX_FUSED_ROUTE_EXPERTS, 16]
+    lds0: fx.Array[fx.Int32, MAX_FUSED_ROUTE_EXPERTS, 16]
+    lds1: fx.Array[fx.Int32, MAX_FUSED_ROUTE_EXPERTS, 16]
+
+
 @fx.struct
 class _PsumRemapEpStorage:
     """LDS for the EP remap kernel: the scan ping-pong buffers only.
@@ -596,7 +611,7 @@ def build_moe_contiguous_psum_remap_ep_module():
     return launch_psum_remap_ep
 
 
-def build_moe_route_psum_fused_module():
+def build_moe_route_psum_fused_module(block: int = MAX_EXPERTS_PER_BLOCK):
     """JIT launcher: single-workgroup fused route + atomic + psum + remap.
 
     For small token counts every route fits in one workgroup, so the three
@@ -607,11 +622,22 @@ def build_moe_route_psum_fused_module():
 
     Outputs match ``topids_to_rows`` (contiguous layout) + ``masked_m`` counts
     + ``psum`` (m_tile_map) of the split-kernel path bit-for-bit.
+
+    ``block`` is the lane count and so the widest E: 512, or 1024 for E > 512.
     """
 
+    if block == MAX_EXPERTS_PER_BLOCK:
+        storage = _RoutePsumStorage
+        kernel_name = "moe_route_psum_fused"
+    elif block == MAX_FUSED_ROUTE_EXPERTS:
+        storage = _RoutePsumStorageWide
+        kernel_name = f"moe_route_psum_fused_b{block}"
+    else:
+        raise ValueError(f"fused route+psum block must be 512 or 1024, got {block}")
+
     @flyc.kernel(
-        name="moe_route_psum_fused",
-        known_block_size=[MAX_EXPERTS_PER_BLOCK, 1, 1],
+        name=kernel_name,
+        known_block_size=[block, 1, 1],
     )
     def route_psum_fused_kernel(
         topk_ids: fx.Pointer,  # (numel,) i32 in
@@ -630,7 +656,7 @@ def build_moe_route_psum_fused_module():
         tile_v = fx.Uint32(tile_m)
         tile_minus_1 = tile_v - 1
 
-        lds = fx.SharedAllocator().allocate(_RoutePsumStorage).peek()
+        lds = fx.SharedAllocator().allocate(storage).peek()
         lds_cnt = lds.cnt.ptr
         lds0 = lds.lds0.ptr
         lds1 = lds.lds1.ptr
@@ -654,7 +680,7 @@ def build_moe_route_psum_fused_module():
         # gets DROPPED_ROUTE_ROW, as in the split-kernel route. The store is in
         # the else so a valid route is written once.
         numel_i32 = fx.Uint32(numel)
-        for route_i32 in range(tid, numel_i32, MAX_EXPERTS_PER_BLOCK):
+        for route_i32 in range(tid, numel_i32, block):
             e = fx.Int32(topk_p[route_i32])
             routed = (e >= fx.Int32(0)) & (e < experts)
             if routed:
@@ -675,7 +701,7 @@ def build_moe_route_psum_fused_module():
 
         src = lds0
         dst = lds1
-        for offset in range_constexpr(1, MAX_EXPERTS_PER_BLOCK):
+        for offset in range_constexpr(1, block):
             if const_expr((offset & (offset - 1)) != 0):
                 continue
             if in_expert:
@@ -699,7 +725,7 @@ def build_moe_route_psum_fused_module():
         gpu.barrier()
 
         # Phase D: in-place masked -> contiguous row remap.
-        for route_i32 in range(tid, numel_i32, MAX_EXPERTS_PER_BLOCK):
+        for route_i32 in range(tid, numel_i32, block):
             row_raw = rows_p[route_i32]
             if fx.Int32(row_raw) >= 0:
                 row = fx.Uint32(row_raw)
@@ -734,7 +760,7 @@ def build_moe_route_psum_fused_module():
             tile_m,
         ).launch(
             grid=(1, 1, 1),
-            block=(MAX_EXPERTS_PER_BLOCK, 1, 1),
+            block=(block, 1, 1),
             stream=stream,
         )
 
