@@ -62,8 +62,8 @@ def fused_gemm_a16w16_mul_add(
         y (Optional[torch.Tensor]): Pre-allocated output with M * N elements
             that can be viewed as (M, N).
         config (Optional[dict]): Kernel tuning parameters. The default comes
-            from FUSED-GEMM-A16W16-MUL_ADD on gfx1151 and from GEMM-A16W16
-            on other arches.
+            from FUSED-GEMM-A16W16-MUL_ADD on gfx1150 and gfx1151 and from
+            GEMM-A16W16 on other arches.
 
     Returns:
         torch.Tensor: Output with shape x.shape[:-1] + (N,).
