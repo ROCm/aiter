@@ -1006,6 +1006,83 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
     }
     raw_groups = aiter::warpReduce<aiter::AddFunctor, int32_t, opus::get_warp_size()>(raw_groups);
 
+    // Wave cap (params.xcd_wave_cap). Each of a lane's `rows` workgroups runs one work per wave,
+    // so a wave holds rows / qo_tiles groups per lane. The budget above rounds every batch's
+    // fragment count up on its own and the nudge rounds the total up again, so the plan can land
+    // a few groups past a wave -- 72 for 64 slots at qo_tiles = 4 on 256 CUs -- and the rows that
+    // take a second work then set the wall at two fragments. Instead, for each whole wave count w
+    // the plan can take, find the smallest fragment x_w (kv blocks, no finer than bpf) whose
+    // groups fit w waves, and keep the w with the least w * (x_w + per-work overhead). Fragments
+    // only get coarser, so the group count stays under what the budget asked for, and the nudge
+    // below stays inside the waves because a wave's group count is a multiple of num_xcd.
+    if(params.xcd_wave_cap && (num_batches > 0))
+    {
+        const int32_t wave_groups = (rows / qo_tiles) * num_xcd;
+        if((wave_groups > 0) && (raw_groups > wave_groups))
+        {
+            auto groups_at = [&](const int32_t x) -> int32_t {
+                int32_t n = 0;
+                for(int32_t b = lane_idx; b < num_batches; b += opus::get_warp_size())
+                {
+                    n += integer_divide_ceil(blocks_of(b), x);
+                }
+                return aiter::warpReduce<aiter::AddFunctor, int32_t, opus::get_warp_size()>(n);
+            };
+            int32_t max_blocks = 0;
+            for(int32_t b = lane_idx; b < num_batches; b += opus::get_warp_size())
+            {
+                max_blocks = max(max_blocks, blocks_of(b));
+            }
+            max_blocks =
+                aiter::warpReduce<aiter::MaxFunctor, int32_t, opus::get_warp_size()>(max_blocks);
+
+            // Wave counts searched: w_lo is the fewest waves that can hold every batch as one
+            // group (at x = max(bpf, max_blocks) every batch is one group, and num_batches fits
+            // w_lo waves, so the search below always ends on a fitting x); w_hi is the wave count
+            // the budget's own cut needs. raw_groups is groups_at(bpf), bpf is the search's floor,
+            // so from w_hi on x_w = bpf and the cost w * (bpf + overhead) only grows: more waves
+            // than w_hi never pay, and trying every count in [w_lo, w_hi] (one binary search over
+            // x each) makes the pick exact (max: empty batches take no fragment).
+            const int32_t w_lo = integer_divide_ceil(num_batches, wave_groups);
+            const int32_t w_hi = max(w_lo, integer_divide_ceil(raw_groups, wave_groups));
+            int32_t best_x     = bpf;
+            int32_t best_cost  = 0x7fffffff;
+            for(int32_t w = w_lo; w <= w_hi; ++w)
+            {
+                int32_t lo = bpf;
+                int32_t hi = max(bpf, max_blocks);
+                while(lo < hi)
+                {
+                    const int32_t mid = lo + (hi - lo) / 2;
+                    if(groups_at(mid) <= w * wave_groups)
+                    {
+                        hi = mid;
+                    }
+                    else
+                    {
+                        lo = mid + 1;
+                    }
+                }
+                const int32_t cost = w * (lo + params.fixed_over_head_num_blocks);
+                if(cost < best_cost)
+                {
+                    best_cost = cost;
+                    best_x    = lo;
+                }
+            }
+
+            raw_groups = 0;
+            for(int32_t b = lane_idx; b < num_batches; b += opus::get_warp_size())
+            {
+                const int32_t f = integer_divide_ceil(blocks_of(b), best_x);
+                p_lds_frags[b]  = f;
+                raw_groups += f;
+            }
+            raw_groups =
+                aiter::warpReduce<aiter::AddFunctor, int32_t, opus::get_warp_size()>(raw_groups);
+        }
+    }
+
     const int32_t nudge      = (num_batches > 0) ? ((num_xcd - raw_groups % num_xcd) % num_xcd) : 0;
     const int32_t nudge_base = (num_batches > 0) ? (nudge / num_batches) : 0;
     const int32_t nudge_rem  = (num_batches > 0) ? (nudge % num_batches) : 0;
@@ -1441,6 +1518,10 @@ void get_mla_metadata_v1_2_device(const aiter_tensor_t& seqlens_qo_indptr, // [b
                                 ((xcd_rows_per_lane % max_seqlen_qo) == 0);
     params.xcd_lane_works =
         natively_supported && xcd_multi_tile && (topk < 0) && (params.num_xcd > 1);
+    // Read per call, like the planner's other switches. On by default; 0 keeps
+    // the budget's cut.
+    const char* wave_cap_env = std::getenv("AITER_MLA_XCD_WAVE_CAP");
+    params.xcd_wave_cap      = (wave_cap_env == nullptr) || (std::atoi(wave_cap_env) != 0);
 
     // launch kernel
     MLA_METADATA_DISPATCHER(
