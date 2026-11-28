@@ -66,6 +66,10 @@ def gemm_a16w16_fake_tensor(
     # [triton only] split-K with skip_reduce returns the unreduced partials.
     if skip_reduce:
         cfg = deserialize_str(config) if config else _get_triton_config(M, N, K)[0]
+        if "SPLITK_BLOCK_SIZE" not in cfg:
+            # A hand-written config is derived exactly as gemm_a16w16_ derives it,
+            # so a traced call reports the partial count the kernel returns.
+            cfg = compute_splitk_params(dict(cfg), K)
         num_ksplit = cfg.get("NUM_KSPLIT", 1)
         if num_ksplit > 1:
             return torch.empty((num_ksplit, M, N), dtype=torch.float32, device=x.device)
@@ -624,6 +628,13 @@ def _gemm_a16w16_native(
 
     if config is None:
         config, _ = _get_triton_config(M, N, K)
+    elif "SPLITK_BLOCK_SIZE" not in config:
+        # A config that came from the config file already carries SPLITK_BLOCK_SIZE
+        # and the BLOCK_SIZE_K / NUM_KSPLIT clamp, and re-deriving it would move
+        # NUM_KSPLIT and change what skip_reduce returns. Derive only for a
+        # hand-written config, which the kernel still needs SPLITK_BLOCK_SIZE for.
+        # Work on a copy, the caller owns theirs.
+        config = compute_splitk_params(dict(config), K)
 
     if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
         y = torch.empty((M, N), dtype=dtype, device=x.device)
