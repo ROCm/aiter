@@ -5,14 +5,13 @@
 FlyDSL kernels: ``flydsl_unified_attention_gfx11`` takes one step's batch of
 prefill chunks and decode tokens over a paged KV cache and writes ``out``.
 
-Two kernels share the work. Sequences with more than ``16 / (heads per KV
+Three kernels, all FlyDSL. Sequences with more than ``16 / (heads per KV
 head)`` queries run on the paged prefill kernel (128-row query blocks, many
 waves per workgroup); the shorter ones (decode, speculative decode) on the
 decode kernel, one wave per (sequence, KV head, KV segment) with the KV head's
-query heads packed into the WMMA rows. An all-short batch splits the keys into
-segments merged by aiter's Triton ``reduce_segments``; in a mixed batch the
-short sequences take one segment and write their rows directly, so the two
-kernels never touch the same output row and no reduce is needed.
+query heads packed into the WMMA rows; when the keys are split into segments,
+the merge kernel combines them and writes those rows, leaving the prefill
+kernel's rows alone. The two attention kernels never touch the same row.
 """
 
 import functools
@@ -27,10 +26,25 @@ from aiter.ops.flydsl.kernels.flash_attn_paged_decode_gfx11 import (
 from aiter.ops.flydsl.kernels.flash_attn_paged_gfx11 import (
     build_flash_attn_paged_module_gfx11,
 )
+from aiter.ops.flydsl.kernels.flash_attn_paged_reduce_gfx11 import (
+    build_flash_attn_paged_reduce_module_gfx11,
+)
 
 __all__ = ["flydsl_unified_attention_gfx11", "gfx11_paged_supported"]
 
 _DTYPE_STR = {torch.bfloat16: "bf16", torch.float16: "f16"}
+_LDS_BYTES = 65536
+# The decode side's tile and grid choices (the prefill tile comes from the
+# varlen rule). One place, so a sweep can set them.
+_TUNE = {
+    "decode_block_n": 16,  # keys per decode tile (16 or 32)
+    "decode_vt_rows": 2,  # keys per LDS write in the V^T staging (2, 4, 8)
+    "target_wgs": 160,  # one-wave decode workgroups the segments aim for
+    "max_segments": 32,  # KV segments per sequence at most
+    # decode rows of a mixed batch: KV segments + merge (True) or one segment
+    # with several waves per workgroup writing the rows themselves (False)
+    "mixed_segments": True,
+}
 
 
 @functools.lru_cache(maxsize=64)
@@ -81,19 +95,11 @@ def _decode_kernel(
     )
 
 
-_DECODE_BLOCK_N = 16
-_LDS_BYTES = 65536
-
-
-def _decode_waves(D, block_n=_DECODE_BLOCK_N):
-    """Waves per decode workgroup: as many as fit their V^T tiles in LDS, up
-    to 8 (4 at head_dim 256, 8 at head_dim 128)."""
-    dp = -(-D // 16) * 16
-    tile_bytes = dp * (block_n + 8) * 2
-    nw = 8
-    while nw > 1 and nw * tile_bytes > _LDS_BYTES:
-        nw //= 2
-    return nw
+@functools.lru_cache(maxsize=64)
+def _reduce_kernel(device_index, H, D, dtype_str):
+    return build_flash_attn_paged_reduce_module_gfx11(
+        num_heads=H, head_dim=D, dtype_str=dtype_str
+    )
 
 
 def _short_limit(H, HKV):
@@ -104,13 +110,24 @@ def _short_limit(H, HKV):
     return 16 // group if group <= 16 and 16 % group == 0 else 0
 
 
-def _num_segments(batch, HKV, max_seqlen_k, block_n, target_wgs=160):
-    """KV segments for an all-short batch: enough workgroups to fill the GPU
-    (gfx1151: 20 WGPs x 8), at most one tile per segment, a power of two (the
-    Triton reduce's segment vector)."""
-    want = -(-target_wgs // max(1, batch * HKV))
+def _decode_waves(D, block_n):
+    """Waves per decode workgroup when it runs without segments: as many as
+    fit their V^T tiles in LDS, up to 8 (4 at head_dim 256, 8 at head_dim 128)."""
+    dp = -(-D // 16) * 16
+    tile_bytes = dp * (block_n + 8) * 2
+    nw = 8
+    while nw > 1 and nw * tile_bytes > _LDS_BYTES:
+        nw //= 2
+    return nw
+
+
+def _num_segments(batch, HKV, max_seqlen_k, block_n):
+    """KV segments for the decode kernel: enough one-wave workgroups to reach
+    ``target_wgs`` (gfx1151: 20 WGPs x 8), at least one tile per segment, a
+    power of two, at most ``max_segments``."""
+    want = -(-int(_TUNE["target_wgs"]) // max(1, batch * HKV))
     tiles = -(-max_seqlen_k // block_n)
-    n = int(max(1, min(want, tiles, 32)))
+    n = int(max(1, min(want, tiles, int(_TUNE["max_segments"]))))
     return 1 << (n.bit_length() - 1)
 
 
@@ -214,11 +231,11 @@ def flydsl_unified_attention_gfx11(
     stream = torch.cuda.current_stream(q.device)
     short = _short_limit(H, HKV)
     max_q, max_k = int(max_seqlen_q), int(max_seqlen_k)
-    dnw = _decode_waves(D)
-    bn = _DECODE_BLOCK_N
+    bn = int(_TUNE["decode_block_n"])
+    vt = int(_TUNE["decode_vt_rows"])
 
     if max_q > short:
-        # Prefill chunks (and anything longer than a decode tile).
+        # The long sequences (prefill chunks): the kernel skips the short ones.
         num_waves, block_n, head_group, vt_rows = _gfx11_varlen_config(
             arch, max_q, max_k, H, D, batch, True
         )
@@ -248,36 +265,20 @@ def flydsl_unified_attention_gfx11(
             stream=stream,
             q_small=short,
         )
-        if short:
-            dec = _decode_kernel(
-                dev, H, HKV, D, page, dtype_str, scale, bn, 2, dnw, True
-            )
-            dec(
-                q,
-                k,
-                v,
-                out,
-                out,
-                out,
-                out,
-                cu_seqlens_q,
-                seqused_k,
-                block_table,
-                batch,
-                short,
-                1,
-                stream=stream,
-            )
-        return out
+        if short == 0:
+            return out
+    dec_q = min(max_q, short)  # the decode kernel's longest sequence
 
-    # All sequences are short: split the keys so the grid fills the GPU
-    # (counted in waves: the workgroups already hold dnw of them).
-    # One wave per workgroup here: with the segments supplying the parallelism,
-    # the small LDS footprint of a single V^T tile keeps more workgroups
-    # resident than the multi-wave merge does (measured 5-10% on 8-32 decodes).
+    # The short sequences: their keys split into segments so that the grid
+    # fills the GPU (the batch may hold long sequences too: an upper bound).
     nseg = _num_segments(batch, HKV, max_k, bn)
+    if max_q > short and not _TUNE["mixed_segments"]:
+        nseg = 1
     if nseg == 1:
-        dec = _decode_kernel(dev, H, HKV, D, page, dtype_str, scale, bn, 2, 1, True)
+        # Enough workgroups without splitting; several waves per workgroup
+        # split the tiles instead.
+        nw = _decode_waves(D, bn) if max_q > short else 1
+        dec = _decode_kernel(dev, H, HKV, D, page, dtype_str, scale, bn, vt, nw, True)
         dec(
             q,
             k,
@@ -290,18 +291,19 @@ def flydsl_unified_attention_gfx11(
             seqused_k,
             block_table,
             batch,
-            max_q,
+            dec_q,
             1,
             stream=stream,
         )
         return out
-    dec = _decode_kernel(dev, H, HKV, D, page, dtype_str, scale, bn, 2, 1, False)
+    dec = _decode_kernel(dev, H, HKV, D, page, dtype_str, scale, bn, vt, 1, False)
     dpad = dec.dpad2
-    segm_output = torch.empty(
-        total_q, H, nseg, dpad, dtype=torch.float32, device=q.device
-    )
-    segm_max = torch.empty(total_q, H, nseg, dtype=torch.float32, device=q.device)
-    segm_expsum = torch.empty(total_q, H, nseg, dtype=torch.float32, device=q.device)
+    # Partials per (sequence, token slot): the long sequences' slots stay
+    # unused, so the buffers do not grow with the prefill tokens.
+    rows = batch * dec_q
+    segm_output = torch.empty(rows, H, nseg, dpad, dtype=torch.float32, device=q.device)
+    segm_max = torch.empty(rows, H, nseg, dtype=torch.float32, device=q.device)
+    segm_expsum = torch.empty(rows, H, nseg, dtype=torch.float32, device=q.device)
     dec(
         q,
         k,
@@ -314,95 +316,20 @@ def flydsl_unified_attention_gfx11(
         seqused_k,
         block_table,
         batch,
-        max_q,
+        dec_q,
         nseg,
         stream=stream,
     )
-    _reduce(
-        q,
-        k,
-        v,
-        out,
-        cu_seqlens_q,
-        seqused_k,
-        block_table,
-        scale,
-        max_q,
-        max_k,
+    red = _reduce_kernel(dev, H, D, dtype_str)
+    red(
         segm_output,
         segm_max,
         segm_expsum,
+        out,
+        cu_seqlens_q,
+        batch,
         nseg,
-        bn,
+        dec_q,
+        stream=stream,
     )
     return out
-
-
-def _reduce(
-    q,
-    k,
-    v,
-    out,
-    cu_seqlens_q,
-    seqused_k,
-    block_table,
-    scale,
-    max_q,
-    max_k,
-    segm_output,
-    segm_max,
-    segm_expsum,
-    nseg,
-    tile,
-):
-    """Merge the decode kernel's segments with aiter's Triton reduce_segments."""
-    from aiter.ops.triton.attention.unified_attention import (
-        _reduce_segments_triton,
-        _UAParams,
-    )
-    from aiter.ops.triton.utils.device_info import get_num_sms
-
-    total_q, H, D = q.shape
-    num_blocks, page, HKV, _ = k.shape
-    batch = seqused_k.numel()
-    cu = get_num_sms()
-    params = _UAParams(
-        q=q,
-        k=k,
-        v=v,
-        out=out,
-        cu_seqlens_q=cu_seqlens_q,
-        seqused_k=seqused_k,
-        block_table=block_table,
-        softmax_scale=scale,
-        softcap=0.0,
-        causal=True,
-        sliding_window=0,
-        max_seqlen_q=max_q,
-        max_seqlen_k=max_k,
-        num_tokens=total_q,
-        num_query_heads=H,
-        num_kv_heads=HKV,
-        num_queries_per_kv=H // HKV,
-        head_size=D,
-        head_size_v=D,
-        num_seqs=batch,
-        total_num_q_blocks=batch,
-        num_2d_prgms=batch * HKV,
-        num_blocks=num_blocks,
-        block_size=page,
-        k_width=8,
-        scale_k_width=4,
-        block_scales_size=16,
-        q_dtype=q.dtype,
-        kv_cache_dtype=k.dtype,
-        v_cache_dtype=v.dtype,
-        all_decode=max_q == 1,
-        spec_decode=False,
-        shuffled_kv_cache=False,
-        use_alibi_slopes=False,
-        use_qq_bias=False,
-        num_sms=cu,
-        target_num_prgms=cu * 4,
-    )
-    _reduce_segments_triton(params, segm_output, segm_max, segm_expsum, nseg, tile)

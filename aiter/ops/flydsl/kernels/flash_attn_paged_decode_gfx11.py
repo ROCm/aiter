@@ -73,10 +73,11 @@ def build_flash_attn_paged_decode_module_gfx11(
     cu_seqlens_q, seqused_k, block_table, batch_size, max_seqlen_q,
     num_segments, stream=None)``: ``q`` / ``out`` are packed THD
     ``[total_q, num_heads, head_dim]``; the caches ``[num_blocks, page_size,
-    num_kv_heads, head_dim]``; ``segm_output`` fp32 ``[total_q, num_heads,
-    num_segments, next_pow2(head_dim)]``, ``segm_max`` / ``segm_expsum`` fp32
-    ``[total_q, num_heads, num_segments]`` (unused with ``direct``, pass
-    ``out``); ``cu_seqlens_q`` ``batch + 1`` int32 entries, ``seqused_k``
+    num_kv_heads, head_dim]``; ``segm_output`` fp32 ``[batch * max_seqlen_q,
+    num_heads, num_segments, next_pow2(head_dim)]``, ``segm_max`` /
+    ``segm_expsum`` fp32 ``[batch * max_seqlen_q, num_heads, num_segments]``,
+    row ``b * max_seqlen_q + t`` for token ``t`` of sequence ``b`` (unused with
+    ``direct``, pass ``out``); ``cu_seqlens_q`` ``batch + 1`` int32 entries, ``seqused_k``
     ``batch`` entries, ``block_table`` int32 ``[batch, max_blocks]``.
     Sequences with more than ``max_seqlen_q`` queries are left alone (the
     prefill kernel's); ``max_seqlen_q`` is at most ``16 / GROUP`` x the number
@@ -200,7 +201,6 @@ def build_flash_attn_paged_decode_module_gfx11(
         bt_stride: fx.Int32,
         num_segments: fx.Int32,
         q_small: fx.Int32,
-        total_q: fx.Int32,
     ):
         lds_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().vt.ptr
 
@@ -564,7 +564,6 @@ def build_flash_attn_paged_decode_module_gfx11(
         # ---- epilogue (wave 0 only when NW > 1) ----
         l_fin = fx.Float32(results[1])
         l_fin = l_fin + l_fin.shuffle_xor(16, WAVE_SIZE)
-        token = q_start + tok
         # An element offset past every descriptor, so the store is dropped. Its
         # byte offset plus a 16-byte access must not wrap past 2^32 (that would
         # land at the start of the buffer), and nothing is added to it after
@@ -614,10 +613,11 @@ def build_flash_attn_paged_decode_module_gfx11(
                         unit_elems=8,
                     )
         else:
-            # Segment partials in the Triton reduce's layout; a row with no
-            # visible key in this segment gets max = -inf (its O and sum are 0).
+            # Segment partials for the merge kernel, row b * q_small + t (a
+            # sequence's slots past its tokens stay unwritten and unread); a row
+            # with no visible key in this segment gets max = -inf (O, sum 0).
             nseg64 = fx.Int64(num_segments)
-            rows64 = fx.Int64(total_q) * H
+            rows64 = fx.Int64(batch_size) * fx.Int64(q_small) * H
             o_tab = ptr_buf_tensor(
                 buf_base_i64(SEGM_O),
                 elem=fx.Float32,
@@ -637,12 +637,20 @@ def build_flash_attn_paged_decode_module_gfx11(
                 unit_elems=1,
                 num_records_bytes=rows64 * nseg64 * 4,
             )
-            row_seg = (token * H + head) * num_segments + seg
+            row_seg = ((bat * q_small + tok) * H + head) * num_segments + seg
             m_log2 = fx.Float32(results[0]) * fx.Float32(SCALE_LOG2)
             m_out = (l_fin > 0.0).select(m_log2, fx.Float32(NEG_INF))
-            stat_off = gated(row_seg, is_h0)
+            # A segment without keys for this row still writes its statistics,
+            # (-inf, 0), so the merge needs no knowledge of the partition; its O
+            # slot stays unwritten and the merge skips it by the zero exp-sum.
+            m_out = has_keys.select(m_out, fx.Float32(NEG_INF))
+            l_out = has_keys.select(l_fin, fx.Float32(0.0))
+            stat_off = row_ok.select(row_seg, OOB)
+            if const_expr(NW > 1):
+                stat_off = is_w0.select(stat_off, OOB)
+            stat_off = is_h0.select(stat_off, OOB)
             buf_copy_store(m_tab, stat_off, m_out, elem=fx.Float32, unit_elems=1)
-            buf_copy_store(l_tab, stat_off, l_fin, elem=fx.Float32, unit_elems=1)
+            buf_copy_store(l_tab, stat_off, l_out, elem=fx.Float32, unit_elems=1)
             o_row = row_seg * DPAD2
             for dc in range_constexpr(ND):
                 o = Vec(results[2 + dc])
@@ -680,7 +688,6 @@ def build_flash_attn_paged_decode_module_gfx11(
         bt_stride: fx.Int32,
         num_segments: fx.Int32,
         q_small: fx.Int32,
-        total_q: fx.Int32,
         stream: fx.Stream = fx.Stream(  # noqa: B008  framework idiom: default is evaluated once at import on purpose
             None
         ),
@@ -700,7 +707,6 @@ def build_flash_attn_paged_decode_module_gfx11(
             bt_stride,
             num_segments,
             q_small,
-            total_q,
             value_attrs={
                 "rocdl.waves_per_eu": (
                     int(waves_per_eu)
@@ -757,7 +763,6 @@ def build_flash_attn_paged_decode_module_gfx11(
             block_table.stride(0),
             int(num_segments),
             int(max_seqlen_q),
-            Q.shape[0],
             fx.Stream(None) if stream is None else stream,
         )
 

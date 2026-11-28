@@ -5,7 +5,7 @@
 ``flydsl_unified_attention_gfx11`` against an fp32 reference that gathers the
 keys through the block table, over prefills, chunks over a longer prefix, mixed
 prefill + decode batches, speculative decode and pure decode batches (the
-latter take the segmented path and aiter's Triton reduce)."""
+decode rows take the segmented path and the FlyDSL merge)."""
 
 import pytest
 import torch
@@ -137,7 +137,7 @@ def _check(seq_lens, H, HKV, D, page, dtype):
         ([(200, 200), (16, 16)], 16, 16, 64, 16, "f16"),
         ([(100, 100), (33, 77)], 4, 4, 40, 16, "bf16"),  # head_dim % 16 == 8
         # mixed: the prefill kernel takes the long sequences, the decode kernel
-        # the short ones (one segment, no reduce)
+        # the short ones (segments + merge, the prefill rows left alone)
         ([(1280, 1280)] + [(1, 1536)] * 31, 8, 2, 256, 32, "bf16"),
         ([(2048, 2048)] + [(1, 2048)] * 15, 8, 2, 256, 16, "bf16"),
         (
@@ -149,7 +149,7 @@ def _check(seq_lens, H, HKV, D, page, dtype):
             "bf16",
         ),
         ([(600, 600), (2, 900), (1, 1), (4, 4)], 32, 8, 128, 16, "bf16"),
-        # speculative decode and pure decode (segments + the Triton reduce)
+        # speculative decode and pure decode (segments + merge)
         ([(4, 2048)] * 32, 8, 2, 256, 16, "bf16"),
         ([(4, 512)] * 8, 8, 2, 256, 32, "bf16"),
         ([(3, 100), (4, 100), (2, 2), (4, 4), (3, 17)], 8, 2, 256, 16, "bf16"),
