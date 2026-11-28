@@ -480,7 +480,10 @@ class OpusGemmInstance:
     @property
     def m_align(self) -> int:
         """M multiple enforced by the generated launcher (1 means tail-safe)."""
-        if self.kernel_tag == "a8w8_blockscale_mxscale_gemm_bpreshuffle":
+        if self.kernel_tag in (
+            "a8w8_blockscale_mxscale_gemm_bpreshuffle",
+            "a8w8_blockscale_mxfp8",
+        ):
             entry = self.bpreshuffle_co or self.bpreshuffle_entry or {}
             return entry.get("m_align", 64 if self.pad_m else self.B_M)
         mult = _BMM_M_ALIGN_TILES.get(self.kernel_tag)
@@ -2897,7 +2900,19 @@ GFX950_CO_KERNELS_JSON = os.path.join(
     "gen_co",
     "co_kernels_gfx950_a8w8_blockscale_bpreshuffle.json",
 )
+# MXFP8 NT / NN / TT / TN with plain (not shuffled) A and B: the a8w8_blockscale_mxfp8
+# family, with its own CO manifest, kid space and image directory.
+GFX950_MXFP8_CO_KERNELS_JSON = os.path.join(
+    os.path.dirname(__file__), "gen_co", "co_kernels_gfx950_a8w8_blockscale.json"
+)
+_MXFP8_TAG = "a8w8_blockscale_mxfp8"
+# Manifest -> image directory under gen_co/gfx950/.
+_GFX950_CO_IMAGE_DIRS = {
+    GFX950_CO_KERNELS_JSON: "a8w8_blockscale_bpreshuffle",
+    GFX950_MXFP8_CO_KERNELS_JSON: "a8w8_blockscale",
+}
 a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list = {}
+a8w8_blockscale_mxfp8_kernels_list = {}
 
 
 # Shared metadata and names
@@ -2961,6 +2976,7 @@ def _bpreshuffle_instance(
     max_k=None,
     max_m=None,
     name_suffix=None,
+    tag=_TAG,
 ):
     """Build a JIT or CO instance with the shared bpreshuffle geometry."""
     instance = OpusGemmInstance(
@@ -2979,7 +2995,7 @@ def _bpreshuffle_instance(
         1,
         128,
         128,
-        _TAG,
+        tag,
         ["bf16_t"],
         WG_PER_CU=wg,
         cachectl_a=ca if co is None else -1,
@@ -3024,9 +3040,22 @@ def _bpreshuffle_instance(
 # CO metadata
 
 
-def _gfx950_co_image_path(path, entry):
-    root = os.environ.get("OPUS_GEN_CO_DIR") or os.path.dirname(path)
-    return os.path.join(root, "gfx950", "a8w8_blockscale_bpreshuffle", entry["image"])
+def _gfx950_co_image_path(entry):
+    root = os.environ.get("OPUS_GEN_CO_DIR") or os.path.dirname(GFX950_CO_KERNELS_JSON)
+    return os.path.join(root, "gfx950", entry["image_dir"], entry["image"])
+
+
+_MXFP8_DIRECTION_PIPELINES = {
+    "mxfp8_nt": "NT",
+    "mxfp8_nn": "NN",
+    "mxfp8_tt": "TT",
+    "mxfp8_tn": "TN",
+}
+
+
+def mxfp8_direction(entry):
+    """Direction ("NT" / "NN" / "TT" / "TN") of an a8w8_blockscale_mxfp8 CO manifest entry."""
+    return _MXFP8_DIRECTION_PIPELINES.get((entry or {}).get("pipeline"))
 
 
 def _load_gfx950_co_kernels(path, require_image=True):
@@ -3035,7 +3064,7 @@ def _load_gfx950_co_kernels(path, require_image=True):
     defaults = document.get("defaults", {})
     entries = {}
     for record in document["gfx950"]:
-        entry = {**defaults, **record}
+        entry = {**defaults, **record, "image_dir": _GFX950_CO_IMAGE_DIRS[path]}
         kid = entry["kid"]
         if kid in entries:
             raise ValueError(f"Duplicate gfx950 CO kid {kid} in {path}")
@@ -3055,6 +3084,10 @@ def _load_gfx950_co_kernels(path, require_image=True):
         "prefetch_b_vgpr": "b_vgpr_co",
         "prefetch_b_vgpr_overlap": "b_vgpr_overlap_co",
         "pingpong_lds": "m_repeat_co",
+        "mxfp8_nt": "mxfp8_nt_4wave_co",
+        "mxfp8_nn": "mxfp8_nn_4wave_co",
+        "mxfp8_tt": "mxfp8_tt_4wave_co",
+        "mxfp8_tn": "mxfp8_tn_4wave_co",
     }
     for entry in entries.values():
         fields = (
@@ -3088,7 +3121,7 @@ def _load_gfx950_co_kernels(path, require_image=True):
     return {
         kid: entry
         for kid, entry in entries.items()
-        if not require_image or os.path.isfile(_gfx950_co_image_path(path, entry))
+        if not require_image or os.path.isfile(_gfx950_co_image_path(entry))
     }
 
 
@@ -3865,6 +3898,9 @@ def _bpreshuffle_jit_instances():
 gfx950_co_kernels_declared = _load_gfx950_co_kernels(
     GFX950_CO_KERNELS_JSON, require_image=False
 )
+gfx950_mxfp8_co_kernels_declared = _load_gfx950_co_kernels(
+    GFX950_MXFP8_CO_KERNELS_JSON, require_image=False
+)
 
 
 for _kid, _instance in chain(
@@ -3889,6 +3925,12 @@ for _kid, _entry in gfx950_co_kernels_declared.items():
     a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list[_kid] = _bpreshuffle_instance(
         _bm, _bn, _bk, _wm, _wn, wg=2, co=_entry
     )
+for _kid, _entry in gfx950_mxfp8_co_kernels_declared.items():
+    _bm, _bn, _bk = _entry["tile"]
+    _wm, _wn = _entry["wave_layout"]
+    a8w8_blockscale_mxfp8_kernels_list[_kid] = _bpreshuffle_instance(
+        _bm, _bn, _bk, _wm, _wn, wg=2, co=_entry, tag=_MXFP8_TAG
+    )
 
 
 # Shape support
@@ -3897,6 +3939,32 @@ for _kid, _entry in gfx950_co_kernels_declared.items():
 def bpreshuffle_workspace_bytes(instance, m, n, k):
     split = (instance.bpreshuffle_entry or {}).get("split_k", 1)
     return 4 * split * m * n if split > 1 else 0
+
+
+def _pad_k_supports(instance, k):
+    """A pad_k CO runs a partial last K tile; with a K-contiguous operand, from K = 16."""
+    co = instance.bpreshuffle_co or {}
+    return bool(co.get("pad_k")) and (mxfp8_direction(co) == "TN" or k >= 16)
+
+
+def bpreshuffle_input_extents(instance, m, n, k):
+    """Byte extents of A, B and scaleA that the kernel addresses with 32-bit offsets.
+
+    Each must stay within INT32_MAX; the generated launcher checks the same list.
+    A CO with ``wide_input`` (the a8w8_blockscale_mxfp8 family) addresses A and B from
+    a 64-bit base per tile, or per K tile for an operand stored [K, M] / [K, N], so only
+    that view is limited and A / B may be 4 GiB or larger. Otherwise the whole operand
+    is one view.
+    """
+    co = instance.bpreshuffle_co or {}
+    if not co.get("wide_input"):
+        return [m * k, n * k]
+    a, b = mxfp8_direction(co)
+    return [
+        instance.B_M * k if a == "N" else instance.B_K * m,
+        instance.B_N * k if b == "T" else instance.B_K * n,
+        m * -(-k // 128),
+    ]
 
 
 def a8w8_mxscale_bpreshuffle_supports_shape(instance, m, n, k):
@@ -3910,13 +3978,15 @@ def a8w8_mxscale_bpreshuffle_supports_shape(instance, m, n, k):
         min(m, n, k) <= 0
         or m % instance.m_align
         or n % 128
-        or k % (split * instance.B_K)
+        or (k % (split * instance.B_K) and not _pad_k_supports(instance, k))
         or n % instance.B_N
         or (instance.max_m is not None and m > instance.max_m)
         or (instance.max_k is not None and k > instance.max_k)
     ):
         return False
-    if max(m * k, n * k) > _INT32_MAX:
+    if not all(
+        extent <= _INT32_MAX for extent in bpreshuffle_input_extents(instance, m, n, k)
+    ):
         return False
     if (
         instance.bpreshuffle_entry is not None
@@ -3996,6 +4066,7 @@ KERNEL_REGISTRY = {
         "gfx942": {cu: dict(gfx942_a8w8_kernels_list) for cu in (80, 228, 304)},
         "gfx950": {cu: dict(sorted(a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list.items())) for cu in (128, 256)},
     },
+    "a8w8_blockscale_mxfp8": {"gfx950": {cu: dict(sorted(a8w8_blockscale_mxfp8_kernels_list.items())) for cu in (128, 256)}},
 }
 
 
@@ -4012,6 +4083,7 @@ for _cat in (
     gfx942_kernels_list,
     gfx1250_a16w16_kernels_list,
     a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list,
+    a8w8_blockscale_mxfp8_kernels_list,
 ):
     for _kid, _inst in _cat.items():
         _sig = repr(asdict(_inst))
@@ -4075,14 +4147,15 @@ def get_registry(family: str, gfx: str, cu_num: int) -> dict[int, object]:
             if instance.kernel_tag not in _A16W16_CO_TAGS
             or os.path.isfile(co_image_path(CO_KERNELS_JSON, instance))
         }
-    if family == "a8w8_blockscale_bpreshuffle" and gfx == "gfx950":
+    if (
+        family in ("a8w8_blockscale_bpreshuffle", "a8w8_blockscale_mxfp8")
+        and gfx == "gfx950"
+    ):
         return {
             kid: instance
             for kid, instance in records.items()
             if instance.bpreshuffle_co is None
-            or os.path.isfile(
-                _gfx950_co_image_path(GFX950_CO_KERNELS_JSON, instance.bpreshuffle_co)
-            )
+            or os.path.isfile(_gfx950_co_image_path(instance.bpreshuffle_co))
         }
     return records
 
@@ -4320,6 +4393,7 @@ OPUS_KERNEL_TAGS_BY_ARCH_FAMILY = {
         "a8w8_blockscale_bpreshuffle": frozenset(
             {"a8w8_blockscale_mxscale_gemm_bpreshuffle"}
         ),
+        "a8w8_blockscale_mxfp8": frozenset({"a8w8_blockscale_mxfp8"}),
     },
     "gfx942": {
         "a16w16": frozenset(
@@ -4343,6 +4417,7 @@ OPUS_KERNEL_TAGS_BY_ARCH_FAMILY = {
         "a8w8_blockscale_bpreshuffle": frozenset(
             {"a8w8_blockscale_bpreshuffle_singlebuf"}
         ),
+        "a8w8_blockscale_mxfp8": frozenset(),
     },
     "gfx1250": {
         "a16w16": frozenset(
@@ -4359,6 +4434,7 @@ OPUS_KERNEL_TAGS_BY_ARCH_FAMILY = {
         "a8w8_blockscale": frozenset(),
         "a8w8_mxscale_bmm": frozenset(),
         "a8w8_blockscale_bpreshuffle": frozenset(),
+        "a8w8_blockscale_mxfp8": frozenset(),
     },
 }
 
@@ -4442,12 +4518,10 @@ def get_kernel_instance(
     ):
         return None
     if (
-        family == "a8w8_blockscale_bpreshuffle"
+        family in ("a8w8_blockscale_bpreshuffle", "a8w8_blockscale_mxfp8")
         and arch == "gfx950"
         and instance.bpreshuffle_co is not None
-        and not os.path.isfile(
-            _gfx950_co_image_path(GFX950_CO_KERNELS_JSON, instance.bpreshuffle_co)
-        )
+        and not os.path.isfile(_gfx950_co_image_path(instance.bpreshuffle_co))
     ):
         return None
     return instance

@@ -260,4 +260,15 @@ def _opus_dispatch(
             instance=instance,
             workspace=workspace,
         )
+    if family == "a8w8_blockscale_mxfp8":
+        return family_module._launch_a8w8_blockscale_mxfp8_gemm(
+            XQ,
+            WQ,
+            x_scale,
+            w_scale,
+            Y,
+            kid=kid,
+            route_arch=route_arch,
+            instance=instance,
+        )
     raise RuntimeError(f"unsupported canonical OPUS family {family!r}")

@@ -8,6 +8,9 @@
 # make it add a dummy CUDA Tensor to every raw launch, which is observable host
 # overhead on short BMM kernels.
 
+import re
+from functools import lru_cache
+
 import torch
 from torch import Tensor
 
@@ -15,6 +18,7 @@ from csrc.opus_gemm.opus_gemm_common import (
     a8w8_mxscale_bpreshuffle_supports_shape,
     bpreshuffle_workspace_bytes,
     get_registry,
+    mxfp8_direction,
 )
 
 from ...jit.core import compile_ops
@@ -23,6 +27,7 @@ from .launch_plan import (
     _A8W8_BLOCKSCALE_FAMILY,
     _A8W8_BPRESHUFFLE_FAMILY,
     _A8W8_FAMILY,
+    _A8W8_MXFP8_FAMILY,
     _A8W8_MXSCALE_BMM_FAMILY,
     _FP8_DTYPES,
     _get_cached_a8w8_mxscale_bmm_plan,
@@ -102,6 +107,33 @@ def _gen_opus_gemm_a8w8_blockscale_bpreshuffle_launch_fake_tensors(
     workspace: Tensor | None = None,
 ) -> Tensor:
     return Y
+
+
+def _gen_opus_gemm_a8w8_blockscale_mxfp8_launch_fake_tensors(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Y: Tensor,
+    kid: int,
+) -> Tensor:
+    return Y
+
+
+@compile_ops(
+    "module_deepgemm_opus",
+    fc_name="opus_gemm_a8w8_blockscale_mxfp8_launch",
+    gen_fake=_gen_opus_gemm_a8w8_blockscale_mxfp8_launch_fake_tensors,
+    develop=True,
+)
+def _opus_gemm_a8w8_blockscale_mxfp8_launch_raw(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Y: Tensor,
+    kid: int,
+) -> Tensor: ...
 
 
 @compile_ops(
@@ -227,6 +259,12 @@ def _launch_a8w8_backend(
             kid,
             *((workspace,) if workspace is not None else ()),
         )
+        return
+
+    if family == _A8W8_MXFP8_FAMILY:
+        if workspace is not None or split_k != 0:
+            raise RuntimeError("A8W8 blockscale-mxfp8 backend received split-K state")
+        _opus_gemm_a8w8_blockscale_mxfp8_launch_raw(XQ, WQ, x_scale, w_scale, Y, kid)
         return
 
     if family == _A8W8_MXSCALE_BMM_FAMILY:
@@ -395,6 +433,278 @@ def _launch_a8w8_blockscale_bpreshuffle_gemm(
     if workspace is not None:
         workspace.record_stream(torch.cuda.current_stream(XQ.device))
     return Y
+
+
+def _launch_a8w8_blockscale_mxfp8_gemm(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Y: Tensor,
+    *,
+    kid: int,
+    route_arch: str | None = None,
+    instance: object | None = None,
+) -> Tensor:
+    """Launch logical 2D MXFP8 blockscale GEMM with plain A / B.
+
+    ``XQ`` [M, K] / ``WQ`` [N, K] are logical views; the kid's layout (NT / NN /
+    TT / TN) must match their strides, which the generated launcher checks.
+    """
+    resolved_kid = kid
+    if instance is None:
+        if any(tensor.dim() != 2 for tensor in (XQ, WQ, Y, x_scale, w_scale)):
+            raise ValueError(
+                "opus_gemm A8W8 blockscale mxfp8 expects logical 2D "
+                "XQ/WQ/Y/x_scale/w_scale; this family is GEMM-only"
+            )
+        device_arch, cu_num = _device_arch_and_cu(XQ.device)
+        resolved_kid = _require_registered_kid(
+            arch=route_arch or device_arch,
+            family=_A8W8_MXFP8_FAMILY,
+            kid=kid,
+            output_dtype=Y.dtype,
+            cu_num=cu_num,
+        )
+    _launch_a8w8_backend(
+        XQ.unsqueeze(0),
+        WQ.unsqueeze(0),
+        Y.unsqueeze(0),
+        x_scale,
+        w_scale,
+        None,
+        _A8W8_MXFP8_FAMILY,
+        resolved_kid,
+        0,
+    )
+    return Y
+
+
+# ---- MXFP8 NT / NN / TT / TN, plain B (gfx950 CO kids) ------------------------
+
+
+def _mxfp8_direction(XQ: Tensor, WQ: Tensor) -> str | None:
+    """Storage of logical XQ [M, K] / WQ [N, K] as the kernel names spell it.
+
+    First letter A, second B. A "N" is stored [M, K] (strides (>= K, 1)), A "T"
+    [K, M] (strides (1, M)); B "T" is stored [N, K] (strides (>= K, 1)), B "N"
+    [K, N] (strides (1, N)). Returns "NN", "TT", "TN", "NT" or None. The rows of
+    a K-contiguous operand may be more than K apart: a [M, K] view of a wider buffer.
+    """
+    (M, K), N = XQ.shape, WQ.shape[0]
+
+    def k_contiguous(operand):
+        return operand.stride(1) == 1 and operand.stride(0) >= K
+
+    if k_contiguous(XQ):
+        a = "N"
+    elif XQ.stride() == (1, M):
+        a = "T"
+    else:
+        return None
+    if k_contiguous(WQ):
+        b = "T"
+    elif WQ.stride() == (1, N):
+        b = "N"
+    else:
+        return None
+    return a + b
+
+
+# Scalar-only key, as _get_cached_a16w16_launch_plan: the pick filters the registry
+# (one CO image stat per kid), which costs more than a small GEMM if redone per call.
+@lru_cache(maxsize=256)
+def _select_mxfp8_direction_kid(
+    direction: str, M: int, N: int, K: int, arch: str, cu_num: int
+) -> int | None:
+    """Pick a supported NT / NN / TT / TN kid for the shape.
+
+    The rule is fitted to a sweep of every kid over 264 shapes per direction on a
+    256-CU gfx950 (M 16 to 32768, N 128 to 8192, K 512 to 7168): there the pick is
+    0.5% slower than the fastest kid on average and within 2% of it on 95% of the
+    shapes. On 60 shapes per direction outside that grid (NN, TT) it is 1.6% slower
+    on average, within 2% on 78% and at most 17% slower.
+
+    * 256x128 tiles while they do not outnumber the CUs (or N % 256 != 0), else
+      256x256: more, smaller tiles only pay while there are CUs left to fill.
+    * GroupM for a tall, narrow grid (at least 4 M tiles of at most 8 N tiles):
+      8 on 256x128, 4 on 256x256 (8 from 128 M tiles of at most 4 N tiles).
+    * PadM only when M is not a multiple of 256 (it has no GroupM variant).
+    """
+    m_tiles = -(-M // 256)
+    want_bn = 256 if N % 256 == 0 and m_tiles * (N // 128) > cu_num else 128
+    n_tiles = N // want_bn
+    want_group_m = 0
+    if m_tiles >= 4 and n_tiles <= 8:
+        wide_tall = want_bn == 256 and not (m_tiles >= 128 and n_tiles <= 4)
+        want_group_m = 4 if wide_tall else 8
+    best = None
+    for kid, instance in get_registry(_A8W8_MXFP8_FAMILY, arch, cu_num).items():
+        if mxfp8_direction(instance.bpreshuffle_co) != direction:
+            continue
+        if not a8w8_mxscale_bpreshuffle_supports_shape(instance, M, N, K):
+            continue
+        group_m = re.search(r"_gm(\d+)", instance.name)
+        rank = (
+            instance.B_N != want_bn,
+            (int(group_m[1]) if group_m else 0) != want_group_m,
+            instance.m_align != instance.B_M,
+            kid,
+        )
+        if best is None or rank < best[0]:
+            best = (rank, kid)
+    return None if best is None else best[1]
+
+
+def _mxfp8_run_shape(direction: str, M: int, N: int, K: int) -> tuple[int, int, int]:
+    """The (M, N, K) the kernel runs for a logical one.
+
+    The kernels take M % 16 == 0 (PadM; x_scale and a [K, M] A are read 16 rows at
+    a time), N % 128 == 0 (one w_scale group; C is written in whole 128-column
+    quadrants) and any K, from 16 with a K-contiguous operand (its partial K tile
+    is rewritten from the last 16 bytes of each row).
+    """
+    run_k = 16 if K < 16 and direction != "TN" else K
+    return -(-M // 16) * 16, -(-N // 128) * 128, run_k
+
+
+def _mxfp8_padded_operand(
+    operand: Tensor, k_contiguous: bool, rows: int, K: int
+) -> Tensor:
+    """Logical [R, K0] operand zero-padded to [rows, K], in the same storage.
+
+    Zero rows and zero K only add zero products. A K-contiguous copy gets rows a
+    multiple of 128 bytes apart, the layout the kernel reads fastest.
+    """
+    R, K0 = operand.shape
+    if k_contiguous:
+        padded = operand.new_zeros((rows, -(-K // 128) * 128))
+        padded[:R, :K0] = operand
+        return padded[:, :K]
+    padded = operand.new_zeros((K, rows))
+    padded[:K0, :R] = operand.t()
+    return padded.t()
+
+
+def _mxfp8_padded_x_scale(x_scale: Tensor, M: int, rows: int) -> Tensor:
+    """x_scale [M, groups] (column-major bytes) padded to [rows, groups], as a strides
+    (1, rows) view. The scales of the padded rows multiply zeros."""
+    if x_scale.dim() != 2 or x_scale.shape[0] != M:
+        raise ValueError(
+            f"x_scale must be [{M}, ceil(K / 128)], got {tuple(x_scale.shape)}"
+        )
+    groups = x_scale.shape[1]
+    if x_scale.stride() == (1, M):
+        columns = x_scale.t()
+    elif x_scale.is_contiguous():
+        columns = x_scale.reshape(groups, M)
+    else:
+        raise ValueError(
+            "x_scale must hold column-major bytes: contiguous or a strides (1, M) "
+            f"view, got strides {tuple(x_scale.stride())}"
+        )
+    padded = x_scale.new_zeros((groups, rows))
+    padded[:, :M] = columns
+    return padded.t()
+
+
+def gemm_a8w8_blockscale_opus(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = torch.bfloat16,
+    *,
+    kernelId: int | None = None,
+    out: Tensor | None = None,
+) -> Tensor:
+    """gfx950 MXFP8 1x128 blockscale GEMM for NT / NN / TT / TN operand storage.
+
+    Computes Y[M, N] = XQ[M, K] @ WQ[N, K]^T on logical shapes; the storage is
+    read from the strides (see ``_mxfp8_direction``), so pass the transposed
+    view of a [K, M] A or of a [K, N] B, never a copy. A and B are plain FP8
+    (no ``shuffle_weight``), as DeepGEMM's fp8_gemm_{nt,nn,tn,tt}. x_scale is
+    the E8M0 [M, K/128] scale with column-major bytes; w_scale the E8M0
+    [N/128, K/128] scale stored like WQ ([N/128, K/128] for B "T",
+    [K/128, N/128] for B "N"). Output is BF16. XQ, WQ and the output may each be
+    4 GiB or larger.
+
+    M, N and K are any positive sizes. The scales have ceil(K / 128) K groups, the
+    last one over the K % 128 elements left, and w_scale ceil(N / 128) N groups.
+    The kernels take M % 16 == 0, N % 128 == 0 and, with a [M, K] / [N, K]
+    operand, K >= 16: otherwise XQ and x_scale (M), WQ (N) or both operands (K) are
+    first copied into zero-padded ones and the [M, N] result is cut from the padded
+    output (a copy when N is padded or ``out`` is given). Any other K is read in
+    place.
+    A [M, K] / [N, K] operand may be a view of a wider buffer (rows >= K apart;
+    what follows a row's K bytes is not read into the result). The kernel copies
+    128 bytes of a row per K tile and is fastest when every row starts on a
+    128-byte boundary (rows a multiple of 128 apart); the rows of a K % 128 != 0
+    operand packed [M, K] do not, which costs up to 2x on a small GEMM.
+
+    ``kernelId`` runs that a8w8_blockscale_mxfp8 kid (0-39: NT 0-9, NN 10-19,
+    TT 20-29, TN 30-39); otherwise one is picked by shape.
+    """
+    # 1. Check the request; read the storage (NT / NN / TT / TN) off the strides.
+    if XQ.dim() != 2 or WQ.dim() != 2:
+        raise ValueError("gemm_a8w8_blockscale_opus expects 2D XQ / WQ")
+    if dtype != torch.bfloat16:
+        raise ValueError("gemm_a8w8_blockscale_opus writes BF16 only")
+    direction = _mxfp8_direction(XQ, WQ)
+    if direction is None:
+        raise ValueError(
+            "gemm_a8w8_blockscale_opus serves NT / NN / TT / TN storage; got "
+            f"XQ strides {tuple(XQ.stride())}, WQ strides {tuple(WQ.stride())}"
+        )
+    M, K = map(int, XQ.shape)
+    N = int(WQ.shape[0])
+    if min(M, N, K) <= 0:
+        raise ValueError(
+            f"gemm_a8w8_blockscale_opus needs M, N, K > 0, got {M}, {N}, {K}"
+        )
+    if out is not None and (tuple(out.shape) != (M, N) or out.dtype != dtype):
+        raise ValueError(
+            f"out must be {dtype} [{M}, {N}], got {out.dtype} {tuple(out.shape)}"
+        )
+
+    # 2. Pad the inputs to the shape the kernel runs (a no-op for a shape it takes).
+    run_m, run_n, run_k = _mxfp8_run_shape(direction, M, N, K)
+    if (run_m, run_k) != (M, K):
+        XQ = _mxfp8_padded_operand(XQ, direction[0] == "N", run_m, run_k)
+    if run_m != M:
+        x_scale = _mxfp8_padded_x_scale(x_scale, M, run_m)
+    if (run_n, run_k) != (N, K):
+        WQ = _mxfp8_padded_operand(WQ, direction[1] == "T", run_n, run_k)
+    padded_out = (run_m, run_n) != (M, N)
+    if padded_out or out is None:
+        Y = torch.empty((run_m, run_n), dtype=dtype, device=XQ.device)
+    else:
+        Y = out
+
+    # 3. Pick the kid for the run shape, unless the caller named one.
+    if kernelId is None:
+        arch, cu_num = _device_arch_and_cu(XQ.device)
+        kernelId = _select_mxfp8_direction_kid(
+            direction, run_m, run_n, run_k, arch, cu_num
+        )
+        if kernelId is None:
+            raise ValueError(
+                f"no {direction} MXFP8 kernel supports M={M}, N={N}, K={K} on {arch}: "
+                "one tile's view of A / B (256 rows of an operand stored [M, K] / "
+                "[N, K], 128 rows of one stored [K, M] / [K, N]) and x_scale must "
+                "each stay below 2**31 bytes"
+            )
+
+    # 4. Launch; the generated launcher checks the kid against the tensors.
+    _launch_a8w8_blockscale_mxfp8_gemm(XQ, WQ, x_scale, w_scale, Y, kid=int(kernelId))
+
+    # 5. Cut [M, N] from a padded output.
+    if not padded_out:
+        return Y
+    if out is not None:
+        out.copy_(Y[:M, :N])
+        return out
+    return Y[:M, :N].contiguous()
 
 
 def _validate_a8w8_mxscale_bmm_tensors(
@@ -779,5 +1089,6 @@ def _mxscale_bmm_workspace(
 __all__ = [
     "bmm_a8w8_mxscale_opus",
     "bmm_a8w8_mxscale_opus_bpreshuffle",
+    "gemm_a8w8_blockscale_opus",
     "opus_gemm_a8w8_blockscale_bpreshuffle_tune",
 ]

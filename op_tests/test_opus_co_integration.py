@@ -239,6 +239,498 @@ def test_gfx950_mxscale_co_accepts_supported_shape(kid, shape, _gfx950_device):
     assert (backing[M * N :] == -7.0).all().item(), "CO modified output canary"
 
 
+# a8w8_blockscale_mxfp8 (plain-B NT / NN / TT / TN) COs: (direction, kid, shape), every
+# shipped kid: NT 0-9, NN 10-19, TT 20-29, TN 30-39.
+# 256x256 crosses the 64-column scale panel (K / 128 = 65), PadM takes
+# M % 16 == 0, 256x128 takes N an odd multiple of 128, and GroupM 4 / 8 / 16
+# runs a partial last group (17 M tiles). K = 256 is two K tiles, which only the
+# prologue copies, so the PadM / GroupM kids also run K = 1024: the main loop
+# then copies K tile i + 2 (PadM: through the bounds-checked offset).
+_MXFP8_DIRECTION_SHAPES = (
+    ((0, 10, 20, 30), (512, 512, 8320)),  # 256x256
+    ((1, 11, 21, 31), (272, 512, 256)),  # 256x256 PadM
+    ((2, 12, 22, 32), (512, 384, 256)),  # 256x128
+    ((3, 13, 23, 33), (272, 384, 256)),  # 256x128 PadM
+    ((4, 14, 24, 34), (4352, 768, 256)),  # 256x256 GroupM 4
+    ((5, 15, 25, 35), (4352, 768, 256)),  # 256x256 GroupM 8
+    ((6, 16, 26, 36), (4352, 768, 256)),  # 256x256 GroupM 16
+    ((7, 17, 27, 37), (4352, 768, 256)),  # 256x128 GroupM 4
+    ((8, 18, 28, 38), (4352, 768, 256)),  # 256x128 GroupM 8
+    ((9, 19, 29, 39), (4352, 768, 256)),  # 256x128 GroupM 16
+    ((1, 11, 21, 31), (272, 512, 1024)),  # 256x256 PadM, main-loop copies
+    ((3, 13, 23, 33), (272, 384, 1024)),  # 256x128 PadM, main-loop copies
+    ((4, 14, 24, 34), (4352, 768, 1024)),  # 256x256 GroupM 4, main-loop copies
+    ((5, 15, 25, 35), (4352, 768, 1024)),  # 256x256 GroupM 8, main-loop copies
+    ((6, 16, 26, 36), (4352, 768, 1024)),  # 256x256 GroupM 16, main-loop copies
+    ((7, 17, 27, 37), (4352, 768, 1024)),  # 256x128 GroupM 4, main-loop copies
+    ((8, 18, 28, 38), (4352, 768, 1024)),  # 256x128 GroupM 8, main-loop copies
+    ((9, 19, 29, 39), (4352, 768, 1024)),  # 256x128 GroupM 16, main-loop copies
+)
+_MXFP8_DIRECTION_CASES = tuple(
+    (direction, kid, shape)
+    for kids, shape in _MXFP8_DIRECTION_SHAPES
+    for direction, kid in zip(("NT", "NN", "TT", "TN"), kids)
+)
+
+
+def _gfx950_mxfp8_direction_inputs(direction, M, N, K, device):
+    """Plain operands of C = A @ B stored as `direction` (first letter A, second B, BLAS op)."""
+    gen = torch.Generator(device=device).manual_seed(M + 7 * N + 13 * K)
+    a = torch.randn(M, K, device=device, generator=gen).to(torch.float8_e4m3fn)
+    b = torch.randn(K, N, device=device, generator=gen).to(torch.float8_e4m3fn)
+    # E8M0 exponents around 2^0: A [M, K/128], B [K/128, N/128].
+    sa = torch.randint(
+        124, 131, (M, K // 128), device=device, generator=gen, dtype=torch.uint8
+    )
+    sb = torch.randint(
+        124, 131, (K // 128, N // 128), device=device, generator=gen, dtype=torch.uint8
+    )
+    ref = (a.float() * torch.exp2(sa.float() - 127).repeat_interleave(128, dim=1)) @ (
+        b.float()
+        * torch.exp2(sb.float() - 127)
+        .repeat_interleave(128, dim=0)
+        .repeat_interleave(128, dim=1)
+    )
+    xq = a.contiguous() if direction[0] == "N" else a.t().contiguous().t()
+    if direction[1] == "N":
+        wq = b.contiguous().t()  # storage [K, N]
+        w_scale = sb.contiguous().t()
+    else:
+        wq = b.t().contiguous()  # storage [N, K]
+        w_scale = sb.t().contiguous()
+    x_scale = sa.t().contiguous().t()  # column-major bytes, strides (1, M)
+    return xq, wq, x_scale, w_scale, ref
+
+
+def _gfx950_mxfp8_direction_run(xq, wq, x_scale, w_scale, kid):
+    Y = torch.empty(xq.shape[0], wq.shape[0], device=xq.device, dtype=torch.bfloat16)
+    return opus_gemm(
+        xq,
+        wq,
+        Y,
+        family="a8w8_blockscale_mxfp8",
+        kid=kid,
+        layout="plain",
+        x_scale=x_scale,
+        w_scale=w_scale,
+    )
+
+
+@pytest.mark.parametrize(("direction", "kid", "shape"), _MXFP8_DIRECTION_CASES)
+def test_gfx950_mxfp8_direction_co_matches_reference(
+    direction, kid, shape, _gfx950_device
+):
+    xq, wq, x_scale, w_scale, ref = _gfx950_mxfp8_direction_inputs(
+        direction, *shape, _gfx950_device
+    )
+    Y = _gfx950_mxfp8_direction_run(xq, wq, x_scale, w_scale, kid)
+    torch.cuda.synchronize(_gfx950_device)
+    err = (Y.float() - ref).abs().max().item()
+    assert (
+        err <= 2e-2 * ref.abs().max().item()
+    ), f"{direction} kid {kid} {shape}: max err {err}"
+
+
+@pytest.mark.parametrize(
+    ("direction", "other_kid"), (("NT", 10), ("NN", 20), ("TT", 10), ("TN", 10))
+)
+def test_gfx950_mxfp8_direction_co_rejects_other_layout(
+    direction, other_kid, _gfx950_device
+):
+    # Another direction's launcher must reject these operand strides before launch.
+    xq, wq, x_scale, w_scale, _ = _gfx950_mxfp8_direction_inputs(
+        direction, 256, 256, 128, _gfx950_device
+    )
+    with pytest.raises(RuntimeError, match="CO expects XQ strides"):
+        _gfx950_mxfp8_direction_run(xq, wq, x_scale, w_scale, other_kid)
+
+
+# gemm_a8w8_blockscale_opus picks the kid by shape: 256x128 for few tiles
+# (512 x 512, also crossing the scale panel at K = 8320), PadM (M = 272) and 256x128
+# GroupM 8 (4352 x 1024 and 16384 x 256). See
+# test_gfx950_mxfp8_direction_kid_pick for the rule.
+@pytest.mark.parametrize("direction", ("NT", "NN", "TT", "TN"))
+@pytest.mark.parametrize(
+    "shape",
+    ((512, 512, 8320), (272, 384, 256), (4352, 1024, 256), (16384, 256, 256)),
+)
+def test_gfx950_mxfp8_direction_api_matches_reference(direction, shape, _gfx950_device):
+    from aiter.ops.opus import gemm_a8w8_blockscale_opus
+
+    xq, wq, x_scale, w_scale, ref = _gfx950_mxfp8_direction_inputs(
+        direction, *shape, _gfx950_device
+    )
+    Y = gemm_a8w8_blockscale_opus(xq, wq, x_scale, w_scale)
+    torch.cuda.synchronize(_gfx950_device)
+    assert Y.shape == ref.shape and Y.dtype == torch.bfloat16
+    err = (Y.float() - ref).abs().max().item()
+    assert err <= 2e-2 * ref.abs().max().item(), f"{direction} {shape}: max err {err}"
+
+
+def test_gfx950_mxfp8_direction_api_explicit_kid_and_out(_gfx950_device):
+    from aiter.ops.opus import gemm_a8w8_blockscale_opus
+
+    xq, wq, x_scale, w_scale, ref = _gfx950_mxfp8_direction_inputs(
+        "TT", 512, 384, 256, _gfx950_device
+    )
+    out = torch.full(
+        (512, 384), float("nan"), device=_gfx950_device, dtype=torch.bfloat16
+    )
+    Y = gemm_a8w8_blockscale_opus(xq, wq, x_scale, w_scale, kernelId=22, out=out)
+    torch.cuda.synchronize(_gfx950_device)
+    assert Y.data_ptr() == out.data_ptr()
+    assert (Y.float() - ref).abs().max().item() <= 2e-2 * ref.abs().max().item()
+    # Another direction's kid rejects these strides in its launcher.
+    with pytest.raises(RuntimeError, match="CO expects XQ strides"):
+        gemm_a8w8_blockscale_opus(xq, wq, x_scale, w_scale, kernelId=12)
+
+
+@pytest.mark.parametrize("direction", ("NT", "NN", "TT", "TN"))
+def test_gfx950_mxfp8_direction_api_contiguous_column_major_x_scale(
+    direction, _gfx950_device
+):
+    from aiter.ops.opus import gemm_a8w8_blockscale_opus
+
+    # x_scale as per_group_quant_hip(transpose_scale=True) emits it: column-major
+    # bytes ([K/128, M] row-major) in a contiguous [M, K/128] tensor. K / 128 = 4
+    # columns of distinct scales, so reading them row-major fails the reference.
+    M, N, K = 512, 384, 512
+    xq, wq, x_scale, w_scale, ref = _gfx950_mxfp8_direction_inputs(
+        direction, M, N, K, _gfx950_device
+    )
+    x_scale = x_scale.t().contiguous().view(M, K // 128)
+    assert x_scale.is_contiguous() and x_scale.stride() == (K // 128, 1)
+    Y = gemm_a8w8_blockscale_opus(xq, wq, x_scale, w_scale)
+    torch.cuda.synchronize(_gfx950_device)
+    err = (Y.float() - ref).abs().max().item()
+    assert err <= 2e-2 * ref.abs().max().item(), f"{direction}: max err {err}"
+
+
+def test_gfx950_mxfp8_direction_api_rejects_bad_layouts_and_shapes(_gfx950_device):
+    from aiter.ops.opus import gemm_a8w8_blockscale_opus
+
+    xq, wq, x_scale, w_scale, _ = _gfx950_mxfp8_direction_inputs(
+        "TT", 256, 256, 128, _gfx950_device
+    )
+    # Neither row- nor column-major A (a column slice).
+    with pytest.raises(ValueError, match="serves NT / NN / TT / TN storage"):
+        gemm_a8w8_blockscale_opus(
+            xq.t().contiguous()[:, :128].t(), wq, x_scale, w_scale
+        )
+    # out of another shape.
+    out = torch.empty(256, 128, device=_gfx950_device, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="out must be"):
+        gemm_a8w8_blockscale_opus(xq, wq, x_scale, w_scale, out=out)
+
+
+# The pick by shape (kid within the direction; _select_mxfp8_direction_kid): 256x128
+# while its tiles do not outnumber the 256 CUs, GroupM for a tall and narrow grid,
+# PadM for M % 256 != 0.
+@pytest.mark.parametrize(
+    ("shape", "kid"),
+    (
+        ((512, 512, 1024), 2),  # 8 tiles: 256x128
+        ((2048, 4096, 1024), 2),  # 256 tiles of 256x128, 32 wide: no GroupM
+        ((2048, 7168, 1024), 0),  # 448 > 256: 256x256
+        ((2048, 4224, 1024), 2),  # N % 256 != 0: 256x128
+        ((272, 384, 1024), 3),  # PadM
+        ((4368, 7168, 1024), 1),  # PadM, 256x256
+        ((16384, 256, 1024), 8),  # 64 M tiles of 2: 256x128 GroupM 8
+        ((16384, 1024, 1024), 4),  # 64 M tiles of 4 256x256: GroupM 4
+        ((32768, 512, 1024), 5),  # 128 M tiles of 2 256x256: GroupM 8
+        ((16384, 8192, 1024), 0),  # 32 N tiles: no GroupM
+    ),
+)
+def test_gfx950_mxfp8_direction_kid_pick(shape, kid, _gfx950_device):
+    from aiter.ops.opus.gemm_op_a8w8 import (
+        _device_arch_and_cu,
+        _select_mxfp8_direction_kid,
+    )
+
+    arch, cu_num = _device_arch_and_cu(_gfx950_device)
+    if cu_num != 256:
+        pytest.skip("the expected kids are for 256 CUs")
+    for first_kid, direction in ((0, "NT"), (10, "NN"), (20, "TT"), (30, "TN")):
+        picked = _select_mxfp8_direction_kid(direction, *shape, arch, cu_num)
+        assert picked == first_kid + kid, f"{direction} {shape}: kid {picked}"
+
+
+# K is any positive size: the last K tile is partial and the scales have
+# ceil(K / 128) K groups. (kid within the direction, shape): K below 16 (padded to 16
+# by the API unless TN), a single partial tile, 2 to 5, 8 and 9 K tiles (the prologue,
+# the first iteration, the one after the steady loop and the steady loop each copy the
+# partial tile in turn), tails below, at and above a 16-byte chunk, PadM, GroupM, a
+# one-element tail past the 64-group scale panel (K = 8321), and the pick by shape
+# (also for K = 1: a [N, 1] operand is stored both ways, and is read as [K, N]).
+_MXFP8_DIRECTION_ANY_K_CASES = (
+    (None, (512, 384, 1)),
+    (2, (512, 384, 15)),
+    (2, (512, 384, 16)),
+    (0, (512, 512, 17)),
+    (2, (512, 384, 127)),
+    (2, (512, 384, 129)),
+    (3, (272, 384, 255)),
+    (0, (512, 512, 300)),
+    (2, (512, 384, 600)),
+    (0, (512, 512, 1000)),
+    (1, (272, 512, 1025)),
+    (6, (4352, 768, 1000)),
+    (9, (4352, 768, 385)),
+    (0, (512, 512, 8321)),
+    (None, (512, 512, 1025)),
+)
+
+
+def _gfx950_mxfp8_direction_any_k_inputs(direction, M, N, K, device):
+    """Operands of C = A @ B with ceil(K / 128) scale groups, and the reference.
+
+    Each operand is the head of a buffer that continues with FP8 NaN bytes, so a kernel
+    that used anything past the operand (K rows past one stored [K, M] / [K, N], bytes
+    past the last row of one stored [M, K] / [N, K]) would return NaN. Within a
+    K-contiguous operand the bytes past K of a row are the next row's values.
+    """
+    gen = torch.Generator(device=device).manual_seed(M + 7 * N + 13 * K)
+    groups = -(-K // 128)
+    a = torch.randn(M, K, device=device, generator=gen).to(torch.float8_e4m3fn)
+    b = torch.randn(K, N, device=device, generator=gen).to(torch.float8_e4m3fn)
+    sa = torch.randint(
+        124, 131, (M, groups), device=device, generator=gen, dtype=torch.uint8
+    )
+    sb = torch.randint(
+        124,
+        131,
+        (groups, -(-N // 128)),
+        device=device,
+        generator=gen,
+        dtype=torch.uint8,
+    )
+    scale_a = torch.exp2(sa.float() - 127).repeat_interleave(128, dim=1)[:, :K]
+    scale_b = (
+        torch.exp2(sb.float() - 127)
+        .repeat_interleave(128, dim=0)[:K]
+        .repeat_interleave(128, dim=1)[:, :N]
+    )
+    ref = (a.float() * scale_a) @ (b.float() * scale_b)
+
+    def stored(operand):  # row-major copy followed by 4096 NaN bytes
+        rows, cols = operand.shape
+        backing = torch.full(
+            (rows * cols + 4096,), 0x7F, device=device, dtype=torch.uint8
+        ).view(torch.float8_e4m3fn)
+        backing[: rows * cols] = operand.reshape(-1)
+        return backing[: rows * cols].view(rows, cols)
+
+    xq = stored(a) if direction[0] == "N" else stored(a.t()).t()
+    if direction[1] == "N":
+        wq, w_scale = stored(b).t(), sb.contiguous().t()
+    else:
+        wq, w_scale = stored(b.t()), sb.t().contiguous()
+    x_scale = sa.t().contiguous().t()
+    return xq, wq, x_scale, w_scale, ref
+
+
+@pytest.mark.parametrize(
+    ("direction", "first_kid"), (("NT", 0), ("NN", 10), ("TT", 20), ("TN", 30))
+)
+@pytest.mark.parametrize(("kid", "shape"), _MXFP8_DIRECTION_ANY_K_CASES)
+def test_gfx950_mxfp8_direction_api_any_k(
+    direction, first_kid, kid, shape, _gfx950_device
+):
+    from aiter.ops.opus import gemm_a8w8_blockscale_opus
+
+    xq, wq, x_scale, w_scale, ref = _gfx950_mxfp8_direction_any_k_inputs(
+        direction, *shape, _gfx950_device
+    )
+    Y = gemm_a8w8_blockscale_opus(
+        xq, wq, x_scale, w_scale, kernelId=None if kid is None else first_kid + kid
+    )
+    torch.cuda.synchronize(_gfx950_device)
+    err = (Y.float() - ref).abs().max().item()
+    assert (
+        err <= 2e-2 * ref.abs().max().item()
+    ), f"{direction} kid {kid} {shape}: max err {err}"
+
+
+# M, N and K are any positive sizes: the API zero-pads M to a multiple of 16 (XQ and
+# x_scale), N to one of 128 (WQ) and a K below 16, and cuts [M, N] from the padded
+# output. w_scale has ceil(N / 128) N groups.
+@pytest.mark.parametrize("direction", ("NT", "NN", "TT", "TN"))
+@pytest.mark.parametrize(
+    "shape",
+    (
+        (1, 128, 256),  # M only
+        (1000, 384, 256),  # M only, PadM tile
+        (256, 1, 256),  # N only
+        (512, 7100, 128),  # N only
+        (7, 100, 1025),  # M, N and a partial K tile
+        (100, 200, 5),  # M, N and K below 16
+        (17, 129, 300),
+    ),
+)
+@pytest.mark.parametrize("given_out", (False, True))
+def test_gfx950_mxfp8_direction_api_any_m_n(
+    direction, shape, given_out, _gfx950_device
+):
+    from aiter.ops.opus import gemm_a8w8_blockscale_opus
+
+    M, N, K = shape
+    xq, wq, x_scale, w_scale, ref = _gfx950_mxfp8_direction_any_k_inputs(
+        direction, M, N, K, _gfx950_device
+    )
+    if given_out:
+        # x_scale as a contiguous tensor of column-major bytes; a canary after out.
+        x_scale = x_scale.t().contiguous().view(M, -1)
+        backing = torch.full(
+            (M * N + 64,), -7.0, device=_gfx950_device, dtype=torch.bfloat16
+        )
+        out = backing[: M * N].view(M, N)
+        Y = gemm_a8w8_blockscale_opus(xq, wq, x_scale, w_scale, out=out)
+        assert Y is out
+        assert (backing[M * N :] == -7.0).all().item(), "wrote past out"
+    else:
+        Y = gemm_a8w8_blockscale_opus(xq, wq, x_scale, w_scale)
+    torch.cuda.synchronize(_gfx950_device)
+    assert Y.shape == (M, N) and Y.is_contiguous() and Y.dtype == torch.bfloat16
+    err = (Y.float() - ref).abs().max().item()
+    assert err <= 2e-2 * ref.abs().max().item(), f"{direction} {shape}: max err {err}"
+
+
+# A [M, K] / [N, K] operand may be a view of a wider buffer: rows `pitch` >= K apart,
+# here with FP8 NaN in every byte the view leaves out (between rows and after the
+# last one). A pitch that is a multiple of 128 is the aligned layout a caller with
+# K % 128 != 0 would use; 1003 / 1030 are odd ones.
+@pytest.mark.parametrize("direction", ("NT", "NN", "TT"))
+@pytest.mark.parametrize(
+    ("shape", "pitch"),
+    (
+        ((512, 384, 1000), 1024),
+        ((512, 384, 1000), 1003),
+        ((272, 512, 1025), 1152),
+        ((272, 512, 1025), 1030),
+        ((512, 512, 1024), 1152),
+    ),
+)
+def test_gfx950_mxfp8_direction_api_wide_rows(direction, shape, pitch, _gfx950_device):
+    from aiter.ops.opus import gemm_a8w8_blockscale_opus
+
+    M, N, K = shape
+    xq, wq, x_scale, w_scale, ref = _gfx950_mxfp8_direction_any_k_inputs(
+        direction, M, N, K, _gfx950_device
+    )
+
+    def wide(operand):
+        backing = torch.full(
+            (operand.shape[0], pitch), 0x7F, device=_gfx950_device, dtype=torch.uint8
+        ).view(torch.float8_e4m3fn)
+        backing[:, :K] = operand
+        return backing[:, :K]
+
+    if direction[0] == "N":
+        xq = wide(xq)
+    if direction[1] == "T":
+        wq = wide(wq)
+    Y = gemm_a8w8_blockscale_opus(xq, wq, x_scale, w_scale)
+    torch.cuda.synchronize(_gfx950_device)
+    err = (Y.float() - ref).abs().max().item()
+    assert (
+        err <= 2e-2 * ref.abs().max().item()
+    ), f"{direction} {shape} pitch {pitch}: max err {err}"
+
+
+# A, B and the output may each be 4 GiB or larger. Each (M, N, K) puts one operand
+# just past 4 GiB along K or along M / N, so both storages of it are covered: one view
+# per tile when it is K-contiguous, one per K tile when it is stored [K, M] / [K, N].
+# The kid is picked by shape: 256x128 PadM, 256x128 GroupM 16, 256x128 and 256x256
+# (whose 8.5 GiB output is also past 4 GiB).
+_MXFP8_DIRECTION_4GIB_SHAPES = (
+    (66064, 256, 65536),  # A, long K, PadM
+    (1048576, 256, 4224),  # A, long M
+    (256, 66048, 65536),  # B, long K
+    (4352, 1048576, 4224),  # B, long N; output 8.5 GiB
+)
+
+
+def _gfx950_mxfp8_direction_4gib_inputs(direction, M, N, K, device):
+    """As _gfx950_mxfp8_direction_inputs, built in row chunks and without the reference."""
+    if torch.cuda.mem_get_info(device)[0] < 48 << 30:
+        pytest.skip("needs 48 GiB of free GPU memory")
+    gen = torch.Generator(device=device).manual_seed(M + 7 * N + 13 * K)
+
+    def fp8(rows, cols):
+        out = torch.empty(rows, cols, device=device, dtype=torch.float8_e4m3fn)
+        for r in range(0, rows, 4096):
+            out[r : r + 4096] = torch.randn(
+                min(4096, rows - r), cols, device=device, generator=gen
+            ).to(torch.float8_e4m3fn)
+        return out
+
+    a, b = fp8(M, K), fp8(K, N)
+    sa = torch.randint(
+        124, 131, (M, K // 128), device=device, generator=gen, dtype=torch.uint8
+    )
+    sb = torch.randint(
+        124, 131, (K // 128, N // 128), device=device, generator=gen, dtype=torch.uint8
+    )
+    xq = a if direction[0] == "N" else a.t().contiguous().t()
+    if direction[1] == "N":
+        wq, w_scale = b.t(), sb.t()
+    else:
+        wq, w_scale = b.t().contiguous(), sb.t().contiguous()
+    return a, b, sa, sb, xq, wq, sa.t().contiguous().t(), w_scale
+
+
+@pytest.mark.parametrize("direction", ("NT", "NN", "TT", "TN"))
+@pytest.mark.parametrize("shape", _MXFP8_DIRECTION_4GIB_SHAPES)
+def test_gfx950_mxfp8_direction_api_4gib_operands(direction, shape, _gfx950_device):
+    from aiter.ops.opus import gemm_a8w8_blockscale_opus
+
+    M, N, K = shape
+    a, b, sa, sb, xq, wq, x_scale, w_scale = _gfx950_mxfp8_direction_4gib_inputs(
+        direction, M, N, K, _gfx950_device
+    )
+    assert max(M * K, N * K) > 1 << 32
+    Y = torch.full((M, N), float("nan"), device=_gfx950_device, dtype=torch.bfloat16)
+    gemm_a8w8_blockscale_opus(xq, wq, x_scale, w_scale, out=Y)
+    torch.cuda.synchronize(_gfx950_device)
+    # Every element against the reference, in row chunks.
+    bf = b.float() * torch.exp2(sb.float() - 127).repeat_interleave(
+        128, dim=0
+    ).repeat_interleave(128, dim=1)
+    step = max(1, (256 << 20) // max(K, N))
+    for r in range(0, M, step):
+        ref = (
+            a[r : r + step].float()
+            * torch.exp2(sa[r : r + step].float() - 127).repeat_interleave(128, dim=1)
+        ) @ bf
+        err = (Y[r : r + step].float() - ref).abs().max().item()
+        assert (
+            err <= 2e-2 * ref.abs().max().item()
+        ), f"{direction} {shape}: rows {r}..{r + step} max err {err}"
+
+
+@pytest.mark.parametrize(("direction", "kid"), (("NT", 0), ("TT", 22)))
+def test_gfx950_mxfp8_direction_api_rejects_view_past_2gib(
+    direction, kid, _gfx950_device
+):
+    from aiter.ops.opus import gemm_a8w8_blockscale_opus
+
+    # What one view of A spans must stay below 2**31 bytes: 256 rows of an A stored
+    # [M, K] (256 * K), 128 rows of one stored [K, M] (128 * M).
+    M, N, K = (256, 256, 1 << 23) if direction[0] == "N" else (1 << 24, 128, 128)
+    xq = torch.zeros(M, K, device=_gfx950_device, dtype=torch.float8_e4m3fn)
+    wq = torch.zeros(N, K, device=_gfx950_device, dtype=torch.float8_e4m3fn)
+    if direction[0] == "T":
+        xq = xq.view(K, M).t()
+    x_scale = torch.full((M, K // 128), 127, device=_gfx950_device, dtype=torch.uint8)
+    w_scale = torch.full(
+        (N // 128, K // 128), 127, device=_gfx950_device, dtype=torch.uint8
+    )
+    with pytest.raises(ValueError, match=f"no {direction} MXFP8 kernel supports"):
+        gemm_a8w8_blockscale_opus(xq, wq, x_scale, w_scale)
+    with pytest.raises(RuntimeError, match="CO tensor extent exceeds pipeline limits"):
+        gemm_a8w8_blockscale_opus(xq, wq, x_scale, w_scale, kernelId=kid)
+
+
 @pytest.fixture
 def _mxscale_csv(tmp_path, monkeypatch):
     from aiter.jit.core import AITER_CONFIGS

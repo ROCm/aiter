@@ -31,9 +31,14 @@ identical without any sidecar::
     .co filename == extern "C" symbol inside the .co == host launcher symbol
 
 gfx950 uses short image/launcher names while retaining each verified ELF symbol.
-Its manifest is
-``gen_co/co_kernels_gfx950_a8w8_blockscale_bpreshuffle.json``. Its images and
-build metadata live in ``gen_co/gfx950/a8w8_blockscale_bpreshuffle/``.
+Its preshuffled-B manifest is
+``gen_co/co_kernels_gfx950_a8w8_blockscale_bpreshuffle.json``; its images and
+build metadata live in ``gen_co/gfx950/a8w8_blockscale_bpreshuffle/``. The
+plain-B MXFP8 NT / NN / TT / TN kernels (the a8w8_blockscale_mxfp8 family, its
+own kid space; select it with --family) are declared in
+``gen_co/co_kernels_gfx950_a8w8_blockscale.json`` and live in
+``gen_co/gfx950/a8w8_blockscale/``. Without --out-dir, a build goes to the
+family's directory.
 The gfx1250 manifest is ``gen_co/co_kernels_gfx1250.json``.
 
 The compiler is NOT pinned to a version
@@ -90,7 +95,9 @@ from codegen.gen_instances_gfx1250 import (
 # kid), and this script exists to create exactly those files.
 from opus_gemm_common import (
     gfx950_co_kernels_declared,
+    gfx950_mxfp8_co_kernels_declared,
     gfx1250_4wave_co_kernels_declared,
+    mxfp8_direction,
 )
 
 from aiter_worker_limits import (
@@ -353,18 +360,46 @@ def _check_gfx950_pin(
             path,
         ]
     ).stdout
-    reads = {int(x) for x in re.findall(r"ds_read_b128\s+a\[(\d+):", asm)}
-    bm, bn, bk = entry["tile"]
-    wm, wn = entry["wave_layout"]
-    a_regs = bm // (wm * 16) * (bk // 128) * 8
-    if entry["pipeline"] == "pingpong_lds":
-        a_regs = min(bm // (wm * 16), 3) * 8
-    b_regs = bn // (wn * 16) * 8
-    for bit, first, size in ((1, 0, a_regs), (2, 64, b_regs)):
-        if mask & bit and not set(range(first, first + size, 4)).issubset(reads):
-            raise ValueError(
-                f"pin mask {mask}: LDS reads did not reach AGPR range {first}:{first + size}"
-            )
+    if mxfp8_direction(entry):
+        # NT / NN / TT / TN pin A / B anywhere in the AGPRs, loaded by plain or TR8 reads:
+        # every MFMA A / B operand must be an AGPR range that an LDS read filled.
+        reads = {
+            reg
+            for first, last in re.findall(r"\bds_read\w*\s+a\[(\d+):(\d+)\]", asm)
+            for reg in range(int(first), int(last) + 1)
+        }
+        mmas = [
+            re.split(r",\s*", line.split("//", 1)[0].strip().split(None, 1)[1])
+            for line in asm.splitlines()
+            if "v_mfma_scale_" in line
+        ]
+        if not mmas:
+            raise ValueError("pin A/B: no MFMA instructions")
+        for bit, index, operand in ((1, 1, "A"), (2, 2, "B")):
+            if not mask & bit:
+                continue
+            for op in mmas:
+                match = re.fullmatch(r"a\[(\d+):(\d+)\]", op[index])
+                if match is None:
+                    raise ValueError(f"pin {operand}: MFMA operand is not in AGPRs")
+                first, last = map(int, match.groups())
+                if not set(range(first, last + 1)).issubset(reads):
+                    raise ValueError(
+                        f"pin {operand}: MFMA AGPRs were not loaded from LDS"
+                    )
+    else:
+        reads = {int(x) for x in re.findall(r"ds_read_b128\s+a\[(\d+):", asm)}
+        bm, bn, bk = entry["tile"]
+        wm, wn = entry["wave_layout"]
+        a_regs = bm // (wm * 16) * (bk // 128) * 8
+        if entry["pipeline"] == "pingpong_lds":
+            a_regs = min(bm // (wm * 16), 3) * 8
+        b_regs = bn // (wn * 16) * 8
+        for bit, first, size in ((1, 0, a_regs), (2, 64, b_regs)):
+            if mask & bit and not set(range(first, first + size, 4)).issubset(reads):
+                raise ValueError(
+                    f"pin mask {mask}: LDS reads did not reach AGPR range {first}:{first + size}"
+                )
     if mask & 4:
         mmas = [
             line.split("//", 1)[0].strip().split(None, 1)[1].split(", ")
@@ -828,9 +863,16 @@ def build_one(k, args, llvm_bin, workdir):
     return info
 
 
-def _default_co_output_dir(arch, offload_arch):
+# gfx950 CO families: their declared manifests (separate kid spaces) and image dirs.
+_GFX950_CO_FAMILIES = {
+    "a8w8_blockscale_bpreshuffle": gfx950_co_kernels_declared,
+    "a8w8_blockscale_mxfp8": gfx950_mxfp8_co_kernels_declared,
+}
+
+
+def _default_co_output_dir(arch, offload_arch, image_dir=None):
     if arch == "gfx950":
-        return os.path.join(_HERE, arch, "a8w8_blockscale_bpreshuffle")
+        return os.path.join(_HERE, arch, image_dir)
     if offload_arch == "gfx1250-strict":
         return os.path.join(_HERE, arch + "-strict")
     return os.path.join(_HERE, "named_reg", arch)
@@ -903,6 +945,13 @@ def main():
         help=JOBS_CLI_HELP,
     )
     p.add_argument(
+        "--family",
+        choices=sorted(_GFX950_CO_FAMILIES),
+        default="a8w8_blockscale_bpreshuffle",
+        help="gfx950 CO family (manifest) the --kids refer to; each has its own kid "
+        "space and image directory",
+    )
+    p.add_argument(
         "--kids",
         nargs="+",
         default=None,
@@ -918,15 +967,11 @@ def main():
         "gfx1250-strict",
     ):
         p.error("--offload-arch does not match --arch")
-    if not args.out_dir:
-        args.out_dir = _default_co_output_dir(args.arch, args.offload_arch)
-    os.makedirs(args.out_dir, exist_ok=True)
-
     llvm_bin = os.path.abspath(args.llvm_bin) if args.llvm_bin else ""
     print(f"[build_co] clang from: {llvm_bin or '(PATH / hipcc default)'}")
 
     table = (
-        gfx950_co_kernels_declared
+        _GFX950_CO_FAMILIES[args.family]
         if args.arch == "gfx950"
         else gfx1250_4wave_co_kernels_declared
     )
@@ -949,6 +994,11 @@ def main():
     ]
     if not instances:
         raise SystemExit(f"build_co: no pre-compiled entries for {args.arch}")
+    if not args.out_dir:
+        # gfx950: each CO family has its own image directory (and build_info.json).
+        image_dir = instances[0]["image_dir"] if args.arch == "gfx950" else None
+        args.out_dir = _default_co_output_dir(args.arch, args.offload_arch, image_dir)
+    os.makedirs(args.out_dir, exist_ok=True)
     build = build_one_gfx950 if args.arch == "gfx950" else build_one
     jobs = get_worker_count_for(len(instances), args.jobs)
 
