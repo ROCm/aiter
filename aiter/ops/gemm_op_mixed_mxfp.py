@@ -9,6 +9,8 @@ import os
 import pandas as pd
 import torch
 
+from ..jit.utils.chip_info import get_tuned_cu_nums, log_tuned_cu_fallback
+
 _TUNED_CONFIG_KEY_COLUMNS = ("gfx", "cu_num", "M", "N", "K")
 _TUNED_CONFIG_NUMERIC_COLUMNS = ("cu_num", "M", "N", "K", "splitK")
 _TUNED_CONFIG_COLUMNS = frozenset(
@@ -95,19 +97,43 @@ def _find_mixed_mxfp_config(
     padM: int,
     padN: int,
     padK: int,
+    device: int | None = None,
 ) -> tuple[dict[str, object], str, tuple[int, int, int]] | None:
-    """Find an exact tuning record before trying its physical padded shape."""
+    """Find an exact tuning record before trying its physical padded shape.
+
+    At each shape, the CU counts of get_tuned_cu_nums(cu_num, device) are tried
+    in turn.
+    """
     candidates = [((M, N, K), "exact")]
     padded = (padM, padN, padK)
     if padded != (M, N, K):
         candidates.append((padded, "padded"))
 
+    cu_nums = get_tuned_cu_nums(cu_num, device)
     for (candidate_M, candidate_N, candidate_K), match_kind in candidates:
-        config = configs.get((gfx, cu_num, candidate_M, candidate_N, candidate_K))
-        if config is not None:
-            return (
-                config,
-                match_kind,
-                (candidate_M, candidate_N, candidate_K),
-            )
+        for tuned_cu in cu_nums:
+            config = configs.get((gfx, tuned_cu, candidate_M, candidate_N, candidate_K))
+            if config is not None:
+                if tuned_cu != cu_num:
+                    log_tuned_cu_fallback("mixed MXFP GEMM", gfx, cu_num, tuned_cu)
+                return (
+                    config,
+                    match_kind,
+                    (candidate_M, candidate_N, candidate_K),
+                )
     return None
+
+
+def _tuned_rows_snapshot(configs, gfx: str, cu_num: int, device: int):
+    """(M, N, K, kernelName) of the rows a lookup for gfx/cu_num on device may
+    use, in the order of get_tuned_cu_nums(cu_num, device).
+
+    A compiled caller takes the first row of the exact shape, then the first
+    row of the padded shape, so it keeps the order of _find_mixed_mxfp_config.
+    """
+    return tuple(
+        (M, N, K, str(config["kernelName"]))
+        for tuned_cu in get_tuned_cu_nums(cu_num, device)
+        for (config_gfx, config_cu, M, N, K), config in configs.items()
+        if config_gfx == gfx and config_cu == tuned_cu
+    )

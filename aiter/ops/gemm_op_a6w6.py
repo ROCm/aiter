@@ -12,10 +12,10 @@ from torch import Tensor
 from aiter import logger
 
 from ..jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG, compile_ops
-from ..jit.utils.chip_info import get_cu_num
+from ..jit.utils.chip_info import find_tuned_cu_row, get_cu_num
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..utility import dtypes
-from .gemm_op_mixed_mxfp import _get_device_gfx_cu
+from .gemm_op_mixed_mxfp import _get_device_gfx_cu, _tuned_rows_snapshot
 
 # The mxfp6 (E2M3, per-1x32 blockscale) asm gemm shares the a4w4 kernarg ABI.
 # Its packed operand/scale layouts are produced by the helpers below and must
@@ -753,20 +753,40 @@ def _default_gemm_a6w6_kernel(M: int, N: int, K: int) -> str:
 
 @functools.lru_cache(maxsize=1024)
 def get_GEMM_A6W6_config(
-    M: int, N: int, K: int, tuned_file: str | None = None
+    M: int,
+    N: int,
+    K: int,
+    tuned_file: str | None = None,
+    device: int | None = None,
 ) -> dict[str, object] | None:
-    """Return an exact or physical-shape A6W6 tuning record."""
+    """Return an exact or physical-shape A6W6 tuning record.
+
+    device is a HIP ordinal and defaults to the current device.
+    """
     tuned_file = tuned_file or AITER_CONFIGS.AITER_CONFIG_GEMM_A6W6_FILE
     tuned_file = os.path.abspath(tuned_file)
     configs = _load_gemm_a6w6_configs(tuned_file)
-    gfx, cu_num = get_gfx(), get_cu_num()
+    if device is None:
+        gfx, cu_num = get_gfx(), get_cu_num()
+    else:
+        try:
+            gfx, cu_num = _get_device_gfx_cu(device)
+        except (AssertionError, IndexError, KeyError, RuntimeError):
+            return None
     candidates = [(M, N, K, "exact")]
     padded = (_ceil(M, _TILE), _ceil(N, _TILE), _ceil(K, _K_TILE))
     if padded != (M, N, K):
         candidates.append((*padded, "padded"))
 
     for candidate_M, candidate_N, candidate_K, match_kind in candidates:
-        config = configs.get((gfx, cu_num, candidate_M, candidate_N, candidate_K))
+        config = find_tuned_cu_row(
+            configs,
+            lambda cu, shape=(candidate_M, candidate_N, candidate_K): (gfx, cu, *shape),
+            gfx,
+            cu_num,
+            tuned_file,
+            device,
+        )
         if config is not None:
             if AITER_LOG_TUNED_CONFIG:
                 logger.info(
@@ -809,11 +829,7 @@ def _compiled_gemm_a6w6_configs(
         gfx, cu_num = _get_device_gfx_cu(device_index)
     except (AssertionError, IndexError, KeyError, RuntimeError):
         return ()
-    return tuple(
-        (M, N, K, str(config["kernelName"]))
-        for (config_gfx, config_cu, M, N, K), config in configs.items()
-        if config_gfx == gfx and config_cu == cu_num
-    )
+    return _tuned_rows_snapshot(configs, gfx, cu_num, device_index)
 
 
 def _select_gemm_a6w6_kernel(
@@ -844,7 +860,9 @@ def _select_gemm_a6w6_kernel(
             if padM == tuned_M and padN == tuned_N and padK == tuned_K:
                 return tuned_kernel
         return _default_gemm_a6w6_kernel(M, N, K)
-    config = get_GEMM_A6W6_config(M, N, K)
+    config = get_GEMM_A6W6_config(
+        M, N, K, device=None if device is None else device.index
+    )
     if config is not None:
         return str(config["kernelName"])
     return _default_gemm_a6w6_kernel(M, N, K)
