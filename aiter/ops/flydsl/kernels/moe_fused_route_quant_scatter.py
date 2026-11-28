@@ -336,6 +336,18 @@ def _load_activated_gate_up(c, hidden_rsrc, col_base):
     return fx.Vector.from_elements(values, fx.Float32).to(bf16)
 
 
+def _hidden_pk8_load(c, rsrc, mx_group_base, it):
+    """Iteration ``it``'s 8 bf16 of this lane from the hidden row ``rsrc``:
+    one aligned dwordx4, as ``_emit_quant_block_loop`` reads it."""
+    mx_block = (mx_group_base + fx.Int32(it)) * fx.Int32(
+        c.mx_blocks_per_wave_iter
+    ) + c.block_in_wave
+    col_base = mx_block * fx.Int32(32) + c.lane_in_block * c.c_elems_per_lane
+    return buffer_ops.buffer_load(
+        rsrc, col_base >> fx.Int32(1), vec_width=4, dtype=T.i32
+    )
+
+
 def _emit_quant_block_loop(c: SimpleNamespace) -> None:
     """Emit one warp's per-MX-block quant + e8m0 scale-preshuffle loop.
 
@@ -431,10 +443,10 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
 
     def _emit_hidden_load(it):
         """This iteration's 8 bf16 (one aligned dwordx4)."""
-        col_base = (
-            _mx_block_of(it) * fx.Int32(32) + c.lane_in_block * c.c_elems_per_lane
-        )
         if const_expr(hidden_lds_load is not None):
+            col_base = (
+                _mx_block_of(it) * fx.Int32(32) + c.lane_in_block * c.c_elems_per_lane
+            )
             chunk = it // iters_per_chunk
             chunk_elems = c.mx_blocks_per_wave_iter * iters_per_chunk * 32
             return hidden_lds_load(
@@ -443,12 +455,7 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
                 + fx.Int32((chunk % 2) * c.hidden_slot_bytes)
                 + (col_base - fx.Int32(chunk * chunk_elems)) * fx.Int32(2),
             )
-        return buffer_ops.buffer_load(
-            hidden_rsrc,
-            (feat_elem_base + col_base) >> c.c1_i32,
-            vec_width=4,
-            dtype=i32,
-        )
+        return _hidden_pk8_load(c, hidden_rsrc, mx_group_base, it)
 
     quant_results = []
     for it in range_constexpr(c.block_iters):
@@ -2185,23 +2192,9 @@ def build_moe_token_multidest_quant_module(
     L = _quant_layout(feat_dim, quant_mode, wmma_rep)
     if not L.use_pk8:
         raise NotImplementedError("token multidest quant requires gfx1250 pk8")
-    is_fp8 = L.is_fp8
-    use_native = L.use_native
-    use_pk8 = L.use_pk8
-    elems_per_lane = L.elems_per_lane
-    lanes_per_mx_block = L.lanes_per_mx_block
-    mx_dtype = L.mx_dtype
-    payload_bytes_per_row = L.payload_bytes_per_row
-    payload_bytes_per_block = L.payload_bytes_per_block
-    payload_bytes_per_lane = L.payload_bytes_per_lane
     wave_size = L.wave_size
     warps_per_block = L.warps_per_block
-    mx_blocks_per_wave_iter = L.mx_blocks_per_wave_iter
-    mx_blocks_per_row = L.mx_blocks_per_row
-    rows_per_tile = L.rows_per_tile
-    dst_scale_dwords_per_row = L.dst_scale_dwords_per_row
     row_iters = L.block_iters
-    amax_shuffle_dists = L.amax_shuffle_dists
     # Splitting the row's K groups over grid.y is safe because an MX block scale
     # covers 32 contiguous elements: the slices need no cross-block reduction.
     if row_iters % ksplit:
@@ -2224,7 +2217,7 @@ def build_moe_token_multidest_quant_module(
     # Blocks 4k..4k+3 share one destination dword, so their e8m0 bytes go out as
     # a single packed store instead of four predicated byte stores. Needs the
     # pk8 geometry (4 lanes per MX block) to assemble them with xor-shuffles.
-    scale_pack_dwords = lanes_per_mx_block == 4
+    scale_pack_dwords = L.lanes_per_mx_block == 4
     module_name = (
         f"moe_token_multidest_quant_k{topk}_fd{feat_dim}_r{wmma_rep}"
         f"_{quant_mode}_{L.native_tag}"
@@ -2232,6 +2225,111 @@ def build_moe_token_multidest_quant_module(
         f"{f'_hidtdm{tdm_hidden_chunks}' if tdm_hidden_chunks else ''}"
         f"{f'_ks{ksplit}' if ksplit > 1 else ''}"
     )
+
+    def _quant_ctx(
+        hidden,
+        grouped_payload,
+        grouped_scale,
+        token_eff,
+        valid,
+        lane,
+        raw_rows,
+        *,
+        hidden_chunks,
+        chunk_prefetch,
+        hidden_lds_load,
+        hidden_lds_idx,
+        hidden_lds_row_off,
+        hidden_slot_bytes,
+        mx_group_base,
+    ):
+        """``_emit_quant_block_loop`` context of one warp: quantize row
+        ``token_eff`` of ``hidden`` once and store it to each live row of
+        ``raw_rows``. A warp past the last token, or one whose routes are all
+        dropped, gets zero-length destination descriptors, so the hardware
+        bounds check drops its stores. The keyword-only parameters say how the
+        hidden row arrives. None has a default: ``_emit_quant_block_loop`` reads
+        optional fields with ``getattr`` defaults, so a missing or misspelled
+        name has to fail here, when the kernel is built.
+        """
+        c0_i32 = fx.Int32(0)
+        c16_i32 = fx.Int32(16)
+        rows, any_live = _token_multidest_live_rows(raw_rows)
+        token_live = valid & any_live
+        pay_records = token_live.select(fx.Int32(L.payload_bytes_per_row), c0_i32)
+        # Sign-extended to i64 by the descriptor builder, so stay under 2 GiB.
+        scale_records = token_live.select(fx.Int32(_SCALE_RSRC_MAX_BYTES), c0_i32)
+        scales = [
+            _token_multidest_scale_base(
+                row,
+                fx.Int32(L.rows_per_tile),
+                fx.Int32(L.dst_scale_dwords_per_row),
+                c16_i32,
+            )
+            for row in rows
+        ]
+        c_lanes_per_block = fx.Int32(L.lanes_per_mx_block)
+        block_in_wave = lane // fx.Uint32(c_lanes_per_block)
+        lane_in_block = lane - block_in_wave * c_lanes_per_block
+        return SimpleNamespace(
+            i32=T.i32,
+            f32=T.f32,
+            block_iters=block_iters,
+            payload_base=fx.Int64(ptrtoint(grouped_payload)),
+            payload_bytes_per_row=L.payload_bytes_per_row,
+            hidden_base=fx.Int64(ptrtoint(hidden)),
+            feat_bytes_per_row=feat_dim * 2,
+            feat_row_i32=token_eff,
+            payload_num_records=pay_records,
+            prequantized=False,
+            payload_dwords_per_lane=L.payload_bytes_per_lane // 4,
+            src_scale_base=fx.Int64(0),
+            src_scale_bytes_per_row=0,
+            mx_blocks_per_wave_iter=L.mx_blocks_per_wave_iter,
+            mx_blocks_per_row=L.mx_blocks_per_row,
+            amax_shuffle_dists=L.amax_shuffle_dists,
+            is_fp8=L.is_fp8,
+            use_native=L.use_native,
+            use_pk8=L.use_pk8,
+            mx_dtype=L.mx_dtype,
+            c0_i32=c0_i32,
+            c1_i32=fx.Int32(1),
+            c4_i32=fx.Int32(4),
+            c23_i32=fx.Int32(23),
+            c254_i32=fx.Int32(254),
+            c0_f32=fx.Float32(0.0),
+            c_wave=fx.Int32(L.wave_size),
+            c_elems_per_lane=fx.Int32(L.elems_per_lane),
+            c_payload_bytes_per_block=fx.Int32(L.payload_bytes_per_block),
+            c_payload_bytes_per_lane=fx.Int32(L.payload_bytes_per_lane),
+            c_wmma_rep=fx.Int32(wmma_rep),
+            block_in_wave=block_in_wave,
+            lane_in_block=lane_in_block,
+            is_block_lead=lane_in_block == c0_i32,
+            payload_dests=[SimpleNamespace(payload_row_i32=row) for row in rows],
+            # Scale destinations; the payload keeps its own list above.
+            dests=[
+                SimpleNamespace(payload_row_i32=row, scale_row_dword_base=sc)
+                for row, sc in zip(rows, scales)
+            ],
+            scale_t=ptr_buf_tensor(
+                grouped_scale, fx.Int8, num_records_bytes=scale_records
+            ),
+            # The packed dword store needs a width-agnostic V#; it carries the same
+            # zero-on-invalid bound as the byte view above.
+            scale_rsrc=buffer_ops.create_buffer_resource_from_addr(
+                fx.Int64(ptrtoint(grouped_scale)),
+                num_records_bytes=scale_records,
+            ),
+            scale_pack_dwords=scale_pack_dwords,
+            hidden_chunks=hidden_chunks,
+            chunk_prefetch=chunk_prefetch,
+            hidden_lds_load=hidden_lds_load,
+            hidden_lds_idx=hidden_lds_idx,
+            hidden_lds_row_off=hidden_lds_row_off,
+            hidden_slot_bytes=hidden_slot_bytes,
+            mx_group_base=mx_group_base,
+        )
 
     @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
     def token_multidest_kernel(
@@ -2242,24 +2340,8 @@ def build_moe_token_multidest_quant_module(
         token_num: Int32,
     ):
         i32 = T.i32
-        f32 = T.f32
-
         c0_i32 = fx.Int32(0)
-        c1_i32 = fx.Int32(1)
-        c4_i32 = fx.Int32(4)
-        c16_i32 = fx.Int32(16)
-        c23_i32 = fx.Int32(23)
-        c254_i32 = fx.Int32(254)
-        c0_f32 = fx.Float32(0.0)
-
         c_wave = fx.Int32(wave_size)
-        c_payload_bytes_per_block = fx.Int32(payload_bytes_per_block)
-        c_payload_bytes_per_lane = fx.Int32(payload_bytes_per_lane)
-        c_dst_scale_dwords_per_row = fx.Int32(dst_scale_dwords_per_row)
-        c_wmma_rep = fx.Int32(wmma_rep)
-        c_rows_per_tile = fx.Int32(rows_per_tile)
-        c_lanes_per_block = fx.Int32(lanes_per_mx_block)
-        c_elems_per_lane = fx.Int32(elems_per_lane)
 
         tid = fx.Uint32(fx.thread_idx.x)
         bid = fx.Uint32(fx.block_idx.x)
@@ -2339,80 +2421,19 @@ def build_moe_token_multidest_quant_module(
         if token0 < fx.Uint32(token_num):
             rows_t = ptr_buf_tensor(topids_to_rows)
             route0 = token_eff * fx.Int32(topk)
-            # Scalar loads: the route is wave-uniform, and landing each row in
-            # an SGPR is what keeps its destination descriptor uniform too.
-            rows, any_live = _token_multidest_live_rows(
+            qc = _quant_ctx(
+                hidden,
+                grouped_payload,
+                grouped_scale,
+                token_eff,
+                valid,
+                lane,
+                # Scalar loads: the route is wave-uniform, and landing each row
+                # in an SGPR is what keeps its destination descriptor uniform.
                 [
                     fx.Int32(buf_scalar_load(rows_t, route0 + fx.Int32(k)))
                     for k in range_constexpr(topk)
-                ]
-            )
-            token_live = valid & any_live
-            pay_records = token_live.select(fx.Int32(payload_bytes_per_row), c0_i32)
-            # Sign-extended to i64 by the descriptor builder, so stay under 2 GiB.
-            scale_records = token_live.select(fx.Int32(_SCALE_RSRC_MAX_BYTES), c0_i32)
-            scales = [
-                _token_multidest_scale_base(
-                    row, c_rows_per_tile, c_dst_scale_dwords_per_row, c16_i32
-                )
-                for row in rows
-            ]
-
-            block_in_wave = lane // fx.Uint32(c_lanes_per_block)
-            lane_in_block = lane - block_in_wave * c_lanes_per_block
-            qc = SimpleNamespace(
-                i32=i32,
-                f32=f32,
-                block_iters=block_iters,
-                payload_base=fx.Int64(ptrtoint(grouped_payload)),
-                payload_bytes_per_row=payload_bytes_per_row,
-                hidden_base=fx.Int64(ptrtoint(hidden)),
-                feat_bytes_per_row=feat_dim * 2,
-                feat_row_i32=token_eff,
-                payload_num_records=pay_records,
-                prequantized=False,
-                payload_dwords_per_lane=payload_bytes_per_lane // 4,
-                src_scale_base=fx.Int64(0),
-                src_scale_bytes_per_row=0,
-                mx_blocks_per_wave_iter=mx_blocks_per_wave_iter,
-                mx_blocks_per_row=mx_blocks_per_row,
-                amax_shuffle_dists=amax_shuffle_dists,
-                is_fp8=is_fp8,
-                use_native=use_native,
-                use_pk8=use_pk8,
-                mx_dtype=mx_dtype,
-                c0_i32=c0_i32,
-                c1_i32=c1_i32,
-                c4_i32=c4_i32,
-                c23_i32=c23_i32,
-                c254_i32=c254_i32,
-                c0_f32=c0_f32,
-                c_wave=c_wave,
-                c_elems_per_lane=c_elems_per_lane,
-                c_payload_bytes_per_block=c_payload_bytes_per_block,
-                c_payload_bytes_per_lane=c_payload_bytes_per_lane,
-                c_wmma_rep=c_wmma_rep,
-                block_in_wave=block_in_wave,
-                lane_in_block=lane_in_block,
-                is_block_lead=lane_in_block == c0_i32,
-                payload_dests=[SimpleNamespace(payload_row_i32=row) for row in rows],
-                # Scale destinations; the payload keeps its own list above.
-                dests=[
-                    SimpleNamespace(payload_row_i32=row, scale_row_dword_base=sc)
-                    for row, sc in zip(rows, scales)
                 ],
-                # Zero-on-invalid bound: a dead token takes a zero-length
-                # descriptor rather than a branch.
-                scale_t=ptr_buf_tensor(
-                    grouped_scale, fx.Int8, num_records_bytes=scale_records
-                ),
-                # The packed dword store needs a width-agnostic V#; it carries
-                # the same zero-on-invalid bound as the byte view above.
-                scale_rsrc=buffer_ops.create_buffer_resource_from_addr(
-                    fx.Int64(ptrtoint(grouped_scale)),
-                    num_records_bytes=scale_records,
-                ),
-                scale_pack_dwords=scale_pack_dwords,
                 hidden_chunks=max(1, tdm_hidden_chunks),
                 chunk_prefetch=chunk_prefetch,
                 hidden_lds_load=hidden_lds_load,
