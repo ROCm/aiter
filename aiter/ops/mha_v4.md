@@ -13,8 +13,8 @@ dispatch metadata. Unsupported recipes fail instead of falling back to another a
   the launcher refuses longer sequences instead of overrunning a staged LUT.
 - Grouped-query ratios `1, 2, 4, 8, 16`.
 - Per-batch key lengths via `seqlens_k`, on every dense GFX950 row and the dense `BF16 Q/K` rows
-  of GFX942. Entries clamp to the padded key extent, and a null pointer lets one object serve dense
-  and varlen. Every other GFX942 recipe and the sorted-sparse path reject it.
+  of GFX942. Entries clamp to the padded key extent, and a null pointer lets one object serve calls
+  with and without them. Every other GFX942 recipe and the sorted-sparse path reject it.
 - Log-sum-exp via `return_lse` wherever the selected manifest row declares `lse`. On GFX950 and
   GFX942 that is every row.
   The value is the log-sum-exp of the *quantized* scores, so its error tracks the row max at each
@@ -298,10 +298,11 @@ require byte-level checks at aligned and ragged sequence lengths, eager/fullgrap
 churn, and downstream-consumer coverage. Kernel performance changes require the relevant retained
 model captures and balanced multi-GPU target-shape benchmarks.
 
-`_VARLEN_CAPABLE_QV` is a claim about the deployed dense objects, keyed on `(q_format, v_format)`
-alone -- a new object for an already-claimed pair inherits the claim without being rebuilt, and
-answers stay plausible because the feature is simply ignored. The suite disassembles every claimed
-row rather than trusting the table. LSE is claimed per row instead, by the manifest's `lse` column.
+`_KEY_LENGTHS_CAPABLE_QV` is a claim about the deployed dense objects, keyed on
+`(q_format, v_format)` alone -- a new object for an already-claimed pair inherits the claim without
+being rebuilt, and answers stay plausible because the feature is simply ignored. The suite
+disassembles every claimed row rather than trusting the table. LSE is claimed per row instead, by
+the manifest's `lse` column.
 
 Key implementation locations:
 

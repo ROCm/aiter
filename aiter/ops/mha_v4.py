@@ -1645,7 +1645,7 @@ def _check_lse_capable(q_format: AttentionFormat, v_format: AttentionFormat) -> 
 # carries the load, but only these objects were rebuilt with it; the rest would silently attend
 # over the full padded key length, so they are rejected rather than left to return a wrong answer.
 # (FP8, FP8) covers both the fp8 and mxfp8 objects, which differ only by scale mode.
-_VARLEN_CAPABLE_QV = frozenset(
+_KEY_LENGTHS_CAPABLE_QV = frozenset(
     {
         (AttentionFormat.BF16, AttentionFormat.BF16),
         (AttentionFormat.BF16, AttentionFormat.FP8_E4M3),
@@ -1661,25 +1661,27 @@ _VARLEN_CAPABLE_QV = frozenset(
 )
 
 
-def _varlen_capable(q_format: AttentionFormat, v_format: AttentionFormat) -> bool:
+def _key_lengths_capable(q_format: AttentionFormat, v_format: AttentionFormat) -> bool:
     """Whether the dense row for these operands takes per-batch key lengths.
 
     Asks the live GPU, as the launcher dispatches on it, not get_gfx(), which follows GPU_ARCHS.
     """
     return (
         arch_info.get_arch() in ("gfx942", "gfx950")
-        and (q_format, v_format) in _VARLEN_CAPABLE_QV
+        and (q_format, v_format) in _KEY_LENGTHS_CAPABLE_QV
     )
 
 
-def _check_varlen_capable(q_format: AttentionFormat, v_format: AttentionFormat) -> None:
+def _check_key_lengths_capable(
+    q_format: AttentionFormat, v_format: AttentionFormat
+) -> None:
     """Reject per-batch key lengths on rows whose code object ignores them."""
     arch = get_gfx()
     if arch not in ("gfx942", "gfx950"):
         raise NotImplementedError(
             f"MHA v4 per-batch key lengths are not implemented on {arch} yet"
         )
-    if not _varlen_capable(q_format, v_format):
+    if not _key_lengths_capable(q_format, v_format):
         raise NotImplementedError(
             f"MHA v4 per-batch key lengths are not implemented for "
             f"Q={q_format.name} V={v_format.name} yet"
@@ -1970,7 +1972,7 @@ def mha_v4_packed(
             raise NotImplementedError(
                 "sorted-sparse MHA v4 does not accept per-batch key lengths yet"
             )
-        _check_varlen_capable(q_format, v_format)
+        _check_key_lengths_capable(q_format, v_format)
         if seqlens_k.dtype != torch.int32 or seqlens_k.device != q.device:
             raise ValueError(
                 "seqlens_k must be an int32 tensor on the same device as Q"
@@ -2376,7 +2378,7 @@ def _resolve_kv_splits(
     q: Tensor,
     k: Tensor,
     sparse: bool,
-    varlen: bool,
+    key_lengths: bool,
 ) -> int:
     capable = recipe.kind in _KV_SPLIT_RECIPES and (
         recipe.kind != _RawRecipeKind.FP8 or _is_fp8_format(v_format)
@@ -2387,7 +2389,7 @@ def _resolve_kv_splits(
         if (
             not capable
             or sparse
-            or varlen
+            or key_lengths
             or _lse_unsupported(q_format, v_format) is not None
         ):
             return 1
@@ -2399,7 +2401,7 @@ def _resolve_kv_splits(
             q.shape[2],
             k.shape[1],
             q.device,
-            ragged=_varlen_capable(q_format, v_format),
+            ragged=_key_lengths_capable(q_format, v_format),
             q_format=q_format,
         )
     if isinstance(kv_splits, bool) or not isinstance(kv_splits, int) or kv_splits < 1:
@@ -2410,7 +2412,7 @@ def _resolve_kv_splits(
         return 1
     if sparse:
         raise NotImplementedError("kv_splits does not combine with block_mask yet")
-    if varlen:
+    if key_lengths:
         raise NotImplementedError("kv_splits does not combine with seqlens_k yet")
     if not capable:
         raise NotImplementedError(
@@ -2438,7 +2440,7 @@ def _resolve_kv_splits(
             f"kv_splits={kv_splits} must leave every key range at least one {kv_tile}-key "
             f"tile: at most {most} for key length {k.shape[1]}"
         )
-    if not _varlen_capable(q_format, v_format) and k.shape[1] % kv_splits:
+    if not _key_lengths_capable(q_format, v_format) and k.shape[1] % kv_splits:
         raise ValueError(
             f"kv_splits={kv_splits} must divide the key length {k.shape[1]} for "
             f"Q={q_format.name} V={v_format.name}, whose dense row takes no per-batch key "
@@ -2517,7 +2519,7 @@ def _split_kv_launch(
             q.shape[2],
             k.shape[1],
             q.device,
-            ragged=_varlen_capable(q_format, v_format),
+            ragged=_key_lengths_capable(q_format, v_format),
             q_format=q_format,
         )
     if splits == 1:
@@ -2973,7 +2975,7 @@ def mha_v4(
             raise NotImplementedError(
                 "sorted-sparse MHA v4 does not accept per-batch key lengths yet"
             )
-        _check_varlen_capable(q_format, v_format)
+        _check_key_lengths_capable(q_format, v_format)
     out_given = out is not None
     out = _validate_mha_v4_raw_inputs(q, k, v, out, "mha_v4")
     sparse = block_mask is not None

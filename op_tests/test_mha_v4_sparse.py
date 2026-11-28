@@ -1354,7 +1354,7 @@ def test_mha_v4_sparse_rejects_ragged_key_length_on_a_padded_row():
 
 
 def test_mha_v4_sparse_rejects_per_batch_key_lengths():
-    """BF16 Q/V so the varlen capability gate cannot fire; only the sparse guard can raise."""
+    """BF16 Q/V so the key-length capability gate cannot fire; only the sparse guard can raise."""
     q = torch.zeros((1, 256, 2, 128), dtype=torch.bfloat16)
     # A literal tile count, not _default_kv_tile(): the guard runs before mask geometry is
     # checked, and the manifest read would raise here on an architecture with no sparse row.
@@ -1379,7 +1379,7 @@ def test_mha_v4_packed_sparse_rejects_per_batch_key_lengths():
     """mha_v4 guards this too, but the MX recipes return through launchers it never reaches.
 
     Matching "sorted-sparse" rather than the shared "per-batch key lengths" phrase is what keeps
-    this pinned to the sparse guard: FP8 is not varlen-capable, so _check_varlen_capable would
+    this pinned to the sparse guard: FP8 takes no key lengths, so _check_key_lengths_capable would
     otherwise raise NotImplementedError here too and the test would pass with the guard removed.
     """
     heads = 2
