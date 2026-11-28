@@ -79,18 +79,26 @@ def build_flash_attn_paged_module_gfx11(
     head_group=None,
     waves_per_eu=None,
     num_kv_heads=None,
+    k_strides=None,
+    v_strides=None,
+    descale=False,
     fast_fp_math=True,
     unsafe_fp_math=True,
 ):
     """Build the gfx11 paged-KV forward and return its launcher.
 
     ``launch(q, k_cache, v_cache, out, cu_seqlens_q, seqused_k, block_table,
-    batch_size, max_seqlen_q, stream=None)``: ``q`` / ``out`` are packed THD
-    ``[total_q, num_heads, head_dim]``; ``k_cache`` / ``v_cache`` are
-    ``[num_blocks, page_size, num_kv_heads, head_dim]``; ``cu_seqlens_q`` has
+    batch_size, max_seqlen_q, k_descale, v_descale, stream=None)``: ``q`` /
+    ``out`` are packed THD ``[total_q, num_heads, head_dim]``; ``k_cache`` /
+    ``v_cache`` are ``[num_blocks, page_size, num_kv_heads, head_dim]`` with
+    the element strides ``k_strides`` / ``v_strides`` of (block, token, head)
+    (None = dense) and unit stride along the head dim; ``cu_seqlens_q`` has
     ``batch + 1`` int32 entries, ``seqused_k`` ``batch`` entries (keys per
     sequence, cache rows already written), ``block_table`` is int32
-    ``[batch, max_blocks]`` (row stride ``max_blocks``). All on the device.
+    ``[batch, max_blocks]`` (row stride ``max_blocks``); ``k_descale`` /
+    ``v_descale`` one fp32 each, read only when built with ``descale=True``
+    (the scores are multiplied by the former, the output by the latter;
+    without it they are 1 at compile time). All on the device.
 
     Args:
         num_heads, head_dim: compile-time head geometry (``head_dim % 8 == 0``).
@@ -162,8 +170,17 @@ def build_flash_attn_paged_module_gfx11(
     NK = BLOCK_N // WMMA_MNK
     THREADS = num_waves * WAVE_SIZE
     TOK = H * D  # elements between consecutive Q / O tokens (THD)
-    TOK_KV = HKV * D  # elements of one K / V cache row
-    PAGE_ELEMS = PAGE * TOK_KV  # elements of one cache block
+    # Cache strides in elements: (block, token, head); the loads are 16-byte
+    # rows of 8 elements, so every stride is a multiple of 8.
+    K_SB, K_ST, K_SH = (
+        (PAGE * HKV * D, HKV * D, D) if k_strides is None else map(int, k_strides)
+    )
+    V_SB, V_ST, V_SH = (
+        (PAGE * HKV * D, HKV * D, D) if v_strides is None else map(int, v_strides)
+    )
+    for s in (K_SB, K_ST, K_SH, V_SB, V_ST, V_SH):
+        if s % 8 != 0 or s < 0:
+            raise ValueError(f"cache strides must be non-negative multiples of 8: {s}")
     # A tile's rows lie in NP consecutive pages when the tile is a multiple of
     # the page or the page a multiple of the tile: the block ids are then
     # wave-uniform (scalar loads, fetched one tile ahead) and a row's offset
@@ -259,6 +276,8 @@ def build_flash_attn_paged_module_gfx11(
         n_qblk_max: fx.Int32,
         bt_stride: fx.Int32,
         q_small: fx.Int32,
+        K_DESC: fx.Pointer,
+        V_DESC: fx.Pointer,
     ):
         lds_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().kv.ptr
 
@@ -397,19 +416,26 @@ def build_flash_attn_paged_module_gfx11(
                 return tok * TOK + head * D
 
             kv_head = head // GROUP if GROUP > 1 else head  # GROUP is a Python int
-            k_base = buf_base_i64(K) + fx.Int64(kv_head * D) * 2
-            v_base = buf_base_i64(V) + fx.Int64(kv_head * D) * 2
+            k_base = buf_base_i64(K) + fx.Int64(kv_head * K_SH) * 2
+            v_base = buf_base_i64(V) + fx.Int64(kv_head * V_SH) * 2
+            # The descales as scalar loads: K's multiplies the scores, V's the
+            # output. Only when built for them: the extra live values tip the
+            # head_dim-128 tile from 221 VGPRs into spilling.
+            if const_expr(descale):
+                k_desc = fx.Int32(table_scalar(K_DESC, 0, 1)).bitcast(fx.Float32)
+                v_desc = fx.Int32(table_scalar(V_DESC, 0, 1)).bitcast(fx.Float32)
             # 16-byte aligned global pointer type for the gathered K / V loads.
             GPTR16 = fx.PointerType.get(
                 elem.ir_type, address_space=fx.AddressSpace.Global, alignment=16
             )
 
-            def kv_row(base, key, align=1):
-                """64-bit address of row `key` of this sequence's K or V, through
-                the block table. A key past the last one is clamped onto the last
-                key (valid memory; the caller masks or zeroes the row), rounded
-                down to a multiple of `align` so that `align` consecutive rows
-                from it stay inside one page (`align` divides the page)."""
+            def kv_row(base, key, sb, st, align=1):
+                """64-bit address of row `key` of this sequence's K or V (block
+                and token strides `sb`, `st`), through the block table. A key
+                past the last one is clamped onto the last key (valid memory;
+                the caller masks or zeroes the row), rounded down to a multiple
+                of `align` so that `align` consecutive rows from it stay inside
+                one page (`align` divides the page)."""
                 if const_expr(align > 1):
                     last = (last_key // align) * align
                 else:
@@ -418,7 +444,7 @@ def build_flash_attn_paged_module_gfx11(
                 key_c = (key_c > 0).select(key_c, fx.Int32(0))
                 page = key_c // PAGE
                 blk = fx.Int32(buf_copy_load(bt_buf, page, elem=fx.Int32, unit_elems=1))
-                off = fx.Int64(blk) * PAGE_ELEMS + fx.Int64((key_c % PAGE) * TOK_KV)
+                off = fx.Int64(blk) * sb + fx.Int64((key_c % PAGE) * st)
                 return base + off * 2
 
             def load8_at(addr, off):
@@ -475,36 +501,40 @@ def build_flash_attn_paged_module_gfx11(
             if const_expr(SCALAR_PAGES):
                 # Per-lane, loop-invariant: which of the tile's pages a lane's
                 # chunk sits in and its byte offset inside that page.
-                def geo(row, d0):
+                def geo(row, d0, st):
                     if const_expr(NP > 1):
-                        return row // PAGE, ((row % PAGE) * TOK_KV + d0) * 2
-                    return None, (row * TOK_KV + d0) * 2
+                        return row // PAGE, ((row % PAGE) * st + d0) * 2
+                    return None, (row * st + d0) * 2
 
                 k_geos = []
                 for i in range_constexpr(K_PER_THR):
                     chunk = k_chunk(i)
-                    k_geos.append(geo(chunk // DBLKS, (chunk % DBLKS) * 8))
+                    k_geos.append(geo(chunk // DBLKS, (chunk % DBLKS) * 8, K_ST))
                 v_geos = []
                 for i in range_constexpr(V_PER_THR):
                     blk = v_block(i)
                     # The vt_rows rows of a block start at a multiple of vt_rows,
                     # which divides the page: they share a page.
-                    v_geos.append(geo((blk // DBLKS) * vt_rows, (blk % DBLKS) * 8))
+                    v_geos.append(
+                        geo((blk // DBLKS) * vt_rows, (blk % DBLKS) * 8, V_ST)
+                    )
 
-                def page_addr(base, blks, s_off, pg, voff):
+                def page_addr(base, blks, s_off, pg, voff, sb):
                     """64-bit address: the lane's page base (SGPRs) + its offset."""
-                    sel = base + fx.Int64(blks[0]) * (PAGE_ELEMS * 2) + s_off
+                    sel = base + fx.Int64(blks[0]) * (sb * 2) + s_off
                     for i in range_constexpr(1, NP):
-                        b_i = base + fx.Int64(blks[i]) * (PAGE_ELEMS * 2) + s_off
+                        b_i = base + fx.Int64(blks[i]) * (sb * 2) + s_off
                         sel = (pg == i).select(b_i, sel)
                     return sel + fx.Int64(voff)
 
             def gload_tile(tile, blks=None):
                 key0 = tile * BLOCK_N
                 if const_expr(SCALAR_PAGES):
-                    s_off = fx.Int64(0)
+                    k_soff = fx.Int64(0)
+                    v_soff = fx.Int64(0)
                     if const_expr(PAGE_OFF):
-                        s_off = fx.Int64((key0 % PAGE) * (TOK_KV * 2))
+                        k_soff = fx.Int64((key0 % PAGE) * (K_ST * 2))
+                        v_soff = fx.Int64((key0 % PAGE) * (V_ST * 2))
                 kregs = []
                 for i in range_constexpr(K_PER_THR):
                     chunk = k_chunk(i)
@@ -513,10 +543,12 @@ def build_flash_attn_paged_module_gfx11(
                     if const_expr(SCALAR_PAGES):
                         pg, voff = k_geos[i]
                         kregs.append(
-                            load8_at(page_addr(k_base, blks, s_off, pg, voff), 0)
+                            load8_at(page_addr(k_base, blks, k_soff, pg, voff, K_SB), 0)
                         )
                     else:
-                        kregs.append(load8_at(kv_row(k_base, key0 + row), d0))
+                        kregs.append(
+                            load8_at(kv_row(k_base, key0 + row, K_SB, K_ST), d0)
+                        )
                 vregs = []
                 for i in range_constexpr(V_PER_THR):
                     blk = v_block(i)
@@ -524,15 +556,15 @@ def build_flash_attn_paged_module_gfx11(
                     d0 = (blk % DBLKS) * 8
                     if const_expr(SCALAR_PAGES):
                         pg, voff = v_geos[i]
-                        addr0 = page_addr(v_base, blks, s_off, pg, voff)
+                        addr0 = page_addr(v_base, blks, v_soff, pg, voff, V_SB)
                         d0 = 0
                     else:
                         # The vt_rows rows of a block start at a multiple of vt_rows,
                         # so they share a page: one block-table lookup for all of them.
-                        addr0 = kv_row(v_base, kb0, vt_rows)
+                        addr0 = kv_row(v_base, kb0, V_SB, V_ST, vt_rows)
                     rows = []
                     for r in range_constexpr(vt_rows):
-                        v = Vec(load8_at(addr0, r * TOK_KV + d0))
+                        v = Vec(load8_at(addr0, r * V_ST + d0))
                         # A row past the keys would multiply P = 0 by whatever the
                         # clamped page holds (NaN * 0 = NaN): zero it.
                         rows.append((kb0 + r < seq_kv).select(v, zero_e8))
@@ -728,6 +760,8 @@ def build_flash_attn_paged_module_gfx11(
                     row = []
                     for si in range_constexpr(8):
                         x = fx.Float32(acc[si])
+                        if const_expr(descale):
+                            x = x * k_desc
                         if const_expr(causal or mask_tail):
                             key = j32 * BLOCK_N + kb * 16 + 2 * si + hh
                         if const_expr(causal):
@@ -826,7 +860,8 @@ def build_flash_attn_paged_module_gfx11(
             l_fin = fx.Float32(results[1])
             l_fin = l_fin + l_fin.shuffle_xor(16, WAVE_SIZE)
             # l is 0 only when no key was seen (a sequence without keys): O = 0 then.
-            inv = (l_fin > 0.0).select(fx.Float32(1.0) / l_fin, fx.Float32(0.0))
+            num = v_desc if const_expr(descale) else fx.Float32(1.0)
+            inv = (l_fin > 0.0).select(num / l_fin, fx.Float32(0.0))
             # Recomputed rather than kept live across the main loop (VGPR pressure).
             q_base = (
                 tok_off(qblk * BLOCK_M + ((tid // WAVE_SIZE) // DS) * 16 + (tid % 16))
@@ -873,6 +908,8 @@ def build_flash_attn_paged_module_gfx11(
         CU_Q: fx.Pointer,
         SEQUSED_K: fx.Pointer,
         BLOCK_TABLE: fx.Pointer,
+        K_DESC: fx.Pointer,
+        V_DESC: fx.Pointer,
         batch_size: fx.Int32,
         max_seqlen_q: fx.Int32,
         bt_stride: fx.Int32,
@@ -895,6 +932,8 @@ def build_flash_attn_paged_module_gfx11(
             n_qblk,
             bt_stride,
             q_small,
+            K_DESC,
+            V_DESC,
             value_attrs={
                 "rocdl.waves_per_eu": (
                     int(waves_per_eu)
@@ -919,6 +958,8 @@ def build_flash_attn_paged_module_gfx11(
         block_table,
         batch_size,
         max_seqlen_q,
+        k_descale,
+        v_descale,
         stream=None,
         q_small=0,
     ):
@@ -934,6 +975,8 @@ def build_flash_attn_paged_module_gfx11(
             ptr_arg(cu_seqlens_q, fx.Int32),
             ptr_arg(seqused_k, fx.Int32),
             ptr_arg(block_table, fx.Int32),
+            ptr_arg(k_descale, fx.Float32),
+            ptr_arg(v_descale, fx.Float32),
             batch_size,
             max_seqlen_q,
             block_table.stride(0),

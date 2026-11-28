@@ -2,8 +2,12 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """vLLM-style paged attention (the ``unified_attention`` form) on gfx11 with the
-FlyDSL kernels: ``flydsl_unified_attention_gfx11`` takes one step's batch of
-prefill chunks and decode tokens over a paged KV cache and writes ``out``.
+FlyDSL kernels: ``flydsl_unified_attention`` takes one step's batch of prefill
+chunks and decode tokens over a paged KV cache and writes ``out``. It is a
+separate entry point with the ``unified_attention`` signature: the caller (an
+attention backend) decides to use it, ``gfx11_paged_unsupported_reason`` tells
+it up front what the kernels do not take, and a call they do not take raises
+instead of falling back.
 
 Three kernels, all FlyDSL. Sequences with more than ``16 / (heads per KV
 head)`` queries run on the paged prefill kernel (128-row query blocks, many
@@ -31,7 +35,12 @@ from aiter.ops.flydsl.kernels.flash_attn_paged_reduce_gfx11 import (
     build_flash_attn_paged_reduce_module_gfx11,
 )
 
-__all__ = ["flydsl_unified_attention_gfx11", "gfx11_paged_supported"]
+__all__ = [
+    "flydsl_unified_attention",
+    "flydsl_unified_attention_gfx11",
+    "gfx11_paged_supported",
+    "gfx11_paged_unsupported_reason",
+]
 
 _DTYPE_STR = {torch.bfloat16: "bf16", torch.float16: "f16"}
 # Tile and grid choices. 0 / None = the shape rules below (from the gfx1151
@@ -78,6 +87,9 @@ def _prefill_kernel(
     lds_sched,
     vt_layout,
     head_group,
+    k_strides,
+    v_strides,
+    descale,
 ):
     # device_index intentionally participates in the cache key.
     return build_flash_attn_paged_module_gfx11(
@@ -100,6 +112,9 @@ def _prefill_kernel(
         head_group=head_group,
         waves_per_eu=waves_per_eu,
         num_kv_heads=HKV,
+        k_strides=k_strides,
+        v_strides=v_strides,
+        descale=descale,
     )
 
 
@@ -120,6 +135,9 @@ def _decode_kernel(
     skew_rows,
     s_slots,
     direct,
+    k_strides,
+    v_strides,
+    descale,
 ):
     return build_flash_attn_paged_decode_module_gfx11(
         num_heads=H,
@@ -136,7 +154,16 @@ def _decode_kernel(
         skew_rows=skew_rows,
         s_slots=s_slots,
         num_kv_heads=HKV,
+        k_strides=k_strides,
+        v_strides=v_strides,
+        descale=descale,
     )
+
+
+@functools.lru_cache(maxsize=16)
+def _unit_descale(device_index):
+    """The 1.0 the kernels read when the caller passes no descale."""
+    return torch.ones(1, dtype=torch.float32, device=torch.device("cuda", device_index))
 
 
 @functools.lru_cache(maxsize=64)
@@ -247,7 +274,13 @@ def _num_segments(batch, HKV, max_seqlen_k, block_n, D):
     return int(max(1, min(want, tiles, int(_TUNE["max_segments"]))))
 
 
-def gfx11_paged_supported(
+def _descale_ok(t):
+    return t is None or (
+        torch.is_tensor(t) and t.numel() == 1 and t.dtype == torch.float32 and t.is_cuda
+    )
+
+
+def gfx11_paged_unsupported_reason(
     q,
     k,
     v,
@@ -255,72 +288,158 @@ def gfx11_paged_supported(
     cu_seqlens_q,
     seqused_k,
     block_table,
-    causal,
-    window_size,
-    softcap,
-    q_descale,
-    k_descale,
-    v_descale,
-    alibi_slopes,
-    sinks,
-    qq_bias,
-    output_scale,
+    causal=True,
+    window_size=(-1, -1),
+    softcap=0.0,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
+    alibi_slopes=None,
+    sinks=None,
+    qq_bias=None,
+    output_scale=None,
 ):
-    """True when the FlyDSL kernels take the call: causal, bf16 / f16 all
-    round, dense ``[blocks, page, kv_heads, head_dim]`` caches with a page a
-    multiple of 8, ``head_dim % 8 == 0``, packed q / out, int32 tables, and
-    none of the options the kernels have no code for."""
-    if not causal or softcap or window_size[0] >= 0 or window_size[1] >= 0:
-        return False
-    if any(
-        x is not None
-        for x in (
-            q_descale,
-            k_descale,
-            v_descale,
-            alibi_slopes,
-            sinks,
-            qq_bias,
-            output_scale,
-        )
+    """None when the FlyDSL kernels take the call, else why not. They take:
+    causal, no window / softcap / alibi / sinks / qq_bias / output scale /
+    q descale; bf16 or f16 q, caches and out; k / v descales absent or one
+    fp32 each (the softmax scale and the output take them); ``[blocks, page,
+    kv_heads, head_dim]`` caches of any (block, token, head) strides that are
+    multiples of 8 elements with unit stride along the head dim (vLLM's
+    interleaved K / V views included), page a multiple of 8, ``head_dim % 8 ==
+    0``; packed q / out; int32 tables on the device."""
+    if not causal:
+        return "not causal"
+    if softcap:
+        return "softcap"
+    if window_size[0] >= 0 or window_size[1] >= 0:
+        return "sliding window"
+    for name, x in (
+        ("q_descale", q_descale),
+        ("alibi_slopes", alibi_slopes),
+        ("sinks", sinks),
+        ("qq_bias", qq_bias),
+        ("output_scale", output_scale),
     ):
-        return False
-    if (
-        q.dtype not in _DTYPE_STR
-        or k.dtype != q.dtype
-        or v.dtype != q.dtype
-        or out.dtype != q.dtype
-    ):
-        return False
+        if x is not None:
+            return name
+    if not (_descale_ok(k_descale) and _descale_ok(v_descale)):
+        return "k_descale / v_descale must be one fp32 on the device"
+    if q.dtype not in _DTYPE_STR:
+        return f"q dtype {q.dtype}"
+    if k.dtype != q.dtype or v.dtype != q.dtype or out.dtype != q.dtype:
+        return "k / v / out dtype differs from q"
     if q.dim() != 3 or k.dim() != 4 or v.shape != k.shape or out.shape != q.shape:
-        return False
+        return "shapes: q / out [total_q, heads, head_dim], k / v [blocks, page, kv_heads, head_dim]"
     total_q, H, D = q.shape
     num_blocks, page, HKV, dk = k.shape
-    if dk != D or D % 8 != 0 or page % 8 != 0 or H % HKV != 0:
-        return False
-    if not (
-        q.is_contiguous()
-        and out.is_contiguous()
-        and k.is_contiguous()
-        and v.is_contiguous()
-    ):
-        return False
+    if dk != D or D % 8 != 0:
+        return f"head_dim {D} / {dk} (must match and be a multiple of 8)"
+    if page % 8 != 0:
+        return f"page {page} (must be a multiple of 8)"
+    if H % HKV != 0:
+        return f"{H} heads over {HKV} KV heads"
+    if not (q.is_contiguous() and out.is_contiguous()):
+        return "q / out not contiguous"
+    for name, t in (("k", k), ("v", v)):
+        if t.stride(3) != 1 or any(s % 8 for s in t.stride()[:3]) or t.stride(0) < 0:
+            return f"{name} strides {tuple(t.stride())} (head dim unit, others multiples of 8)"
     if (
         q.data_ptr() % 16
         or out.data_ptr() % 16
         or k.data_ptr() % 16
         or v.data_ptr() % 16
     ):
-        return False
-    for t in (cu_seqlens_q, seqused_k, block_table):
+        return "q / k / v / out not 16-byte aligned"
+    for name, t in (
+        ("cu_seqlens_q", cu_seqlens_q),
+        ("seqused_k", seqused_k),
+        ("block_table", block_table),
+    ):
         if t.dtype != torch.int32 or not t.is_contiguous() or t.device != q.device:
-            return False
+            return f"{name} must be contiguous int32 on q's device"
     if block_table.dim() != 2 or block_table.shape[0] != seqused_k.numel():
-        return False
+        return "block_table must be [batch, max_blocks]"
     if cu_seqlens_q.numel() != seqused_k.numel() + 1:
-        return False
+        return "cu_seqlens_q must have batch + 1 entries"
     # Per-sequence Q / O descriptors address with 32-bit byte offsets.
-    return total_q * H * D * q.element_size() < 2**31
+    if total_q * H * D * q.element_size() >= 2**31:
+        return "q / out over 2 GiB"
+    return None
+
+
+def gfx11_paged_supported(*args, **kwargs):
+    """True when ``gfx11_paged_unsupported_reason`` returns None."""
+    return gfx11_paged_unsupported_reason(*args, **kwargs) is None
+
+
+def flydsl_unified_attention(
+    q,
+    k,
+    v,
+    out,
+    cu_seqlens_q,
+    max_seqlen_q,
+    seqused_k,
+    max_seqlen_k,
+    softmax_scale,
+    causal,
+    window_size,
+    block_table,
+    softcap,
+    q_descale,
+    k_descale,
+    v_descale,
+    alibi_slopes=None,
+    sinks=None,
+    qq_bias=None,
+    output_scale=None,
+    arch=None,
+):
+    """The ``unified_attention`` call on the gfx11 FlyDSL kernels: the caller
+    picks this entry point instead of the Triton one. A call the kernels do
+    not take raises ValueError with the reason (no silent fallback); check
+    ``gfx11_paged_unsupported_reason`` up front to decide. Writes and returns
+    ``out``."""
+    why = gfx11_paged_unsupported_reason(
+        q,
+        k,
+        v,
+        out,
+        cu_seqlens_q,
+        seqused_k,
+        block_table,
+        causal,
+        window_size,
+        softcap,
+        q_descale,
+        k_descale,
+        v_descale,
+        alibi_slopes,
+        sinks,
+        qq_bias,
+        output_scale,
+    )
+    if why is not None:
+        raise ValueError(
+            f"flydsl_unified_attention (gfx11) does not take this call: {why}"
+        )
+    if arch is None:
+        arch = torch.cuda.get_device_properties(q.device).gcnArchName.split(":")[0]
+    return flydsl_unified_attention_gfx11(
+        q,
+        k,
+        v,
+        out,
+        cu_seqlens_q,
+        max_seqlen_q,
+        seqused_k,
+        max_seqlen_k,
+        softmax_scale,
+        block_table,
+        arch=arch,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
 
 
 def flydsl_unified_attention_gfx11(
@@ -335,9 +454,11 @@ def flydsl_unified_attention_gfx11(
     softmax_scale,
     block_table,
     arch="gfx1151",
+    k_descale=None,
+    v_descale=None,
 ):
-    """Paged causal attention over a vLLM step; ``gfx11_paged_supported`` must
-    have accepted the call. Writes and returns ``out``."""
+    """Paged causal attention over a vLLM step; ``gfx11_paged_unsupported_reason``
+    must have returned None for the call. Writes and returns ``out``."""
     total_q, H, D = q.shape
     page, HKV = k.shape[1], k.shape[2]
     batch = seqused_k.numel()
@@ -348,6 +469,14 @@ def flydsl_unified_attention_gfx11(
     short = _short_limit(H, HKV)
     max_q, max_k = int(max_seqlen_q), int(max_seqlen_k)
     bn, vt, ds, qr, (vpad, skr, slots) = _decode_tile(D, batch, HKV)
+    k_strides = tuple(int(s) for s in k.stride()[:3])
+    v_strides = tuple(int(s) for s in v.stride()[:3])
+    # Kernels specialized on descales being present: without them the scale
+    # and the output factor are compile-time 1 (vLLM passes 1.0 tensors for
+    # bf16 caches; a caller that drops them gets the leaner kernels).
+    has_desc = k_descale is not None or v_descale is not None
+    kd = _unit_descale(dev) if k_descale is None else k_descale
+    vd = _unit_descale(dev) if v_descale is None else v_descale
 
     if max_q > short:
         # The long sequences (prefill chunks): the kernel skips the short ones.
@@ -383,6 +512,9 @@ def flydsl_unified_attention_gfx11(
             ),
             lay,
             head_group,
+            k_strides,
+            v_strides,
+            has_desc,
         )
         exe(
             q,
@@ -394,6 +526,8 @@ def flydsl_unified_attention_gfx11(
             block_table,
             batch,
             max_q,
+            kd,
+            vd,
             stream=stream,
             q_small=short,
         )
@@ -424,6 +558,9 @@ def flydsl_unified_attention_gfx11(
             skr,
             slots,
             True,
+            k_strides,
+            v_strides,
+            has_desc,
         )
         dec(
             q,
@@ -439,11 +576,30 @@ def flydsl_unified_attention_gfx11(
             batch,
             dec_q,
             1,
+            kd,
+            vd,
             stream=stream,
         )
         return out
     dec = _decode_kernel(
-        dev, H, HKV, D, page, dtype_str, scale, bn, vt, ds, qr, vpad, skr, slots, False
+        dev,
+        H,
+        HKV,
+        D,
+        page,
+        dtype_str,
+        scale,
+        bn,
+        vt,
+        ds,
+        qr,
+        vpad,
+        skr,
+        slots,
+        False,
+        k_strides,
+        v_strides,
+        has_desc,
     )
     dpad = dec.dpad2
     # Partials per (sequence, token slot): the long sequences' slots stay
@@ -466,6 +622,8 @@ def flydsl_unified_attention_gfx11(
         batch,
         dec_q,
         nseg,
+        kd,
+        vd,
         stream=stream,
     )
     red = _reduce_kernel(dev, H, D, dtype_str)

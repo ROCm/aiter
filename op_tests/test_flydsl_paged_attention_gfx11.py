@@ -28,13 +28,15 @@ _gfx11_only = pytest.mark.skipif(
 )
 
 
-def _ref_paged(query, k_cache, v_cache, cu, sk, bt, scale):
+def _ref_paged(query, k_cache, v_cache, cu, sk, bt, scale, v_scale=1.0):
     """fp32 reference: per sequence, gather the cache rows through the block
     table, bottom-right causal mask, softmax, PV; a row without keys gives 0."""
     total, H, D = query.shape
     HKV = k_cache.shape[2]
     page = k_cache.shape[1]
     G = H // HKV
+    k_rows = k_cache.reshape(-1, HKV, D)  # copies a strided cache
+    v_rows = v_cache.reshape(-1, HKV, D)
     out = torch.zeros(total, H, D, dtype=torch.float32, device=query.device)
     for b in range(sk.numel()):
         q0, q1 = cu[b].item(), cu[b + 1].item()
@@ -43,8 +45,8 @@ def _ref_paged(query, k_cache, v_cache, cu, sk, bt, scale):
             continue
         t = torch.arange(kv, device=query.device)
         rows = bt[b, t // page].long() * page + (t % page)
-        k = k_cache.view(-1, HKV, D)[rows].float().repeat_interleave(G, dim=1)
-        v = v_cache.view(-1, HKV, D)[rows].float().repeat_interleave(G, dim=1)
+        k = k_rows[rows].float().repeat_interleave(G, dim=1)
+        v = v_rows[rows].float().repeat_interleave(G, dim=1)
         q = query[q0:q1].float()
         lq = q1 - q0
         s = torch.einsum("qhd,khd->hqk", q, k) * scale
@@ -52,13 +54,16 @@ def _ref_paged(query, k_cache, v_cache, cu, sk, bt, scale):
         ki = torch.arange(kv, device=query.device)[None, :]
         s = s.masked_fill((ki > qi + (kv - lq))[None], float("-inf"))
         p = torch.softmax(s, dim=-1).nan_to_num(0.0)
-        out[q0:q1] = torch.einsum("hqk,khd->qhd", p, v)
+        out[q0:q1] = torch.einsum("hqk,khd->qhd", p, v) * v_scale
     return out
 
 
-def _make(seq_lens, H, HKV, D, page, dtype):
+def _make(seq_lens, H, HKV, D, page, dtype, layout="dense"):
     """Random q and a paged cache whose block table maps every sequence's pages
-    to distinct blocks in a shuffled order."""
+    to distinct blocks in a shuffled order. layout "interleaved": the vLLM
+    gfx1151 backend's view, K and V side by side in one [blocks, kv_heads,
+    page, 2 * head_dim] buffer, presented as [blocks, page, kv_heads, head_dim]
+    views with strides (kv_heads * page * 2D, 2D, page * 2D, 1)."""
     g = torch.Generator(device="cuda").manual_seed(0)
     total_q = sum(a for a, _ in seq_lens)
     pages = [-(-kv // page) for _, kv in seq_lens]
@@ -67,6 +72,14 @@ def _make(seq_lens, H, HKV, D, page, dtype):
     q = torch.randn(total_q, H, D, device="cuda", dtype=dtype, generator=g)
     k_cache = torch.randn(nblk, page, HKV, D, device="cuda", dtype=dtype, generator=g)
     v_cache = torch.randn(nblk, page, HKV, D, device="cuda", dtype=dtype, generator=g)
+    if layout == "interleaved":
+        kv = torch.empty(nblk, HKV, page, 2 * D, device="cuda", dtype=dtype)
+        k_view = kv[..., :D].permute(0, 2, 1, 3)
+        v_view = kv[..., D:].permute(0, 2, 1, 3)
+        k_view.copy_(k_cache)
+        v_view.copy_(v_cache)
+        k_cache, v_cache = k_view, v_view
+        assert not k_cache.is_contiguous() and k_cache.stride(1) == 2 * D
     perm = torch.randperm(nblk, generator=torch.Generator().manual_seed(1)).tolist()
     bt = torch.zeros(len(seq_lens), max_pages, dtype=torch.int32)
     nxt = 0
@@ -82,37 +95,45 @@ def _make(seq_lens, H, HKV, D, page, dtype):
     return q, k_cache, v_cache, cu, sk, bt
 
 
-def _check(seq_lens, H, HKV, D, page, dtype):
-    q, k_cache, v_cache, cu, sk, bt = _make(seq_lens, H, HKV, D, page, dtype)
+def _check(seq_lens, H, HKV, D, page, dtype, layout="dense", descale=None):
+    """descale: None or (k, v) floats passed as the fp32 descale tensors; the
+    softmax scale is multiplied by k's, the output by v's."""
+    q, k_cache, v_cache, cu, sk, bt = _make(seq_lens, H, HKV, D, page, dtype, layout)
     out = torch.zeros_like(q)
     scale = D**-0.5
-    assert pa.gfx11_paged_supported(
+    kd = vd = None
+    if descale is not None:
+        kd = torch.tensor([descale[0]], dtype=torch.float32, device="cuda")
+        vd = torch.tensor([descale[1]], dtype=torch.float32, device="cuda")
+    why = pa.gfx11_paged_unsupported_reason(
+        q, k_cache, v_cache, out, cu, sk, bt, k_descale=kd, v_descale=vd
+    )
+    assert why is None, why
+    max_q = max(a for a, _ in seq_lens)
+    max_k = max(kv for _, kv in seq_lens)
+    # the public entry point, as an attention backend calls it
+    res = pa.flydsl_unified_attention(
         q,
         k_cache,
         v_cache,
         out,
         cu,
+        max_q,
         sk,
-        bt,
+        max_k,
+        scale,
         True,
         (-1, -1),
+        bt,
         0,
         None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    max_q = max(a for a, _ in seq_lens)
-    max_k = max(kv for _, kv in seq_lens)
-    res = pa.flydsl_unified_attention_gfx11(
-        q, k_cache, v_cache, out, cu, max_q, sk, max_k, scale, bt
+        kd,
+        vd,
     )
     assert res is out
     torch.cuda.synchronize()
-    ref = _ref_paged(q, k_cache, v_cache, cu, sk, bt, scale)
+    k_mul, v_mul = (1.0, 1.0) if descale is None else descale
+    ref = _ref_paged(q, k_cache, v_cache, cu, sk, bt, scale * k_mul, v_mul)
     got = out.float()
     assert not torch.isnan(got).any()
     # bf16 output of a bf16 kernel against fp32 math: 1.5e-2 absolute, as the
@@ -185,12 +206,41 @@ def test_flydsl_paged_attention_gfx11(seq_lens, H, HKV, D, page, dtype_str):
 
 
 @_gfx11_only
+@pytest.mark.parametrize(
+    "seq_lens, H, HKV, D, page",
+    [
+        # the vLLM gfx1151 backend's interleaved K / V view: prefill, mixed, decode
+        ([(300, 300), (37, 1000)], 8, 2, 256, 32),
+        ([(700, 700)] + [(1, 1500)] * 7 + [(3, 17)], 8, 2, 256, 32),
+        ([(1, 2048)] * 8 + [(4, 512)] * 4, 32, 8, 128, 16),
+    ],
+)
+def test_flydsl_paged_attention_gfx11_interleaved_cache(seq_lens, H, HKV, D, page):
+    _check(seq_lens, H, HKV, D, page, torch.bfloat16, layout="interleaved")
+
+
+@_gfx11_only
+@pytest.mark.parametrize(
+    "seq_lens, H, HKV, D, page, descale",
+    [
+        # k / v descales as vLLM passes them (1.0 for bf16) and off 1.0 to see
+        # them land: k's on the softmax scale, v's on the output
+        ([(300, 300), (37, 1000), (1, 1536)], 8, 2, 256, 32, (1.0, 1.0)),
+        ([(129, 2049), (3, 17), (1, 1)] + [(1, 1000)] * 5, 8, 2, 256, 16, (0.5, 2.0)),
+        ([(1, 4096)] * 4 + [(4, 300)] * 4, 32, 8, 128, 16, (1.25, 0.75)),
+    ],
+)
+def test_flydsl_paged_attention_gfx11_descale(seq_lens, H, HKV, D, page, descale):
+    _check(seq_lens, H, HKV, D, page, torch.bfloat16, descale=descale)
+
+
+@_gfx11_only
 def test_flydsl_paged_attention_gfx11_gate():
-    """The gate takes dense bf16 / f16 caches with int32 tables and refuses
-    what the kernels have no code for."""
+    """The gate takes bf16 / f16 caches of any stride with int32 tables and
+    unit descales, refuses what the kernels have no code for, and names it."""
     q, k_cache, v_cache, cu, sk, bt = _make([(16, 64)], 8, 2, 128, 16, torch.bfloat16)
     out = torch.empty_like(q)
-    ok = lambda **kw: pa.gfx11_paged_supported(  # noqa: E731
+    why = lambda **kw: pa.gfx11_paged_unsupported_reason(  # noqa: E731
         kw.get("q", q),
         kw.get("k", k_cache),
         kw.get("v", v_cache),
@@ -209,12 +259,16 @@ def test_flydsl_paged_attention_gfx11_gate():
         kw.get("qq", None),
         kw.get("oscale", None),
     )
+    ok = lambda **kw: why(**kw) is None  # noqa: E731
     assert ok()
-    assert not ok(causal=False)
-    assert not ok(window=(64, -1))
-    assert not ok(softcap=30.0)
-    assert not ok(sinks=torch.ones(8, device="cuda"))
-    assert not ok(kd=torch.ones(1, device="cuda"))
+    assert why(causal=False) == "not causal"
+    assert why(window=(64, -1)) == "sliding window"
+    assert why(softcap=30.0) == "softcap"
+    assert why(sinks=torch.ones(8, device="cuda")) == "sinks"
+    assert ok(kd=torch.ones(1, device="cuda"), vd=torch.ones((), device="cuda"))
+    assert not ok(kd=torch.ones(2, device="cuda"))  # one scalar each
+    assert not ok(kd=torch.ones(1, device="cuda", dtype=torch.bfloat16))
+    assert not ok(qd=torch.ones(1, device="cuda"))
     assert not ok(
         k=(
             k_cache.to(torch.float8_e4m3fnuz)
@@ -227,5 +281,31 @@ def test_flydsl_paged_attention_gfx11_gate():
     assert not ok(q=q.transpose(0, 1))  # not packed
     k24 = torch.randn(k_cache.shape[0], 24, 2, 128, device="cuda", dtype=torch.bfloat16)
     assert ok(k=k24, v=k24)  # any page size that is a multiple of 8
+    # strided caches: the interleaved view is fine, a head-dim stride is not
+    _, ki, vi, *_ = _make([(16, 64)], 8, 2, 128, 16, torch.bfloat16, "interleaved")
+    assert ok(k=ki, v=vi)
+    wide = torch.randn(
+        k_cache.shape[0], 16, 2, 256, device="cuda", dtype=torch.bfloat16
+    )
+    assert not ok(k=wide[..., ::2], v=wide[..., ::2])
+    with pytest.raises(ValueError, match="not causal"):
+        pa.flydsl_unified_attention(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            cu,
+            16,
+            sk,
+            64,
+            0.1,
+            False,
+            (-1, -1),
+            bt,
+            0,
+            None,
+            None,
+            None,
+        )
     k20 = torch.randn(k_cache.shape[0], 20, 2, 128, device="cuda", dtype=torch.bfloat16)
     assert not ok(k=k20, v=k20)

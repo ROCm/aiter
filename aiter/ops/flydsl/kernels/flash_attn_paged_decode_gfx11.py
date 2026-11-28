@@ -73,6 +73,9 @@ def build_flash_attn_paged_decode_module_gfx11(
     s_slots=2,
     waves_per_eu=None,
     num_kv_heads=None,
+    k_strides=None,
+    v_strides=None,
+    descale=False,
     fast_fp_math=True,
     unsafe_fp_math=True,
 ):
@@ -80,9 +83,13 @@ def build_flash_attn_paged_decode_module_gfx11(
 
     ``launch(q, k_cache, v_cache, out, segm_output, segm_max, segm_expsum,
     cu_seqlens_q, seqused_k, block_table, batch_size, max_seqlen_q,
-    num_segments, stream=None)``: ``q`` / ``out`` are packed THD
-    ``[total_q, num_heads, head_dim]``; the caches ``[num_blocks, page_size,
-    num_kv_heads, head_dim]``; ``segm_output`` fp32 ``[batch * max_seqlen_q,
+    num_segments, k_descale, v_descale, stream=None)``: ``q`` / ``out`` are
+    packed THD ``[total_q, num_heads, head_dim]``; the caches ``[num_blocks,
+    page_size, num_kv_heads, head_dim]`` with the element strides
+    ``k_strides`` / ``v_strides`` of (block, token, head) (None = dense) and
+    unit stride along the head dim; ``k_descale`` / ``v_descale`` one fp32
+    each, read only when built with ``descale=True`` (the former multiplies
+    the scores, the latter the output); ``segm_output`` fp32 ``[batch * max_seqlen_q,
     num_heads, num_segments, next_pow2(head_dim)]``, ``segm_max`` /
     ``segm_expsum`` fp32 ``[batch * max_seqlen_q, num_heads, num_segments]``,
     row ``b * max_seqlen_q + t`` for token ``t`` of sequence ``b`` (unused with
@@ -136,8 +143,17 @@ def build_flash_attn_paged_decode_module_gfx11(
     NK = BLOCK_N // WMMA_MNK
     THREADS = WAVE_SIZE * NWD
     TOK = H * D  # elements between consecutive Q / O tokens (THD)
-    TOK_KV = HKV * D  # elements of one K / V cache row
-    PAGE_ELEMS = PAGE * TOK_KV
+    # Cache strides in elements: (block, token, head); the loads are 16-byte
+    # rows of 8 elements, so every stride is a multiple of 8.
+    K_SB, K_ST, K_SH = (
+        (PAGE * HKV * D, HKV * D, D) if k_strides is None else map(int, k_strides)
+    )
+    V_SB, V_ST, V_SH = (
+        (PAGE * HKV * D, HKV * D, D) if v_strides is None else map(int, v_strides)
+    )
+    for s in (K_SB, K_ST, K_SH, V_SB, V_ST, V_SH):
+        if s % 8 != 0 or s < 0:
+            raise ValueError(f"cache strides must be non-negative multiples of 8: {s}")
     is_bf16 = dtype_str == "bf16"
     elem = fx.BFloat16 if is_bf16 else fx.Float16
 
@@ -229,6 +245,8 @@ def build_flash_attn_paged_decode_module_gfx11(
         bt_stride: fx.Int32,
         num_segments: fx.Int32,
         q_small: fx.Int32,
+        K_DESC: fx.Pointer,
+        V_DESC: fx.Pointer,
     ):
         lds_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().vt.ptr
 
@@ -318,18 +336,24 @@ def build_flash_attn_paged_decode_module_gfx11(
             num_records_bytes=bt_bytes,
         )
         last_key = seq_kv - 1
-        k_base = buf_base_i64(K) + fx.Int64(kvh) * (D * 2)
-        v_base = buf_base_i64(V) + fx.Int64(kvh) * (D * 2)
+        k_base = buf_base_i64(K) + fx.Int64(kvh) * (K_SH * 2)
+        v_base = buf_base_i64(V) + fx.Int64(kvh) * (V_SH * 2)
+        # The descales as scalar loads: K's multiplies the scores, V's the
+        # output; only when built for them.
+        if const_expr(descale):
+            k_desc = fx.Int32(table_scalar(K_DESC, 0, 1)).bitcast(fx.Float32)
+            v_desc = fx.Int32(table_scalar(V_DESC, 0, 1)).bitcast(fx.Float32)
         GPTR16 = fx.PointerType.get(
             elem.ir_type, address_space=fx.AddressSpace.Global, alignment=16
         )
 
-        def kv_row(base, key, align=1):
-            """64-bit address of row `key` of this sequence's K or V, through the
-            block table. A key past the last one is clamped onto the last key
-            (valid memory; the caller masks or zeroes the row), rounded down to
-            a multiple of `align` so that `align` consecutive rows from it stay
-            inside one page (`align` divides the page)."""
+        def kv_row(base, key, sb, st, align=1):
+            """64-bit address of row `key` of this sequence's K or V (block and
+            token strides `sb`, `st`), through the block table. A key past the
+            last one is clamped onto the last key (valid memory; the caller
+            masks or zeroes the row), rounded down to a multiple of `align` so
+            that `align` consecutive rows from it stay inside one page (`align`
+            divides the page)."""
             if const_expr(align > 1):
                 last = (last_key // align) * align
             else:
@@ -338,7 +362,7 @@ def build_flash_attn_paged_decode_module_gfx11(
             key_c = (key_c > 0).select(key_c, fx.Int32(0))
             page = key_c // PAGE
             blk = fx.Int32(buf_copy_load(bt_buf, page, elem=fx.Int32, unit_elems=1))
-            off = fx.Int64(blk) * PAGE_ELEMS + fx.Int64((key_c % PAGE) * TOK_KV)
+            off = fx.Int64(blk) * sb + fx.Int64((key_c % PAGE) * st)
             return base + off * 2
 
         def load8_at(addr, off):
@@ -395,10 +419,10 @@ def build_flash_attn_paged_decode_module_gfx11(
                 d0 = (blk % DBLKS) * 8
                 # The vt_rows rows of a block start at a multiple of vt_rows, so
                 # they share a page: one block-table lookup for all of them.
-                addr0 = kv_row(v_base, kb0, vt_rows)
+                addr0 = kv_row(v_base, kb0, V_SB, V_ST, vt_rows)
                 rows = []
                 for r in range_constexpr(vt_rows):
-                    v = Vec(load8_at(addr0, r * TOK_KV + col0 + d0))
+                    v = Vec(load8_at(addr0, r * V_ST + col0 + d0))
                     # A row past the keys would multiply P = 0 by whatever the
                     # clamped page holds (NaN * 0 = NaN): zero it.
                     rows.append((kb0 + r < seq_kv).select(v, zero_e8))
@@ -491,7 +515,7 @@ def build_flash_attn_paged_decode_module_gfx11(
             s_acc = []
             for kb in range_constexpr(NK):
                 acc = zero8
-                k_addr = kv_row(k_base, key0 + kb * 16 + l16)
+                k_addr = kv_row(k_base, key0 + kb * 16 + l16, K_SB, K_ST)
                 for c in range_constexpr(NDW):
                     acc = _wmma(k_vec(k_addr, c), qv[c], acc)
                 s_acc.append(Vec(acc))
@@ -525,6 +549,8 @@ def build_flash_attn_paged_decode_module_gfx11(
                 row = []
                 for si in range_constexpr(8):
                     x = fx.Float32(s_acc[kb][si])
+                    if const_expr(descale):
+                        x = x * k_desc
                     key = key0 + kb * 16 + 2 * si + hh
                     x = (key > q_lim).select(fx.Float32(NEG_BIG), x)
                     x = (key >= seq_kv).select(fx.Float32(NEG_BIG), x)
@@ -605,7 +631,8 @@ def build_flash_attn_paged_decode_module_gfx11(
 
         if const_expr(direct):
             # One segment: normalized output, as the varlen kernel's epilogue.
-            inv = (l_fin > 0.0).select(fx.Float32(1.0) / l_fin, fx.Float32(0.0))
+            num = v_desc if const_expr(descale) else fx.Float32(1.0)
+            inv = (l_fin > 0.0).select(num / l_fin, fx.Float32(0.0))
             o_buf = seq_buf(O, seq_q, fx.Int64(q_start) * TOK)
             for dc in range_constexpr(NDW):
                 if const_expr(dc * 16 < D):
@@ -675,7 +702,10 @@ def build_flash_attn_paged_decode_module_gfx11(
             o_row = row_seg * DPAD2 + col0
             for dc in range_constexpr(NDW):
                 o = Vec(results[2 + dc])
+                # V's descale goes into the partials (the merge only normalizes)
                 own = [fx.Float32(o[si]) for si in range_constexpr(8)]
+                if const_expr(descale):
+                    own = [x * v_desc for x in own]
                 part = [own[si].shuffle_xor(16, WAVE_SIZE) for si in range_constexpr(8)]
                 ev = [is_h0.select(own[si], part[si]) for si in range_constexpr(8)]
                 od = [is_h0.select(part[si], own[si]) for si in range_constexpr(8)]
@@ -704,6 +734,8 @@ def build_flash_attn_paged_decode_module_gfx11(
         CU_Q: fx.Pointer,
         SEQUSED_K: fx.Pointer,
         BLOCK_TABLE: fx.Pointer,
+        K_DESC: fx.Pointer,
+        V_DESC: fx.Pointer,
         batch_size: fx.Int32,
         n_qtile: fx.Int32,
         bt_stride: fx.Int32,
@@ -728,6 +760,8 @@ def build_flash_attn_paged_decode_module_gfx11(
             bt_stride,
             num_segments,
             q_small,
+            K_DESC,
+            V_DESC,
             value_attrs={
                 "rocdl.waves_per_eu": (
                     int(waves_per_eu)
@@ -760,6 +794,8 @@ def build_flash_attn_paged_decode_module_gfx11(
         batch_size,
         max_seqlen_q,
         num_segments,
+        k_descale,
+        v_descale,
         stream=None,
     ):
         """max_seqlen_q: the longest sequence this kernel handles (its q_small);
@@ -779,6 +815,8 @@ def build_flash_attn_paged_decode_module_gfx11(
             ptr_arg(cu_seqlens_q, fx.Int32),
             ptr_arg(seqused_k, fx.Int32),
             ptr_arg(block_table, fx.Int32),
+            ptr_arg(k_descale, fx.Float32),
+            ptr_arg(v_descale, fx.Float32),
             batch_size,
             n_qtile,
             block_table.stride(0),
