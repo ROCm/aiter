@@ -14,9 +14,11 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     get_rot_bufs_kwargs,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    config_launch,
     get_caller_name_no_ext,
     get_model_benchmark_object,
     get_shape_benchmark_object,
+    metric_value,
     print_vgpr,
 )
 from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
@@ -29,11 +31,22 @@ from op_tests.triton_tests.gemm.basic.test_gemm_a16w4 import (
 _OUT_VAL_KEYS = ["x", "w", "w_scales", "w_zeros", "x_perm", "_", "y", "_"]
 
 
-def bench_gemm_fn(
-    bencher: RotatingBufferBench, M: int, N: int, K: int, metric: str, args
+def make_bench_case(
+    bencher: RotatingBufferBench,
+    M: int,
+    N: int,
+    K: int,
+    dtype: torch.dtype,
+    group_size: int,
+    has_zeros: bool = False,
+    act_order: bool = False,
 ):
-    dtype = torch.float16 if args.dtype == "fp16" else torch.bfloat16
-    group_size = args.group_size
+    """(launch, rot_bufs, flops, mem) of one shape.
+
+    A K that is not a multiple of group_size gets per-channel scales.
+    ``launch(config, **bufs)`` takes a config; None is the installed one.
+    The tuning scripts in aiter/ops/triton/utils/_triton/tuning use this function.
+    """
     if group_size != -1 and K % group_size != 0:
         logger.warning(
             "K=%d is not a multiple of group size %d: using per-channel scales",
@@ -49,11 +62,12 @@ def bench_gemm_fn(
         K,
         group_size=group_size,
         dtype=dtype,
-        has_zeros=args.has_zeros,
-        act_order=args.act_order,
+        has_zeros=has_zeros,
+        act_order=act_order,
         output=True,
     )
     rot_bufs = bencher.build_pool([_p_gen], [_OUT_VAL_KEYS])
+    launch = config_launch(gemm_a16w4)
 
     sample = rot_bufs[0]
     x, w, w_scales, w_zeros = (
@@ -67,17 +81,24 @@ def bench_gemm_fn(
     if w_zeros is not None:
         w_bytes += w_zeros.numel()
     mem = (M * K + M * N) * x.element_size() + w_bytes
+    return launch, rot_bufs, flops, mem
 
-    ms = bencher.bench(gemm_a16w4)
 
-    if metric == "time":
-        return ms
-    elif metric == "throughput":
-        return flops / ms * 1e-9
-    elif metric == "bandwidth":
-        return mem / (ms * 1e-3) * 1e-9
-    else:
-        raise ValueError("Unknown metric: " + metric)
+def bench_gemm_fn(
+    bencher: RotatingBufferBench, M: int, N: int, K: int, metric: str, args
+):
+    launch, _, flops, mem = make_bench_case(
+        bencher,
+        M,
+        N,
+        K,
+        torch.float16 if args.dtype == "fp16" else torch.bfloat16,
+        args.group_size,
+        has_zeros=args.has_zeros,
+        act_order=args.act_order,
+    )
+    ms = bencher.bench(functools.partial(launch, None))
+    return metric_value(metric, ms, flops, mem)
 
 
 def run_model_benchmark(args):

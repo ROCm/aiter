@@ -1,3 +1,4 @@
+import copy
 import inspect
 import json
 import os
@@ -378,3 +379,41 @@ def get_dtype_bytes(dtype):
 def get_caller_name_no_ext():
     caller_file = inspect.stack()[1].filename  # full path of caller
     return Path(caller_file).stem  # filename without extension
+
+
+def config_launch(kernel_fn, derive_keys=None):
+    """``launch(config, **bufs)``: ``kernel_fn`` with ``config=``; None is the installed config.
+
+    Each launch gets a deep copy of the config, because the wrappers change it.
+    ``derive_keys(config)`` adds the keys that the wrapper derives from the JSON keys.
+    """
+
+    def launch(config, **bufs):
+        if config is not None:
+            config = copy.deepcopy(config)
+            if derive_keys is not None:
+                derive_keys(config)
+        return kernel_fn(config=config, **bufs)
+
+    return launch
+
+
+def splitk_block_size(K):
+    """``derive_keys`` for the wrappers that read SPLITK_BLOCK_SIZE, which the JSON does not have."""
+
+    def derive_keys(config):
+        if "NUM_KSPLIT" in config:
+            config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, config["NUM_KSPLIT"])
+
+    return derive_keys
+
+
+def metric_value(metric, ms, flops, mem):
+    """The value that the benchmark reports for ``--metric``."""
+    if metric == "time":
+        return ms
+    if metric == "throughput":
+        return flops / ms * 1e-9  # TFLOPS
+    if metric == "bandwidth":
+        return mem / (ms * 1e-3) * 1e-9  # GB/s
+    raise ValueError("Unknown metric: " + metric)

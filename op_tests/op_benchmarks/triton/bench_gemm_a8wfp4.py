@@ -17,10 +17,13 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     get_rot_bufs_kwargs,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    config_launch,
     get_caller_name_no_ext,
     get_model_benchmark_object,
     get_shape_benchmark_object,
+    metric_value,
     print_vgpr,
+    splitk_block_size,
 )
 from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
     RotatingBufferBench,
@@ -30,14 +33,18 @@ from op_tests.triton_tests.gemm.basic.test_gemm_a8wfp4 import (
 )
 
 
-def bench_gemm_fn(
+def make_bench_case(
     bencher: RotatingBufferBench,
     M: int,
     N: int,
     K: int,
-    metric: str,
     layout: str,
 ):
+    """(launch, rot_bufs, flops, mem) of one shape.
+
+    ``launch(config, **bufs)`` takes a config; None is the installed one.
+    The tuning scripts in aiter/ops/triton/utils/_triton/tuning use this function.
+    """
     _e5m2_type, e4m3_type = get_fp8_dtypes()
     a_dtype = e4m3_type
     out_dtype = torch.float16
@@ -57,7 +64,9 @@ def bench_gemm_fn(
 
     rot_bufs = bencher.build_pool([_p_gen], [_out_vals_keys])
 
-    kernel_fn = functools.partial(gemm_a8wfp4, dtype=out_dtype)
+    launch = config_launch(
+        functools.partial(gemm_a8wfp4, dtype=out_dtype), splitk_block_size(K)
+    )
 
     # flops
     flops = 2.0 * M * N * K
@@ -74,18 +83,20 @@ def bench_gemm_fn(
     mem_write = (M * N) * rot_bufs[0]["y"].element_size()
     mem = mem_read + mem_write
 
-    ms = bencher.bench(kernel_fn)
-    # Return exactly one scalar depending on which metric is active
-    if metric == "time":
-        return ms
-    elif metric == "throughput":
-        tflops = flops / ms * 1e-9
-        return tflops
-    elif metric == "bandwidth":
-        bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
-        return bandwidth
-    else:
-        raise ValueError("Unknown metric: " + metric)
+    return launch, rot_bufs, flops, mem
+
+
+def bench_gemm_fn(
+    bencher: RotatingBufferBench,
+    M: int,
+    N: int,
+    K: int,
+    metric: str,
+    layout: str,
+):
+    launch, _, flops, mem = make_bench_case(bencher, M, N, K, layout)
+    ms = bencher.bench(functools.partial(launch, None))
+    return metric_value(metric, ms, flops, mem)
 
 
 def run_benchmark(args, defaults):

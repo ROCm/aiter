@@ -15,6 +15,8 @@ decode layer does with its own weight.
 Select fused_nope_only to write only the NoPE prefix of a preallocated output.
 """
 
+import argparse
+import functools
 import json
 from collections import Counter
 
@@ -37,6 +39,7 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     positive_int,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    config_launch,
     get_caller_name_no_ext,
 )
 from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
@@ -74,9 +77,11 @@ def fields(args, provider):
     return ROPE_CACHE_FIELDS if args.rope_cache else FIELDS
 
 
-def make_input_gen(M, provider, args):
+def make_input_gen(M, provider, args, kv_lora=KV_LORA, d_nope=D_NOPE):
     def gen():
-        q_nope, w_uk_t, q_pe = generate_inputs(M, args.qh)
+        q_nope, w_uk_t, q_pe = generate_inputs(
+            M, args.qh, kv_lora=kv_lora, d_nope=d_nope
+        )
         q_scale = torch.ones((), dtype=torch.float32, device="cuda")
         fp8 = get_fp8_e4m3_dtype()
         q_dim = w_uk_t.shape[-1] + q_pe.shape[-1]
@@ -88,7 +93,7 @@ def make_input_gen(M, provider, args):
             return q_nope, w_uk_t, q_scale, buf
         if not args.rope_cache:
             return q_nope, w_uk_t, q_pe, q_scale, buf
-        rope_cache = generate_rope_cache_inputs(M)
+        rope_cache = generate_rope_cache_inputs(M, kv_lora=kv_lora)
         k_scale = torch.ones((), dtype=torch.float32, device="cuda")
         # The unpadded fp8 query fused_qk_rope_concat_and_cache_mla writes.
         q_out_shape = (M, args.qh, q_dim) if provider == "unfused" else (0,)
@@ -154,9 +159,19 @@ def make_fn(M, provider, args, cat_quant):
             q = cat_quant(buf, q_pe, q_scale, fp8_max)
             return q.repeat_interleave(dup, dim=1)
 
-    elif provider in ("fused", "fused_nope_only"):
+    else:
+        fn = functools.partial(fused_kernel_fn(provider, args), config=config)
 
-        def fn(q_nope, w_uk_t, q_scale, buf, q_pe=None):
+    return fn
+
+
+def fused_kernel_fn(provider, args):
+    """``fn(config=..., **bufs)`` of a fused provider: one launch of its public wrapper."""
+    fp8_max = fp8_quant_max()
+    cache_dtype = get_fp8_e4m3_dtype()
+    if provider in ("fused", "fused_nope_only"):
+
+        def fn(q_nope, w_uk_t, q_scale, buf, config, q_pe=None):
             return fused_bf16_bmm_cat_quant_pad_mla(
                 q_nope,
                 w_uk_t,
@@ -168,43 +183,78 @@ def make_fn(M, provider, args, cat_quant):
                 config=config,
             )
 
-    else:
+        return fn
 
-        def fn(
+    def fn(
+        q_nope,
+        w_uk_t,
+        q_pe,
+        q_scale,
+        buf,
+        kv_c,
+        k_pe,
+        cos_sin_cache,
+        positions,
+        slot_mapping,
+        kv_cache,
+        k_scale,
+        q_out,
+        config,
+    ):
+        return fused_bf16_bmm_rope_cat_quant_pad_cache_mla(
             q_nope,
             w_uk_t,
             q_pe,
             q_scale,
-            buf,
             kv_c,
             k_pe,
-            cos_sin_cache,
-            positions,
+            kv_cache.view(cache_dtype),
             slot_mapping,
-            kv_cache,
             k_scale,
-            q_out,
-        ):
-            return fused_bf16_bmm_rope_cat_quant_pad_cache_mla(
-                q_nope,
-                w_uk_t,
-                q_pe,
-                q_scale,
-                kv_c,
-                k_pe,
-                kv_cache.view(cache_dtype),
-                slot_mapping,
-                k_scale,
-                positions,
-                cos_sin_cache,
-                args.is_neox,
-                args.padded_heads,
-                out=buf,
-                fp8_max=fp8_max,
-                config=config,
-            )
+            positions,
+            cos_sin_cache,
+            args.is_neox,
+            args.padded_heads,
+            out=buf,
+            fp8_max=fp8_max,
+            config=config,
+        )
 
     return fn
+
+
+def make_bench_case(
+    bencher: RotatingBufferBench,
+    M: int,
+    qh: int,
+    padded_heads: int,
+    kv_lora: int,
+    d_nope: int,
+    rope_cache: bool,
+    is_neox: bool,
+):
+    """(launch, rot_bufs, flops, mem) of the fused kernel, with the RoPE and the fp8 KV-cache
+    write when rope_cache is set.
+
+    ``launch(config, **bufs)`` takes a config; None is the installed one.
+    The tuning scripts in aiter/ops/triton/utils/_triton/tuning use this function.
+    """
+    provider = "fused_rope_cache" if rope_cache else "fused"
+    args = argparse.Namespace(
+        qh=qh, padded_heads=padded_heads, rope_cache=rope_cache, is_neox=is_neox
+    )
+    rot_bufs = bencher.build_pool(
+        [make_input_gen(M, provider, args, kv_lora, d_nope)], [fields(args, provider)]
+    )
+    launch = config_launch(fused_kernel_fn(provider, args))
+    # the BMM is q_nope (qh, M, d_nope) @ w_uk_t (qh, d_nope, kv_lora)
+    flops = 2.0 * qh * M * d_nope * kv_lora
+    mem = sum(
+        t.numel() * t.element_size()
+        for t in rot_bufs[0].values()
+        if isinstance(t, torch.Tensor)
+    )
+    return launch, rot_bufs, flops, mem
 
 
 def print_kernels(M, args, cat_quant, calls=4):

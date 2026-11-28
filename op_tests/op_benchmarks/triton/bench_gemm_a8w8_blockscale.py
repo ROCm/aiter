@@ -1,6 +1,5 @@
 import functools
 import math
-from collections.abc import Callable
 
 import torch
 import triton
@@ -20,9 +19,11 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     get_rot_bufs_kwargs,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    config_launch,
     get_caller_name_no_ext,
     get_model_benchmark_object,
     get_shape_benchmark_object,
+    metric_value,
     print_vgpr,
 )
 from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
@@ -36,17 +37,20 @@ from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
 block_shape = (128, 128)
 
 
-def bench_gemm_fn(
+def make_bench_case(
     bencher: RotatingBufferBench,
     M: int,
     N: int,
     K: int,
-    metric: str,
     layout: str,
-    impl: Callable,
-    shuffle: bool = False,
-    test: bool = False,
+    shuffle: bool,
+    backend: str | None,
 ):
+    """(launch, rot_bufs, flops, mem) of one shape; backend None lets the wrapper pick.
+
+    ``launch(config, **bufs)`` takes a config; None is the installed one.
+    The tuning scripts in aiter/ops/triton/utils/_triton/tuning use this function.
+    """
     block_shape_n, block_shape_k = block_shape
     c_dtype = torch.bfloat16
 
@@ -62,14 +66,6 @@ def bench_gemm_fn(
         shuffle=shuffle,
     )
 
-    if test:
-        x, weight, weight_shuffled, x_scale, x_scale_shuffled, w_scale, y_ref = _p_gen()
-        bench_weight = weight_shuffled if shuffle else weight
-        bench_x_scale = x_scale_shuffled if shuffle else x_scale
-        ref = run_torch(x, weight, x_scale, w_scale, c_dtype)
-        out = impl(x, bench_weight, bench_x_scale, w_scale, c_dtype, y_ref)
-        checkAllclose(ref, out, msg=f"M={M},N={N},K={K}")
-
     # (x, weight, weight_shuffled, x_scale, x_scale_shuffled, w_scale, y); keep
     # only the weight/scale variant actually consumed by the kernel
     if shuffle:
@@ -79,7 +75,12 @@ def bench_gemm_fn(
 
     rot_bufs = bencher.build_pool([_p_gen], [_out_vals_keys])
 
-    kernel_fn = functools.partial(impl, dtype=c_dtype)
+    impl = (
+        triton_gemm_a8w8_blockscale_preshuffle
+        if shuffle
+        else triton_gemm_a8w8_blockscale
+    )
+    launch = config_launch(functools.partial(impl, dtype=c_dtype, backend=backend))
 
     # flops
     flops = 2.0 * M * N * K
@@ -90,22 +91,48 @@ def bench_gemm_fn(
     mem_write = (M * N) * rot_bufs[0]["y"].element_size()
     mem = mem_read + mem_write
 
-    ms = bencher.bench(kernel_fn)
-
-    # Return exactly one scalar depending on which metric is active
-    if metric == "time":
-        return ms
-    elif metric == "throughput":
-        tflops = flops / ms * 1e-9
-        return tflops
-    elif metric == "bandwidth":
-        bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
-        return bandwidth
-    else:
-        raise ValueError("Unknown metric: " + metric)
+    return launch, rot_bufs, flops, mem
 
 
-def run_model_benchmark(args, impl):
+def bench_gemm_fn(
+    bencher: RotatingBufferBench,
+    M: int,
+    N: int,
+    K: int,
+    metric: str,
+    layout: str,
+    backend: str | None,
+    shuffle: bool = False,
+    test: bool = False,
+):
+    launch, _, flops, mem = make_bench_case(bencher, M, N, K, layout, shuffle, backend)
+    if test:
+        block_shape_n, block_shape_k = block_shape
+        x, weight, weight_shuffled, x_scale, x_scale_shuffled, w_scale, y_ref = (
+            generate_gemm_a8w8_blockscale_inputs(
+                M,
+                N,
+                K,
+                block_shape_n,
+                block_shape_k,
+                layout=layout,
+                output=True,
+                shuffle=shuffle,
+            )
+        )
+        bench_weight = weight_shuffled if shuffle else weight
+        bench_x_scale = x_scale_shuffled if shuffle else x_scale
+        ref = run_torch(x, weight, x_scale, w_scale, torch.bfloat16)
+        out = launch(
+            None, x=x, w=bench_weight, x_scale=bench_x_scale, w_scale=w_scale, y=y_ref
+        )
+        checkAllclose(ref, out, msg=f"M={M},N={N},K={K}")
+
+    ms = bencher.bench(functools.partial(launch, None))
+    return metric_value(metric, ms, flops, mem)
+
+
+def run_model_benchmark(args, backend):
     """
     Runs benchmark given a --model argument.
     """
@@ -150,7 +177,7 @@ def run_model_benchmark(args, impl):
             K,
             metric,
             args.layout,
-            impl,
+            backend,
             shuffle=args.preshuffle,
             test=args.test,
         )
@@ -158,7 +185,7 @@ def run_model_benchmark(args, impl):
     bench_gemm_a8w8_blockscale.run(save_path="." if args.o else None, print_data=True)
 
 
-def run_shape_benchmark(args, impl):
+def run_shape_benchmark(args, backend):
     benchmark = get_shape_benchmark_object(get_caller_name_no_ext(), args)
 
     bencher = RotatingBufferBench.from_dict(
@@ -176,7 +203,7 @@ def run_shape_benchmark(args, impl):
             K,
             metric,
             args.layout,
-            impl,
+            backend,
             shuffle=args.preshuffle,
             test=args.test,
         )
@@ -188,12 +215,7 @@ def run_benchmark(args, defaults):
     assert not (args.shape and args.model) or not (
         args.shape and args.M
     ), "User can specify --shape or --model MODEL -M VAL exclusively"
-    if args.gluon:
-        impl = functools.partial(triton_gemm_a8w8_blockscale, backend="gluon")
-    elif args.preshuffle:
-        impl = triton_gemm_a8w8_blockscale_preshuffle
-    else:
-        impl = triton_gemm_a8w8_blockscale
+    backend = "gluon" if args.gluon else None
     if args.model:
         unsupported_args = []
         for arg in unsupported_args:
@@ -201,7 +223,7 @@ def run_benchmark(args, defaults):
                 raise RuntimeError(
                     f"Argument '{arg}' is not supported for benchmarking with the --model flag."
                 )
-        run_model_benchmark(args, impl)
+        run_model_benchmark(args, backend)
     else:
         unsupported_args = [
             "fc1",
@@ -213,7 +235,7 @@ def run_benchmark(args, defaults):
                 raise RuntimeError(
                     f"Argument '{arg}' is not supported for benchmarking without the --model flag."
                 )
-        run_shape_benchmark(args, impl)
+        run_shape_benchmark(args, backend)
 
 
 def parse_args(args: list[str] | None = None):

@@ -4,17 +4,27 @@ Scope: every file in `aiter/ops/triton/utils/_triton/tuning/`. The config tree t
 into has its own rulebook, `aiter/ops/triton/configs/AGENTS.md`; read both before changing anything
 here. Update this file in the same change as any behaviour change.
 
+## Split between tuning and benchmarks
+
+The tuning scripts make, prune and select configs. They do not make inputs, launch kernels or
+time anything. All of that is in the kernel's benchmark,
+`op_tests/op_benchmarks/triton/bench_<op>.py`: `make_bench_case` gives the inputs, the launch
+with a config and the derived keys, and `utils/rotating_buffer_bench.py` gives the pool and the
+timer (`RotatingBufferBench.bench_times`) and the tuner's timing settings (`TUNE_SCREEN`,
+`TUNE_CONFIRM`). The pool uses the `RotatingBufferBench` defaults. Never add a second timer, input
+generator or launch to this directory: change the benchmark.
+
 ## File map
 
 | File | Role | May import |
 | --- | --- | --- |
-| `sweep_configs.py` | driver: plan, run worker batches, install | stdlib, `_utils`, `kernels` |
-| `harness.py` | worker: `--plan` or time candidates, write JSONL | torch/aiter inside functions |
-| `write_best_configs.py` | install step, also a standalone CLI | aiter inside `install()` |
-| `verify_configs.py` | resolve + time one installed shape | as the worker |
+| `sweep_configs.py` | driver: plan, run worker batches, final round, install | stdlib, `_utils`, `kernels` |
+| `harness.py` | worker: `--plan`, or time candidates through the benchmark and write JSONL | torch/aiter/op_tests inside functions |
+| `write_best_configs.py` | install step: final-round selection with `MIN_GAIN`, also a standalone CLI | aiter inside `install()` |
+| `verify_configs.py` | resolve one installed shape, then time it through the benchmark | as the worker |
 | `space.py` | `SEARCH_SPACE`, key discovery, shape filters, generic rules | aiter inside functions |
-| `kernels.py` | one function per kernel (inputs, launch, resets, derived keys, `should_skip`) + `@kernel` metadata | torch/aiter/op_tests inside the functions |
-| `_utils.py` | file names, records, shape args | stdlib only |
+| `kernels.py` | one function per kernel (its benchmark via `bench_case`, `should_skip`) + `@kernel` metadata | torch/aiter/op_tests inside the functions |
+| `_utils.py` | file names, records, shape args, `FINAL_PASSES`, `MIN_GAIN` | stdlib only |
 
 ## Invariants
 
@@ -56,26 +66,34 @@ here. Update this file in the same change as any behaviour change.
    restored. Bucket collisions are resolved before writing (largest M wins). With `--cu-dir`
    every file named here is the CU tree's own (`DEFAULT.json`, seed, `any`, `M_BOUNDS`); nothing
    is read from another tree.
-6. Data contracts: a kernel function returns `(call, inputs, should_skip)`; a result
+6. Data contracts: a kernel function returns `(make_case, should_skip)`; `make_case(bencher)`
+   is the benchmark's `make_bench_case` and returns `(launch, rot_bufs, flops, mem)`; a result
    record's fields are listed in the `harness.py` docstring and include `cu_num`, the device's CU
    count; the plan JSON carries the family's `bounds`, `cu_num` and `cu_dir`; the worker prints
    `ready` and one line per candidate for the driver's watchdog; the plan is kept per (arch,
-   backend, kernel, shape) in the runs dir and the installer only lets its candidates win; resume
-   requires the same `--calls`/`--replays` and no record timed on another CU count;
+   backend, kernel, shape) in the runs dir and the installer only lets its candidates win; the
+   worker resumes a results file only if its `ready` record has the same `pool` and `timing`
+   settings, and the driver only if no record was timed on another CU count;
    `write_best_configs.py --cu-dir` uses only records timed on this device's CU count (records
    without `cu_num` are skipped); `config` in a record is the raw
    candidate. Keys a wrapper derives or clamps (`SPLITK_BLOCK_SIZE`, clamped `NUM_BUFFERS`,
    `GROUP_K`, CTAS-scaled tiles) are never recorded or written. Wrappers mutate their config
-   dict, so every launch gets a deep copy; the only framework code that mutates a config is a
-   kernel's `call` (`add_splitk_block_size`, `compute_splitk_params`).
+   dict, so every launch gets a deep copy; the only code that mutates a config is the
+   benchmark's `config_launch` (`splitk_block_size`, `compute_splitk_params`).
 7. The driver never imports torch or aiter: `arch_info` initializes the GPU on import, so key
    discovery runs in the worker (`harness.py --plan`) under `HIP_VISIBLE_DEVICES`.
 8. One GPU op in flight per GPU: each worker is serial and owns one GPU. A driver may use several
-   GPUs (`--gpu 0 1 2 3`, distinct): candidates are dealt round-robin, then a final round re-times
-   the baseline and the ten fastest candidates of the current plan on the first GPU into
-   `<results>.final.jsonl`, with the same crash/hang recovery as the sweep; when that file exists
-   the installer uses only it, so a later run (even on one GPU) always refreshes it, and an M timed
-   on several GPUs without it is skipped. Never two drivers on one GPU.
+   GPUs (`--gpu 0 1 2 3`, distinct): candidates are dealt round-robin and timed with
+   `TUNE_SCREEN`, and every shard starts with the baseline (record key `baseline@<gpu>`). Never
+   compare absolute times from two GPUs: the finalists are ranked by `us` divided by the baseline
+   `us` of their own GPU (absolute time only when a GPU has no ok baseline, with a warning). Then
+   the final round always runs, also on one GPU. It re-times the baseline, the ten best candidates
+   of the current plan by that ratio and every candidate within 3% of the best ratio on the first
+   GPU, with `TUNE_CONFIRM` (`harness.py --confirm`). It runs `FINAL_PASSES` passes, one file each
+   (`<results>.final<p>.jsonl`), with the same crash/hang recovery as the sweep. The installer
+   uses only these files. A finalist can win only if it is `ok` in every pass, and it replaces
+   the baseline only if it is `MIN_GAIN` faster in every pass. An M without all pass files is
+   skipped. Never two drivers on one GPU.
 9. Call the public wrappers (`aiter.ops.triton.gemm...`) only, never `_triton_kernels` or
    `_gluon_kernels`; pass `backend=` where the wrapper takes it and refuse a backend the wrapper
    cannot select (`KernelSpec.supports`).
@@ -91,11 +109,13 @@ element widths as they sit in LDS, scales not counted), `cta_split` when a key s
 and register checks and `should_skip` judge one CTA's share), `vector_tiles=True` when a path
 without `tl.dot` takes `BLOCK_SIZE_M/N` below 8 (the `gemm_a16w32` fp32 FMA kernel), `gluon_archs` / `gluon_default_archs` /
 `backend_kwarg` from the wrapper, `bounds` copied from the kernel's `_get_config` (the CLI K is the
-logical K, so no K transform is needed). The function builds the inputs once with the `op_tests`
-generator, preallocates the output, and returns `(call, inputs, should_skip)`;
-`should_skip(config)` holds what the kernel asserts (block multiples, buffer clamps). Output
-resets and derived keys live in `call`. Keep everything about a kernel inside that one function;
-the `kernels.py` docstring has a complete example. Then run the checks below.
+logical K, so no K transform is needed). The function returns `(make_case, should_skip)`:
+`make_case = bench_case("<bench module>", <shape>, <flags>)`, and `should_skip(config)` holds what
+the kernel asserts (block multiples, buffer clamps). The inputs, the launch and the derived keys
+go in the benchmark's `make_bench_case`, which the benchmark CLI also uses (`bench_gemm_a16w16.py`
+is the example). If the benchmark has no `make_bench_case` yet, add it there; never put inputs or
+a launch in `kernels.py`. The `kernels.py` docstring has a complete example. Then run the checks
+below.
 
 ## Adding a key
 
@@ -128,6 +148,9 @@ Add it to `SEARCH_SPACE`; add an alias if a family spells it differently. Nothin
 
 - Bring back rocprof, positional config tuples, per-key CLI flags, or the old block-size group
   exclusion heuristic.
+- Add a timer, a CUDA graph, input generation or a kernel launch to this directory, or timing
+  flags to the command line: they live in the benchmark (`RotatingBufferBench`, `TUNE_*`).
+- Install a winner from the screen numbers, or without the `MIN_GAIN` margin in every pass.
 - Put an arch prefix on an installed file, write to the current directory, write `DEFAULT.json`,
   or copy untuned buckets into a shape file.
 - Write into a `<cu_num>cu/` tree without `--cu-dir`, create that tree's `DEFAULT.json`, or make

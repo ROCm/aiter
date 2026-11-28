@@ -285,12 +285,29 @@ class RotatingBufferBench:
     ) -> float:
         """Rotating-buffer CUDA graph benchmark, single process.
 
+        Returns the mean per-kernel latency in ms of :meth:`bench_times`.
+        """
+        times_ms = self.bench_times(
+            fn, warmup_iters, warmup_replays, kernels_per_graph, num_replays
+        )
+        return sum(times_ms) / len(times_ms)
+
+    def bench_times(
+        self,
+        fn: Callable,
+        warmup_iters: int | None = None,
+        warmup_replays: int | None = None,
+        kernels_per_graph: int | None = None,
+        num_replays: int | None = None,
+    ) -> list[float]:
+        """Rotating-buffer CUDA graph benchmark, single process.
+
         Captures ``max(kernels_per_graph, len(self.rot_bufs))`` calls to
         ``fn`` into one CUDA graph, rotating through ``self.rot_bufs`` so the
         whole pool is covered -- a CUDA graph replays the exact calls
         captured, so a pool bigger than ``kernels_per_graph`` would
-        otherwise leave entries unused. Returns the mean per-kernel latency
-        in ms.
+        otherwise leave entries unused. Returns the per-kernel latency in ms
+        of each timed replay; the GEMM tuner takes their median.
 
         Any of warmup_iters/warmup_replays/kernels_per_graph/num_replays
         given here overrides (persists onto) this instance's value.
@@ -351,7 +368,7 @@ class RotatingBufferBench:
         times_ms = [se.elapsed_time(ee) for se, ee in zip(start_events, end_events)]
         per_kernel_ms = [t / actual_kernels_per_graph for t in times_ms]
 
-        return sum(per_kernel_ms) / len(per_kernel_ms)
+        return per_kernel_ms
 
     def bench_synced(
         self,
@@ -465,3 +482,20 @@ class RotatingBufferBench:
         per_kernel_ms = [t / actual_kernels_per_graph for t in times_ms]
 
         return sum(per_kernel_ms) / len(per_kernel_ms)
+
+
+# Timing settings of the GEMM tuner (aiter/ops/triton/utils/_triton/tuning). The pool uses the
+# RotatingBufferBench defaults. SCREEN ranks every candidate; CONFIRM re-times the best ones in
+# the final round.
+TUNE_SCREEN = {
+    "warmup_iters": 1,
+    "kernels_per_graph": 50,
+    "num_replays": 20,
+    "warmup_replays": 3,
+}
+TUNE_CONFIRM = {
+    "warmup_iters": 1,
+    "kernels_per_graph": 1000,
+    "num_replays": 10,
+    "warmup_replays": 3,
+}

@@ -330,7 +330,8 @@ table for each op (`attn_2d`, `attn_3d`, `reduce`, `kv_split`) and a
 4. Move tuning values that are still in Python into the JSON.
 5. Test on the target arch. Make sure that the config loads, that `is_tuned`
    is `True` for each tuned M and that the results do not change. For GEMM,
-   `verify_configs.py --expect-tuned` checks `is_tuned`.
+   `verify_configs.py --expect-tuned` checks `is_tuned`, and then times the
+   config with the kernel's benchmark.
 
 ## Seed a new arch
 

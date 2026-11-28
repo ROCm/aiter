@@ -2,105 +2,56 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Worker: plans the search space (--plan) or benchmarks candidate configs on one GPU.
 
-Flow: set the kernel up once (inputs, call, should_skip), then
+The kernel's benchmark (op_tests/op_benchmarks/triton/bench_<op>.py, make_bench_case) makes the
+inputs and the launch, and RotatingBufferBench (op_tests/op_benchmarks/triton/utils/
+rotating_buffer_bench.py) times it. This file only feeds it the candidates and writes the
+records.
+
+Flow: get the kernel's (make_case, should_skip), then
   --plan     build the space (space.build_space) and write it as JSON for the driver
-  --configs  for each candidate: warm up (compiles) -> capture a CUDA graph over cold input
-             copies -> replay -> append one record to --out
+  --configs  build the rotating-buffer pool once (the RotatingBufferBench defaults), then time
+             each candidate with TUNE_SCREEN, or with --confirm TUNE_CONFIRM -> append one
+             record to --out
 
 --configs is a JSON list of config dicts; null is the baseline, the wrapper called with
 config=None (the installed config). Records are appended as soon as a candidate finishes.
 
 Record fields:
   status    ready (worker is set up), start (candidate began), ok, error
-  baseline  true for the installed config
+  baseline  true for the installed config; every GPU of a sweep times it once
   config    the raw candidate, never the mutated copy; for the baseline the installed config of
             the tree the sweep installs into (the default tree, or with --cu-dir the <cu_num>cu/
             tree), launched through the wrapper's own config=None path unless that path reads
             another tree on this device or keys DEFAULT.json does not have had to be stripped
             first (dropped_keys lists them)
-  gpu       HIP_VISIBLE_DEVICES of the worker
+  gpu       HIP_VISIBLE_DEVICES of the worker; the baseline record of each GPU is keyed
+            baseline@<gpu> (_utils.candidate_key)
   cu_num    CU count of the worker's device (get_config_cu_num()); null when it cannot be read
   is_tuned  baseline only: a specialized file served this shape
-  us, us_min, us_max, tflops   per-launch time from graph replay (median, min, max)
+  us, us_min, us_max, tflops   per-launch time over the timed graph replays (median, min, max)
   error     the exception text when status is error
   dur_s     wall time of the candidate
+The ready record carries the pool and timing settings (pool, timing, n_bufs); a results file is
+only resumed with the same settings.
 """
 
 import argparse
-import copy
-import gc
+import functools
 import json
 import os
+import statistics
 import sys
 import time
 
-from _utils import add_shape_args, append_record, shape_from_args
+from _utils import add_shape_args, append_record, iter_records, shape_from_args
 from kernels import (
     check_backend,
     ensure_repo_on_path,
     family_bounds,
-    flops,
     get_spec,
     installed_baseline,
 )
 from space import UnknownConfigKey, build_space, load_defaults
-
-
-def make_cold_copies(inputs, cold_mb):
-    """copies[0] is the original input tuple; the rest are clones, within the byte budget."""
-    import torch
-
-    def clone(a):
-        if not isinstance(a, torch.Tensor):
-            return a
-        return torch.empty_strided(
-            a.shape, a.stride(), dtype=a.dtype, device=a.device
-        ).copy_(a)
-
-    per_copy = sum(
-        a.numel() * a.element_size() for a in inputs if isinstance(a, torch.Tensor)
-    )
-    budget = min(cold_mb << 20, torch.cuda.mem_get_info()[0] // 4)
-    n = max(1, min(64, budget // max(per_copy, 1)))
-    return [tuple(inputs)] + [tuple(clone(a) for a in inputs) for _ in range(n - 1)]
-
-
-def time_with_cuda_graph(call, config, copies, calls=24, replays=25):
-    """Median/min/max microseconds per launch: one eager warm-up (compiles), then graph replay.
-
-    Every launch gets a deep copy of config because the wrappers mutate it.
-    """
-    import torch
-
-    stream = torch.cuda.Stream()
-    n_calls = max(calls, len(copies))
-    with torch.cuda.stream(stream):
-        call(copy.deepcopy(config), *copies[0])
-        torch.cuda.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        gc.disable()
-        try:
-            with torch.cuda.graph(graph, stream=stream):
-                for i in range(n_calls):
-                    call(copy.deepcopy(config), *copies[i % len(copies)])
-        finally:
-            gc.enable()
-    torch.cuda.synchronize()
-    for _ in range(3):
-        graph.replay()
-    torch.cuda.synchronize()
-    times = []
-    for _ in range(replays):
-        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
-            enable_timing=True
-        )
-        start.record()
-        graph.replay()
-        end.record()
-        end.synchronize()
-        times.append(start.elapsed_time(end) * 1e3 / n_calls)
-    times.sort()
-    return times[len(times) // 2], times[0], times[-1]
 
 
 def gpu_alive():
@@ -139,24 +90,35 @@ def plan(spec, shape, backend, arch, should_skip, space_out, cu_num=None):
     return 0
 
 
-def benchmark(
-    spec,
-    shape,
-    backend,
-    arch,
-    call,
-    inputs,
-    candidates,
-    out,
-    calls,
-    replays,
-    cold_mb,
-    cu_num=None,
-):
-    from aiter.ops.triton.utils.config_utils import get_config_cu_num
+def check_settings(out, settings):
+    """Records can only be resumed when they were timed the same way."""
+    ready = next((r for r in iter_records(out) if r["status"] == "ready"), None)
+    if ready is not None and {k: ready.get(k) for k in settings} != settings:
+        sys.exit(
+            f"{out} was timed with pool={ready.get('pool')} timing={ready.get('timing')}; "
+            "rerun with --fresh"
+        )
 
+
+def benchmark(spec, shape, backend, arch, make_case, candidates, out, confirm, cu_num):
+    from aiter.ops.triton.utils.config_utils import get_config_cu_num
+    from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+        TUNE_CONFIRM,
+        TUNE_SCREEN,
+        RotatingBufferBench,
+    )
+
+    bencher = RotatingBufferBench()
+    timing = TUNE_CONFIRM if confirm else TUNE_SCREEN
+    pool = {
+        "target_rot_pool_sz_mb": bencher.target_rot_pool_sz_mb,
+        "min_pool_len": bencher.min_pool_len,
+        "max_pool_len": bencher.max_pool_len,
+    }
+    settings = {"pool": pool, "timing": timing}
+    check_settings(out, settings)
     keys, _, _ = load_defaults(spec, backend, cu_num)
-    copies = make_cold_copies(inputs, cold_mb)
+    launch, rot_bufs, flops, _ = make_case(bencher)
     common = {
         "kernel": spec.name,
         "backend": backend,
@@ -165,17 +127,7 @@ def benchmark(
         "gpu": os.environ.get("HIP_VISIBLE_DEVICES"),
         "cu_num": get_config_cu_num(),
     }
-    append_record(
-        out,
-        dict(
-            common,
-            status="ready",
-            n_copies=len(copies),
-            calls=calls,
-            replays=replays,
-            cold_mb=cold_mb,
-        ),
-    )
+    append_record(out, dict(common, status="ready", n_bufs=len(rot_bufs), **settings))
     print("ready", flush=True)  # the driver's watchdog reads the worker's log
     for candidate in candidates:
         is_baseline = candidate is None
@@ -194,14 +146,15 @@ def benchmark(
                 if explicit:
                     candidate = record["config"]
                 # otherwise candidate stays None: the wrapper's own installed-config path
-            median, low, high = time_with_cuda_graph(
-                call, candidate, copies, calls, replays
+            times_ms = bencher.bench_times(
+                functools.partial(launch, candidate), **timing
             )
+            median = statistics.median(times_ms) * 1e3
             record.update(
                 us=round(median, 3),
-                us_min=round(low, 3),
-                us_max=round(high, 3),
-                tflops=round(flops(shape) / median / 1e6, 2),
+                us_min=round(min(times_ms) * 1e3, 3),
+                us_max=round(max(times_ms) * 1e3, 3),
+                tflops=round(flops / median / 1e6, 2),
             )
         except Exception as e:  # noqa: BLE001
             # a failing candidate is a result, not a crash
@@ -238,12 +191,10 @@ def main(argv=None):
     )
     parser.add_argument("--configs", help="JSON list of candidates, null = baseline")
     parser.add_argument("--out", help="JSONL results file, appended")
-    parser.add_argument("--replays", type=int, default=25)
     parser.add_argument(
-        "--calls", type=int, default=24, help="launches captured per graph"
-    )
-    parser.add_argument(
-        "--cold-mb", type=int, default=1024, help="byte budget for cold input copies"
+        "--confirm",
+        action="store_true",
+        help="final-round timing (TUNE_CONFIRM)",
     )
     args = parser.parse_args(argv)
 
@@ -255,7 +206,7 @@ def main(argv=None):
     arch = arch_info.get_arch()
     backend = args.backend or spec.default_backend(arch)
     check_backend(spec, arch, backend)
-    call, inputs, should_skip = spec.setup(shape, backend)
+    make_case, should_skip = spec.setup(shape, backend)
     cu_num = None
     if args.cu_dir:
         from aiter.ops.triton.utils.config_utils import get_config_cu_num
@@ -273,13 +224,10 @@ def main(argv=None):
         shape,
         backend,
         arch,
-        call,
-        inputs,
+        make_case,
         candidates,
         args.out,
-        args.calls,
-        args.replays,
-        args.cold_mb,
+        args.confirm,
         cu_num,
     )
     return 0
