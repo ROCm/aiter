@@ -15,8 +15,9 @@ reference and the pinned staged route (uneven, idle, padded ranks), per-layer
 weight rebinding with interleaved staged calls, the 32-bit epoch wrap with zero
 rows, CUDA graph replay against eager, and paired timing against the staged route.
 The fused routes need an a8w4 layout of FUSED_LAYOUTS (mega_moe_config.py) on an
-8-XCD gfx950: DeepSeek-V4-Pro (--network v4_pro) on 8 ranks, or DeepSeek-V4.1-Flash
-(--network v41_flash) on the rank counts listed there (EP8: 8 ranks, EP4: 4 ranks, EP2: 2 ranks).
+8-XCD gfx950: DeepSeek-V4-Pro (--network v4_pro) or Kimi-K2.6 (--network kimi_k26) on 8 ranks, or
+DeepSeek-V4.1-Flash (--network v41_flash) on the rank counts listed there (EP8: 8 ranks, EP4: 4 ranks, EP2: 2
+ranks).
 
     torchrun --nproc-per-node 8 test_mega_moe_v2.py --bs-list 1,64,128
     torchrun --nproc-per-node 8 test_mega_moe_v2.py --max-tok-per-rank 8192 \
@@ -85,6 +86,14 @@ NETWORKS = {
         "experts": 384,
         "topk": 6,
         "swiglu_limit": 10.0,
+    },
+    # Kimi-K2.6: SiLU without a SwiGLU clamp.
+    "kimi_k26": {
+        "model_dim": 7168,
+        "inter_dim": 2048,
+        "experts": 384,
+        "topk": 8,
+        "swiglu_limit": 0.0,
     },
     "r1_v3": {
         "model_dim": 7168,
@@ -1858,9 +1867,12 @@ def main():
                 f"[SKIP] the small- and large-input routes need gfx950, got {get_gfx()}"
             )
             return
-        if args.network not in ("v4_pro", "v41_flash") or args.quant != "a8w4":
+        if (
+            args.network not in ("v4_pro", "v41_flash", "kimi_k26")
+            or args.quant != "a8w4"
+        ):
             raise ValueError(
-                "--suite routes needs --network v4_pro or v41_flash and --quant a8w4"
+                "--suite routes needs --network v4_pro, v41_flash or kimi_k26 and --quant a8w4"
             )
         args.seed = 7 if args.seed is None else args.seed
         args.rtol = 0.08 if args.rtol is None else args.rtol

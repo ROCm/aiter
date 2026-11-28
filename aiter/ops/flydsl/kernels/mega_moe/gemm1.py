@@ -311,7 +311,7 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
 @flyc.jit
 def do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
     a_scale_lds, a_lds_i32, K_ITERS, M_REPEAT, NUM_ACC_N, A_K_STEP_BYTES, trb_rsrc, rows_rsrc, LA, row_map=None,
-    meta=None, a_ahead=1):
+    meta=None, a_ahead=1, mfma_amajor=False, k_unroll=0, a_early=False):
 # fmt: on
     """pipe_weights K-loop with B / B-scale issued LA K-steps ahead, unrolled xLA.
 
@@ -325,8 +325,20 @@ def do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_
     :func:`do_tile`, without the arrival wait.
     a_ahead > 1: the A rows of K-step k + a_ahead are loaded into registers at step k and written to LDS at step
     k + a_ahead - 1. With a_ahead=1 the end-of-step LDS write waits for a load issued at the start of the same step.
+    ``k_unroll`` > 0: K-steps per loop iteration (at least LA). At LA 1 the next step's B lands in fresh registers
+    while the current B is still read, so a one-step body copies it into the loop arguments at the back-edge, and
+    the copies wait for every next-step load; two steps per iteration bring the registers back to identity. With
+    a_ahead 2 the K-loop stays (instead of unrolling every K-step): the next K-step's A registers are loop-carried,
+    and each step writes them to the free LDS buffer before its MFMAs, so the LDS writes complete under them
+    instead of right before the step's barrier.
+    ``mfma_amajor``: the K-steps use the A-major pipe, which holds one A operand at a time instead of all
+    ``M_REPEAT * 2`` (same per-accumulator order); ``a_early`` reads each MFMA group's A operand a group ahead.
     """
     assert 1 <= a_ahead < K_ITERS
+    # a_loop: the looped a_ahead 2 body (k_unroll), which carries one A register set.
+    a_loop = a_ahead > 1 and k_unroll > 0
+    assert not a_loop or a_ahead == 2
+    assert not a_early or mfma_amajor
     N_ACC = M_REPEAT * NUM_ACC_N
     NUM_B = NUM_ACC_N * _PACK
     NUM_SB = NUM_ACC_N // _PACK
@@ -348,6 +360,9 @@ def do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_
         a_gather.for_tile(tile_row_base, valid_rows)
         a_gather.store(a_buf, a_gather.load_regs(fx.Int32(0)), fx.Int32(0))
         a_scale.stage(a_scale_lds, tile_row_base)
+    NUM_A = len(a_gather._chunks)
+    # a_loop: K-step 1's A is read ahead of the B loads, as step 0 writes it to LDS first.
+    aq = [[v for _lb, v in a_gather.load_regs(fx.Int32(A_K_STEP_BYTES))]] if const_expr(a_loop) else []
     wait_lds_barrier(63)
     init = [mfma.zero_value for _ in range(N_ACC)]
     for q in range_constexpr(LA):
@@ -355,8 +370,11 @@ def do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_
     for q in range_constexpr(LA):
         init += b_scale.load_step(b_row, fx.Int32(q), _LA_CM)
     a_lds_bytes = [lb for lb, _c in a_gather._chunks]
-    # a_ahead > 1: A register sets of K-steps k+1 .. k+a_ahead-1 (only in the unrolled K-loop).
-    aq = [[v for _lb, v in a_gather.load_regs(fx.Int32(j * A_K_STEP_BYTES))] for j in range_constexpr(1, a_ahead)]
+    if const_expr(a_loop):
+        init += aq[0]
+    else:
+        # a_ahead > 1: A register sets of K-steps k+1 .. k+a_ahead-1 (only in the unrolled K-loop).
+        aq = [[v for _lb, v in a_gather.load_regs(fx.Int32(j * A_K_STEP_BYTES))] for j in range_constexpr(1, a_ahead)]
 
     def unpack(state):
         acc = [Vec(a) for a in state[:N_ACC]]
@@ -366,6 +384,9 @@ def do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_
             bq.append([[Vec(state[base + ni * _PACK + ks]) for ks in range(_PACK)] for ni in range(NUM_ACC_N)])
         sbase = N_ACC + LA * NUM_B
         sbq = [[fx.Int32(state[sbase + q * NUM_SB + g]) for g in range(NUM_SB)] for q in range(LA)]
+        if const_expr(a_loop):
+            abase = sbase + LA * NUM_SB
+            aq[:] = [[Vec(state[abase + c]) for c in range(NUM_A)]]
         return acc, bq, sbq
 
     def pack(acc, bq, sbq):
@@ -374,18 +395,22 @@ def do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_
             out += [h for ni_list in b for h in ni_list]
         for sb in sbq:
             out += list(sb)
+        if const_expr(a_loop):
+            out += list(aq[0])
         return out
 
     def step(sp, acc, bq, sbq, issue, a_next, a_issue=False):
         cur_off = (sp & fx.Int32(1)) * fx.Int32(a_lds_i32)
         nxt_off = ((sp + fx.Int32(1)) & fx.Int32(1)) * fx.Int32(a_lds_i32)
         kl = sp + fx.Int32(LA)
+        if const_expr(a_loop and a_next):
+            a_gather.store(a_buf, list(zip(a_lds_bytes, aq.pop(0))), nxt_off)
         if const_expr(a_issue):
             aq.append([v for _lb, v in a_gather.load_regs((sp + fx.Int32(a_ahead)) * fx.Int32(A_K_STEP_BYTES))])
         sb_new = b_scale.load_step(b_row, kl, _LA_CM) if const_expr(issue) else None
         sa = a_scale.load_step(a_scale_lds, sp)
         a_regs = None
-        if const_expr(a_next):
+        if const_expr(a_next and not a_loop):
             if const_expr(a_ahead > 1):
                 a_regs = aq.pop(0)
             else:
@@ -398,7 +423,10 @@ def do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_
             return b_loader.load_ni(b_row, ni, _kn)
 
         if const_expr(issue):
-            acc, b_new = mfma.call_pipe(a_load, bq[0], acc, sa, sbq[0], load_next)
+            if const_expr(mfma_amajor):
+                acc, b_new = mfma.call_pipe_am(a_load, bq[0], acc, sa, sbq[0], load_next, a_early)
+            else:
+                acc, b_new = mfma.call_pipe(a_load, bq[0], acc, sa, sbq[0], load_next)
             bq = bq[1:] + [b_new]
             sbq = sbq[1:] + [sb_new]
         else:
@@ -406,23 +434,26 @@ def do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_
             bq = bq[1:]
             sbq = sbq[1:]
         if const_expr(a_next):
-            a_gather.store(a_buf, list(zip(a_lds_bytes, a_regs)), nxt_off)
+            if const_expr(not a_loop):
+                a_gather.store(a_buf, list(zip(a_lds_bytes, a_regs)), nxt_off)
             wait_lds_barrier()
         return acc, bq, sbq
 
-    # a_ahead > 1 unrolls every K-step: a loop would rotate the register queues through phi copies, which wait for
-    # the loads still in flight.
-    n_loop = 0 if const_expr(a_ahead > 1) else (K_ITERS - LA) // LA
+    # a_ahead > 1 without k_unroll unrolls every K-step: a loop would rotate the register queues through phi copies,
+    # which wait for the loads still in flight. Every looped step of a_loop also reads K-step sp + 2, so its last
+    # two steps are peeled.
+    unroll = max(LA, k_unroll)
+    n_loop = 0 if const_expr(a_ahead > 1 and not a_loop) else (K_ITERS - max(LA, a_ahead)) // unroll
     state = init
     if const_expr(n_loop > 0):
         for it_i, state in range(0, n_loop, 1, init=init):
-            sp0 = fx.Int32(it_i) * fx.Int32(LA)
+            sp0 = fx.Int32(it_i) * fx.Int32(unroll)
             acc, bq, sbq = unpack(state)
-            for u in range_constexpr(LA):
-                acc, bq, sbq = step(sp0 + fx.Int32(u), acc, bq, sbq, True, True)
+            for u in range_constexpr(unroll):
+                acc, bq, sbq = step(sp0 + fx.Int32(u), acc, bq, sbq, True, True, a_loop)
             state = yield pack(acc, bq, sbq)
     acc, bq, sbq = unpack(state)
-    for k in range_constexpr(n_loop * LA, K_ITERS):
+    for k in range_constexpr(n_loop * unroll, K_ITERS):
         acc, bq, sbq = step(fx.Int32(k), acc, bq, sbq, k + LA <= K_ITERS - 1, k < K_ITERS - 1,
             a_ahead > 1 and k + a_ahead <= K_ITERS - 1)
     wait_lds_barrier()
@@ -439,7 +470,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     source_rows=0, a_dtype="fp8", out_dtype="fp8", swiglu_limit=0.0, pair_k=False, evec,
     act="silu", situ_beta=1.0, situ_linear_beta=1.0, narrow_final_a=False, rows_rsrc=None, lookahead=0,
     out_cache_modifier=0, tile_zero=False, fused_v8=False, epi_lean=0, row_map=None, short_rows=0, fold_rows=0,
-    a_async_lds=False, ascale_packed=False, plan_lookup=None, a_ahead=1):
+    a_async_lds=False, ascale_packed=False, plan_lookup=None, a_ahead=1, k_unroll=0, a_early=False):
     # fmt: on
     """Build the GEMM1 atoms and return its expert resolver and tile runner.
 
@@ -449,7 +480,8 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     The remaining knobs serve the fused kernels: ``fused_v8`` / ``epi_lean`` pick the fused evec 8 epilogue
     (SiluQuantEpilogue), ``row_map`` reads A through the srcmap (:func:`do_tile`), ``a_async_lds`` /
     ``ascale_packed`` are the A loaders' modes, ``plan_lookup(m_tile) -> (expert, tile_row_base, rows)`` takes
-    the lookahead tiles' metadata from the CTA's own plan and ``a_ahead`` is :func:`do_tile_la`'s.
+    the lookahead tiles' metadata from the CTA's own plan and ``a_ahead`` / ``k_unroll`` / ``a_early`` are
+    :func:`do_tile_la`'s.
 
     short_rows > 0 also returns a runner for tiles whose rows past the first short_rows are all padding: it
     computes and stores only those leading rows (m_repeat short_rows // 16) and leaves the rest unwritten.
@@ -525,10 +557,10 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
             expert = sched.expert_of(m_tile)
         # fmt: off
         if const_expr(lookahead > 0):
-            assert pipe_weights and not async_a_copy and not mfma_amajor and not indirect_input
+            assert pipe_weights and not async_a_copy and not indirect_input
             do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi,
                 a_buf, a_scale_lds, a_lds_i32, k_iters, m_repeat, num_acc_n, a_k_step_bytes, trb_rsrc, rows_rsrc,
-                lookahead, row_map, meta, a_ahead)
+                lookahead, row_map, meta, a_ahead, mfma_amajor, k_unroll, a_early)
             return
         assert plan_lookup is None
         do_tile(m_tile, n_tile_base, expert, sched, a_gather,

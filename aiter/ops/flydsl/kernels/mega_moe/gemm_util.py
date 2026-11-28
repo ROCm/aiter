@@ -759,18 +759,28 @@ class MfmaScaleGU:
                     )
         return acc, b_next
 
-    def call_pipe_am(self, a_load, b_prev, acc, sa, sb, load_next):
-        """A-major pipe: lazy-A per (mi,ksub) overlaps next A ds_read with MFMA; next-B loads spread over groups."""
+    def call_pipe_am(self, a_load, b_prev, acc, sa, sb, load_next, a_early=False):
+        """A-major pipe: lazy-A per (mi,ksub) overlaps next A ds_read with MFMA; next-B loads spread over groups.
+
+        ``a_early``: each group's A operand is read before the previous group's MFMAs (one operand held ahead).
+        """
         nn = self._num_acc_n
         b_next = [None] * nn
         ngrp = self._m_repeat * _PACK
         g = 0
         nb = 0
+        order = [(mi, ks) for mi in range(self._m_repeat) for ks in range(_PACK)]
+        a_nx = a_load(*order[0]) if a_early else None
         for mi in range_constexpr(self._m_repeat):
             ia = mi % _PACK
             sa_v = sa[mi // _PACK]
             for ksub in range_constexpr(_PACK):
-                a_op = a_load(mi, ksub)
+                if const_expr(a_early):
+                    a_op = a_nx
+                    if g + 1 < ngrp:
+                        a_nx = a_load(*order[g + 1])
+                else:
+                    a_op = a_load(mi, ksub)
                 tgt = ((g + 1) * nn) // ngrp
                 while nb < tgt:
                     b_next[nb] = load_next(nb)

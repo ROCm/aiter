@@ -57,11 +57,18 @@ V41_FLASH_EP4_LAYOUT = (4, 96, 5120, 2304)
 V41_FLASH_EP2_LAYOUT = (2, 192, 5120, 2304)
 # EP8 DeepSeek-V4.1-Flash: V4-Pro's rank / expert geometry with V4.1-Flash's dims.
 V41_FLASH_EP8_LAYOUT = (8, 48, 5120, 2304)
+# Kimi-K2.6: 384 experts (48 per rank at EP8), top-8, R1's 7168x2048 shape, SiLU without a SwiGLU clamp.
+KIMI_K26_EXPERTS_PER_RANK = 48
+K26_MODEL_DIM, K26_INTER_DIM = 7168, 2048
+K26_FUSED_LAYOUT = (8, K26_MODEL_DIM, K26_INTER_DIM, 8 * KIMI_K26_EXPERTS_PER_RANK, 8)
+K26_EP8_LAYOUT = (8, KIMI_K26_EXPERTS_PER_RANK, K26_MODEL_DIM, K26_INTER_DIM)
+V4_PRO_EP8_LAYOUT = (8, REFERENCE_EXPERTS_PER_RANK, V4_MODEL_DIM, V4_INTER_DIM)
 # (world_size, model_dim, inter_dim, experts, topk) of the layouts the fused (small- and large-input) kernels
-# serve: EP8 DeepSeek-V4-Pro and EP4 / EP2 / EP8 DeepSeek-V4.1-Flash.
+# serve: EP8 DeepSeek-V4-Pro, EP4 / EP2 / EP8 DeepSeek-V4.1-Flash and EP8 Kimi-K2.6.
 FUSED_LAYOUTS = frozenset(
     {
         (8, V4_MODEL_DIM, V4_INTER_DIM, 8 * REFERENCE_EXPERTS_PER_RANK, 6),
+        K26_FUSED_LAYOUT,
         *(
             (world, model_dim, inter_dim, world * epr, 6)
             for world, epr, model_dim, inter_dim in (
@@ -103,6 +110,15 @@ V41_FLASH_EP2_LARGE_M_MTPRS = (8192, 16384)
 # EP8 DeepSeek-V4.1-Flash, whose large-input tune builds on EP4's, likewise: at 1024 it faulted the same way
 # (1 of 2 runs), so 1024, 2048 and 4096 stay staged.
 V41_FLASH_EP8_LARGE_M_MTPRS = (8192, 16384)
+# SwiGLU clamp each FUSED_LAYOUTS layout is served with (10.0 unless listed).
+_FUSED_SWIGLU_LIMITS = {K26_FUSED_LAYOUT: 0.0}
+# EP8 Kimi-K2.6 takes its large-input tune at 8192 and 16384. At 16384 it runs 0.73x-0.97x the staged path
+# (1.01x under one-hot-expert routing from 12288 tokens); at 32768 the staged path stays, as it is 4% faster at
+# 32768 tokens under skewed routing.
+K26_LARGE_M_MTPRS = (8192, 16384)
+# EP8 DeepSeek-V4-Pro runs the large-input kernel at every LARGE_M_MTPRS capacity, tuned at 8192 and 16384 (the
+# others keep the default config). At 16384 the tune runs 0.67x-1.01x the default config.
+V4_PRO_TUNED_LARGE_M_MTPRS = (8192, 16384)
 # (world_size, model_dim, inter_dim) -> large-input capacities of the DeepSeek-V4.1-Flash layouts.
 _V41_FLASH_LARGE_M_MTPRS = {
     (world, model_dim, inter_dim): mtprs
@@ -192,9 +208,9 @@ class Stage2Config:
 class FusedStage1Knobs:
     """Dispatch / plan / GEMM1 knobs only the fused (small- and large-input) kernels read.
 
-    All off is the EP8 DeepSeek-V4-Pro kernel; the V4.1-Flash tunes
+    All off is the default fused kernel; the V4.1-Flash tunes
     (_tune_v41_flash_ep4_small / _tune_v41_flash_ep4_large and the EP2 / EP8
-    tunes built on them) turn them on. The protocol knobs (dedup_rows,
+    tunes built on them) and the EP8 Kimi-K2.6 / DeepSeek-V4-Pro tunes turn them on. The protocol knobs (dedup_rows,
     plan_local, direct_done, tok_done) change what the ranks of a launch
     exchange, so every rank of a launch must agree on them; tok_counters and
     bf16_head_tokens are set per layout, never per token bucket.
@@ -228,6 +244,11 @@ class FusedStage1Knobs:
     g1_lookahead: int = 1
     # Small-input GEMM1: K-steps its A rows are loaded ahead of their MFMAs (2: through registers, see do_tile_la).
     g1_a_ahead: int = 1
+    # Small-input GEMM1: K-steps per K-loop iteration (0: the lookahead; with g1_a_ahead 2 the K-loop stays, see
+    # do_tile_la's k_unroll).
+    g1_k_unroll: int = 0
+    # Small-input GEMM1 with mfma_amajor: each MFMA group's A operand is read a group ahead (do_tile_la a_early).
+    g1_a_early: bool = False
     # Small-input fused kernel: when a rank's routes need at most this many producers, each of them adds its share of
     # the source flag to every destination itself after its own drain, instead of the last of all producers storing
     # it behind a rank-local done counter (0: off; at most mega_moe_small_m._DIRECT_DONE_INC).
@@ -315,7 +336,7 @@ class FusedStage1Knobs:
 
 @dataclass(frozen=True, slots=True)
 class FusedStage2Knobs:
-    """GEMM2 / combine knobs only the fused kernels read (all off: the EP8 DeepSeek-V4-Pro kernels)."""
+    """GEMM2 / combine knobs only the fused kernels read (all off: the default fused kernels)."""
 
     # Large-input fused kernel: the GEMM2 units are dealt to the 8 XCDs in chunks of this many; a CTA claims from
     # its own XCD's counter, then from the next XCDs' once that one is spent (0: one claim counter per work shard).
@@ -361,6 +382,9 @@ class FusedStage2Knobs:
     # Large-input fused kernel (with epi_lean): the P2P rows carry offset int8 (u8 = q + 128) with the same E8M0
     # scale per 32 values instead of E4M3: same bytes, about half the transport rounding error.
     route_i8: bool = False
+    # Small-input fused kernel: the GEMM2 block_n of a launch whose plan has a hot expert (fewer GEMM2 tiles, so
+    # fewer per-tile P2P store drains on the ranks that hold many rows; 0: always block_n).
+    hot_block_n: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -478,7 +502,10 @@ def fused_layout_supported(
         arch.split(":", 1)[0] == "gfx950"
         and (world_size, model_dim, inter_dim, experts, topk) in FUSED_LAYOUTS
         and quant == "a8w4"
-        and swiglu_limit == 10.0
+        and swiglu_limit
+        == _FUSED_SWIGLU_LIMITS.get(
+            (world_size, model_dim, inter_dim, experts, topk), 10.0
+        )
         and act == "silu"
         and not fanout_masks
     )
@@ -491,8 +518,11 @@ def large_m_mtprs_for(
 
     EP8 DeepSeek-V4-Pro takes LARGE_M_MTPRS; EP4 DeepSeek-V4.1-Flash takes V41_FLASH_EP4_LARGE_M_MTPRS, the
     capacities its one tune was measured at (see _tune_v41_flash_ep4_large), EP2 DeepSeek-V4.1-Flash
-    V41_FLASH_EP2_LARGE_M_MTPRS and EP8 DeepSeek-V4.1-Flash V41_FLASH_EP8_LARGE_M_MTPRS (see their tunes).
+    V41_FLASH_EP2_LARGE_M_MTPRS and EP8 DeepSeek-V4.1-Flash V41_FLASH_EP8_LARGE_M_MTPRS (see their tunes); EP8
+    Kimi-K2.6 K26_LARGE_M_MTPRS.
     """
+    if (world_size, model_dim, inter_dim) == K26_FUSED_LAYOUT[:3]:
+        return K26_LARGE_M_MTPRS
     return _V41_FLASH_LARGE_M_MTPRS.get(
         (world_size, model_dim, inter_dim), LARGE_M_MTPRS
     )
@@ -1092,6 +1122,27 @@ def _tune_kimi_k3(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
     return config
 
 
+def _tune_kimi_k26(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
+    """Kimi-K2.6 (48 experts per rank, 7168x2048, top-8) A8W4: the base config, except
+    the 16K / 32K buckets of the large-MTPR class (above the large-input path's 8192
+    tokens a rank), whose Stage2 runs the deep pipeline with a wider skew cohort."""
+    if (
+        ctx.a_dtype == ACTIVATION_FP8
+        and ctx.mtpr_class == MAX_MTPR_CLASS
+        and ctx.bucket in (16384, 32768)
+    ):
+        config = _replace_config(
+            config,
+            stage2={
+                "persist_cu": 224,
+                "skew_cu": 224,
+                "b2stage": True,
+                "deep_a_pipeline": True,
+            },
+        )
+    return config
+
+
 def _tune_v41_flash_ep2(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
     """DeepSeek-V4.1-Flash at EP2 (192 experts per rank), the two buckets swept
     on gfx950 (bench_mega_moe_v2, 384 and 16384 source tokens a rank): SBM32
@@ -1185,6 +1236,13 @@ _NETWORKS = (
     ),
     NetworkProfile(
         "kimi_k3", KIMI_K3_EXPERTS_PER_RANK, K3_MODEL_DIM, K3_INTER_DIM, _tune_kimi_k3
+    ),
+    NetworkProfile(
+        "kimi_k26",
+        KIMI_K26_EXPERTS_PER_RANK,
+        K26_MODEL_DIM,
+        K26_INTER_DIM,
+        _tune_kimi_k26,
     ),
     NetworkProfile(
         "v41_flash_ep2",
@@ -1679,6 +1737,105 @@ def _tune_v41_flash_ep8_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConf
     return config
 
 
+def _small_m_eight_waves(config: MegaMoEConfig) -> MegaMoEConfig:
+    """The 8-wave small-input kernel of the hidden-7168 EP8 layouts (from 256 tokens).
+
+    8 waves, one CTA a CU: each wave's GEMM1 tile is 64 x 64 (tile_n 512, A-major MFMA, which keeps the 8-wave body
+    free of VGPR spills) and GEMM2 splits block_n 256 over the 8 waves; 8 waves cost 1.08x at 128 tokens (K2.6). A hot
+    plan runs GEMM2 at block_n 512, as each GEMM2 tile ends in a P2P store drain and the hot ranks hold many tiles
+    (uniform loses 1-5% with it at every plan, so it follows the hot plan bit only). Reading each MFMA group's A
+    operand a group ahead: zipf:1 0.985-0.993x, uniform / spike within 0.3% (K2.6).
+    """
+    return replace(
+        config,
+        stage1=replace(config.stage1, num_waves=8, tile_n=512, mfma_amajor=True),
+        stage2=replace(config.stage2, block_n=256),
+        fused_stage1=replace(config.fused_stage1, g1_a_early=True),
+        fused_stage2=replace(config.fused_stage2, hot_block_n=512),
+    )
+
+
+def _tune_kimi_k26_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConfig:
+    """EP8 Kimi-K2.6 small-input kernel (48 experts per rank), measured on gfx950 (8 ranks, MTPR 512; uniform,
+    zipf:1 and one-hot-expert routes)."""
+    # The EP8 V4.1-Flash tune (same 8 x 48-expert layout and launch protocol): 0.89-0.98x the default config
+    # (uniform), 0.81-0.98x (zipf:1), 0.87-0.99x (spike).
+    config = _tune_v41_flash_ep8_small(config, bucket)
+    if bucket >= 256:
+        # Against the 4-wave tune: 0.87-0.91x (uniform), 0.81-0.83x (zipf:1), 0.86-0.89x (spike).
+        return _small_m_eight_waves(config)
+    if 8 <= bucket <= 32:
+        # GEMM2 at block_n 256 (half the tiles, so half the per-tile P2P store drains): 0.95x-1.00x (uniform),
+        # 0.98x-1.02x (zipf:1), 0.96x-0.99x (spike) at 8-32 tokens.
+        config = replace(config, stage2=replace(config.stage2, block_n=256))
+    knobs = config.fused_stage1
+    if bucket in (16, 64, 128):
+        # GEMM1 also reads A two K-steps ahead in its K-loop and runs two K-steps per iteration: 0.98x at 16 and
+        # 96-160 tokens, 0.99x at 64. Bucket 8 spills 4 VGPRs with it (1.02x) and bucket 32 loses 1%.
+        knobs = replace(knobs, g1_a_ahead=2, g1_k_unroll=2)
+    return replace(config, fused_stage1=knobs)
+
+
+def _tune_ep8_h7168_large(config: MegaMoEConfig, expert_waves: int) -> MegaMoEConfig:
+    """EP8 Kimi-K2.6 (top-8) and DeepSeek-V4-Pro (top-6) large-input kernel (48 experts per rank, hidden 7168),
+    measured on gfx950 at MTPR 8192 (8 ranks; uniform, zipf:1 and one-hot-expert routes). Both also run it at
+    16384: its thresholds are rows a rank of the launch, so a capacity only sizes buffers.
+    """
+    # Half the payload producers leave their CTAs to GEMM1; a chunk's tile publication releases its stores
+    # system-wide once, and nothing reads payload_ready. One row per (token, destination), copied with every load of
+    # a batch ahead of its remote stores (gfx950's vmcnt counts loads and stores alike).
+    # On top of those, from the EP8 V4.1-Flash tune (whose tail-tile knobs and part of whose GEMM2 knobs do not fit
+    # K2.6's LDS): the presend, the parallel / lean plan with bucketed pair order, and the payload / acquire /
+    # release / epilogue knobs. K2.6: 0.890x (uniform), 0.844x (zipf:1), 0.758x (spike) the knobs above (presend
+    # alone 0.92x, the small knobs alone 0.90x). V4-Pro, against the default: 0.865x / 0.930x / 0.880x, while the
+    # knobs above alone lose 1.09x (zipf:1) / 1.17x (spike).
+    # The GEMM2 knobs of the V4.1-Flash tune that fit (row-aligned, staged, lean GEMM2) and 32-row short tails:
+    # K2.6 0.90x-0.99x, V4-Pro 0.85x-0.99x the knobs above (MTPR 8192, 768-8192 tokens a rank).
+    # The per-token combine wait: 0.97x-0.99x on both at every routing, for a payload the runtime keeps to itself
+    # (world x MTPR token rows, about 0.5 GB a GPU at MTPR 8192).
+    return replace(
+        config,
+        stage1=replace(config.stage1, num_dispatch_cu=48 * expert_waves),
+        fused_stage1=replace(
+            config.fused_stage1,
+            merge_release=True,
+            skip_payload_ready=True,
+            dedup_rows=True,
+            batch_rows=True,
+            presend_experts=8,
+            presend_rows=16384,
+            parallel_plan=True,
+            lean_plan=True,
+            tag_counts=True,
+            bucket_pairs=True,
+            early_hist=True,
+            payload_min_blocks=8,
+            payload_small_blocks=12,
+            payload_small_tokens=640,
+            one_row_acquire=True,
+            no_chunk_release=True,
+            a_async_lds=True,
+            ascale_packed=True,
+            epi_evec=8,
+            epi_lean=3,
+            early_clear=True,
+            peer_hoist=True,
+            short_tail_rows=32,
+        ),
+        fused_stage2=replace(
+            config.fused_stage2,
+            row_align=128,
+            scale_stage=True,
+            a_dma_uniform=True,
+            skip_pad=True,
+            epi_lean=True,
+            ascale_lds=True,
+            route_i8=True,
+            comb_tok_wait=True,
+        ),
+    )
+
+
 def _tune_v41_flash_ep8_large(config: MegaMoEConfig) -> MegaMoEConfig:
     """EP8 DeepSeek-V4.1-Flash large-input kernel (48 experts per rank), measured on gfx950 at MTPR 16384 (8 ranks;
     uniform, zipf and all-to-rank-0 routes). It serves 8192 and 16384 (V41_FLASH_EP8_LARGE_M_MTPRS) unchanged, as
@@ -1725,6 +1882,10 @@ def _fused_config(
             return _tune_v41_flash_ep2_large(config)
         if layout == V41_FLASH_EP8_LAYOUT:
             return _tune_v41_flash_ep8_large(config)
+        if layout == K26_EP8_LAYOUT or (
+            layout == V4_PRO_EP8_LAYOUT and mtpr in V4_PRO_TUNED_LARGE_M_MTPRS
+        ):
+            return _tune_ep8_h7168_large(config, expert_waves)
         return config
     config = MegaMoEConfig(
         stage1=_small_m_stage1(bucket, expert_waves),
@@ -1737,6 +1898,13 @@ def _fused_config(
         return _tune_v41_flash_ep2_small(config, bucket)
     if layout == V41_FLASH_EP8_LAYOUT:
         return _tune_v41_flash_ep8_small(config, bucket)
+    if layout == K26_EP8_LAYOUT:
+        return _tune_kimi_k26_small(config, bucket)
+    if layout == V4_PRO_EP8_LAYOUT:
+        # The EP8 V4.1-Flash tune (same 8 x 48-expert layout and launch protocol): 0.937x (uniform), 0.915x (zipf:1),
+        # 0.939x (spike) the default config; from 256 tokens 8 waves, 0.88-0.95x / 0.86-0.91x / 0.93-0.97x on top.
+        config = _tune_v41_flash_ep8_small(config, bucket)
+        return _small_m_eight_waves(config) if bucket >= 256 else config
     return config
 
 

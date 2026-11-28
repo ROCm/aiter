@@ -468,21 +468,24 @@ def _plan_counts(a_running, lane, fz_epr, fz_cap, fz_tile_m, count_cm=0):
     return chunks, total_tiles, routed_rows, max_count, overflow_count, no_overflow
 
 
-def _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, stream_w=False):
+def _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, fz_topk, stream_w=False, hot_bit=None):
     """Low 32 bits of the plan word: num_valid, plus the row-count bits of _PLAN_CACHED_W_BIT /
-    _PLAN_FP8_ROWS_BIT (``stream_w``: the routed rows never pick the cached-weight bodies, only a hot expert does)."""
+    _PLAN_FP8_ROWS_BIT (``stream_w``: the routed rows never pick the cached-weight bodies, only a hot expert does).
+    ``hot_bit`` (wave-uniform) goes to _PLAN_HOT_BIT."""
     nv_flag = no_overflow.select(total_tiles * fx.Int32(fz_tile_m), fx.Int32(0))
     cached_w = hot_expert if stream_w else hot_expert | (routed_rows >= fx.Int32(_CACHED_W_MIN_ROWS))
     nv_flag = nv_flag | cached_w.select(fx.Int32(1 << _PLAN_CACHED_W_BIT), fx.Int32(0))
-    return nv_flag | (hot_expert | (routed_rows >= fx.Int32(_FP8_ROWS_MIN_ROWS))).select(
+    if hot_bit is not None:
+        nv_flag = nv_flag | hot_bit.select(fx.Int32(1 << _PLAN_HOT_BIT), fx.Int32(0))
+    return nv_flag | (hot_expert | (routed_rows >= fx.Int32(_fp8_rows_min_rows(fz_topk)))).select(
         fx.Int32(1 << _PLAN_FP8_ROWS_BIT), fx.Int32(0)
     )
 
 
 @flyc.jit
 def emit_direct_fixed_slot_finalize(
-    *, fz_npes, fz_epr, fz_cap, fz_mtpr, fz_rank, fz_tile_m, addr_disp, parity, expected, plan_nv,
-    plan_wt=False, keep_running=False, uniform=False, running_half=None, stream_w=False,
+    *, fz_npes, fz_epr, fz_cap, fz_mtpr, fz_rank, fz_tile_m, fz_topk, addr_disp, parity, expected, plan_nv,
+    plan_wt=False, keep_running=False, uniform=False, running_half=None, stream_w=False, hot_bit=False,
 ):
     """Finalize local fixed slots as soon as every source publishes this destination.
 
@@ -490,6 +493,7 @@ def emit_direct_fixed_slot_finalize(
     consumers get num_valid from the flag itself. Only this rank's consumers read it. The srcmap of padding rows
     is left unwritten: GEMM2 masks rows past the tile's valid count itself.
     ``running_half``: the expert counters are two halves of fz_epr; this launch's routes counted into this one.
+    ``hot_bit``: also publish the hot-expert decision in _PLAN_HOT_BIT.
     """
     assert 0 < fz_epr <= 256, "direct fixed-slot finalize requires 1..256 experts per rank"
     disp = ptr_buf_tensor(addr_disp, fx.Int64)
@@ -551,8 +555,10 @@ def emit_direct_fixed_slot_finalize(
         fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
         if const_expr(not plan_wt):
             comm_ops.fence_system_release()
+        plan_hot = hot_expert if const_expr(hot_bit) else None
         if lane == fx.Int32(0):
-            nv_flag = _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, stream_w)
+            nv_flag = _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, fz_topk, stream_w,
+                hot_bit=plan_hot)
             comm_ops.store_i64_global_system(
                 plan_nv[0], (fx.Int64(plan_nv[1]) << fx.Int64(32)) | fx.Int64(nv_flag))
     fx.barrier()
@@ -560,8 +566,10 @@ def emit_direct_fixed_slot_finalize(
 
 def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_experts, experts_per_rank, N_OUT,
     flag_is_value=False, l1_acquire=False, row_format=False, reset_running=0, reset_tok=0, tok_done=False,
-    n_blocks=1, bf16_head_tokens=0):
+    n_blocks=1, bf16_head_tokens=0, waves=4):
     """Combine after this WG's P2P scatter: grid ticket, cross-device flag, reduce by the last WGs.
+
+    ``waves``: waves per WG; each reducer wave takes every ``nred * waves``-th 256-column item.
 
     ``flag_is_value``: ``arg_flag`` is this launch's flag itself (identical on every rank) instead of the address
     of a counter the last WG advances.
@@ -672,8 +680,8 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_exp
             idx_rsrc = AddrBuffer(arg_idx)
             out_rsrc = AddrBuffer(arg_out)
             items = i32_cur_tok * fx.Int32(chunks)
-            worker = (fx.Int32(ticket) - first) * fx.Int32(4) + wave
-            for item in range(worker, items, nred * fx.Int32(4)):
+            worker = (fx.Int32(ticket) - first) * fx.Int32(waves) + wave
+            for item in range(worker, items, nred * fx.Int32(waves)):
                 tok = item // fx.Int32(chunks)
                 col = (item - tok * fx.Int32(chunks)) * fx.Int32(256) + lane * fx.Int32(4)
                 src = tok * fx.Int32(topk * row_i32) + col
@@ -770,7 +778,7 @@ def g2_lds_layout(*, BM, BN, BK, a_dtype, npes, g2_bf16_lds=False):
 # fmt: off
 def make_g2_tile_runner(*, BM, BN, BK, SBM, use_nt, INTER_MAX, a_dtype, g2_bhoist, g2_ascale_pf, expert_offset,
     npes, topk, N_OUT, max_tok, recv_cap, comb_inp_nbytes, clamp_a, store_cm=2, row_mask=False,
-    p2p_quant_type="none", uniform=False, epi_lean=0, tok_done=False, bf16_head_tokens=0):
+    p2p_quant_type="none", uniform=False, epi_lean=0, tok_done=False, bf16_head_tokens=0, NW=4, lay_BN=None):
 # fmt: on
     """One stage2 tile (m_block, n_block) as a jit helper, for kernels that run GEMM2 after their own phase.
 
@@ -780,9 +788,12 @@ def make_g2_tile_runner(*, BM, BN, BK, SBM, use_nt, INTER_MAX, a_dtype, g2_bhois
     ``uniform``: the pointer arguments move to SGPRs (no waterfall loops around the tile's buffer loads).
     ``epi_lean`` / ``tok_done`` (with the tile's ``i64_tok_off``) / ``bf16_head_tokens``: p2p_scatter_epilog's
     ``lean`` / ``tok_off`` / ``bf16_head_tokens``.
+    ``NW``: the caller's wave count. ``lay_BN``: size the layout for this tile width instead (>= BN), so runners of
+    several tile widths share it.
     """
     assert clamp_a or not row_mask
-    lay = g2_lds_layout(BM=BM, BN=BN, BK=BK, a_dtype=a_dtype, npes=npes)
+    assert lay_BN is None or lay_BN >= BN
+    lay = g2_lds_layout(BM=BM, BN=BN if lay_BN is None else lay_BN, BK=BK, a_dtype=a_dtype, npes=npes)
     is_f8 = a_dtype == "fp8"
     aStages = kStages + 1
     KH_TILE_A = BK // (1 if is_f8 else 2)
@@ -811,7 +822,7 @@ def make_g2_tile_runner(*, BM, BN, BK, SBM, use_nt, INTER_MAX, a_dtype, g2_bhois
         m_row0 = m_block * fx.Int32(BM)
         for slot in range_constexpr(kStages):
             issue_a_load_lds_dt(arg_aq, lds_base_i32, slot, slot, m_row0, wave, lane, is_f8, KH_TILE_A, k_bytes,
-                BM=BM, valid_rows=vrows)
+                BM=BM, valid_rows=vrows, NW=NW)
         rocdl.sched_barrier(0)
         sort_block_idx = m_row0 // fx.Int32(SBM)
         srcmap_row_base = load_at(AddrBuffer(arg_trb), sort_block_idx, fx.Int32, 1) + (m_row0 - sort_block_idx * fx.Int32(SBM))
@@ -829,11 +840,11 @@ def make_g2_tile_runner(*, BM, BN, BK, SBM, use_nt, INTER_MAX, a_dtype, g2_bhois
             arg_bscale, arg_eids, arg_aq, i32_max_m_blocks, unit_bx, lane, wave, i32_inter, i32_hidden,
             fx.Int32(0), fx.Int32(0), BM=BM, BN=BN, BK=BK, use_nt=use_nt, INTER_MAX=INTER_MAX, aStages=aStages,
             a_dtype=a_dtype, has_pad=False, SBM=SBM, g2_bhoist=g2_bhoist, g2_ascale_pf=g2_ascale_pf,
-            expert_offset=expert_offset, valid_rows=vrows)
+            expert_offset=expert_offset, valid_rows=vrows, NW=NW)
         p2p_scatter_epilog(lds_base_i32, accm_vecs, n_block_idx, wave, lane, N_OUT=N_OUT, BM=BM, BN=BN, npes=npes,
             topk=topk, log2_max_tok=log2_max_tok, mask_max_tok=max_tok - 1, recv_cap=recv_cap,
             comb_inp_nbytes=comb_inp_nbytes, meta=Stage2Meta(lds_base_i32, lay["packed"], lay["weight"], lay["peer"]),
-            g2_bf16_lds=False, p2p_quant_type=p2p_quant_type, store_cm=store_cm,
+            g2_bf16_lds=False, p2p_quant_type=p2p_quant_type, NW=NW, store_cm=store_cm,
             fp8_store_cm=2, fp8_rows=i32_fp8_rows, elem_view_stores=True, lean=epi_lean,
             tok_off=i64_tok_off if const_expr(tok_done) else None, bf16_head_tokens=bf16_head_tokens)
         # fmt: on
@@ -862,7 +873,8 @@ def compile_mega_moe_stage1(
     plan_local: bool = False, g2_early: tuple = (0, 0), g2_uniform: bool = False, head_uniform: bool = False,
     g2_epi_lean: int = 0, g1_lookahead: int = 1, g1_a_ahead: int = 1, direct_done: int = 0, tok_done: bool = False,
     tok_counters: bool = False, bf16_head_tokens: int = 0, epi_evec: int = 2, epi_lean: int = 0,
-    ascale_packed: bool = False, stream_w: bool = False,
+    ascale_packed: bool = False, stream_w: bool = False, g1_k_unroll: int = 0, g1_a_early: bool = False,
+    g2_hot_bn: int = 0,
 ):
     arch = get_gfx_runtime()
     if arch != "gfx950":
@@ -951,9 +963,20 @@ def compile_mega_moe_stage1(
     # Finalize publishes per-tile valid rows that clamp the GEMM1 A loads and epilogue stores, and each XCD
     # drains a contiguous slice of the m-major work space.
     g2_bn, g2_bk, g2_recv_cap, fused_reducers = fused
+    # g2_hot_bn: the GEMM2 tile width of a launch whose plan has the hot bit (fewer GEMM2 tiles, so fewer per-tile
+    # P2P store drains on the ranks that hold many rows).
+    g2_bn_hot = int(g2_hot_bn) if g2_hot_bn else g2_bn
+    hot_g2 = g2_bn_hot != g2_bn
     assert fused_reducers > 0, "the fused combine needs reducers"
-    assert model_dim % g2_bn == 0 and NUM_WAVES == 4 and fz_npes <= 47
+    assert model_dim % g2_bn == 0 and model_dim % g2_bn_hot == 0 and NUM_WAVES in (4, 8) and fz_npes <= 47
+    # GEMM2 pairs a wave's 16-column subblocks under one B scale: each wave needs an even number of them.
+    assert (g2_bn // NUM_WAVES) % 32 == 0 and (g2_bn_hot // NUM_WAVES) % 32 == 0 and sort_block_m % NUM_WAVES == 0
+    # A tok_done reducer waits for valid routes x its own GEMM2 n-blocks; a hot sender would count fewer.
+    assert not (tok_done and hot_g2)
     g2_n_blocks = model_dim // g2_bn
+    g2_n_blocks_hot = model_dim // g2_bn_hot
+    # A hot plan runs its own GEMM2 tile (width g2_bn_hot); all runners share one LDS layout.
+    g2_lay_bn = max(g2_bn, g2_bn_hot) if hot_g2 else None
     # The P2P row stores go to the uncached shmem heap; non-temporal stores there are slower (store_cm=0).
     # GEMM2 masks the padding rows of each tile itself, so the plan leaves their srcmap unwritten.
     g2_tile, g2_lay = make_g2_tile_runner(
@@ -962,7 +985,8 @@ def compile_mega_moe_stage1(
         npes=int(fuse_npes), topk=int(fuse_topk), N_OUT=model_dim, max_tok=int(fuse_mtpr),
         recv_cap=int(g2_recv_cap), comb_inp_nbytes=int(fuse_mtpr) * int(fuse_topk) * model_dim * 2,
         clamp_a=True, store_cm=0, row_mask=True, p2p_quant_type="dynamic", uniform=g2_uniform,
-        epi_lean=g2_epi_lean, tok_done=tok_done, bf16_head_tokens=bf16_head_tokens,
+        epi_lean=g2_epi_lean, tok_done=tok_done, bf16_head_tokens=bf16_head_tokens, NW=NUM_WAVES,
+        lay_BN=g2_lay_bn,
     )
     g2_tile_cached, _ = make_g2_tile_runner(
         BM=sort_block_m, BN=g2_bn, BK=g2_bk, SBM=sort_block_m, use_nt=False, INTER_MAX=inter_dim,
@@ -970,8 +994,21 @@ def compile_mega_moe_stage1(
         npes=int(fuse_npes), topk=int(fuse_topk), N_OUT=model_dim, max_tok=int(fuse_mtpr),
         recv_cap=int(g2_recv_cap), comb_inp_nbytes=int(fuse_mtpr) * int(fuse_topk) * model_dim * 2,
         clamp_a=True, store_cm=0, row_mask=True, p2p_quant_type="dynamic", uniform=g2_uniform,
-        epi_lean=g2_epi_lean, tok_done=tok_done, bf16_head_tokens=bf16_head_tokens,
+        epi_lean=g2_epi_lean, tok_done=tok_done, bf16_head_tokens=bf16_head_tokens, NW=NUM_WAVES,
+        lay_BN=g2_lay_bn,
     )
+    # A hot plan also picks the cached weights (_plan_flag sets both), so the hot tile needs only that body.
+    g2_tile_hot = None
+    if hot_g2:
+        g2_tile_hot, _ = make_g2_tile_runner(
+            BM=sort_block_m, BN=g2_bn_hot, BK=g2_bk, SBM=sort_block_m, use_nt=False, INTER_MAX=inter_dim,
+            a_dtype="fp8", g2_bhoist=True, g2_ascale_pf=True, expert_offset=int(rank) * int(experts_per_rank),
+            npes=int(fuse_npes), topk=int(fuse_topk), N_OUT=model_dim, max_tok=int(fuse_mtpr),
+            recv_cap=int(g2_recv_cap), comb_inp_nbytes=int(fuse_mtpr) * int(fuse_topk) * model_dim * 2,
+            clamp_a=True, store_cm=0, row_mask=True, p2p_quant_type="dynamic", uniform=g2_uniform,
+            epi_lean=g2_epi_lean, tok_done=tok_done, bf16_head_tokens=bf16_head_tokens, NW=NUM_WAVES,
+            lay_BN=g2_lay_bn,
+        )
     # The combine's last WG zeroes the expert counters one per thread.
     assert not plan_local or fz_epr <= TOTAL_THREADS, "plan_local resets at most one expert counter per thread"
     # The combine input is in the uncached shmem heap: the reducers only need to drop their L1.
@@ -979,12 +1016,14 @@ def compile_mega_moe_stage1(
         npes=int(fuse_npes), rank=int(rank), topk=int(fuse_topk), total_experts=fz_total_experts,
         experts_per_rank=fz_epr, N_OUT=model_dim, flag_is_value=True, l1_acquire=True, row_format=True,
         reset_running=fz_epr if plan_local else 0, reset_tok=fz_mtpr if tok_counters else 0, tok_done=tok_done,
-        n_blocks=g2_n_blocks, bf16_head_tokens=bf16_head_tokens)
+        n_blocks=g2_n_blocks, bf16_head_tokens=bf16_head_tokens, waves=NUM_WAVES)
     g2_scratch_off = g2_lay["bytes"]
     lds_pool_bytes = max(lds_pool_bytes, (g2_scratch_off + 16 + 15) // 16 * 16)
     # The combine reducers spin until every CTA has taken its ticket, so no CTA may still be waiting for a
-    # slot: the whole grid must be co-resident (2 CTAs per CU: <= 256 VGPRs and half the 160 KiB LDS).
-    assert grid_mult <= 2 and 2 * lds_pool_bytes <= 160 * 1024, (grid_mult, lds_pool_bytes)
+    # slot: the whole grid must be co-resident (8 waves a CU: <= 256 VGPRs, and the LDS of 8 // NUM_WAVES CTAs
+    # within the 160 KiB).
+    assert grid_mult * NUM_WAVES <= 8 and (8 // NUM_WAVES) * lds_pool_bytes <= 160 * 1024, (
+        grid_mult, NUM_WAVES, lds_pool_bytes)
     # Every launch ends in a cross-rank exchange, so a rank can only enter launch N+1 after every peer has
     # entered launch N (its plan waits for all sources) and finished launch N-1. All cross-rank buffers a launch
     # writes before its own plan are parity double-buffered, so there is no launch handshake:
@@ -1041,6 +1080,8 @@ def compile_mega_moe_stage1(
         f"{'_ap' if ascale_packed else ''}"
         f"{f'_ek{G2_EARLY_K}p{G2_EARLY_P}' if G2_EARLY_K else ''}"
         f"{'_stw' if stream_w else ''}"
+        f"{f'_ku{g1_k_unroll}' if g1_k_unroll else ''}{'_aer' if g1_a_early else ''}"
+        f"{f'_hbn{g2_bn_hot}' if hot_g2 else ''}"
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[TOTAL_THREADS, 1, 1])
@@ -1175,10 +1216,10 @@ def compile_mega_moe_stage1(
         if owner:
             emit_direct_fixed_slot_finalize(
                 fz_npes=fz_npes, fz_epr=fz_epr, fz_cap=fz_cap, fz_mtpr=fz_mtpr, fz_rank=fz_rank,
-                fz_tile_m=fz_tile_m, addr_disp=addr_disp, parity=payload_parity,
+                fz_tile_m=fz_tile_m, fz_topk=fz_k, addr_disp=addr_disp, parity=payload_parity,
                 expected=payload_expected, plan_nv=(_disp_ptr(DispatchSlot.PLAN_NV), gate_epoch),
                 plan_wt=plan_wt, keep_running=plan_local, uniform=head_uniform, running_half=running_half,
-                stream_w=stream_w,
+                stream_w=stream_w, hot_bit=hot_g2,
             )
         wave_id = fx.thread_idx.x // 64
 
@@ -1246,7 +1287,8 @@ def compile_mega_moe_stage1(
             swiglu_limit=swiglu_limit,
             rows_rsrc=ptr_buf_tensor(_disp_ptr(DispatchSlot.TILE_ROWS), fx.Int32),
             lookahead=g1_lookahead, row_map=row_map, plan_lookup=plan_lookup, a_ahead=g1_a_ahead,
-            fused_v8=True, epi_lean=epi_lean, ascale_packed=ascale_packed,
+            fused_v8=True, epi_lean=epi_lean, ascale_packed=ascale_packed, k_unroll=g1_k_unroll,
+            a_early=g1_a_early,
         )
         # A rank that receives many rows holds experts with many m-tiles: it reads W1 through the cache so they
         # reuse it, while the other ranks keep streaming W1 once per tile.
@@ -1266,7 +1308,8 @@ def compile_mega_moe_stage1(
                 swiglu_limit=swiglu_limit,
                 rows_rsrc=ptr_buf_tensor(_disp_ptr(DispatchSlot.TILE_ROWS), fx.Int32),
                 lookahead=g1_lookahead, row_map=row_map, plan_lookup=plan_lookup, a_ahead=g1_a_ahead,
-                fused_v8=True, epi_lean=epi_lean, ascale_packed=ascale_packed,
+                fused_v8=True, epi_lean=epi_lean, ascale_packed=ascale_packed, k_unroll=g1_k_unroll,
+                a_early=g1_a_early,
             )
 
         a_g2_cnt = _disp_ptr(DispatchSlot.G2_CNT)
@@ -1313,7 +1356,9 @@ def compile_mega_moe_stage1(
                 fx.ptr_store(metadata_base + num_expert_tiles, plan_ptr(incl_base, slot))
                 fx.ptr_store(safe_count, plan_ptr(count_base, slot))
             hot_expert = max_count >= fx.Int32(_HOT_EXPERT_MIN_ROWS)
-            return _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, stream_w)
+            plan_hot = hot_expert if const_expr(hot_g2) else None
+            return _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m, fz_k, stream_w,
+                hot_bit=plan_hot)
         if tid == fx.Int32(0):
             xcd = fx.Int32(comm_ops.hw_xcc_id()) & fx.Int32(7)
             # The owner reset the counters before opening the gate: the first work fetch overlaps the plan wait.
@@ -1339,11 +1384,14 @@ def compile_mega_moe_stage1(
                     fx.ptr_store(plan_low_local, nv_ptr)
         fx.barrier()
         plan_low = fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.ptr_load(nv_ptr).ir_value()))
-        num_valid = plan_low & fx.Int32((1 << _PLAN_CACHED_W_BIT) - 1)
+        num_valid = plan_low & fx.Int32((1 << (_PLAN_HOT_BIT if hot_g2 else _PLAN_CACHED_W_BIT)) - 1)
         if const_expr(dedup_rows):
             row_map["x_token"] = fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(token_offsets[0])))
             row_map["scale_token"] = fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(token_offsets[1] // fx.Int64(16))))
         cached_w = (plan_low >> fx.Int32(_PLAN_CACHED_W_BIT)) & fx.Int32(1)
+        plan_hot = fx.Int32(0)
+        if const_expr(hot_g2):
+            plan_hot = (plan_low >> fx.Int32(_PLAN_HOT_BIT)) & fx.Int32(1)
         num_m_tiles = ceildiv(num_valid, fx.Int32(sort_block_m))
         total_work = num_m_tiles * fx.Int32(N_TILES)
 
@@ -1457,8 +1505,11 @@ def compile_mega_moe_stage1(
         # that GEMM1 did not cut keeps its GEMM2 on the XCD whose L2 holds its GEMM1 output (an independent
         # equal split could move the first units of such an m-tile to the previous XCD when the GEMM1 slice end
         # was rounded down to an m-tile boundary).
-        g2_base = (shard_base * fx.Int32(g2_n_blocks)) // fx.Int32(N_TILES)
-        g2_units = (shard_end * fx.Int32(g2_n_blocks)) // fx.Int32(N_TILES) - g2_base
+        g2_nb = fx.Int32(g2_n_blocks)
+        if const_expr(hot_g2):
+            g2_nb = (plan_hot != fx.Int32(0)).select(fx.Int32(g2_n_blocks_hot), fx.Int32(g2_n_blocks))
+        g2_base = (shard_base * g2_nb) // fx.Int32(N_TILES)
+        g2_units = (shard_end * g2_nb) // fx.Int32(N_TILES) - g2_base
         g2_head = a_work_head + fx.Int64(work_shard) * fx.Int64(64)
         g2_active = fx.Int32(1) == fx.Int32(1)
         g2_fetch = fx.Int32(0)
@@ -1493,8 +1544,8 @@ def compile_mega_moe_stage1(
             g2_local = fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.ptr_load(g2_scratch).ir_value()))
             if g2_local < g2_units:
                 g2_u = g2_base + g2_local
-                g2_m = g2_u // fx.Int32(g2_n_blocks)
-                g2_n = g2_u - g2_m * fx.Int32(g2_n_blocks)
+                g2_m = g2_u // g2_nb
+                g2_n = g2_u - g2_m * g2_nb
                 if tid == fx.Int32(0):
                     comm_ops.wait_i32_until_equals(a_g2_ready + fx.Int64(g2_m) * fx.Int64(4), gate_epoch)
                 fx.barrier()
@@ -1503,14 +1554,29 @@ def compile_mega_moe_stage1(
                 # CU's L1 can be stale.
                 comm_ops.invalidate_l1()
                 # As in GEMM1, a rank that receives many rows reads W2 through the cache.
-                if cached_w != fx.Int32(0):
-                    g2_tile_cached(lds_base_i32, tid, g2_lane, g2_wave, g2_m, g2_n, g2_aq, g2_ascale, g2_bq,
-                        g2_bscale, g2_eids, g2_stids, g2_sweights, g2_trb, g2_rows, g2_max_m_blocks,
-                        fx.Int32(inter_dim), fx.Int32(model_dim), fp8_rows, tok_off)
+                if const_expr(hot_g2):
+                    if plan_hot != fx.Int32(0):
+                        g2_tile_hot(lds_base_i32, tid, g2_lane, g2_wave, g2_m, g2_n, g2_aq, g2_ascale, g2_bq,
+                            g2_bscale, g2_eids, g2_stids, g2_sweights, g2_trb, g2_rows, g2_max_m_blocks,
+                            fx.Int32(inter_dim), fx.Int32(model_dim), fp8_rows, tok_off)
+                    else:
+                        if cached_w != fx.Int32(0):
+                            g2_tile_cached(lds_base_i32, tid, g2_lane, g2_wave, g2_m, g2_n, g2_aq, g2_ascale,
+                                g2_bq, g2_bscale, g2_eids, g2_stids, g2_sweights, g2_trb, g2_rows, g2_max_m_blocks,
+                                fx.Int32(inter_dim), fx.Int32(model_dim), fp8_rows, tok_off)
+                        else:
+                            g2_tile(lds_base_i32, tid, g2_lane, g2_wave, g2_m, g2_n, g2_aq, g2_ascale, g2_bq,
+                                g2_bscale, g2_eids, g2_stids, g2_sweights, g2_trb, g2_rows, g2_max_m_blocks,
+                                fx.Int32(inter_dim), fx.Int32(model_dim), fp8_rows, tok_off)
                 else:
-                    g2_tile(lds_base_i32, tid, g2_lane, g2_wave, g2_m, g2_n, g2_aq, g2_ascale, g2_bq, g2_bscale,
-                        g2_eids, g2_stids, g2_sweights, g2_trb, g2_rows, g2_max_m_blocks, fx.Int32(inter_dim),
-                        fx.Int32(model_dim), fp8_rows, tok_off)
+                    if cached_w != fx.Int32(0):
+                        g2_tile_cached(lds_base_i32, tid, g2_lane, g2_wave, g2_m, g2_n, g2_aq, g2_ascale, g2_bq,
+                            g2_bscale, g2_eids, g2_stids, g2_sweights, g2_trb, g2_rows, g2_max_m_blocks,
+                            fx.Int32(inter_dim), fx.Int32(model_dim), fp8_rows, tok_off)
+                    else:
+                        g2_tile(lds_base_i32, tid, g2_lane, g2_wave, g2_m, g2_n, g2_aq, g2_ascale, g2_bq, g2_bscale,
+                            g2_eids, g2_stids, g2_sweights, g2_trb, g2_rows, g2_max_m_blocks, fx.Int32(inter_dim),
+                            fx.Int32(model_dim), fp8_rows, tok_off)
             g2_active = g2_local < g2_units
             g2_fetch = fx.Int32(1)
 
@@ -1557,13 +1623,21 @@ _COMBINE_REDUCERS = 256
 # cached-weight ones, whose experts then span enough m-tiles to reuse their weights. Measured: cached loads
 # cost uniform routing at 384 tokens (2304 rows) and gain from 448 (2688).
 _CACHED_W_MIN_ROWS = 2560
+
+
 # Routed rows a rank receives from which its GEMM2 sends FP8 rows (1x32 E8M0 scales, the numerics of the main
-# path) to the combine instead of BF16: above the 3072 rows of uniform routing at 512 tokens.
-_FP8_ROWS_MIN_ROWS = 3584
+# path) to the combine instead of BF16: 512 rows above uniform routing at 512 tokens (3584 at top-6, 4608 at
+# top-8), so uniform calls always combine BF16 rows.
+def _fp8_rows_min_rows(topk: int) -> int:
+    return 512 * (int(topk) + 1)
+
+
 # Rows of a rank's largest expert from which the rank also takes both of the above: its rows sit in a few experts
 # (skewed routing), far above the 64-row average of uniform routing at 512 tokens.
 _HOT_EXPERT_MIN_ROWS = 256
-# Bits of the plan word's low half that carry the two decisions above (num_valid < 2^29).
+# Bits of the plan word's low half that carry the two decisions above (num_valid < 2^29), and the hot-plan decision
+# for kernels whose GEMM2 tile width follows it (num_valid < 2^28 there).
+_PLAN_HOT_BIT = 28
 _PLAN_CACHED_W_BIT = 29
 _PLAN_FP8_ROWS_BIT = 30
 # The word the combine leaves in the rows of the bf16_head_tokens tokens (FusedStage1Knobs) once it summed them.
@@ -1582,7 +1656,9 @@ def _kernel_knobs(config: MegaMoEConfig) -> dict:
         head_uniform=k1.head_uniform, g2_epi_lean=k1.g2_epi_lean, g1_lookahead=k1.g1_lookahead,
         g1_a_ahead=k1.g1_a_ahead, direct_done=k1.direct_done, tok_done=k1.tok_done, tok_counters=k1.tok_counters,
         bf16_head_tokens=k1.bf16_head_tokens, epi_evec=k1.epi_evec, epi_lean=k1.epi_lean,
-        ascale_packed=k1.ascale_packed, stream_w=k1.stream_w,
+        ascale_packed=k1.ascale_packed, stream_w=k1.stream_w, g1_k_unroll=k1.g1_k_unroll,
+        g1_a_early=k1.g1_a_early,
+        g2_hot_bn=k2.hot_block_n,
     )
     # fmt: on
 
@@ -1949,7 +2025,7 @@ class SmallMRuntime:
             fuse_cap=self._s1_cap, fuse_mtpr=self.mtpr, fuse_scale_dim=self._s1_scale_dim,
             fused=fused, num_cu=self._s1_num_cu,
             sort_block_m=stage1.sort_block_m, tile_n=stage1.tile_n, tile_k=stage1.tile_k,
-            num_waves=stage1.num_waves, grid_mult=min(stage1.grid_mult, 2),
+            num_waves=stage1.num_waves, grid_mult=min(stage1.grid_mult, 8 // stage1.num_waves),
             pipe_weights=stage1.pipe_weights,
             mfma_amajor=stage1.mfma_amajor, swizzle_a=stage1.swizzle_a,
             async_a_copy=stage1.async_a_copy, num_dispatch_cu=stage1.num_dispatch_cu,

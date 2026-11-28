@@ -58,6 +58,8 @@ from .gemm2 import (
     issue_a_scale_lds_dt,
 )
 from .mega_moe_config import (
+    K26_INTER_DIM,
+    K26_MODEL_DIM,
     MegaMoEConfig,
     fused_layout_supported,
     large_m_mtprs_for,
@@ -1686,9 +1688,12 @@ CTL_EARLY = 6  # g2_early: claim limit << 3 | the head this CTA claims from
 CTL_WORDS = 8
 
 
-# Chunks of 3 n-major GEMM2 units keep consecutive m-blocks of one n-block together for W2 reuse while short
+# Chunks of n-major GEMM2 units keep consecutive m-blocks of one n-block together for W2 reuse while short
 # enough to narrow the per-CTA drain tail; the kernel takes them only when the received rows warrant it.
-LARGE_M_G2_CHUNK = 3
+# Keyed by (model_dim, inter_dim), LARGE_M_G2_CHUNK_DEFAULT for the other layouts: Kimi-K2.6's shorter GEMM2 K and
+# top-8 rows favour chunks of 2.
+LARGE_M_G2_CHUNK = {(K26_MODEL_DIM, K26_INTER_DIM): 2}
+LARGE_M_G2_CHUNK_DEFAULT = 3
 
 
 def large_m_kernel_specs(
@@ -3124,8 +3129,8 @@ class LargeMRuntime:
         ) or max_tok_per_rank not in large_mtprs:
             raise ValueError(
                 "the large-input path requires a fused a8w4 layout on gfx950 (EP8 DeepSeek-V4-Pro or EP4 / EP2 / EP8 "
-                "DeepSeek-V4.1-Flash, swiglu_limit=10) and a max_tok_per_rank the layout builds it for "
-                f"({large_mtprs or 'none'})"
+                "DeepSeek-V4.1-Flash, swiglu_limit=10; EP8 Kimi-K2.6 without a SwiGLU clamp) and a max_tok_per_rank "
+                f"the layout builds it for ({large_mtprs or 'none'})"
             )
         self.rank = int(rank)
         self.world_size = int(world_size)
@@ -3611,7 +3616,7 @@ class LargeMRuntime:
             "fused_args": (self._fused_mtile_ctr.data_ptr(), *s2_args),
             "fused_combine": c_spec,
             "fused_combine_args": c_args,
-            "fused_g2_chunk": LARGE_M_G2_CHUNK,
+            "fused_g2_chunk": LARGE_M_G2_CHUNK.get((self.model_dim, self.inter_dim), LARGE_M_G2_CHUNK_DEFAULT),
         }
         return s1, kw
 
