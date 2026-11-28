@@ -251,6 +251,10 @@ for file in "${sharded_files[@]}"; do
         op_tests/test_flydsl_pa_decode.py|op_tests/flydsl_tests/test_flydsl_allreduce_policy.py|op_tests/flydsl_tests/test_flydsl_allreduce_rank_agreement.py|op_tests/flydsl_tests/test_flydsl_quick_allreduce_codec.py)
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
             ;;
+        op_tests/test_flydsl_hstu_attention.py|op_tests/test_flydsl_hstu_attention_bwd.py)
+            # Their `__main__` runs the benchmark sweep, not the pytest cases.
+            test_cmd=(timeout 60m python3 -m pytest -q "$file")
+            ;;
         op_tests/test_f4gemm.py)
             test_cmd=(timeout 60m python3 "$file" --mode func)
             ;;

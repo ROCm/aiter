@@ -27,6 +27,10 @@ from aiter.ops.flydsl.kernels.hstu.hstu_attention_fwd import (
     build_hstu_attention_fwd,
     validate_hstu_attention_fwd,
 )
+from aiter.ops.flydsl.kernels.hstu.hstu_attention_fwd_pp import (
+    build_hstu_attention_fwd_pp,
+    validate_hstu_attention_fwd_pp,
+)
 from aiter.ops.triton.utils.common_utils import prev_power_of_2
 
 from .kernels.tensor_shim import _run_compiled, get_dtype_str
@@ -65,12 +69,20 @@ _CSV_COLUMNS: list[str] = [
     "has_window",
     "has_contextual",
     "has_targets",
+    "kernel",
     "block_m",
     "block_n",
     "num_waves",
     "waves_per_eu",
     "duration",
 ]
+
+# Forward kernels, as tagged in the tuned CSV's `kernel` column: the ping-pong
+# kernel (hstu_attention_fwd_pp.py; gfx942, bf16, head_dim == hidden_dim in
+# (64, 128)) and the fallback (hstu_attention_fwd.py), which serves the rest.
+_FWD_KERNEL_PP = "pingpong"
+_FWD_KERNEL_FALLBACK = "fallback"
+_FWD_KERNELS = (_FWD_KERNEL_PP, _FWD_KERNEL_FALLBACK)
 
 
 def _problem_key(
@@ -101,7 +113,13 @@ def _problem_key(
 
 @functools.lru_cache
 def _tuned_config_map(tuned_file: str | None = None) -> dict[tuple, dict]:
-    def _parse_row(row: dict) -> tuple[tuple, float, dict]:
+    """problem key -> {kernel: tiles}, fastest kernel first.
+
+    Each kernel keeps its own lowest-duration row, so an override of the
+    default kernel still gets tuned tiles.
+    """
+
+    def _parse_row(row: dict) -> tuple[tuple, float, str, dict]:
         if set(row.keys()) != set(_CSV_COLUMNS):
             raise KeyError(f"unexpected columns: {set(row.keys()) ^ set(_CSV_COLUMNS)}")
 
@@ -119,17 +137,18 @@ def _tuned_config_map(tuned_file: str | None = None) -> dict[tuple, dict]:
             row["has_contextual"],
             row["has_targets"],
         )
+        kernel = row["kernel"].strip().lower()
+        if kernel not in _FWD_KERNELS:
+            raise ValueError(
+                f"unknown kernel {kernel!r}, expected one of {_FWD_KERNELS}"
+            )
         kernel_config = {
             "block_m": int(row["block_m"]),
             "block_n": int(row["block_n"]),
             "num_waves": int(row["num_waves"]),
             "waves_per_eu": int(row["waves_per_eu"]),
         }
-        return (
-            problem_key,
-            duration,
-            kernel_config,
-        )
+        return problem_key, duration, kernel, kernel_config
 
     default_tuned_file = (
         Path(__file__).resolve().parents[2]
@@ -146,7 +165,7 @@ def _tuned_config_map(tuned_file: str | None = None) -> dict[tuple, dict]:
     with tuned_file.open(mode="r", encoding="utf-8") as f:
         for row_idx, row in enumerate(csv.DictReader(f)):
             try:
-                problem_key, duration, kernel_config = _parse_row(row)
+                problem_key, duration, kernel, kernel_config = _parse_row(row)
             except (KeyError, ValueError, TypeError) as exc:
                 logger.warning(
                     f"[FlyDSL HSTU Fwd] skipping invalid tuned row {row_idx} in {tuned_file}: {exc}"
@@ -156,12 +175,18 @@ def _tuned_config_map(tuned_file: str | None = None) -> dict[tuple, dict]:
             if duration <= 0.0:
                 continue
 
-            if problem_key not in config_map or duration < config_map[problem_key][0]:
-                config_map[problem_key] = (duration, kernel_config)
+            rows = config_map.setdefault(problem_key, {})
+            if kernel not in rows or duration < rows[kernel][0]:
+                rows[kernel] = (duration, kernel_config)
 
     return {
-        problem_key: kernel_config
-        for problem_key, (_, kernel_config) in config_map.items()
+        problem_key: {
+            kernel: kernel_config
+            for kernel, (_, kernel_config) in sorted(
+                rows.items(), key=lambda item: item[1][0]
+            )
+        }
+        for problem_key, rows in config_map.items()
     }
 
 
@@ -246,6 +271,105 @@ def _get_default_config(
     return as_dict(128, 32, 4, 2)
 
 
+# Ping-pong tile at head_dim 64 without a window: 256 is ~12% slower (shorter
+# phases per barrier), and block_m=128 is refused by the gate.
+_FWD_PP_TILES = {
+    "block_m": 512,
+    "block_n": 32,
+    "num_waves": 8,
+    "waves_per_eu": 2,
+}
+
+# block_m=256 elsewhere. Under a window a taller tile sweeps more out-of-band
+# KV: at d=64 W=512 (B=1024 H=4 N=16384), 256/384/512 measure 1.115x/1.086x/
+# 0.93x over the fallback. At d=128, 512 spills 456 VGPRs (0.43x) and 256 runs
+# at 2.2x.
+_FWD_PP_TILES_256 = {**_FWD_PP_TILES, "block_m": 256}
+
+# Where the ping-pong is the default without a tuned row. Speedup over the
+# fallback on MI300X (bf16, B 16-1024, H 4/8, N 1024-16384):
+#   causal, d=128:               1.17-2.29x everywhere
+#   causal, d=64, no window:     0.78-0.92x at N <= 2048, 1.12-1.66x from 4096
+#   causal, d=64, W <= 256:      0.62-0.98x
+#   causal, d=64, W >= 512:      0.73-0.98x at N <= 2048, 1.04-1.47x from 4096
+#   contextual prefix, d=64:     0.64-1.09x
+#   non-causal, d=64:            0.92-1.22x
+# (the few exceptions are 1.11-1.15x at B=16 and N <= 2048).
+_FWD_PP_MIN_SEQ_LEN_D64 = 4096
+_FWD_PP_MIN_WINDOW_D64 = 512
+
+
+def fwd_pp_tiles(head_dim: int, max_attn_len: int) -> dict:
+    """The ping-pong kernel's default tile for this head_dim and window."""
+    if head_dim == 64 and max_attn_len == 0:
+        return dict(_FWD_PP_TILES)
+    return dict(_FWD_PP_TILES_256)
+
+
+def _fwd_pp_preferred(
+    *,
+    head_dim: int,
+    max_seq_len: int,
+    causal: bool,
+    max_attn_len: int,
+    contextual_seq_len: int,
+) -> bool:
+    """Whether the ping-pong is faster here, absent a tuned row."""
+    if not causal or contextual_seq_len > 0:
+        return False
+    if head_dim != 64:
+        return True
+    if max_seq_len < _FWD_PP_MIN_SEQ_LEN_D64:
+        return False
+    return max_attn_len == 0 or max_attn_len >= _FWD_PP_MIN_WINDOW_D64
+
+
+def _resolve_fwd_pp_config(
+    *,
+    pingpong: bool | None,
+    tuned_rows: dict,
+    custom_config: dict,
+    max_seq_len: int,
+    **problem,
+) -> dict | None:
+    """The ping-pong kernel's tiles for this problem, or None for the fallback.
+
+    pingpong=None: the ping-pong if the fastest tuned row is a ping-pong row
+    (or, with no row, `_fwd_pp_preferred`) and its gate accepts the shape;
+    explicit tiles mean the fallback. True: always the ping-pong, re-raising
+    the gate's error. False: never.
+    """
+    if pingpong is False:
+        return None
+    if pingpong is None:
+        if custom_config:
+            return None
+        if tuned_rows and next(iter(tuned_rows)) != _FWD_KERNEL_PP:
+            return None
+        if not tuned_rows and not _fwd_pp_preferred(
+            head_dim=problem["head_dim"],
+            max_seq_len=max_seq_len,
+            causal=problem["causal"],
+            max_attn_len=problem["max_attn_len"],
+            contextual_seq_len=problem["contextual_seq_len"],
+        ):
+            return None
+
+    config = {
+        **fwd_pp_tiles(problem["head_dim"], problem["max_attn_len"]),
+        **tuned_rows.get(_FWD_KERNEL_PP, {}),
+        **custom_config,
+    }
+    try:
+        validate_hstu_attention_fwd_pp(**problem, **config)
+    except ValueError as exc:
+        if pingpong is True:
+            raise
+        logger.debug("hstu fwd ping-pong not applicable, using fallback: %s", exc)
+        return None
+    return config
+
+
 @functools.lru_cache(maxsize=16384)
 def _compile_launcher(
     *,
@@ -264,6 +388,7 @@ def _compile_launcher(
     block_n: int | None,
     num_waves: int | None,
     waves_per_eu: int | None,
+    pingpong: bool | None = None,
 ) -> Callable:
     #  Config overrides (if provided)
     custom_config: dict = {
@@ -295,7 +420,7 @@ def _compile_launcher(
 
     kernel_config = {
         **default_config,
-        **tuned_config,
+        **tuned_config.get(_FWD_KERNEL_FALLBACK, {}),
         **custom_config,
     }
 
@@ -311,6 +436,18 @@ def _compile_launcher(
         contextual_seq_len=contextual_seq_len,
         **kernel_config,
     )
+    # `tuned_config` holds one tile set per kernel, fastest first.
+    problem = {k: v for k, v in kwargs.items() if k not in kernel_config}
+    pp_config = _resolve_fwd_pp_config(
+        pingpong=pingpong,
+        tuned_rows=tuned_config,
+        custom_config=custom_config,
+        max_seq_len=max_seq_len,
+        **problem,
+    )
+    if pp_config is not None:
+        return build_hstu_attention_fwd_pp(**problem, **pp_config)
+
     validate_hstu_attention_fwd(**kwargs)
     launcher = build_hstu_attention_fwd(**kwargs)
     return launcher
@@ -406,8 +543,16 @@ def flydsl_hstu_attention_fwd(
     block_n: int | None = None,
     num_waves: int | None = None,
     waves_per_eu: int | None = None,
+    pingpong: bool | None = None,
     stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
+    """HSTU attention forward over jagged sequences.
+
+    Runs the ping-pong kernel where it is faster and supported, else the
+    fallback (see `_resolve_fwd_pp_config`). Explicit tiles select the
+    fallback. pingpong=True requires the ping-pong (tiles then apply to it)
+    and raises if the shape is unsupported; pingpong=False forces the fallback.
+    """
     batch, num_heads, head_dim, hidden_dim, dtype_str = _validate_inputs(
         q=q,
         k=k,
@@ -433,9 +578,12 @@ def flydsl_hstu_attention_fwd(
         block_n=block_n,
         num_waves=num_waves,
         waves_per_eu=waves_per_eu,
+        pingpong=pingpong,
     )
 
-    out = torch.empty_like(v)
+    # Contiguous whatever v's layout: the kernels store whole rows, and a cached
+    # compiled handle is only valid for the out layout it was compiled with.
+    out = torch.empty_like(v, memory_format=torch.contiguous_format)
     if num_targets is None:
         num_targets = torch.zeros(1, dtype=seq_offsets.dtype, device=out.device)
 
