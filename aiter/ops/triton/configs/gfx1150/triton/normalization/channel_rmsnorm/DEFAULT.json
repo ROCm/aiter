@@ -1,0 +1,22 @@
+{
+    "C_LEQ_128": {
+        "BLOCK_S": 512,
+        "BLOCK_C_MAX": 64,
+        "num_warps": 32
+    },
+    "C_LEQ_256": {
+        "BLOCK_S": 128,
+        "BLOCK_C_MAX": 256,
+        "num_warps": 16
+    },
+    "C_LEQ_512": {
+        "BLOCK_S": 32,
+        "BLOCK_C_MAX": 128,
+        "num_warps": 16
+    },
+    "any": {
+        "BLOCK_S": 64,
+        "BLOCK_C_MAX": 1024,
+        "num_warps": 32
+    }
+}
