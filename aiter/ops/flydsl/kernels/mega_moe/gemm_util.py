@@ -176,6 +176,9 @@ class ATileLoader:
         self._dma_rows = []
         for c in range_constexpr(0, total_chunks, self._total_threads):
             lin = fx.Int32(c) + fx.Int32(self._tx)
+            if const_expr(total_chunks < self._total_threads):
+                # the surplus threads repeat a chunk (same bytes to the same LDS slot)
+                lin = lin % fx.Int32(total_chunks)
             row = lin // fx.Int32(chunks_per_row)
             chunk = lin % fx.Int32(chunks_per_row)
             if const_expr(row_map is not None):

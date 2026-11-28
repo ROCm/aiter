@@ -1,0 +1,500 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+"""Fused EP MegaMoE layer (MXFP4 weights, gfx950) vs the pure-torch EP oracle: accuracy
+over token counts and routings, ending in a markdown summary table::
+
+    torchrun --nproc_per_node=8 op_tests/multigpu_tests/test_mega_moe_ep.py \\
+        -q a8w4 --mtpr 256 8192 -t 1 64 300 2048 8192 -r uniform zipf:1 spike
+
+Run with plain ``python3`` it relaunches itself under torchrun on up to 8 GPUs, or
+skips without >= 2 gfx950 GPUs. Exits 1 if any case failed.
+
+Shape (``--network``, ``NETWORKS``): ``v4_pro`` DeepSeek-V4-Pro (hidden 7168, inter
+3072, top-6, SwiGLU limit 10), ``kimi_k26`` Kimi-K2.6 (hidden 7168, inter 2048, top-8,
+no SwiGLU limit), ``v41_flash`` DeepSeek-V4.1-Flash (hidden 5120, inter 2304, top-6,
+SwiGLU limit 10), all 48 experts per rank; ``kimi_k3`` Kimi-K3 (hidden 3584, inter
+3072, top-16, 112 experts per rank, SiTUv2); ``mixtral_8x7b`` Mixtral-8x7B (hidden 4096,
+inter 14336, top-2, 1 expert per rank: inter_dim > model_dim). Each case runs one eager
+forward, then captures it in a CUDA graph and checks the output of the third replay (the
+replays run on the current stream and two side streams); the kernel's error flag must
+stay 0.  Then 8 back-to-back launches (no host sync) alternate with a second input,
+eager and replayed; each output must equal its input's isolated launch bit for bit
+(``b2b``: the mismatching launches).
+``--mtpr`` <= 512 selects the small-batch kernel, larger values the large one.
+After the cases of a layer, a ``rebind`` row checks ``set_weights`` against a graph
+captured before it (``check_rebind``; ``b2b``: the failed checks).
+
+``--ep-groups N``: N EP groups of W / N ranks (DP x EP), each with its own layer.
+
+Routings (``route_ids``):
+
+* ``uniform``: top-k of softmax(randn) logits -- every rank and expert evenly loaded.
+* ``zipf:S``: the expert of popularity rank r (a fixed random permutation) gets a logit
+  bias of -S * log(1 + r).  The hot experts are scattered over the ranks, so the load
+  is uneven *between* ranks; a larger S concentrates more tokens on fewer experts.
+* ``spike[:P1,P2,..]``: the shape the full model shows after expert-load rebalancing
+  (EPLB): hot expert j sits on rank j and is picked by a fraction P_j of the tokens
+  (default 0.8, 0.5, 0.35, 0.26, 0.2, 0.17, the first W on W ranks; at most W
+  fractions); the other routes go to the remaining
+  experts with rank weight max(K / W - P_r, 0.1).  The ranks stay roughly balanced but
+  a hot rank's rows mostly belong to ONE expert -- the imbalance is *within* a rank.
+* ``same``: every token routes to experts 0..K-1 (one rank takes everything).
+* ``invalid[:P]``: ``uniform`` with a fraction P (default 0.25) of the top-k slots set
+  to -1 or ``experts`` (alternately) and their weights to NaN -- the padded / masked
+  slots ATOM (-1) and SGLang (``experts``) pass; they must not contribute.
+
+``--uneven``: rank r runs ``t * (W + r) // (2 W)`` tokens instead of ``t``.
+
+``--act``: override the network's activation; SiTUv2 (Kimi-K3's, beta / linear beta
+``SITU_BETA``) self-saturates through tanh and so runs without the SwiGLU limit.
+"""
+
+from __future__ import annotations
+
+import argparse
+import gc
+import itertools
+import os
+import subprocess
+import sys
+import traceback
+
+import pandas as pd
+import torch
+import torch.distributed as dist
+
+import aiter
+from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx_runtime
+
+# (model_dim, inter_dim, topk, swiglu_limit, experts per rank, activation)
+NETWORKS = {
+    "v4_pro": (7168, 3072, 6, 10.0, 48, "silu"),
+    "kimi_k26": (7168, 2048, 8, 0.0, 48, "silu"),
+    "v41_flash": (5120, 2304, 6, 10.0, 48, "silu"),
+    "kimi_k3": (3584, 3072, 16, 0.0, 112, "situv2"),
+    "mixtral_8x7b": (4096, 14336, 2, 0.0, 1, "silu"),
+}
+TOL = {"a8w4": 0.10, "a4w4": 0.25}  # rel_l2 vs the oracle
+SITU_BETA = (4.0, 25.0)  # the Kimi-K3 checkpoint constants
+SPIKE = (0.8, 0.5, 0.35, 0.26, 0.2, 0.17)
+SUPPORTED_GFX = ("gfx950",)
+
+
+def route_ids(route, tokens, experts, world, rank, seed, device, H, K):
+    """``(x, wts, ids)`` of ``tokens`` tokens on this rank for routing ``route``."""
+    epr = experts // world
+    g = torch.Generator(device=device).manual_seed(777 + rank * 131 + tokens + seed)
+    x = torch.randn(tokens, H, dtype=torch.bfloat16, device=device, generator=g) * 0.1
+    logits = torch.randn(tokens, experts, device=device, generator=g)
+    if route.startswith("zipf:"):
+        perm = torch.randperm(experts, generator=torch.Generator().manual_seed(5)).to(
+            device
+        )
+        logits -= float(route[5:]) * torch.log1p(perm.float())
+    elif route not in ("uniform", "same") and not route.startswith(
+        ("spike", "invalid")
+    ):
+        raise ValueError(f"unknown route {route!r}")
+    wts, ids = torch.topk(torch.softmax(logits, -1), K, -1)
+    if route.startswith("spike"):
+        if ":" in route:
+            ps = [float(v) for v in route[6:].split(",")]
+            if not 0 < len(ps) <= world:
+                raise ValueError(
+                    f"{route!r}: 1 .. {world} hot fractions (one per rank)"
+                )
+        else:
+            ps = list(SPIKE[:world])
+        ps = torch.tensor(ps, device=device)
+        hot = torch.tensor(
+            [j * epr + (7 * j) % epr for j in range(len(ps))], device=device
+        )
+        gs = torch.Generator(device=device).manual_seed(
+            4242 + rank * 131 + tokens + seed
+        )
+        pick = torch.rand(tokens, len(ps), device=device, generator=gs) < ps
+        wr = torch.full((world,), K / world, device=device)
+        wr[: len(ps)] = (wr[: len(ps)] - ps).clamp(min=0.1)
+        pe = wr.repeat_interleave(epr)
+        pe[hot] = 0
+        rest = torch.multinomial(
+            pe.expand(tokens, -1), K, replacement=False, generator=gs
+        )
+        cand = torch.cat([torch.where(pick, hot.expand(tokens, -1), -1), rest], 1)
+        cand = torch.gather(
+            cand, 1, torch.argsort((cand < 0).int(), dim=1, stable=True)
+        )
+        ids = cand[:, :K]
+    if route == "same":
+        ids = torch.arange(K, device=device).expand(tokens, K)
+    wts, ids = wts.float(), ids.int()
+    if route.startswith("invalid"):
+        p = float(route[8:]) if ":" in route else 0.25
+        gi = torch.Generator(device=device).manual_seed(99 + rank * 131 + tokens + seed)
+        hole = torch.rand(tokens, K, device=device, generator=gi) < p
+        bad = torch.where(
+            torch.rand(tokens, K, device=device, generator=gi) < 0.5, -1, experts
+        )
+        ids = torch.where(hole, bad.int(), ids)
+        wts = torch.where(hole, float("nan"), wts)
+    return x, wts.contiguous(), ids.contiguous()
+
+
+def local_weights(rank, device, H, I, epr):
+    """This rank's local experts: natural MXFP4 ``(w1, w1_scale, w2, w2_scale)``."""
+    qz = aiter.get_torch_quant(aiter.QuantType.per_1x32)
+    g = torch.Generator(device=device).manual_seed(1234 + rank)
+    out = []
+    for rows, cols in ((2 * I, H), (H, I)):
+        w = torch.randn(
+            epr, rows, cols, dtype=torch.bfloat16, device=device, generator=g
+        )
+        q, s = qz(w * cols**-0.25, quant_dtype=dtypes.fp4x2)
+        out += [
+            q.view(epr, rows, cols // 2).contiguous(),
+            s.view(epr, rows, cols // 32).contiguous(),
+        ]
+    return tuple(out)
+
+
+def _max_over_ranks(*vals, device):
+    """Each value's max over every process (all EP groups)."""
+    stats = torch.tensor([float(v) for v in vals], device=device)
+    allv = [torch.empty_like(stats) for _ in range(dist.get_world_size())]
+    dist.all_gather(allv, stats)
+    return tuple(max(v[j].item() for v in allv) for j in range(len(vals)))
+
+
+def check(layer, ws, route, tokens, uneven, rank, world, device):
+    """One case; ``rank`` / ``world`` are the EP group's."""
+    nb = max(1, tokens * (world + rank) // (2 * world)) if uneven else tokens
+    x, wts, ids = route_ids(
+        route,
+        nb,
+        layer.cfg.experts,
+        world,
+        rank,
+        0,
+        device,
+        layer.cfg.model_dim,
+        layer.cfg.topk,
+    )
+    part = layer.engine._part.local  # zeroed so a missed scatter cannot reuse a result
+    part.zero_()
+    out = layer(x, wts, ids)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = layer(x, wts, ids)
+    cur = torch.cuda.current_stream()
+    # side streams sit on other HW queues, which rotate the CTA -> XCC map
+    for stream in (cur, torch.cuda.Stream(), torch.cuda.Stream()):
+        torch.cuda.synchronize()
+        dist.barrier()
+        part.zero_()
+        stream.wait_stream(cur)
+        with torch.cuda.stream(stream):
+            graph.replay()
+        cur.wait_stream(stream)
+    torch.cuda.synchronize()
+    err = layer.poll_errors()
+    ref = layer.reference_forward(x, wts, ids, ws).float()
+    rel = ((out.float() - ref).norm() / ref.norm().clamp_min(1e-9)).item()
+    # back-to-back launches alternating with a second input (no host sync between
+    # them), eager and replayed with the inputs copied into the captured buffers: the
+    # kernel is deterministic, so each output must equal its input's isolated launch
+    first, want = (x.clone(), wts.clone(), ids.clone()), {0: out.clone()}
+    second = route_ids(
+        route,
+        nb,
+        layer.cfg.experts,
+        world,
+        rank,
+        1,
+        device,
+        layer.cfg.model_dim,
+        layer.cfg.topk,
+    )
+    torch.cuda.synchronize()
+    dist.barrier()
+    want[1] = layer(*second).clone()
+    torch.cuda.synchronize()
+    dist.barrier()
+    got = []
+    for k in (1, 0, 1, 0):
+        src = (first, second)[k]
+        got.append((k, layer(*src).clone()))
+        for dst, val in zip((x, wts, ids), src):
+            dst.copy_(val)
+        graph.replay()
+        got.append((k, out.clone()))
+    torch.cuda.synchronize()
+    b2b = sum(
+        bool((o.view(torch.int16) != want[k].view(torch.int16)).any()) for k, o in got
+    )
+    err |= layer.poll_errors()
+    del graph
+    return _max_over_ranks(rel, err, b2b, device=device)
+
+
+def check_rebind(layer, tokens, rank, world, device):
+    """``set_weights`` under CUDA graphs: natural weights are refused, a graph captured
+    before replays its own weights (bit for bit, with the freed memory reused), and
+    forwards after it run on the new (preshuffled) weights.  Leaves the layer bound to
+    the new weights.  Returns (rel_l2 of the new weights, error flag, failed checks)."""
+    from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
+
+    cfg = layer.cfg
+    H, I, epr = cfg.model_dim, cfg.inter_dim, cfg.experts // world
+    x, wts, ids = route_ids(
+        "uniform", tokens, cfg.experts, world, rank, 2, device, H, cfg.topk
+    )
+    layer(x, wts, ids)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = layer(x, wts, ids)
+    graph.replay()
+    torch.cuda.synchronize()
+    want = out.clone()
+    ws = local_weights(rank + world, device, H, I, epr)
+    pre = (
+        shuffle_weight_a16w4(ws[0], 16, True).contiguous(),
+        shuffle_scale_a16w4(ws[1].reshape(-1, H // 32), epr, True).contiguous(),
+        shuffle_weight_a16w4(ws[2], 16, False).contiguous(),
+        shuffle_scale_a16w4(ws[3].reshape(-1, I // 32), epr, False).contiguous(),
+    )
+    bad = 0
+    try:
+        layer.set_weights(w1=ws[0], w1_scale=ws[1], w2=ws[2], w2_scale=ws[3])
+        bad += 1
+    except ValueError:
+        pass
+    layer.set_weights(
+        w1=pre[0], w1_scale=pre[1], w2=pre[2], w2_scale=pre[3], preshuffled=True
+    )
+    gc.collect()
+    # zero-filled blocks take over any weight memory freed by the rebinding
+    junk = [
+        torch.zeros(t.numel() * t.element_size(), dtype=torch.uint8, device=device)
+        for t in pre
+    ]
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph.replay()
+    torch.cuda.synchronize()
+    bad += bool((out.view(torch.int16) != want.view(torch.int16)).any())
+    got = layer(x, wts, ids).float()
+    torch.cuda.synchronize()
+    ref = layer.reference_forward(x, wts, ids, ws).float()
+    rel = ((got - ref).norm() / ref.norm().clamp_min(1e-9)).item()
+    err = layer.poll_errors()
+    del graph, junk
+    return _max_over_ranks(rel, err, bad, device=device)
+
+
+def main() -> int:
+    if get_gfx_runtime() not in SUPPORTED_GFX:
+        if int(os.environ.get("RANK", "0")) == 0:
+            aiter.logger.warning(
+                "MegaMoE EP unsupported on %s; skipping", get_gfx_runtime()
+            )
+        return 0
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter, description=__doc__
+    )
+    parser.add_argument(
+        "-q",
+        "--quant",
+        nargs="*",
+        default=["a8w4", "a4w4"],
+        choices=list(TOL),
+        help="Activation quant.\n    e.g.: -q a8w4",
+    )
+    parser.add_argument(
+        "--mtpr",
+        type=int,
+        nargs="*",
+        default=[256, 8192],
+        help="max_tok_per_rank (power of two).\n    e.g.: --mtpr 8192",
+    )
+    parser.add_argument(
+        "-t",
+        "--tokens",
+        type=int,
+        nargs="*",
+        default=[0, 1, 7, 64, 256, 300, 2048, 8192],
+        help="Tokens per rank (cases above mtpr are skipped).",
+    )
+    parser.add_argument(
+        "-r",
+        "--routes",
+        nargs="*",
+        default=["uniform", "zipf:1", "zipf:2", "spike", "invalid"],
+        help="Routings (see above).\n    e.g.: -r uniform spike:0.9",
+    )
+    parser.add_argument("--uneven", action="store_true", help="Uneven per-rank tokens.")
+    parser.add_argument(
+        "--ep-groups",
+        type=int,
+        default=1,
+        help="Split the ranks into this many EP groups (DP x EP), each its own layer.",
+    )
+    parser.add_argument(
+        "--network", choices=NETWORKS, default="v4_pro", help="Layer shape (see above)."
+    )
+    parser.add_argument(
+        "--act",
+        choices=["silu", "situv2"],
+        default=None,
+        help="Activation (default: the network's).",
+    )
+    args = parser.parse_args()
+
+    from aiter.ops.flydsl.mega_moe_ep import MegaMoeEP, MegaMoeEPConfig
+
+    rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
+    lr = int(os.environ.get("LOCAL_RANK", rank))
+    torch.cuda.set_device(lr)
+    device = torch.device("cuda", lr)
+    dist.init_process_group("cpu:gloo,cuda:nccl", device_id=device)
+    if rank != 0:
+        aiter.logger.setLevel("WARNING")
+    if args.ep_groups < 1 or world % args.ep_groups:
+        raise ValueError(f"--ep-groups {args.ep_groups} does not divide {world} ranks")
+    # rank / world from here on: this process's EP group (grank: the global rank)
+    grank, world = rank, world // args.ep_groups
+    group = None
+    if args.ep_groups > 1:
+        groups = [
+            dist.new_group(list(range(g * world, (g + 1) * world)))
+            for g in range(args.ep_groups)
+        ]
+        group = groups[grank // world]
+    rank = grank % world
+    H, I, K, swiglu_limit, epr, net_act = NETWORKS[args.network]
+    args.act = args.act or net_act
+    act = {"act": args.act}
+    if args.act == "situv2":
+        act.update(situ_beta=SITU_BETA[0], situ_linear_beta=SITU_BETA[1])
+        swiglu_limit = 0.0
+    ws = local_weights(grank, device, H, I, epr)
+
+    rows = []
+    for quant, mtpr in itertools.product(args.quant, args.mtpr):
+        cfg = MegaMoeEPConfig(
+            rank=rank,
+            world_size=world,
+            model_dim=H,
+            inter_dim=I,
+            experts=epr * world,
+            topk=K,
+            max_tok_per_rank=mtpr,
+            quant=quant,
+            swiglu_limit=swiglu_limit,
+            **act,
+        )
+        layer = MegaMoeEP(
+            cfg,
+            w1=ws[0],
+            w1_scale=ws[1],
+            w2=ws[2],
+            w2_scale=ws[3],
+            group=group,
+            device=device,
+        )
+        layer.prepare()
+        for tokens, route in itertools.product(args.tokens, args.routes):
+            if tokens > mtpr:
+                continue
+            row = {
+                "network": args.network,
+                "act": args.act,
+                "quant": quant,
+                "mtpr": mtpr,
+                "tokens": tokens,
+                "route": route,
+                "uneven": args.uneven,
+            }
+            try:
+                rel, err, b2b = check(
+                    layer, ws, route, tokens, args.uneven, rank, world, device
+                )
+                ok = rel < TOL[quant] and not err and not b2b
+                row.update(
+                    rel_l2=f"{rel:.4f}",
+                    err=int(err),
+                    b2b=int(b2b),
+                    status="PASS" if ok else "FAIL",
+                )
+            except Exception:  # noqa: BLE001 - one failed case must not end the sweep
+                if grank == 0:
+                    traceback.print_exc()
+                row.update(rel_l2="-", err="-", b2b="-", status="ERROR")
+            rows.append(row)
+            if grank == 0:
+                aiter.logger.info("%s", row)
+        tokens = min(64, mtpr)
+        row = {
+            "network": args.network,
+            "act": args.act,
+            "quant": quant,
+            "mtpr": mtpr,
+            "tokens": tokens,
+            "route": "rebind",
+            "uneven": False,
+        }
+        try:
+            rel, err, b2b = check_rebind(layer, tokens, rank, world, device)
+            ok = rel < TOL[quant] and not err and not b2b
+            row.update(
+                rel_l2=f"{rel:.4f}",
+                err=int(err),
+                b2b=int(b2b),
+                status="PASS" if ok else "FAIL",
+            )
+        except Exception:  # noqa: BLE001
+            if grank == 0:
+                traceback.print_exc()
+            row.update(rel_l2="-", err="-", b2b="-", status="ERROR")
+        rows.append(row)
+        if grank == 0:
+            aiter.logger.info("%s", row)
+        del layer
+        gc.collect()
+        torch.cuda.empty_cache()
+        dist.barrier()
+
+    failed = [r for r in rows if r["status"] != "PASS"]
+    if grank == 0:
+        aiter.logger.info(
+            "MegaMoE EP %dx ep%d accuracy:\n%s",
+            args.ep_groups,
+            world,
+            pd.DataFrame(rows).to_markdown(index=False),
+        )
+        aiter.logger.info(
+            "MegaMoE EP: %d/%d passed", len(rows) - len(failed), len(rows)
+        )
+    dist.barrier()
+    dist.destroy_process_group()
+    return 1 if failed else 0
+
+
+def _relaunch() -> int:
+    """Plain ``python3`` run (CI): torchrun on up to 8 GPUs, or skip."""
+    from aiter.ops.flydsl.mega_moe_ep import mega_moe_ep_supported
+
+    n = torch.cuda.device_count()
+    if n < 2 or not mega_moe_ep_supported():
+        print("test_mega_moe_ep: skipped (needs >= 2 gfx950 GPUs)", flush=True)
+        return 0
+    n = 8 if n >= 8 else 4 if n >= 4 else 2
+    cmd = [sys.executable, "-m", "torch.distributed.run", "--standalone"]
+    cmd += [f"--nproc_per_node={n}", os.path.abspath(__file__), *sys.argv[1:]]
+    return subprocess.call(cmd)
+
+
+if __name__ == "__main__":
+    sys.exit(main() if "RANK" in os.environ else _relaunch())
