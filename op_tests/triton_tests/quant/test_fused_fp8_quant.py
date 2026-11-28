@@ -11,10 +11,12 @@ from aiter.ops.triton.quant.fused_fp8_quant import (
     fused_rms_fp8_group_quant,
     fused_rms_fp8_per_tensor_static_quant,
     fused_silu_mul_fp8_per_tensor_static_quant,
+    fused_silu_mul_fp8_per_token_quant,
 )
 from aiter.test_common import (
     assertAllclose,
 )
+from op_tests.triton_tests.utils.per_token_fp8_ref import per_token_fp8_ref
 from op_tests.triton_tests.utils.types import with_default_dtype
 
 rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
@@ -830,3 +832,41 @@ def test_silu_mul_quant_fuse(m, n):
     fp8_x = triton_silu_mul_fp8_quantization_fuse(x, x_scale, rocm_fp8_dtype)
 
     assertAllclose(fp8_x.to(torch.float32), fp8_x_ref.to(torch.float32))
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "m, n", [(1, 128), (7, 4096), (256, 14336), (1033, 14336), (333, 1000)]
+)
+def test_silu_mul_fp8_per_token_quant(m, n, dtype):
+    torch.manual_seed(0)
+    x = torch.randn((m, 2 * n), dtype=dtype, device="cuda")
+    gate, up = x.split([n, n], dim=-1)
+    # silu-and-mul as stored by an unfused op: activation and product rounded.
+    act = F.silu(gate.float()).to(dtype).float()
+    y = (act * up.float()).to(dtype).float()
+    q_ref, s_ref = per_token_fp8_ref(y, rocm_aiter_fp8_dtype)
+
+    q, s = fused_silu_mul_fp8_per_token_quant(x)
+
+    assert q.shape == (m, n) and q.dtype == rocm_aiter_fp8_dtype
+    assert s.shape == (m, 1) and s.dtype == torch.float32
+    # exp differs from torch in the last fp32 bit, which can move a rounded
+    # activation by one input ulp; anything beyond that is a real mismatch.
+    torch.testing.assert_close(s, s_ref, rtol=1e-2, atol=0)
+    err = (q.float() * s - y).abs()
+    assert (err <= y.abs() * (2.0**-4 + 2.0**-6) + s * 2.0**-9).all()
+    differ = (q.view(torch.uint8) != q_ref.view(torch.uint8)).float().mean().item()
+    assert differ < 1e-3, f"{differ:.3%} of fp8 codes differ from the reference"
+
+
+def test_silu_mul_fp8_per_token_quant_empty_and_zero_row():
+    x = torch.zeros((0, 256), dtype=torch.bfloat16, device="cuda")
+    q, s = fused_silu_mul_fp8_per_token_quant(x)
+    assert q.shape == (0, 128) and s.shape == (0, 1)
+    x = torch.randn((4, 256), dtype=torch.bfloat16, device="cuda")
+    x[2] = 0
+    q, s = fused_silu_mul_fp8_per_token_quant(x)
+    fp8_max = torch.finfo(rocm_aiter_fp8_dtype).max
+    assert s[2].item() == pytest.approx(1.0 / (fp8_max * 512))
+    assert not q[2].float().any()

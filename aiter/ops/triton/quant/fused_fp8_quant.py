@@ -14,6 +14,7 @@ from aiter.ops.triton._triton_kernels.quant.fused_fp8_quant import (
     _fused_rms_fp8_group_quant_kernel,
     _fused_rms_fp8_per_tensor_static_quant_kernel,
     _fused_silu_mul_fp8_per_tensor_static_quant_kernel,
+    _fused_silu_mul_fp8_per_token_quant_kernel,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
@@ -1053,3 +1054,46 @@ def fused_silu_mul_fp8_per_tensor_static_quant(
     )
 
     return out_fp8
+
+
+def fused_silu_mul_fp8_per_token_quant(inp, dtype_quant=fp8_dtype):
+    """
+    SiLU-and-mul with a dynamic per-token FP8 output:
+        y[m] = silu(inp[m, :N]) * inp[m, N:]
+        out_fp8[m] * out_scale[m] ~= y[m],  out_scale[m] = max(amax(y[m]) / FP8_MAX, 1 / (FP8_MAX * 512))
+
+    silu and the product are rounded to ``inp.dtype`` as an unfused
+    silu-and-mul stores them, so the result matches that op followed by a
+    dynamic per-token quantization of its output.
+
+    Key parameters:
+    - inp: Matrix with shape (M, 2 * N), unit stride along the last dim, N <= 16384.
+
+    Returns:
+    - out_fp8: The output matrix with shape (M, N).
+    - out_scale: Per-token fp32 scales with shape (M, 1).
+    """
+    _LOGGER.info(f"FUSED_SILU_MUL_FP8_PER_TOKEN_QUANT: inp={tuple(inp.shape)}")
+    M, N2 = inp.shape
+    assert N2 % 2 == 0
+    assert inp.stride(1) == 1, "inp must have unit stride along the last dim"
+    N = N2 // 2
+    assert N <= 16384, "rows wider than 16384 are not supported"
+
+    out_fp8 = torch.empty((M, N), dtype=dtype_quant, device=inp.device)
+    out_scale = torch.empty((M, 1), dtype=torch.float32, device=inp.device)
+    if M == 0:
+        return out_fp8, out_scale
+    dtype_max = float(torch.finfo(dtype_quant).max)
+    _fused_silu_mul_fp8_per_token_quant_kernel[(M,)](
+        out_fp8,
+        out_scale,
+        inp,
+        inp.stride(0),
+        N=N,
+        BLOCK_SIZE_N=triton.next_power_of_2(N),
+        DTYPE_MAX=dtype_max,
+        MIN_SCALE=1.0 / (dtype_max * 512.0),
+        num_warps=16,
+    )
+    return out_fp8, out_scale

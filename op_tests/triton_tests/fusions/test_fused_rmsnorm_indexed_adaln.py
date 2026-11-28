@@ -4,9 +4,16 @@
 import pytest
 import torch
 
-from aiter.ops.triton.fusions.fused_rmsnorm_indexed_adaln import (
-    fused_rmsnorm_indexed_adaln,
+from aiter.ops.triton.fusions.fused_indexed_gated_residual import (
+    fused_indexed_gated_residual,
 )
+from aiter.ops.triton.fusions.fused_rmsnorm_indexed_adaln import (
+    fused_gated_residual_rmsnorm_indexed_adaln_fp8_per_token_quant,
+    fused_rmsnorm_indexed_adaln,
+    fused_rmsnorm_indexed_adaln_fp8_per_token_quant,
+)
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+from op_tests.triton_tests.utils.per_token_fp8_ref import per_token_fp8_ref
 
 
 def reference(x, weight, shift, scale, indices, eps, round_intermediate=False):
@@ -171,3 +178,154 @@ def test_int32_indices_are_accepted():
     )
     want = fused_rmsnorm_indexed_adaln(x, weight, shift, scale, indices, eps=1e-5)
     torch.testing.assert_close(got, want, atol=0, rtol=0)
+
+
+# --- dynamic per-token FP8 outputs ---------------------------------------------
+
+FP8 = get_fp8_e4m3_dtype()
+
+
+def assert_quantizes(q, s, want):
+    """q * s is a per-token FP8 quantization of want.
+
+    The kernel quantizes its own y, which may sit one input ulp away from the
+    reference's, so scales are compared to 1%, values to half an fp8 step plus
+    that ulp, and fp8 codes must agree almost everywhere.
+    """
+    M, N = want.shape
+    assert q.shape == (M, N) and q.dtype == FP8
+    assert s.shape == (M, 1) and s.dtype == torch.float32
+    q_ref, s_ref = per_token_fp8_ref(want, FP8)
+    torch.testing.assert_close(s, s_ref, rtol=1e-2, atol=0)
+    wf = want.float()
+    err = (q.float() * s - wf).abs()
+    assert (err <= wf.abs() * (2.0**-4 + 2.0**-6) + s * 2.0**-9).all()
+    differ = (q.view(torch.uint8) != q_ref.view(torch.uint8)).float().mean().item()
+    assert differ < 1e-2, f"{differ:.2%} of fp8 codes differ from the reference"
+
+
+FP8_SHAPES = [
+    (1, 5376, 3),
+    (128, 5376, 9),  # MiniMax-H3 hidden size
+    (333, 320, 4),
+    (64, 8192, 6),
+    (5, 3072, 2),
+]
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("M,N,G", FP8_SHAPES)
+@pytest.mark.parametrize("runs", [True, False])
+def test_fp8_per_token_quant_matches_adaln_then_quant(dtype, M, N, G, runs):
+    x, weight, shift, scale, indices = make(M, N, G, dtype, "cuda", runs=runs)
+    q, s = fused_rmsnorm_indexed_adaln_fp8_per_token_quant(
+        x, weight, shift, scale, indices, eps=1e-5
+    )
+    assert_quantizes(q, s, reference(x, weight, shift, scale, indices, 1e-5))
+
+
+def make_gated(M, N, G, dtype, runs, seed=1):
+    residual, weight, shift, scale, indices = make(M, N, G, dtype, "cuda", runs=runs)
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    branch = torch.randn(M, N, generator=gen, device="cuda", dtype=dtype)
+    gate = torch.randn(G, N, generator=gen, device="cuda", dtype=dtype) * 0.5
+    return residual, gate, branch, weight, shift, scale, indices
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("M,N,G", FP8_SHAPES)
+@pytest.mark.parametrize("runs", [True, False])
+def test_gated_fp8_per_token_quant_matches_unfused(dtype, M, N, G, runs):
+    residual, gate, branch, weight, shift, scale, indices = make_gated(
+        M, N, G, dtype, runs
+    )
+    residual_out, q, s = fused_gated_residual_rmsnorm_indexed_adaln_fp8_per_token_quant(
+        residual, gate, branch, weight, shift, scale, indices, eps=1e-5
+    )
+    want_residual = (
+        residual.float() + gate.index_select(0, indices).float() * branch.float()
+    ).to(dtype)
+    assert residual_out.dtype == dtype
+    tol = {torch.float32: 1e-6, torch.float16: 1e-3, torch.bfloat16: 8e-3}[dtype]
+    torch.testing.assert_close(residual_out, want_residual, atol=tol, rtol=tol)
+    # Quantize the norm of the residual the kernel actually stored.
+    want = reference(residual_out, weight, shift, scale, indices, 1e-5)
+    assert_quantizes(q, s, want)
+
+
+def test_gated_residual_out_matches_fused_indexed_gated_residual():
+    residual, gate, branch, weight, shift, scale, indices = make_gated(
+        256, 5376, 9, torch.bfloat16, runs=False
+    )
+    residual_out, _, _ = fused_gated_residual_rmsnorm_indexed_adaln_fp8_per_token_quant(
+        residual, gate, branch, weight, shift, scale, indices
+    )
+    want = fused_indexed_gated_residual(residual, branch, gate, indices)
+    torch.testing.assert_close(residual_out, want, atol=0, rtol=0)
+
+
+def test_gated_fp32_product_is_rounded_before_the_add():
+    # An fma would keep gate * branch = 2**46 - 1 exact and store -1, not 0.
+    M, N = 2, 256
+    residual, gate, branch, weight, shift, scale, indices = make_gated(
+        M, N, 3, torch.float32, runs=True
+    )
+    residual[:, 0] = -(2.0**46)
+    gate[:, 0] = 2.0**23 + 1
+    branch[:, 0] = 2.0**23 - 1
+    residual_out, _, _ = fused_gated_residual_rmsnorm_indexed_adaln_fp8_per_token_quant(
+        residual, gate, branch, weight, shift, scale, indices
+    )
+    want = residual + gate.index_select(0, indices) * branch
+    assert torch.equal(residual_out, want)
+    assert not residual_out[:, 0].any()
+
+
+def test_gated_rejects_mismatched_gate_table():
+    residual, gate, branch, weight, shift, scale, indices = make_gated(
+        8, 256, 3, torch.bfloat16, runs=True
+    )
+    with pytest.raises(AssertionError):
+        fused_gated_residual_rmsnorm_indexed_adaln_fp8_per_token_quant(
+            residual, gate[:1], branch, weight, shift, scale, indices
+        )
+
+
+def test_fp8_per_token_quant_zero_row_and_int32_indices():
+    x, weight, shift, scale, indices = make(16, 1024, 3, torch.bfloat16, "cuda")
+    shift[1] = 0
+    scale[1] = -1  # rows indexed 1 modulate to exactly zero
+    indices[3] = 1
+    q, s = fused_rmsnorm_indexed_adaln_fp8_per_token_quant(
+        x, weight, shift, scale, indices.to(torch.int32)
+    )
+    q64, s64 = fused_rmsnorm_indexed_adaln_fp8_per_token_quant(
+        x, weight, shift, scale, indices
+    )
+    assert torch.equal(q.view(torch.uint8), q64.view(torch.uint8))
+    assert torch.equal(s, s64)
+    fp8_max = torch.finfo(FP8).max
+    assert (
+        s[3].item() == pytest.approx(1.0 / (fp8_max * 512)) and not q[3].float().any()
+    )
+
+
+def test_fp8_per_token_quant_empty_and_rejects():
+    x, weight, shift, scale, indices = make(0, 256, 3, torch.bfloat16, "cuda")
+    q, s = fused_rmsnorm_indexed_adaln_fp8_per_token_quant(
+        x, weight, shift, scale, indices
+    )
+    assert q.shape == (0, 256) and s.shape == (0, 1)
+    x, weight, shift, scale, indices = make(8, 256, 3, torch.bfloat16, "cuda")
+    with pytest.raises(AssertionError):
+        fused_rmsnorm_indexed_adaln_fp8_per_token_quant(
+            x, weight[:-1], shift, scale, indices
+        )
+    with pytest.raises(AssertionError):
+        fused_rmsnorm_indexed_adaln_fp8_per_token_quant(
+            x[:, ::2], weight[:128], shift[:, :128], scale[:, :128], indices
+        )
+    with pytest.raises(AssertionError):
+        fused_rmsnorm_indexed_adaln_fp8_per_token_quant(
+            x, weight, shift, scale, indices.float()
+        )
