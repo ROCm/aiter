@@ -2260,8 +2260,9 @@ def mhc_fused_post_pre_delayed(
         layer_input[t]     = sum_j pre_mix[t, j] residual_out[t, j]
         post_mix, comb_mix, next_pre_mix = the gates of residual_out (as ``mhc_pre``)
 
-    residual_out reproduces ``mhc_post`` bit for bit (its fp32 order and bf16
-    truncation); layer_input is the fp32 sum over streams 0..3 rounded to nearest even.
+    residual_out is ``mhc_post``'s fp32 value (same order) truncated to bf16, where
+    ``mhc_post`` itself rounds to nearest even; layer_input is the fp32 sum over
+    streams 0..3 rounded to nearest even.
 
     Runs the ASM kernels of hsa/gfx942/mhc_seam in two launches: one kernel for the
     post, the collapse and the split-K partials of the pre GEMM (below

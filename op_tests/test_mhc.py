@@ -690,8 +690,18 @@ def mhc_post_ref(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
+    return mhc_post_ref_fp32(x, residual, post_layer_mix, comb_res_mix).to(x.dtype)
+
+
+def mhc_post_ref_fp32(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+) -> torch.Tensor:
+    """`mhc_post_ref` before its cast to the output dtype."""
     term2 = torch.bmm(comb_res_mix.mT, residual.float())
-    return (x.float().unsqueeze(-2) * post_layer_mix + term2).to(x.dtype)
+    return x.float().unsqueeze(-2) * post_layer_mix + term2
 
 
 @benchmark()
@@ -716,8 +726,30 @@ def test_mhc_post(m, hidden_size, hc_mult, dtype=dtypes.bf16, data_init="norm", 
         f"mhc_post m={m} hidden={hidden_size} {dtype}: {hip_err:.2%} of "
         "elements outside tolerance"
     )
+    # The output must be rounded to nearest, not toward zero: truncation stays inside
+    # the tolerance above but shrinks every output by half an ulp on average, which
+    # compounds over the residual stream of a deep model. Signed error toward the
+    # magnitude, relative to the mean magnitude: about -2.8e-3 for BF16 truncation;
+    # rounding to nearest gives 0 with a spread of 5e-5 at the smallest case
+    # (m=1, hidden=512), so 5e-4 is 10 sigma there. Checked for BF16 only (FP16 is
+    # converted in hardware), and not when the module was built to truncate on
+    # purpose (OPUS_FP32_to_BF16_DEFAULT 1 or 2).
+    out_ref32 = mhc_post_ref_fp32(x, residual, post_layer_mix, comb_res_mix)
+    scale = out_ref32.abs().mean().item() if out_ref32.numel() else 0.0
+    bias = (
+        ((out_hip.float() - out_ref32) * out_ref32.sign()).mean().item() / scale
+        if scale > 0
+        else 0.0
+    )
+    truncating_build = os.environ.get("OPUS_FP32_to_BF16_DEFAULT") in ("1", "2")
+    if dtype == dtypes.bf16 and not truncating_build:
+        assert abs(bias) <= 5e-4, (
+            f"mhc_post m={m} hidden={hidden_size} {dtype}: rounding bias {bias:.2e} "
+            "(outputs rounded toward zero?)"
+        )
     ret = {}
     ret["hip_err"] = hip_err
+    ret["round_bias"] = bias
     ret["hip_us"] = hip_us
     ret["TB/s"] = (
         (

@@ -7,7 +7,8 @@
 // For T tokens, with x the sub-layer output and post / comb / pre the gates of the
 // previous seam:
 //   residual_out[t, j] = bf16(sum_i comb[t, i, j] residual[t, i] + post[t, j] x[t])
-//                        fp32, the order and truncation of aiter's mhc_post (bit-exact)
+//                        fp32 in aiter's mhc_post order, truncated to bf16 (mhc_post
+//                        itself rounds to nearest even)
 //   layer_input[t]     = bf16(((0 + pre[t, 0] r0) + pre[t, 1] r1) + ... + pre[t, 3] r3)
 //                        r_j = fp32(residual_out[t, j]), separate fp32 mul / add, RNE
 // and the split-K partials of the next pre projection over column slices of width w:
