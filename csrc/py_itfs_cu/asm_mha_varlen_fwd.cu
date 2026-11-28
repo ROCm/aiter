@@ -9,6 +9,63 @@
 
 namespace aiter {
 namespace torch_itfs {
+
+// Folds the KV slices of a THD launch into out (and lse) by log-sum-exp, as lse_merge does: a
+// slice that reached none of a row's keys has LSE -inf and weighs 0 without its O being read,
+// since 0 * NaN is NaN. One block per (token, head) row, four channels per thread.
+__global__ void thd_kv_split_merge_kernel(const float* __restrict__ o_part,
+                                          const float* __restrict__ lse_part,
+                                          at::BFloat16* __restrict__ out,
+                                          float* __restrict__ lse,
+                                          int splits,
+                                          int heads,
+                                          int64_t o_part_stride_split,
+                                          int64_t o_part_stride_t,
+                                          int64_t o_part_stride_h,
+                                          int64_t lse_part_stride_split,
+                                          int64_t lse_part_stride_h,
+                                          int64_t out_stride_t,
+                                          int64_t out_stride_h,
+                                          int64_t lse_stride_h)
+{
+    const int64_t row   = blockIdx.x;
+    const int64_t token = row / heads;
+    const int64_t head  = row % heads;
+    const int64_t col   = 4 * static_cast<int64_t>(threadIdx.x);
+
+    const float* lse_row = lse_part + head * lse_part_stride_h + token;
+    float lse_max        = -INFINITY;
+    for(int s = 0; s < splits; ++s)
+        lse_max = fmaxf(lse_max, lse_row[s * lse_part_stride_split]);
+    // A row no slice reached keeps every weight at zero rather than exp(-inf - -inf).
+    const float base = lse_max == -INFINITY ? 0.f : lse_max;
+
+    const float* o_row = o_part + token * o_part_stride_t + head * o_part_stride_h + col;
+    float total        = 0.f;
+    float4 acc         = make_float4(0.f, 0.f, 0.f, 0.f);
+    for(int s = 0; s < splits; ++s)
+    {
+        const float partial = lse_row[s * lse_part_stride_split];
+        if(partial == -INFINITY)
+            continue;
+        const float weight = expf(partial - base);
+        const float4 value = *reinterpret_cast<const float4*>(o_row + s * o_part_stride_split);
+        total += weight;
+        acc.x += weight * value.x;
+        acc.y += weight * value.y;
+        acc.z += weight * value.z;
+        acc.w += weight * value.w;
+    }
+    const float scale     = total > 0.f ? 1.f / total : 0.f;
+    at::BFloat16* out_row = out + token * out_stride_t + head * out_stride_h + col;
+    out_row[0]            = at::BFloat16(acc.x * scale);
+    out_row[1]            = at::BFloat16(acc.y * scale);
+    out_row[2]            = at::BFloat16(acc.z * scale);
+    out_row[3]            = at::BFloat16(acc.w * scale);
+    if(lse != nullptr && threadIdx.x == 0)
+        lse[head * lse_stride_h + token] = base + logf(total);
+}
+
 mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
                                           bool has_dropout_randval,
                                           const mask_info &mask,
@@ -490,8 +547,54 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                 bias_type,
                 how_v3_bf16_cvt);
 
+        // The THD rows may cut each work-group's key walk into KV slices that write FP32
+        // partials, merged below by their LSE.
+        const int kv_splits = aiter::fmha_fwd_v3_thd_kv_splits(args);
+        at::Tensor o_part, lse_part;
+        if (kv_splits > 1) {
+            o_part   = torch::empty({kv_splits, total_q, num_heads, head_size_v},
+                                    opts.dtype(torch::kFloat32));
+            lse_part = torch::empty({kv_splits, num_heads, total_q}, opts.dtype(torch::kFloat32));
+            args.o_ptr               = o_part.data_ptr();
+            args.stride_o            = o_part.stride(1);
+            args.nhead_stride_o      = o_part.stride(2);
+            args.lse_ptr             = lse_part.data_ptr();
+            args.has_lse             = true;
+            args.nhead_stride_lse    = lse_part.stride(1);
+            args.kv_splits           = kv_splits;
+            args.kv_split_stride_o   = o_part.stride(0);
+            args.kv_split_stride_lse = lse_part.stride(0);
+        }
+
         float t = aiter::mha_fwd(args, stream_config);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_v3_varlen_fwd");
+
+        if (kv_splits > 1 && total_q > 0) {
+            TORCH_CHECK(head_size_v % 4 == 0 && head_size_v / 4 <= 1024,
+                        "THD KV-split merge needs head_size_v a multiple of 4, at most 4096");
+            const int64_t merge_rows = int64_t(total_q) * num_heads;
+            TORCH_CHECK(merge_rows <= std::numeric_limits<int32_t>::max(),
+                        "THD KV-split merge launches one block per (token, head) row");
+            hipLaunchKernelGGL(thd_kv_split_merge_kernel,
+                               dim3(static_cast<unsigned int>(merge_rows)),
+                               dim3(head_size_v / 4),
+                               0,
+                               stream,
+                               o_part.data_ptr<float>(),
+                               lse_part.data_ptr<float>(),
+                               out.data_ptr<at::BFloat16>(),
+                               has_lse ? softmax_lse.data_ptr<float>() : nullptr,
+                               kv_splits,
+                               num_heads,
+                               o_part.stride(0),
+                               o_part.stride(1),
+                               o_part.stride(2),
+                               lse_part.stride(0),
+                               lse_part.stride(1),
+                               out.stride(0),
+                               out.stride(1),
+                               has_lse ? softmax_lse.stride(0) : 0);
+        }
     }
     else {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.

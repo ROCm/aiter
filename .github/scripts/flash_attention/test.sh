@@ -15,8 +15,14 @@ V2=tests/test_flash_attn_triton_amd.py
 V3=hopper/test_flash_attn_triton_amd.py
 status=0
 # Triton 3.9: these fault or hang in bwd_kernel_fused_causal (LLVM miscompile, fix pending in
-# https://github.com/llvm/llvm-project/pull/226689).
-OUTPUT_KNOWN_FAIL=(--deselect "test_flash_attn_triton_amd.py::test_flash_attn_output[0.0-0.17-2048-2048-128-True-False-False-False-mha-dtype0-True]" --deselect "test_flash_attn_triton_amd.py::test_flash_attn_output[0.0-0.17-2048-2048-128-True-False-False-False-mha-dtype0-False]")
+# https://github.com/llvm/llvm-project/pull/226689). The alibi=True twins abort the same way
+# (dropout 0.17, d 128, causal, mha), and an abort ends the whole pytest line.
+OUTPUT_KNOWN_FAIL=(
+    --deselect "test_flash_attn_triton_amd.py::test_flash_attn_output[0.0-0.17-2048-2048-128-True-False-False-False-mha-dtype0-True]"
+    --deselect "test_flash_attn_triton_amd.py::test_flash_attn_output[0.0-0.17-2048-2048-128-True-False-False-False-mha-dtype0-False]"
+    --deselect "test_flash_attn_triton_amd.py::test_flash_attn_output[0.0-0.17-2048-2048-128-True-False-True-False-mha-dtype0-True]"
+    --deselect "test_flash_attn_triton_amd.py::test_flash_attn_output[0.0-0.17-2048-2048-128-True-False-True-False-mha-dtype0-False]"
+)
 VARLEN_KNOWN_FAIL=(--deselect "test_flash_attn_triton_amd.py::test_flash_attn_varlen_output[0.0-0.17-1024-1024-32-True-False-True-False-mha-dtype0-False]")
 
 case "${1:-}" in

@@ -5,6 +5,7 @@ import argparse
 import ast
 import inspect
 import itertools
+import os
 
 import pandas as pd
 import pytest
@@ -668,6 +669,10 @@ def flash_attn_varlen_func_benchmark(
     )
 
 
+# Query heads of test_varlen_flash_attn_seq_padding, which takes no head count of its own.
+SEQ_PADDING_NHEADS = 8
+
+
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("gqa_ratio", [1, 8])
 @pytest.mark.parametrize("deterministic", [True, False])
@@ -723,7 +728,7 @@ def test_varlen_flash_attn_seq_padding(
     """End-to-end check that CK group-mode varlen path respects padded tokens."""
     torch.random.manual_seed(0)
 
-    nheads = 8
+    nheads = SEQ_PADDING_NHEADS
     device = "cuda"
 
     assert nheads % gqa_ratio == 0
@@ -920,6 +925,158 @@ def varlen_flash_attn_seq_padding_benchmark(
     )
 
 
+# gfx950 BF16 hd256 THD rows of fmha_v3_fwd (the mha_v4 THD objects): ragged documents with one
+# cu_seqlens tensor for Q and K, any GQA ratio, causal or not, and with
+# AITER_FMHA_V3_FWD_THD_KV_SPLITS each work-group's key walk in KV slices merged by their LSE.
+# The default BSHD sweep gives Q and K different lengths, so it never reaches these rows; the
+# launched kernels are checked in the profiler trace.
+_THD_HD256_FWD_KERNEL = "fmha_fwd_hd256_bf16_varlen"
+_THD_KV_SPLIT_MERGE_KERNEL = "thd_kv_split_merge"
+_THD_KV_SPLITS_ENV = "AITER_FMHA_V3_FWD_THD_KV_SPLITS"
+# AITER_FMHA_V3_FWD_THD=0 turns the THD rows off, so the cases below would not reach them.
+_THD_HD256_ENABLED = (
+    get_gfx() == "gfx950" and os.environ.get("AITER_FMHA_V3_FWD_THD", "1") != "0"
+)
+_THD_HD256_CASES = [
+    # (gqa_ratio, causal, kv_splits); kv_splits None leaves the default, one slice.
+    (1, False, None),
+    (1, True, None),
+    (6, False, None),
+    (6, True, None),
+    (6, True, 2),
+]
+
+
+def _launched_gpu_kernels(fn):
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as prof:
+        result = fn()
+        torch.cuda.synchronize()
+    names = {
+        e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA
+    }
+    return result, names
+
+
+@pytest.mark.skipif(
+    not _THD_HD256_ENABLED,
+    reason="gfx950 hd256 BF16 THD rows (off on other GPUs or with AITER_FMHA_V3_FWD_THD=0)",
+)
+@pytest.mark.parametrize("gqa_ratio,causal,kv_splits", _THD_HD256_CASES)
+def test_flash_attn_varlen_func_thd_hd256(gqa_ratio, causal, kv_splits):
+    torch.random.manual_seed(0)
+    batch_size, seqlen, nheads, d = 3, 1024, 12, 256
+    nheads_k = nheads // gqa_ratio
+    dtype = dtypes.bf16
+    q = torch.randn(
+        batch_size, seqlen, nheads, d, device="cuda", dtype=dtype, requires_grad=True
+    )
+    k = torch.randn(
+        batch_size, seqlen, nheads_k, d, device="cuda", dtype=dtype, requires_grad=True
+    )
+    v = torch.randn(
+        batch_size, seqlen, nheads_k, d, device="cuda", dtype=dtype, requires_grad=True
+    )
+    # Ragged documents, the same for Q and K.
+    padding_mask = generate_random_padding_mask(
+        seqlen, batch_size, "cuda", mode="third"
+    )
+    (
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        q,
+        k,
+        v,
+        output_pad_fn,
+        dq_pad_fn,
+        dk_pad_fn,
+    ) = generate_qkv(q, k, v, padding_mask, padding_mask, qkvpacked=True)
+    assert cu_seqlens_k is cu_seqlens_q
+
+    saved_splits = os.environ.get(_THD_KV_SPLITS_ENV)
+    if kv_splits is None:
+        os.environ.pop(_THD_KV_SPLITS_ENV, None)
+    else:
+        os.environ[_THD_KV_SPLITS_ENV] = str(kv_splits)
+    try:
+        (out_unpad, _), kernels = _launched_gpu_kernels(
+            lambda: aiter.flash_attn_varlen_func(
+                q_unpad,
+                k_unpad,
+                v_unpad,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                causal=causal,
+                return_lse=True,
+            )
+        )
+    finally:
+        if saved_splits is None:
+            os.environ.pop(_THD_KV_SPLITS_ENV, None)
+        else:
+            os.environ[_THD_KV_SPLITS_ENV] = saved_splits
+    case = f"{gqa_ratio=} {causal=} {kv_splits=}"
+    attn_kernels = sorted(
+        n for n in kernels if "fmha" in n.lower() or "attn" in n.lower()
+    )
+    assert any(
+        _THD_HD256_FWD_KERNEL in n for n in kernels
+    ), f"{case}: expected the THD row {_THD_HD256_FWD_KERNEL}, launched {attn_kernels}"
+    merged = any(_THD_KV_SPLIT_MERGE_KERNEL in n for n in kernels)
+    assert merged == (
+        kv_splits is not None and kv_splits > 1
+    ), f"{case}: KV-split merge launched={merged}"
+
+    out = output_pad_fn(out_unpad)
+    dout = torch.randn_like(out)
+    dq_unpad, dk_unpad, dv_unpad = torch.autograd.grad(
+        out, (q_unpad, k_unpad, v_unpad), dout
+    )
+    dq, dk, dv = dq_pad_fn(dq_unpad), dk_pad_fn(dk_unpad), dk_pad_fn(dv_unpad)
+
+    out_ref, dq_ref, dk_ref, dv_ref = run_torch(
+        q, k, v, padding_mask, padding_mask, dout=dout, causal=causal
+    )
+    out_pt, dq_pt, dk_pt, dv_pt = run_torch(
+        q,
+        k,
+        v,
+        padding_mask,
+        padding_mask,
+        dout=dout,
+        causal=causal,
+        upcast=False,
+        reorder_ops=True,
+    )
+
+    out_diff = (out - out_ref).abs().max().item()
+    out_tol = max(4 * (out_pt - out_ref).abs().max().item(), 0.01)
+    print(f"THD {case}: out max diff {out_diff} (tolerance {out_tol})")
+    assert out_diff <= out_tol, f"{case}: forward diff {out_diff} exceeds {out_tol}"
+    mean_diff = (out - out_ref).abs().float().mean().item()
+    ref_mean_diff = (out_pt - out_ref).abs().float().mean().item()
+    assert (
+        mean_diff <= ref_mean_diff
+    ), f"{case}: forward mean diff {mean_diff} exceeds the torch bf16 reference {ref_mean_diff}"
+    for name, grad, grad_ref, grad_pt in (
+        ("dQ", dq, dq_ref, dq_pt),
+        ("dK", dk, dk_ref, dk_pt),
+        ("dV", dv, dv_ref, dv_pt),
+    ):
+        diff = (grad - grad_ref).abs().max().item()
+        tol = max(10 * (grad_pt - grad_ref).abs().max().item(), 0.01)
+        print(f"THD {case}: {name} max diff {diff} (tolerance {tol})")
+        assert diff <= tol, f"{case}: {name} diff {diff} exceeds {tol}"
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
@@ -1109,6 +1266,9 @@ if __name__ == "__main__":
         ["mixed", "q_only", "k_only", "no_padding"],
         args.local,
     ):
+        # Its fixed head count cannot be grouped by every ratio -gr takes (6 does not divide 8).
+        if SEQ_PADDING_NHEADS % gqa_ratio:
+            continue
         ret = varlen_flash_attn_seq_padding_benchmark(
             args.batch_size,
             gqa_ratio,
@@ -1128,6 +1288,12 @@ if __name__ == "__main__":
 
     df_padding = pd.DataFrame(padding_collected)
     aiter.logger.info(f"mha_varlen_seq_padding summary:\n{df_padding}")
+
+    # The gfx950 hd256 BF16 THD rows, which the sweep above never reaches (CI runs this file
+    # as a script, so the pytest cases need this call to run there).
+    if (256, 256) in args.d_qk_v and "bf16" in args.dtype and _THD_HD256_ENABLED:
+        for gqa_ratio, causal, kv_splits in _THD_HD256_CASES:
+            test_flash_attn_varlen_func_thd_hd256(gqa_ratio, causal, kv_splits)
 
 
 # ---------------------------------------------------------------------------

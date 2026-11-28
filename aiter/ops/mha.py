@@ -3475,6 +3475,33 @@ def _flash_attn_varlen_forward(
         )
         return ret
 
+    def is_fmha_v3_thd_bf16_hd256():
+        # gfx950 BF16 hd256 THD rows, which take GQA: varlen self-attention where every document
+        # has the same length for Q and K. The kernels take K/V offsets from cu_seqlens_q, so
+        # the caller must pass the same tensor for cu_seqlens_q and cu_seqlens_k, as mha_v4 takes
+        # one cu_seqlens for both. Contents are not compared, which would sync every call; equal
+        # totals and maxima do not imply equal lengths, so a separate cu_seqlens_k stays off
+        # these rows. is_fmha_fwd_v3_thd in csrc/cpp_itfs/mha_fwd.cu checks the same pointers.
+        # The rows take no mask or a causal one only: get_cfg_mask_type rejects any other
+        # window, and fmha_v3_varlen_fwd has no CK fallback, so such a GQA call must stay on CK.
+        return (
+            get_gfx() == "gfx950"
+            and q.dtype == dtypes.bf16
+            and hdim_q == 256
+            and hdim_v == 256
+            and os.environ.get("AITER_FMHA_V3_FWD_THD", "1") != "0"
+            and window_size_left == -1
+            and window_size_right in (-1, 0)
+            and cu_seqlens_q_padded is None
+            and cu_seqlens_k_padded is None
+            and block_table is None
+            and q.shape[0] == k.shape[0]
+            and max_seqlen_q == max_seqlen_k
+            and cu_seqlens_q.data_ptr() == cu_seqlens_k.data_ptr()
+            and cu_seqlens_q.shape == cu_seqlens_k.shape
+            and cu_seqlens_q.stride() == cu_seqlens_k.stride()
+        )
+
     def can_impl_fmha_v3_fwd():
         # basic
         # fmha v3 varlen is hand-written gfx9 ASM; non-gfx9 must fall back to
@@ -3492,7 +3519,7 @@ def _flash_attn_varlen_forward(
                 and hdim_v == 256
                 and q.dtype == dtypes.bf16
                 and get_gfx() == "gfx950"
-                and nhead_q == nhead_k
+                and (nhead_q == nhead_k or is_fmha_v3_thd_bf16_hd256())
                 and sink_size == 0
                 and sink_ptr is None
             )
@@ -4352,6 +4379,14 @@ def flash_attn_varlen_func(
     will only attend to keys between
     [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q + window_size[1]] inclusive.
 
+    Self-attention fast path (gfx950, BF16, headdim 256): packed documents whose Q and K lengths
+    are equal run a faster forward kernel for MHA and GQA, causal or not, without a window. It
+    engages only when cu_seqlens_q and cu_seqlens_k are the same tensor object (pass one tensor
+    for both), with no cu_seqlens_*_padded and no block_table. Separate tensors with equal
+    contents are not detected, since comparing them would synchronize with the device; such
+    calls take the previous path (v3 group kernels for MHA, CK for GQA). Set
+    AITER_FMHA_V3_FWD_THD=0 to disable this path.
+
     Arguments:
         q: (total_q, nheads, headdim_q), where total_q = total number of query tokens in the batch.
         k: (total_k, nheads_k, headdim_q), where total_k = total number of key tokens in the batch.
@@ -4359,7 +4394,8 @@ def flash_attn_varlen_func(
         cu_seqlens_q: (batch_size + 1,), dtype dtypes.i32. The cumulative sequence lengths
            of the sequences in the batch, used to index into q.
         cu_seqlens_k: (batch_size + 1,), dtype dtypes.i32. The cumulative sequence lengths
-           of the sequences in the batch, used to index into kv.
+           of the sequences in the batch, used to index into kv. For self-attention, pass the
+           cu_seqlens_q tensor itself to enable the fast path described above.
         max_seqlen_q: int. Maximum query sequence length in the batch.
         max_seqlen_k: int. Maximum key sequence length in the batch.
         min_seqlen_q: int. Minimum query sequence length for chunked prefill.

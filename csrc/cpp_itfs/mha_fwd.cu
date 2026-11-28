@@ -3,11 +3,64 @@
 #if FAV3_ON
 #include "asm_fmha_v3_fwd_configs.hpp"
 #endif
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 
 namespace aiter {
 #if FAV3_ON
+
+// THD rows reuse the v1 kernarg layout but read ptr_qseq_padding's slot as a KV-split descriptor.
+static_assert(offsetof(fmha_fwd_v3_args, ptr_qseq_padding) == 0x1E0,
+              "THD rows read their KV split from the ptr_qseq_padding slot");
+static_assert(sizeof(fmha_fwd_v3_args) == 656, "fmha_fwd_v3_args must stay 656 bytes");
+
+// The THD rows' KV-split descriptor, in ptr_qseq_padding's 16-byte slot (pointer and padding).
+// Slice i writes its normalized FP32 O at ptr_o + i * o_stride and its LSE at
+// ptr_lse + i * lse_stride, both in bytes; count 0 walks the keys once and writes in place.
+// cu_budget is read by the causal row only: the CUs a pair's kv_splits + 1 work-groups must fit,
+// 0 to run every pair on kv_splits work-groups.
+struct FmhaFwdV3ThdKvSplit
+{
+    uint32_t count;
+    uint32_t o_stride;
+    uint32_t lse_stride;
+    uint32_t cu_budget;
+};
+static_assert(sizeof(FmhaFwdV3ThdKvSplit) == 16, "THD KV-split descriptor is 16 bytes");
+static_assert(offsetof(fmha_fwd_v3_args, ptr_kseq_padding) - offsetof(fmha_fwd_v3_args,
+                                                                       ptr_qseq_padding) ==
+                  sizeof(FmhaFwdV3ThdKvSplit),
+              "THD KV-split descriptor fills ptr_qseq_padding's slot");
+
+// The THD objects address every token through a 64-bit product, so a pack may pass 4 GiB, but
+// they take each stride as a 32-bit byte count. Strides are computed in 64 bits and a call whose
+// stride does not fit stays off them.
+constexpr int64_t kThdMaxStrideBytes = UINT32_MAX;
+
+uint32_t thd_stride_bytes(int64_t elements, int64_t bytes_per_element)
+{
+    return static_cast<uint32_t>(elements * bytes_per_element);
+}
+
+// mha_v4(kv_splits="auto") takes at most this many slices: past it the merge outweighs the
+// work-groups it adds.
+constexpr int64_t kMaxThdKvSplits = 4;
+
+// Values of the "mode" column in hsa/<arch>/fmha_v3_fwd/fmha_fwd.csv.
+enum class FmhaFwdV3Mode : int
+{
+    Batch      = 0, // fixed seqlen_q / seqlen_k for every batch
+    Group      = 1, // varlen: per-batch seqstart_q / seqstart_k, optionally padded
+    Thd        = 2, // varlen self-attention: equal per-document Q and K lengths, no padding
+    ThdKvSplit = 3, // Thd that also slices each work-group's key walk in-kernel (FP32 partials
+                    // merged by their LSE, FmhaFwdV3ThdKvSplit); its causal row runs pair_split
+};
 
 int get_cfg_mask_type(const mha_fwd_args& a)
 {
@@ -29,7 +82,7 @@ std::string get_kernel_name_key(const std::string& arch_id,
                                 int hdim_v,
                                 int mask_type,
                                 int bf16_cvt,
-                                bool mode,
+                                FmhaFwdV3Mode mode,
                                 const CFG* cfgs)
 {
     std::string kernel_name_key{};
@@ -42,7 +95,7 @@ std::string get_kernel_name_key(const std::string& arch_id,
         }
 
         if(cfg.dtype == data_type && cfg.hdim_q == hdim_q && cfg.hdim_v == hdim_v &&
-           cfg.mask == mask_type && cfg.mode == mode)
+           cfg.mask == mask_type && cfg.mode == static_cast<int>(mode))
         {
             if(arch_id == "gfx950")
             {
@@ -58,6 +111,28 @@ std::string get_kernel_name_key(const std::string& arch_id,
     }
 
     return kernel_name_key;
+}
+
+// A THD call's row: the ThdKvSplit row if the manifest has one, else the Thd row, which runs one
+// KV slice. A kernel is listed under one mode only: the manifest is keyed by kernel name.
+CFG::iterator find_fmha_fwd_v3_thd_cfg(const mha_fwd_args& a,
+                                       const std::string& arch_id,
+                                       int mask_type)
+{
+    for(const FmhaFwdV3Mode mode : {FmhaFwdV3Mode::ThdKvSplit, FmhaFwdV3Mode::Thd})
+    {
+        const auto it = cfg_fmha_fwd.find(get_kernel_name_key(arch_id,
+                                                              a.data_type,
+                                                              a.hdim_q,
+                                                              a.hdim_v,
+                                                              mask_type,
+                                                              a.how_v3_bf16_cvt,
+                                                              mode,
+                                                              &cfg_fmha_fwd));
+        if(it != cfg_fmha_fwd.end())
+            return it;
+    }
+    return cfg_fmha_fwd.end();
 }
 
 std::string get_kernel_co_name(const std::string& cfg_co_name, const std::string& arch_id)
@@ -76,6 +151,148 @@ std::string get_kernel_co_name(const std::string& cfg_co_name, const std::string
         }
     }
     return co_name;
+}
+
+// gfx950 BF16 hd256 THD rows (the fmha_v4 THD objects): varlen self-attention, every document
+// has the same length for Q and K. The objects read only ptr_qseq and take each document's K/V
+// rows from Q's offsets, so cu_seqlens_k must equal cu_seqlens_q. Equal totals and maxima do not
+// imply that, and comparing contents here would synchronize every launch, so Q and K must share
+// one seqstart array: the caller passes the same tensor for cu_seqlens_q and cu_seqlens_k, as
+// mha_v4 takes one cu_seqlens for both.
+// AITER_FMHA_V3_FWD_THD=0 keeps these calls on the hd256 group rows (MHA only).
+bool is_fmha_fwd_v3_thd(const mha_fwd_args& a, const std::string& arch_id)
+{
+    if(arch_id != "gfx950" || !a.is_group_mode || a.data_type != "bf16" || a.hdim_q != 256 ||
+       a.hdim_v != 256)
+        return false;
+    if(const char* env = std::getenv("AITER_FMHA_V3_FWD_THD"); env && std::strcmp(env, "0") == 0)
+        return false;
+    if(a.seqstart_q_ptr == nullptr || a.seqstart_q_ptr != a.seqstart_k_ptr)
+        return false;
+    if(a.cu_seqlen_q_ptr || a.cu_seqlen_k_ptr || a.seqlen_q_ptr || a.seqlen_k_ptr)
+        return false;
+    if(a.seqlen_q != a.seqlen_k || a.max_seqlen_q <= 0)
+        return false;
+    if(a.nhead_k <= 0 || a.nhead_q % a.nhead_k != 0)
+        return false;
+    if(a.bias_type != 0 || a.p_drop > 0.f || a.logits_soft_cap > 0.f || a.has_sink ||
+       a.qscale_type != 0)
+        return false;
+    // The output's strides are checked at FP32 width, which KV-slice partials are written in.
+    for(const int64_t bytes : {int64_t(a.stride_q) * 2,
+                               int64_t(a.nhead_stride_q) * 2,
+                               int64_t(a.stride_k) * 2,
+                               int64_t(a.nhead_stride_k) * 2,
+                               int64_t(a.stride_v) * 2,
+                               int64_t(a.nhead_stride_v) * 2,
+                               int64_t(a.stride_o) * 4,
+                               int64_t(a.nhead_stride_o) * 4,
+                               a.has_lse ? int64_t(a.nhead_stride_lse) * 4 : int64_t(0)})
+    {
+        if(bytes < 0 || bytes > kThdMaxStrideBytes)
+            return false;
+    }
+    return true;
+}
+
+int fmha_fwd_v3_thd_kv_splits(const mha_fwd_args& a)
+{
+    const std::string arch_id = get_gpu_arch();
+    if(!a.use_asm_v3 || !is_fmha_fwd_v3_thd(a, arch_id))
+        return 1;
+    // One slice unless AITER_FMHA_V3_FWD_THD_KV_SPLITS asks for more: on MI355X "auto" ran
+    // 0.58x-1.47x of one slice where it split, losing as often as it won.
+    const char* env = std::getenv("AITER_FMHA_V3_FWD_THD_KV_SPLITS");
+    if(env == nullptr || *env == '\0')
+        return 1;
+    const int mask_type = get_cfg_mask_type(a);
+    if(mask_type < 0)
+        return 1;
+    // Only a ThdKvSplit row reads the KV-split descriptor; a Thd row runs one slice.
+    const auto it = find_fmha_fwd_v3_thd_cfg(a, arch_id, mask_type);
+    if(it == cfg_fmha_fwd.end() ||
+       it->second.mode != static_cast<int>(FmhaFwdV3Mode::ThdKvSplit))
+        return 1;
+
+    // A causal work-group owns Q tile i and its mirror n - 1 - i, which together walk n + 1 tiles
+    // of keys; a non-causal one owns one Q tile and walks all n. A slice keeps at least one Q tile
+    // of that walk.
+    const bool causal      = mask_type != 0;
+    const int64_t ts_qo    = it->second.ts_qo;
+    const int64_t q_tiles  = (a.max_seqlen_q + ts_qo - 1) / ts_qo;
+    const int64_t q_groups = causal ? (q_tiles + 1) / 2 : q_tiles;
+    const int64_t most     = causal ? q_tiles + 1 : q_tiles;
+
+    int64_t splits  = 1;
+    if(std::strcmp(env, "auto") == 0)
+    {
+        // mha_v4's rule: the most slices whose work-groups still fit the CUs once, since a second
+        // slice on a CU reloads Q.
+        const int64_t work_groups =
+            std::max<int64_t>(static_cast<int64_t>(a.batch) * a.nhead_q * q_groups, 1);
+        splits = std::min<int64_t>(
+            {kMaxThdKvSplits, static_cast<int64_t>(get_num_cu_func()) / work_groups, most});
+    }
+    else
+    {
+        splits = std::min<int64_t>(std::atoll(env), most);
+    }
+    if(splits <= 1)
+        return 1;
+    // The kernel steps between slices through 32-bit byte strides, and the merge launches one
+    // block per (token, head) row.
+    const int64_t rows        = static_cast<int64_t>(a.seqlen_q) * a.nhead_q;
+    const int64_t slice_bytes = rows * a.hdim_v * 4;
+    if(slice_bytes > kThdMaxStrideBytes || rows > std::numeric_limits<int32_t>::max())
+        return 1;
+    return static_cast<int>(splits);
+}
+
+// Mirrors fmha_v4_fwd_thd. With one KV slice the descriptor at 0x1E0 stays zero and the kernel
+// writes BF16 O and the LSE in place; with more, a.o_ptr and a.lse_ptr are FP32 partials.
+void init_fmha_fwd_v3_thd_args(fmha_fwd_v3_args& args, const mha_fwd_args& a, uint32_t cu_budget)
+{
+    std::memset(&args, 0, sizeof(args));
+    constexpr int bpe     = 2;
+    const int out_bpe     = a.kv_splits > 1 ? 4 : 2;
+    args.ptr_o         = a.o_ptr;
+    args.ptr_q         = a.q_ptr;
+    args.ptr_k         = a.k_ptr;
+    args.ptr_v         = a.v_ptr;
+    args.scalar        = a.scale_s;
+    args.s_seq_len     = a.max_seqlen_q;
+    args.s_kv_seq_len  = a.max_seqlen_q;
+    args.s_Seqs        = thd_stride_bytes(a.stride_q, bpe);
+    args.s_Hs          = thd_stride_bytes(a.nhead_stride_q, bpe);
+    args.s_gqa         = a.nhead_q / a.nhead_k;
+    args.s_k_Seqs      = thd_stride_bytes(a.stride_k, bpe);
+    args.s_k_Hs        = thd_stride_bytes(a.nhead_stride_k, bpe);
+    args.s_qk_head_dim = a.hdim_q;
+    args.s_v_head_dim  = a.hdim_v;
+    args.s_q_head_num  = a.nhead_q;
+    args.s_v_Seqs      = thd_stride_bytes(a.stride_v, bpe);
+    args.s_v_Hs        = thd_stride_bytes(a.nhead_stride_v, bpe);
+    args.s_o_Seqs      = thd_stride_bytes(a.stride_o, out_bpe);
+    args.s_o_Hs        = thd_stride_bytes(a.nhead_stride_o, out_bpe);
+    args.ptr_qseq      = a.seqstart_q_ptr;
+    args.ptr_kseq      = a.seqstart_k_ptr;
+    if(a.has_lse)
+    {
+        // [nhead_q, total_tokens] float32 per slice; head h's rows start at ptr_lse + h * s_lse_Hs.
+        args.ptr_lse  = a.lse_ptr;
+        args.s_lse    = 1;
+        args.s_lse_Hs = thd_stride_bytes(a.nhead_stride_lse, 4);
+    }
+    if(a.kv_splits > 1)
+    {
+        const FmhaFwdV3ThdKvSplit split{static_cast<uint32_t>(a.kv_splits),
+                                        thd_stride_bytes(a.kv_split_stride_o, 4),
+                                        thd_stride_bytes(a.kv_split_stride_lse, 4),
+                                        cu_budget};
+        std::memcpy(reinterpret_cast<char*>(&args) + offsetof(fmha_fwd_v3_args, ptr_qseq_padding),
+                    &split,
+                    sizeof(split));
+    }
 }
 
 void init_fmha_fwd_v3_args(fmha_fwd_v3_args& args,
@@ -226,27 +443,51 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
         AITER_LOG_WARNING("unsupported condition in fwd_v3!!! data type: " << a.data_type);
         return -1;
     }
-    // gfx950 bf16 hd256: no GQA/MQA (kernel indexes K/V by h_q directly)
-    if(arch_id == "gfx950" && a.hdim_q == 256 && a.data_type == "bf16" && a.nhead_q != a.nhead_k)
+    const bool thd = is_fmha_fwd_v3_thd(a, arch_id);
+    // gfx950 bf16 hd256 group rows: no GQA/MQA (kernel indexes K/V by h_q directly). The THD
+    // rows take any nhead_q % nhead_k == 0.
+    if(arch_id == "gfx950" && a.hdim_q == 256 && a.data_type == "bf16" &&
+       a.nhead_q != a.nhead_k && !thd)
+    {
+        return -1;
+    }
+    // FP32 KV-slice partials exist only on the THD rows.
+    if(a.kv_splits > 1 &&
+       (!thd || !a.has_lse || a.kv_split_stride_o * 4 > kThdMaxStrideBytes ||
+        a.kv_split_stride_lse * 4 > kThdMaxStrideBytes))
     {
         return -1;
     }
 
-    auto fwd_cfgs               = &cfg_fmha_fwd;
-    int cfg_mask_type           = get_cfg_mask_type(a);
-    std::string kernel_name_key = get_kernel_name_key(arch_id,
-                                                      a.data_type,
-                                                      a.hdim_q,
-                                                      a.hdim_v,
-                                                      cfg_mask_type,
-                                                      a.how_v3_bf16_cvt,
-                                                      a.is_group_mode,
-                                                      fwd_cfgs);
-    auto it                     = fwd_cfgs->find(kernel_name_key);
+    auto fwd_cfgs     = &cfg_fmha_fwd;
+    int cfg_mask_type = get_cfg_mask_type(a);
+    auto it           = fwd_cfgs->end();
+    if(thd)
+    {
+        it = find_fmha_fwd_v3_thd_cfg(a, arch_id, cfg_mask_type);
+    }
+    else
+    {
+        const FmhaFwdV3Mode mode =
+            a.is_group_mode ? FmhaFwdV3Mode::Group : FmhaFwdV3Mode::Batch;
+        it = fwd_cfgs->find(get_kernel_name_key(arch_id,
+                                                a.data_type,
+                                                a.hdim_q,
+                                                a.hdim_v,
+                                                cfg_mask_type,
+                                                a.how_v3_bf16_cvt,
+                                                mode,
+                                                fwd_cfgs));
+    }
     if(it == fwd_cfgs->end())
     {
         return -1;
     };
+    // FP32 KV-slice partials only on a ThdKvSplit row.
+    if(a.kv_splits > 1 && it->second.mode != static_cast<int>(FmhaFwdV3Mode::ThdKvSplit))
+    {
+        return -1;
+    }
 
     if(a.v3_api_check)
     {
@@ -265,14 +506,41 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
 
     fmha_fwd_v3_args args;
     size_t arg_size = sizeof(args);
-    init_fmha_fwd_v3_args(args, a, cfg.ts_qo, arch_id);
 
     int bdx = 512;
-    if(a.hdim_q == 192 && a.hdim_v == 128)
-        bdx = 256;
-    if(arch_id == "gfx950" && a.hdim_q == 256 && a.data_type == "bf16" && a.is_group_mode)
-        bdx = 256;
-    auto [gdx, gdy, gdz] = get_grid_dim(a, cfg.ts_qo, arch_id);
+    int gdx = 0, gdy = 0, gdz = 0;
+    if(thd)
+    {
+        // A causal ThdKvSplit row (pair_split in hsa/gfx950/fmha_v4_fwd) runs a pair's 2-5
+        // slices on kv_splits + 1 work-groups when its document has 4+ Q tiles and
+        // nhead_q * pairs * (kv_splits + 1) <= cu_budget; it decides this per document. Work-groups
+        // past a document's need exit at once, so x is sized by max_seqlen whenever any document,
+        // down to the smallest such pair count, 2, could qualify.
+        const bool causal         = cfg_mask_type != 0;
+        const int64_t splits      = a.kv_splits;
+        const uint32_t cu_budget  = causal && splits > 1 ? get_num_cu_func() : 0;
+        init_fmha_fwd_v3_thd_args(args, a, cu_budget);
+        // 32 query rows per wave. The grid is (Q tile groups of the longest document times the
+        // work-groups per group, nhead_q, documents); a causal work-group owns Q tile i and its
+        // mirror n - 1 - i.
+        bdx                     = cfg.ts_qo / 32 * 64;
+        const int64_t q_tiles   = (a.max_seqlen_q + cfg.ts_qo - 1) / cfg.ts_qo;
+        const int64_t q_groups  = causal ? (q_tiles + 1) / 2 : q_tiles;
+        const bool pair_extra   = cu_budget != 0 && splits <= 5 && q_tiles >= 4 &&
+                                int64_t(a.nhead_q) * 2 * (splits + 1) <= cu_budget;
+        gdx = static_cast<int>(q_groups * (pair_extra ? splits + 1 : splits));
+        gdy = a.nhead_q;
+        gdz = a.batch;
+    }
+    else
+    {
+        init_fmha_fwd_v3_args(args, a, cfg.ts_qo, arch_id);
+        if(a.hdim_q == 192 && a.hdim_v == 128)
+            bdx = 256;
+        if(arch_id == "gfx950" && a.hdim_q == 256 && a.data_type == "bf16" && a.is_group_mode)
+            bdx = 256;
+        std::tie(gdx, gdy, gdz) = get_grid_dim(a, cfg.ts_qo, arch_id);
+    }
 
     return ck_tile::launch_kernel(s, [=](const ck_tile::stream_config& s_) mutable {
         // Explicit assignment forces evaluation order and prevents compiler from
@@ -386,7 +654,8 @@ float mha_fwd(mha_fwd_args args, const ck_tile::stream_config& s)
 #endif
 
 #if FAV2_ON
-    if(ret == -1 && !args.v3_api_check)
+    // KV-slice partials are FP32 buffers only the v3 THD rows write; CK must not get them.
+    if(ret == -1 && !args.v3_api_check && args.kv_splits <= 1)
     {
         ret = fmha_fwd_ck(args, s);
     }

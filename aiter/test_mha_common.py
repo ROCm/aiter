@@ -259,6 +259,10 @@ def generate_qkv(
         ).all()
         assert seqlen_q == seqlen_k
         assert d == d_v
+        # Q and K have the same documents, so they share one cu_seqlens tensor, as packed
+        # self-attention callers pass it. The gfx950 hd256 BF16 THD rows of fmha_v3_fwd take
+        # only a call whose cu_seqlens_q and cu_seqlens_k are the same tensor.
+        cu_seqlens_k = cu_seqlens_q
         qkv_unpad = torch.cat([q_unpad, k_unpad, v_unpad], dim=1)
         qkv = torch.cat([q, k, v], dim=2)
         if query_padding_mask is not None:
