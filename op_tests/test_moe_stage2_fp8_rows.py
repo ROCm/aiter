@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""With AITER_FLYDSL_STAGE2_FP8=1, a row of the stage2 FP8 table
-(tuned_stage2_fp8_fmoe) replaces the main row of its shape.
+"""With AITER_FLYDSL_STAGE2_FP8=1 or AITER_MXFP4_INTERMEDIATE=1, a row of the
+stage2 FP8 table (tuned_stage2_fp8_fmoe) replaces the main row of its shape.
 
 Qwen3.8 MXFP4 TP8, E 513: the main rows at 8192 to 32768 tokens are one-stage
 post-reduce kernels; the stage2 FP8 rows are FlyDSL `reduce` rows.
@@ -43,8 +43,14 @@ def _key(token):
     )
 
 
-def _dispatch(monkeypatch, token, fp8, activation=ActivationType.Silu):
-    monkeypatch.setenv("AITER_FLYDSL_STAGE2_FP8", "1" if fp8 else "0")
+SWITCHES = ("AITER_FLYDSL_STAGE2_FP8", "AITER_MXFP4_INTERMEDIATE")
+
+
+def _dispatch(
+    monkeypatch, token, fp8, activation=ActivationType.Silu, switch=SWITCHES[0]
+):
+    for name in SWITCHES:
+        monkeypatch.setenv(name, "1" if fp8 and name == switch else "0")
     get_2stage_cfgs.cache_clear()
     try:
         return get_2stage_cfgs(
@@ -69,12 +75,13 @@ def _dispatch(monkeypatch, token, fp8, activation=ActivationType.Silu):
         get_2stage_cfgs.cache_clear()
 
 
+@pytest.mark.parametrize("switch", SWITCHES)
 @pytest.mark.parametrize(("token", "block_m"), [(8192, 64), (16384, 128), (32768, 64)])
-def test_stage2_fp8_row_replaces_post_reduce_row(monkeypatch, token, block_m):
+def test_stage2_fp8_row_replaces_post_reduce_row(monkeypatch, token, block_m, switch):
     off = _dispatch(monkeypatch, token, fp8=False)
     assert off.run_1stage and off.flat == AsmMoeMode.POST_REDUCE
 
-    on = _dispatch(monkeypatch, token, fp8=True)
+    on = _dispatch(monkeypatch, token, fp8=True, switch=switch)
     assert not on.run_1stage and on.flat == AsmMoeMode.SORTED
     assert on.block_m == block_m
 
@@ -117,21 +124,22 @@ def test_stage2_fp8_row_keeps_main_row_of_other_activation(monkeypatch):
     assert on.run_1stage and on.flat == AsmMoeMode.POST_REDUCE
 
 
-def test_aot_replays_stage2_fp8_rows_only_with_switch():
+@pytest.mark.parametrize("switch", SWITCHES)
+def test_aot_replays_stage2_fp8_rows_only_with_switch(switch):
     # A fresh process: aiter.aot.flydsl.moe reads the switch at import.
-    check = """
+    check = f"""
 import importlib, os
 import aiter.aot.flydsl.moe as aot_moe
 from aiter.jit.core import AITER_CONFIGS
 fp8_csv = AITER_CONFIGS.AITER_CONFIG_FMOE_STAGE2_FP8_FILE
 assert fp8_csv not in aot_moe.DEFAULT_CSVS
-os.environ["AITER_FLYDSL_STAGE2_FP8"] = "1"
+os.environ["{switch}"] = "1"
 aot_moe = importlib.reload(aot_moe)
 assert fp8_csv in aot_moe.DEFAULT_CSVS
-jobs = {(int(j["expert"]), int(j["token"])) for j in aot_moe.parse_csv(fp8_csv)}
-assert {(513, 8192), (513, 16384), (513, 32768)} <= jobs, jobs
+jobs = {{(int(j["expert"]), int(j["token"])) for j in aot_moe.parse_csv(fp8_csv)}}
+assert {{(513, 8192), (513, 16384), (513, 32768)}} <= jobs, jobs
 """
-    env = {**os.environ, "AITER_FLYDSL_STAGE2_FP8": "0"}
+    env = {**os.environ, **dict.fromkeys(SWITCHES, "0")}
     subprocess.run([sys.executable, "-c", check], env=env, check=True)
 
 

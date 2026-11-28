@@ -4802,9 +4802,15 @@ def get_2stage_cfgs(
             logger.info(
                 f"[fused_moe] no row for {keys} with {limit_tag}; using default config"
             )
-    if config_file is None and not limit_tag and _flydsl_stage2_fp8_enabled():
-        # Rows that are fastest when stage 2 writes FP8 route rows, e.g. a
-        # FlyDSL `reduce` row for a shape whose main row is a one-stage kernel.
+    # FP8 wins when both are set, as in _flydsl_v2_stage2_wrapper.
+    route_rows_switch = None
+    if _flydsl_stage2_fp8_enabled():
+        route_rows_switch = "AITER_FLYDSL_STAGE2_FP8=1"
+    elif _mxfp4_intermediate_enabled():
+        route_rows_switch = "AITER_MXFP4_INTERMEDIATE=1"
+    if config_file is None and not limit_tag and route_rows_switch:
+        # Rows that are fastest when stage 2 writes FP8 or MXFP4 route rows, e.g.
+        # a FlyDSL `reduce` row for a shape whose main row is a one-stage kernel.
         if cfg_2stages_stage2_fp8 is None:
             # Exact act_type only: through the act_type-agnostic dict, a Silu row
             # would replace the main row of another activation.
@@ -4816,7 +4822,7 @@ def get_2stage_cfgs(
         # A row of a smaller token tier does not replace a row of this tier.
         if fp8_cfg is not None and (cfg is None or fp8_tier >= cfg_tier):
             logger.info(
-                f"[fused_moe] AITER_FLYDSL_STAGE2_FP8=1: using the stage2 FP8 row for {keys}"
+                f"[fused_moe] {route_rows_switch}: using the stage2 FP8 row for {keys}"
             )
             cfg = fp8_cfg
     if (
