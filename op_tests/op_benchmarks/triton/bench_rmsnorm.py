@@ -31,6 +31,12 @@ def _generate_rmsnorm_mxfp4_inputs(M, N, dtype, add_residual):
     return x, w, res
 
 
+def _generate_rmsnorm_bias_inputs(M, N, dtype, bias_in):
+    x, w = generate_rmsnorm_inputs(M, N, dtype)
+    b = torch.randn(N, dtype=dtype, device="cuda") if bias_in else None
+    return x, w, b
+
+
 def _generate_rmsnorm_backward_inputs(M, N, dtype, eps):
     x, w = generate_rmsnorm_inputs(M, N, dtype)
     x.requires_grad_(True)
@@ -121,6 +127,10 @@ def run_benchmark(args):
     do_backward = args.backward
     if do_backward and quant != "none":
         raise ValueError("--backward cannot be combined with --quant")
+    bias_in = args.bias_in
+    activation = None if args.activation == "none" else args.activation
+    if (bias_in or activation) and (do_backward or quant != "none"):
+        raise ValueError("--bias-in and --activation are forward only, without --quant")
     bencher = RotatingBufferBench.from_dict(
         {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
     )
@@ -193,6 +203,24 @@ def run_benchmark(args):
             flops = 8 * M * N
 
             ms = bencher.bench(_run)
+        elif bias_in or activation:
+            _p_gen = functools.partial(
+                _generate_rmsnorm_bias_inputs, M, N, c_dtype, bias_in
+            )
+            _out_val_keys = ["x", "w", "b"]
+            rot_bufs = bencher.build_pool([_p_gen], [_out_val_keys])
+            es = rot_bufs[0]["x"].element_size()
+
+            def _run(x, w, b):
+                rms_norm(x, w, eps, bias_in=b, activation=activation)
+
+            # x is (M, N); weight and bias_in are (N, ) and stay in cache
+            mem_read = M * N * es
+            mem_write = M * N * es
+            mem = mem_read + mem_write
+            flops = 4 * M * N
+
+            ms = bencher.bench(_run)
         else:
             _p_gen = functools.partial(generate_rmsnorm_inputs, M, N, c_dtype)
             _out_val_keys = ["x", "w"]
@@ -256,6 +284,19 @@ def parse_args(args: list[str] | None = None):
         action="store_true",
         default=False,
         help="With --quant mxfp4, fuse a residual add (res1) ahead of the norm.",
+    )
+    parser.add_argument(
+        "--bias-in",
+        action="store_true",
+        default=False,
+        help="Add a (N, ) bias to the input before the norm (rms_norm bias_in).",
+    )
+    parser.add_argument(
+        "--activation",
+        type=str,
+        choices=["none", "silu"],
+        default="none",
+        help="Apply an activation to the output (rms_norm activation).",
     )
     parser.add_argument(
         "-print_vgpr",

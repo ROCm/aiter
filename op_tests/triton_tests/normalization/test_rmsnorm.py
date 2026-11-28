@@ -24,14 +24,23 @@ def generate_rmsnorm_inputs(M, N, dtype):
     return x, weight
 
 
-def torch_rmsnorm(x, g, out_dtype=torch.float16, epsilon=1e-6):
-    _M, N = x.shape
-    # cast to float32 as the triton kernel
+def torch_rmsnorm(
+    x, g, out_dtype=torch.float16, epsilon=1e-6, bias_in=None, activation=None
+):
+    # act(rmsnorm(x + bias_in) * g) over the last dim, in float32 as the triton
+    # kernel, with one cast to out_dtype after the activation
+    N = x.shape[-1]
     x_f32 = x.float()
+    if bias_in is not None:
+        x_f32 = x_f32 + bias_in.float()
     g_f32 = g.float()
-    rms = torch.sqrt(torch.sum(x_f32 * x_f32, dim=-1) * 1 / N)
+    rms = torch.sqrt(torch.sum(x_f32 * x_f32, dim=-1, keepdim=True) / N + epsilon)
     rsigma = 1.0 / rms
-    rms_norm_f32 = x_f32 * rsigma.unsqueeze(1) * g_f32
+    rms_norm_f32 = x_f32 * rsigma * g_f32
+    if activation == "silu":
+        rms_norm_f32 = torch.nn.functional.silu(rms_norm_f32)
+    elif activation is not None:
+        raise ValueError(f"no reference for activation {activation!r}")
     rms_norm = rms_norm_f32.to(out_dtype)
     return rms_norm
 
@@ -476,3 +485,87 @@ def test_rms_norm_dynamic_per_token_fp8_quant(
 
     torch.testing.assert_close(xq_dequant, ref_xq_dequant, atol=atol, rtol=rtol)
     torch.testing.assert_close(x_normed, ref_x_normed, atol=atol, rtol=rtol)
+
+
+def get_bias_act_vals():
+    # (rows, C) of the RMSNorm calls of the Wan 2.2 VAE encoder for a 224 x 448 frame
+    wan_vae = [
+        (25088, 160),
+        (6272, 160),
+        (6272, 320),
+        (1568, 320),
+        (1568, 640),
+        (392, 640),
+    ]
+    # Generic shapes: tiny, odd N, the blocked path, the large-M / small-N path
+    generic = [
+        (1, 4),
+        (173, 409),
+        (4096, 8192),
+        (3, 40000),
+        (16385, 513),
+        (65536, 512),
+    ]
+    return wan_vae + generic
+
+
+@pytest.mark.parametrize("in_dtype_str", ["fp32", "fp16", "bf16"])
+@pytest.mark.parametrize(
+    "has_bias, activation", [(True, None), (False, "silu"), (True, "silu")]
+)
+@pytest.mark.parametrize("M, N", get_bias_act_vals())
+def test_rmsnorm_bias_activation(M, N, has_bias, activation, in_dtype_str):
+    dtype = str_to_torch_dtype[in_dtype_str]
+    torch.manual_seed(0)
+    x, weight = generate_rmsnorm_inputs(M, N, dtype)
+    bias_in = torch.randn(N, dtype=dtype, device="cuda") if has_bias else None
+    eps = 1e-6
+
+    y_ref = torch_rmsnorm(x, weight, dtype, eps, bias_in=bias_in, activation=activation)
+    y = rms_norm(x, weight, eps, bias_in=bias_in, activation=activation)
+
+    if dtype == torch.float32:
+        atol, rtol = 1e-4, 1e-4
+    else:
+        atol, rtol = 1e-2, 1e-2
+    assert y.dtype == dtype and y.shape == x.shape
+    torch.testing.assert_close(y, y_ref, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("in_dtype_str", ["fp16", "bf16"])
+@pytest.mark.parametrize("B, C, H, W", [(1, 160, 112, 224), (2, 320, 28, 56)])
+def test_rmsnorm_bias_silu_channels_last(B, C, H, W, in_dtype_str):
+    dtype = str_to_torch_dtype[in_dtype_str]
+    torch.manual_seed(0)
+    x = torch.randn((B, C, H, W), dtype=dtype, device="cuda").to(
+        memory_format=torch.channels_last
+    )
+    weight = torch.randn(C, dtype=dtype, device="cuda")
+    bias_in = torch.randn(C, dtype=dtype, device="cuda")
+
+    rows = x.permute(0, 2, 3, 1).reshape(-1, C)
+    assert rows.data_ptr() == x.data_ptr(), "the rows must be a view of x"
+    y = rms_norm(rows, weight, 1e-6, bias_in=bias_in, activation="silu")
+    y = y.view(B, H, W, C).permute(0, 3, 1, 2)
+
+    y_ref = torch_rmsnorm(
+        x.permute(0, 2, 3, 1), weight, dtype, 1e-6, bias_in=bias_in, activation="silu"
+    ).permute(0, 3, 1, 2)
+    torch.testing.assert_close(y, y_ref, atol=1e-2, rtol=1e-2)
+
+
+def test_rmsnorm_bias_activation_rejects():
+    x, weight = generate_rmsnorm_inputs(64, 160, torch.bfloat16)
+    bias_in = torch.randn(160, dtype=torch.bfloat16, device="cuda")
+
+    for name in ("not_an_activation", ""):
+        with pytest.raises(KeyError):
+            rms_norm(x, weight, 1e-6, activation=name)
+    with pytest.raises(AssertionError):
+        rms_norm(x, weight, 1e-6, bias_in=bias_in[:128])
+    x.requires_grad_(True)
+    with pytest.raises(ValueError):
+        rms_norm(x, weight, 1e-6, bias_in=bias_in, activation="silu")
+    with torch.no_grad():
+        y = rms_norm(x, weight, 1e-6, bias_in=bias_in, activation="silu")
+    assert y.shape == x.shape

@@ -47,6 +47,9 @@ _rms_norm_kernel_repr = make_kernel_repr(
     [
         "BLOCK_SIZE",
         "USE_BLOCKED",
+        "HAS_BIAS",
+        "activation",
+        "USE_ACTIVATION",
     ],
 )
 
@@ -71,6 +74,10 @@ def _rms_norm_kernel(
     # Meta-parameters
     BLOCK_SIZE: tl.constexpr,
     USE_BLOCKED: tl.constexpr,
+    bias_ptr=None,
+    HAS_BIAS: tl.constexpr = False,
+    activation: tl.constexpr = None,
+    USE_ACTIVATION: tl.constexpr = False,
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call rms_norm function
@@ -82,6 +89,8 @@ def _rms_norm_kernel(
     - Input: The input tensor to be normalized with shape (n_rows, n_cols).
     - Output: The output tensor with shape (n_rows, n_cols).
     - G: The learnable weights tensor with shape (n_cols, ).
+    - Bias: With HAS_BIAS, a (n_cols, ) tensor that is added to each row before the norm.
+    - Activation: With USE_ACTIVATION, applied to the output before the store.
     """
     # Map the program id to the first row of input and output it should compute.
     row_start = tl.program_id(0)
@@ -102,6 +111,8 @@ def _rms_norm_kernel(
                 input_ptrs = row_input_ptr + cols
                 input_ptrs = tl.multiple_of(input_ptrs, (16,))
                 x = tl.load(input_ptrs).to(tl.float32)
+                if HAS_BIAS:
+                    x += tl.load(bias_ptr + cols).to(tl.float32)
                 sum_squares += tl.sum(x * x, axis=0)
 
             # Handle remainder
@@ -112,6 +123,8 @@ def _rms_norm_kernel(
             x = tl.load(input_ptrs, mask=mask, other=0.0, cache_modifier=".cg").to(
                 tl.float32
             )
+            if HAS_BIAS:
+                x += tl.load(bias_ptr + cols, mask=mask, other=0.0).to(tl.float32)
             sum_squares += tl.sum(x * x, axis=0)
 
             # Compute normalization factor
@@ -127,9 +140,13 @@ def _rms_norm_kernel(
                 input_ptrs = row_input_ptr + cols
                 input_ptrs = tl.multiple_of(input_ptrs, (16,))
                 x = tl.load(input_ptrs).to(tl.float32)
+                if HAS_BIAS:
+                    x += tl.load(bias_ptr + cols).to(tl.float32)
                 g_ptrs = g_ptr + cols
                 g = tl.load(g_ptrs).to(tl.float32)
                 rms_norm = x * norm_factor * g
+                if USE_ACTIVATION:
+                    rms_norm = activation(rms_norm)
                 output_ptrs = row_output_ptr + cols
                 tl.store(output_ptrs, rms_norm.to(output_ptr.type.element_ty))
 
@@ -140,9 +157,13 @@ def _rms_norm_kernel(
             x = tl.load(input_ptrs, mask=mask, other=0.0, cache_modifier=".cg").to(
                 tl.float32
             )
+            if HAS_BIAS:
+                x += tl.load(bias_ptr + cols, mask=mask, other=0.0).to(tl.float32)
             g_ptrs = g_ptr + cols
             g = tl.load(g_ptrs, mask=mask, other=0.0).to(tl.float32)
             rms_norm = x * norm_factor * g
+            if USE_ACTIVATION:
+                rms_norm = activation(rms_norm)
             output_ptrs = row_output_ptr + cols
             tl.store(output_ptrs, rms_norm.to(output_ptr.type.element_ty), mask=mask)
 
@@ -154,6 +175,10 @@ def _rms_norm_kernel(
             row = tl.load(input_ptrs, mask=mask, other=0.0, cache_modifier=".cg").to(
                 tl.float32
             )
+            if HAS_BIAS:
+                row += tl.load(bias_ptr + col_offsets, mask=mask, other=0.0).to(
+                    tl.float32
+                )
             g = tl.load(g_ptr + col_offsets, mask=mask, other=0.0).to(tl.float32)
             row_norm = row * row
             row_norm = tl.sum(row_norm, axis=-1)
@@ -163,6 +188,8 @@ def _rms_norm_kernel(
             tl.store(rsigma_ptr + row_idx, norm_factor)
 
             rms_norm = row * norm_factor * g
+            if USE_ACTIVATION:
+                rms_norm = activation(rms_norm)
 
             output_ptrs = output_ptr + row_idx * output_row_stride + col_offsets
             output_ptrs = tl.multiple_of(output_ptrs, (16,))
@@ -1010,6 +1037,9 @@ _rmsnorm_kernel_large_m_small_n_repr = make_kernel_repr(
         "BLOCK_N",
         "NUM_WARPS",
         "NUM_STAGES",
+        "HAS_BIAS",
+        "activation",
+        "USE_ACTIVATION",
     ],
 )
 
@@ -1031,6 +1061,10 @@ def _rmsnorm_kernel_large_m_small_n(
     BLOCK_N: tl.constexpr,
     NUM_WARPS: tl.constexpr,
     NUM_STAGES: tl.constexpr,
+    B=None,
+    HAS_BIAS: tl.constexpr = False,
+    activation: tl.constexpr = None,
+    USE_ACTIVATION: tl.constexpr = False,
 ):
     pid_m = tl.program_id(0)
     m_off = tl.cast(pid_m * BLOCK_M + tl.arange(0, BLOCK_M), tl.int64)
@@ -1046,6 +1080,8 @@ def _rmsnorm_kernel_large_m_small_n(
         other=0.0,
     ).to(tl.float32)
     w = tl.load(W + n_off, mask=mask_n, other=0.0).to(tl.float32)
+    if HAS_BIAS:
+        x += tl.load(B + n_off, mask=mask_n, other=0.0).to(tl.float32)[None, :]
 
     x = tl.where(mask, x, 0.0)
     sum_sq = tl.sum(x * x, axis=1)
@@ -1053,6 +1089,8 @@ def _rmsnorm_kernel_large_m_small_n(
     rsigma = tl.math.rsqrt(var + eps)
 
     y = x * rsigma[:, None] * w[None, :]
+    if USE_ACTIVATION:
+        y = activation(y)
     tl.store(
         Y + m_off[:, None] * stride_ym + n_off[None, :] * stride_yn,
         y.to(Y.dtype.element_ty),

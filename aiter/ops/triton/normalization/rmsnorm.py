@@ -7,6 +7,7 @@ import triton
 from aiter.ops.triton._gluon_kernels.gfx1250.normalization.rmsnorm import (
     _gluon_rms_norm_kernel,
 )
+from aiter.ops.triton._triton_kernels.common.activation import _get_activation_from_str
 from aiter.ops.triton._triton_kernels.normalization.rmsnorm import (
     _fused_add_rmsnorm_kernel,
     _quant_fused_add_rmsnorm_kernel,
@@ -127,9 +128,15 @@ def _rmsnorm_forward_gluon(x: torch.Tensor, weight: torch.Tensor, epsilon: float
     return y, rsigma
 
 
-def _rmsnorm_forward(x: torch.Tensor, weight: torch.Tensor, epsilon: float):
+def _rmsnorm_forward(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    bias_in: torch.Tensor | None = None,
+    activation: str | None = None,
+):
 
-    if _use_gluon_rmsnorm(x, weight):
+    if bias_in is None and activation is None and _use_gluon_rmsnorm(x, weight):
         return _rmsnorm_forward_gluon(x, weight, epsilon)
 
     n_rows, n_cols = x.shape
@@ -154,6 +161,12 @@ def _rmsnorm_forward(x: torch.Tensor, weight: torch.Tensor, epsilon: float):
         epsilon,
         blk_size,
         USE_BLOCKED,
+        bias_in,
+        HAS_BIAS=bias_in is not None,
+        activation=(
+            _get_activation_from_str(activation) if activation is not None else None
+        ),
+        USE_ACTIVATION=activation is not None,
     )
 
     return y, rsigma
@@ -313,17 +326,37 @@ def _should_use_large_m_small_n(M: int, N: int, backward: bool = False) -> bool:
     return N <= 1024 if backward else N <= 2048
 
 
-def rmsnorm_forward_inference(x: torch.Tensor, weight: torch.Tensor, eps: float):
+def rmsnorm_forward_inference(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    bias_in: torch.Tensor | None = None,
+    activation: str | None = None,
+):
     assert x.ndim == 2 and weight.ndim == 1 and x.shape[1] == weight.shape[0]
+    assert bias_in is None or bias_in.shape == (
+        x.shape[1],
+    ), f"bias_in must be ({x.shape[1]},), got {tuple(bias_in.shape)}"
+    # Resolve the name first, so that an unknown name raises KeyError for all M.
+    if activation is not None:
+        _get_activation_from_str(activation)
     x = x.contiguous()
     weight = weight.contiguous()
+    bias_in = bias_in.contiguous() if bias_in is not None else None
     M, N = x.shape
 
     if _should_use_large_m_small_n(M, N):
-        return _rmsnorm_forward_large_m_small_n(x, weight, eps, return_rsigma=False)
+        return _rmsnorm_forward_large_m_small_n(
+            x,
+            weight,
+            eps,
+            return_rsigma=False,
+            bias_in=bias_in,
+            activation=activation,
+        )
     else:
         y, _ = _rmsnorm_forward(
-            x, weight, eps
+            x, weight, eps, bias_in, activation
         )  # always returns rsigma, but we discard it
         return y
 
@@ -391,22 +424,54 @@ class _RMSNorm2dFwdWithAdd(torch.autograd.Function):
         return None, dx, None, None, dg, None, None
 
 
-def rms_norm(input: torch.Tensor, weight: torch.Tensor, epsilon: float):
+def rms_norm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    bias_in: torch.Tensor | None = None,
+    activation: str | None = None,
+):
     """
     Applies Root Mean Square Layer Normalization over a mini-batch of inputs.
+
+        output = act(rmsnorm(input + bias_in) * weight)
 
     Key parameters:
     - Input: The input tensor to be normalized with shape (M, N).
     - Weight: The learnable weights tensor with shape (N, ).
     - Epsilon: A value added to the denominator for numerical stability.
+    - Bias_in: Optional tensor with shape (N, ). The kernel adds it to each row
+      of the input before the norm, for example the bias of the convolution
+      that makes the input.
+    - Activation: Optional activation after the weight, for example "silu".
+      The names are the names of _triton_kernels/common/activation.py. An
+      unknown name raises KeyError.
+
+    A channels-last (B, C, *) tensor is a set of rows of C channels. Give its
+    (B * prod(*), C) view as input, for example
+    x.permute(0, 2, 3, 1).reshape(-1, C) for a 4-D tensor.
+
+    The sum, the norm and the activation are in fp32. The output is rounded to
+    the input dtype once, after the activation. With bias_in or activation, the
+    call has no backward: it raises ValueError when autograd needs a gradient.
 
     Returns:
     - Output: The output tensor with shape (M, N).
     """
     _LOGGER.info(
-        "RMSNORM: input=%s weight=%s ", tuple(input.shape), tuple(weight.shape)
+        "RMSNORM: input=%s weight=%s bias_in=%s act=%s",
+        tuple(input.shape),
+        tuple(weight.shape),
+        None if bias_in is None else tuple(bias_in.shape),
+        activation,
     )
-    return _RMSNorm.apply(input, weight, epsilon, torch.is_grad_enabled())
+    if bias_in is None and activation is None:
+        return _RMSNorm.apply(input, weight, epsilon, torch.is_grad_enabled())
+    if torch.is_grad_enabled() and any(
+        t is not None and t.requires_grad for t in (input, weight, bias_in)
+    ):
+        raise ValueError("rms_norm with bias_in or activation has no backward")
+    return rmsnorm_forward_inference(input, weight, epsilon, bias_in, activation)
 
 
 def rmsnorm2d_fwd_with_add(
@@ -730,6 +795,8 @@ def _rmsnorm_forward_large_m_small_n(
     weight: torch.Tensor,
     eps: float,
     return_rsigma: bool = False,
+    bias_in: torch.Tensor | None = None,
+    activation: str | None = None,
 ):
     assert x.ndim == 2 and weight.ndim == 1 and x.shape[1] == weight.shape[0]
     x, weight = x.contiguous(), weight.contiguous()
@@ -763,5 +830,11 @@ def _rmsnorm_forward_large_m_small_n(
         NUM_STAGES=_cfg["num_stages"],
         num_warps=_cfg["num_warps"],
         num_stages=_cfg["num_stages"],
+        B=bias_in,
+        HAS_BIAS=bias_in is not None,
+        activation=(
+            _get_activation_from_str(activation) if activation is not None else None
+        ),
+        USE_ACTIVATION=activation is not None,
     )
     return (y, rsigma) if return_rsigma else y
