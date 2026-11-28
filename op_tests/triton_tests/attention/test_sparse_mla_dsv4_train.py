@@ -93,7 +93,7 @@ def _run_fwd(N, H, D, N_kv, topk, has_sink=True):
     return ok
 
 
-def _run_bwd(N, H, D, N_kv, topk, has_sink=True):
+def _run_bwd(N, H, D, N_kv, topk, has_sink=True, invalid_frac=0.0):
     print(
         f"  BWD  N={N} H={H} D={D} N_kv={N_kv} topk={topk} sink={has_sink} ...", end=" "
     )
@@ -101,6 +101,11 @@ def _run_bwd(N, H, D, N_kv, topk, has_sink=True):
     q = torch.randn(N, H, D, dtype=torch.bfloat16, device="cuda", requires_grad=True)
     kv = torch.randn(N_kv, D, dtype=torch.bfloat16, device="cuda", requires_grad=True)
     indices = torch.randint(0, N_kv, (N, topk), dtype=torch.int32, device="cuda")
+    if invalid_frac > 0.0:
+        # Mask some slots with -1. Slot 0 stays valid, so no row is fully masked.
+        drop = torch.rand(N, topk, dtype=torch.float32, device="cuda") < invalid_frac
+        drop[:, 0] = False
+        indices = indices.masked_fill(drop, -1)
     attn_sink = (
         (torch.randn(H, dtype=torch.float32, device="cuda") * 0.1).requires_grad_(True)
         if has_sink
@@ -212,6 +217,20 @@ def test_sparse_mla_fwd(N, H, D, N_kv, topk, has_sink):
 )
 def test_sparse_mla_bwd(N, H, D, N_kv, topk, has_sink):
     assert _run_bwd(N, H, D, N_kv, topk, has_sink)
+
+
+# topk 640 runs two chunks. topk 601 also pads the last chunk with -1.
+@pytest.mark.parametrize("has_sink", [True, False])
+@pytest.mark.parametrize(
+    "N, H, D, N_kv, topk, invalid_frac",
+    [
+        (64, 16, 128, 1024, 640, 0.0),
+        (64, 16, 128, 1024, 601, 0.1),
+        (32, 8, 64, 64, 32, 0.25),
+    ],
+)
+def test_sparse_mla_bwd_chunked(N, H, D, N_kv, topk, invalid_frac, has_sink):
+    assert _run_bwd(N, H, D, N_kv, topk, has_sink, invalid_frac)
 
 
 @pytest.mark.parametrize("has_sink", [True, False])
