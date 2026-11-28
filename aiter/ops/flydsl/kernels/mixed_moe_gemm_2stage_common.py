@@ -3114,6 +3114,8 @@ def compile_mixed_moe_gemm2_common(
     w_elem_bytes = 1
     w_elem_pack = 2 if is_f4_b else 1
     w_nbytes = (experts * model_dim * inter_dim * w_elem_bytes) // w_elem_pack
+    # Past 4 GiB a single 32-bit buffer resource over w2 mis-addresses later experts.
+    w_per_expert_base = w_nbytes > 0xFFFFFFFF
     shared_w_nbytes = model_dim * inter_dim
     # #3476: host e8m0_shuffle pads scale group-N up to a multiple of 8, i.e.
     # 128- but not 256-aligned (e.g. 384) read OOB scales -> garbage e8m0 -> NaN.
@@ -3462,6 +3464,18 @@ def compile_mixed_moe_gemm2_common(
                 else:
                     weight_expert_off_idx = expert_off_idx
                     weight_scale_rsrc = sw_rsrc
+                if const_expr(w_per_expert_base and not shared_b):
+                    # per-expert 64-bit re-base, as in stage 1
+                    per_expert_w_bytes = w_nbytes // experts
+                    routed_w_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                        (
+                            fx.Int64(fx.ptrtoint(arg_w))
+                            + fx.Int64(expert_idx * per_expert_w_bytes)
+                        ).ir_value(),
+                        num_records_bytes=per_expert_w_bytes,
+                    )
+                else:
+                    routed_w_rsrc = w_rsrc
 
                 def mixed_b_mfma(
                     a128,
@@ -3718,17 +3732,20 @@ def compile_mixed_moe_gemm2_common(
                         )
                         return s0, s1, s2, s3
 
+                    routed_b_base = (
+                        fx.Index(0) if const_expr(w_per_expert_base) else expert_b_base
+                    )
                     b0, b1 = load_cell(
-                        w_rsrc,
-                        expert_b_base,
+                        routed_w_rsrc,
+                        routed_b_base,
                         b_stride_n0,
                         w_elem_type(),
                         routed_k0_base,
                     )
                     if const_expr(is_f8_b):
                         b2, b3 = load_cell(
-                            w_rsrc,
-                            expert_b_base,
+                            routed_w_rsrc,
+                            routed_b_base,
                             b_stride_n0,
                             w_elem_type(),
                             routed_k0_base + 1,

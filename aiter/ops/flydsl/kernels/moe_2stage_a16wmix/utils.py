@@ -435,6 +435,8 @@ class _BLoader(NamedTuple):
     # same per-K-step f32 scales that load_scale returns.
     load_scale_raw: Callable | None = None
     convert_scale: Callable | None = None
+    # W resource starts at expert ``e`` (indices are within the expert).
+    w_per_expert_base: bool = False
 
 
 # gfx942 MXFP4: E2M1 mag 0..7 as E4M3FNUZ fp8 bytes for one v_perm_b32.
@@ -547,11 +549,15 @@ def make_b_loader(
     _is_int4 = w_dtype == "int4"
     _is_bf16 = w_dtype == "bf16"
     _is_fp8 = w_dtype == "fp8"
+    _is_fp4 = w_dtype == "fp4"
     _is_gfx942 = str(rocm_arch).startswith("gfx942")
     assert not (_is_fp8 and _is_gfx942), "fp8 (MXFP8) W needs gfx950 cvt_scalef32"
     assert not _is_fp8 or TILE_K % 128 == 0, "fp8 W needs TILE_K % 128 == 0"
-    # W tensors whose per-expert base is folded into the buffer resource address.
-    _w_per_expert_base = _is_bf16 or _is_fp8
+    # W tensors whose per-expert base is folded into the buffer resource address;
+    # mxfp4 only past 4 GiB, where the whole-tensor path mis-addresses experts.
+    _w_per_expert_base = (
+        _is_bf16 or _is_fp8 or (_is_fp4 and NE * N_OUT * (K // 2) > 0xFFFFFFFF)
+    )
     # Emitted before the layouts/resources below: this is where the stages used to
     # compute it, and the ISA is sensitive to the order operands are materialized in.
     expert_off = e * fx.Int32(N_OUT)
@@ -617,10 +623,12 @@ def make_b_loader(
     # ---- buffer resources -----------------------------------------------------
     # bf16 W [E, N_OUT, K] whole-tensor extent overflows the 32-bit num_records/i32
     # byte-offset at large E (E896: 6.6GB): fold the per-expert base into the i64
-    # resource addr and index within the expert (fp8 W too). mxfp4/int4 keep the
-    # whole-tensor path.
+    # resource addr and index within the expert (fp8 W too; mxfp4 past 4 GiB, e.g.
+    # E896 at TP1: 9.9GB). int4 keeps the whole-tensor path.
     if const_expr(_w_per_expert_base):
-        _w_per_expert_bytes = N_OUT * (K * (2 if _is_bf16 else 1))
+        _w_per_expert_bytes = N_OUT * (
+            K_HALF if _is_fp4 else K * (2 if _is_bf16 else 1)
+        )
         w_base_i64 = fx.Int64(arg_bq) + fx.Int64(e) * fx.Int64(_w_per_expert_bytes)
         w_tiles = _global_i32_buffer_tiles(
             w_base_i64, min(_w_per_expert_bytes, 0xFFFFFFFF), 4
@@ -977,4 +985,5 @@ def make_b_loader(
         upconvert=upconvert_b,
         load_scale_raw=load_scale_raw,
         convert_scale=convert_scale,
+        w_per_expert_base=_w_per_expert_base,
     )

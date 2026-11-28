@@ -219,7 +219,10 @@ def _gemm1_body_a16w4(
             # a SHARED dword (np = 0 gate / 1 up). K indexing is unchanged vs standard
             # (verified byte-identical; only the N term differs). mxfp4 only.
             n0_local = col_blk // fx.Int32(16)
-            blk_gate = e * fx.Int32(N_OUT // 16) + n0_local * fx.Int32(2)
+            if const_expr(b_loader.w_per_expert_base):
+                blk_gate = n0_local * fx.Int32(2)
+            else:
+                blk_gate = e * fx.Int32(N_OUT // 16) + n0_local * fx.Int32(2)
             scale_mni = e * fx.Int32(N_OUT // 32) + n0_local
             cols_gate.append(
                 _BCol(blk_gate, lane_mod_16, sc_blk=scale_mni, sc_pack=fx.Int32(0))

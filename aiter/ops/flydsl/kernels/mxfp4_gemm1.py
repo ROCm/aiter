@@ -159,7 +159,14 @@ def _gemm1_body(
     _asc_per_mb = max(BM // 32, 1) * kAS_per_chunk_dw * 4
     ascale_num = fx.Int64(i32_total_m_blocks) * fx.Int64(_asc_per_mb)
 
-    bq_tiles = _global_i32_buffer_tiles(arg_bq, BQ_BYTES, 4)
+    # Past 4 GiB the 32-bit buffer cannot reach every expert: re-base W per expert.
+    if const_expr(BQ_BYTES > 0xFFFFFFFF):
+        bq_expert = fx.Int64(arg_bq) + fx.Int64(e) * fx.Int64(N_OUT * K_HALF)
+        bq_tiles = _global_i32_buffer_tiles(bq_expert, N_OUT * K_HALF, 4)
+        e_row = fx.Int32(0)
+    else:
+        bq_tiles = _global_i32_buffer_tiles(arg_bq, BQ_BYTES, 4)
+        e_row = e * fx.Int32(N_OUT)
     bq_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(b_aux), fx.Int32)
 
     bscale_tiles = _global_i32_buffer_tiles(arg_bscale, BSCALE_BYTES, 1)
@@ -240,7 +247,7 @@ def _gemm1_body(
             g = tile_il & fx.Int32(1)
             n0 = tile_il >> fx.Int32(1)
             col = (g * fx.Int32(N0_HALF) + n0) * fx.Int32(16)
-        v = (e * fx.Int32(N_OUT) + col) * fx.Int32(K_HALF)
+        v = (e_row + col) * fx.Int32(K_HALF)
         b_load_s_base.append(rocdl.readfirstlane(T.i32, v))
 
     if const_expr(interleave):
