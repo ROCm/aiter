@@ -7,13 +7,13 @@ Provides `flydsl_moe_sorting_fwd()` with the same signature as
 `aiter.moe_sorting_fwd()` so it can be used as a direct dispatch target
 in `_moe_sorting_impl()`.
 
-Workspace is pre-allocated here (not inside the kernel) so that CUDA graph
-capture sees deterministic allocations.
+The multiphase workspace is allocated here, once per call, like the Opus
+workspace in ``_moe_sorting_impl``. It must not be shared between calls: two
+sorts captured into different CUDA graphs and replayed on different streams
+would otherwise write the same scratch concurrently.
 """
 
 import torch
-
-_workspace_cache = {}
 
 
 def flydsl_moe_sorting_herd(
@@ -96,15 +96,15 @@ def flydsl_moe_sorting_fwd(
     topk = topk_ids.shape[1]
     device = topk_ids.device
 
-    # Pre-allocate workspace (cached per device for CUDA graph compatibility).
-    # A larger workspace can satisfy smaller requests, so we keep the largest seen.
+    # Allocate the multiphase workspace per call (oneshot needs none). A cached
+    # per-device buffer would be baked into every captured graph, and graphs
+    # replayed concurrently on different streams would corrupt each other's
+    # sort. Each call writes every workspace word it uses before reading it,
+    # so nothing has to carry over between calls.
     ws_size = moe_sorting_get_workspace_size(M, num_experts, topk, unit_size)
-    workspace = None
-    if ws_size > 0:
-        workspace = _workspace_cache.get(device)
-        if workspace is None or workspace.numel() < ws_size:
-            workspace = torch.empty(ws_size, dtype=torch.int32, device=device)
-            _workspace_cache[device] = workspace
+    workspace = (
+        torch.empty(ws_size, dtype=torch.int32, device=device) if ws_size > 0 else None
+    )
 
     moe_sorting_flydsl(
         topk_ids,
