@@ -60,6 +60,7 @@ __all__ = [
     "flydsl_a16w4_moe",
     "gemm1_a16w4_grid",
     "gemm2_a16w4_grid",
+    "mxfp4_scale_ref_exponent",
 ]
 
 
@@ -125,10 +126,51 @@ def _check_shared(device, **tensors):
             )
 
 
+def mxfp4_scale_ref_exponent(scale_u8, rows, k_groups):
+    """Per-row max e8m0 byte of a preshuffled MXFP4 scale, for the gfx942 fp8 mode.
+
+    ``scale_u8`` is the scale exactly as gemm1/gemm2 read it (the standard layout,
+    ``shuffle_scale_a16w4(s, E, False)``): ``rows`` weight rows (E * N) by G e8m0
+    groups, G = K/32 padded to a multiple of 8 with 0x7F.
+    Viewed as (rows/32, G/8, 4, 16, 2, 2) its axes are (row // 32, group // 8,
+    group % 4, row % 16, (group // 4) % 2, (row // 16) % 2), the order
+    ``make_b_loader.load_b_scale`` indexes. Pad groups (>= ``k_groups``) are excluded.
+
+    Returns ``(s_ref, max_residual)``: s_ref is ``[rows]`` uint8 (logical row order),
+    max_residual the largest ``s_ref - s`` over real groups. The fp8 decode is exact
+    only up to ``A16W4_FP8_MAX_RESIDUAL``; the caller must not use s_ref beyond that.
+    """
+    flat = scale_u8.reshape(-1)
+    groups = flat.numel() // rows
+    if rows % 32 or groups % 8 or groups * rows != flat.numel() or groups < k_groups:
+        raise ValueError(
+            f"scale with {flat.numel()} bytes is not {rows} rows x 8k groups "
+            f"(k_groups={k_groups})"
+        )
+    v = flat.view(torch.uint8).view(rows // 32, groups // 8, 4, 16, 2, 2)
+    dev = flat.device
+    g = (
+        torch.arange(groups // 8, device=dev).view(-1, 1, 1) * 8
+        + torch.arange(4, device=dev).view(1, -1, 1)
+        + torch.arange(2, device=dev).view(1, 1, -1) * 4
+    )  # [G/8, 4, 2]: logical group of (group // 8, group % 4, (group // 4) % 2)
+    real = (g < k_groups).view(1, groups // 8, 4, 1, 2, 1)
+    sref = torch.where(real, v, 0).amax(dim=(1, 2, 4))  # [rows/32, 16, 2]
+    neg_r = torch.where(real, sref[:, None, None, :, None, :] - v, 0)
+    max_residual = int(neg_r.amax().item())
+    return sref.permute(0, 2, 1).reshape(rows).contiguous(), max_residual
+
+
 # gfx942 (CDNA3) lacks K=32 mfma_f32_16x16x32_bf16 + v_cvt_pk_bf16_f32 -> K=16 MFMA +
 # scalar dequant fallback; gfx950 (CDNA4) uses the K=32 path. compile_gemm{1,2}_a16w4_port
 # are @functools.cache'd, so building through them directly (all-keyword) shares one
 # compile with moe_kernels.py's AOT/runtime direct calls.
+
+
+def _non_default_a_dtype(a_dtype):
+    # Passed only when not bf16: an explicit a_dtype="bf16" would be a different
+    # functools.cache key from moe_kernels.py's calls and compile the kernel twice.
+    return {} if a_dtype == "bf16" else {"a_dtype": a_dtype}
 
 
 def flydsl_a16w4_gemm1(
@@ -162,6 +204,9 @@ def flydsl_a16w4_gemm1(
     w_layout="standard",
     activation_bf16=False,
     prefetch=1,
+    a_dtype="bf16",
+    a_scale=None,
+    w1_sref=None,
     stream=None,
     fused_shared_w1=None,
     shared_inter_bf16=None,
@@ -205,9 +250,16 @@ def flydsl_a16w4_gemm1(
     ``fused_shared_w1`` / ``shared_inter_bf16`` (together): the shared-expert prologue (see
     the module docstring); bf16 ``fused_shared_w1``, or fp8 e4m3 with ``fused_shared_w1_scale``
     (MXFP8). ``shared_tile_n`` defaults to ``a16w4_default_shared_tile_n``.
+
+    ``a_dtype="fp8"`` (gfx942, mxfp4 W, standard layout): ``a_bf16`` holds per-token
+    e4m3fnuz activations, ``a_scale`` their ``[n_tokens]`` f32 scales and ``w1_sref``
+    the ``[E, 2*D_INTER]`` u8 reference exponents of ``w1_scale_u8``
+    (:func:`mxfp4_scale_ref_exponent`); the GEMM runs on fp8 MFMA.
     """
     if k_batch != 1:
         raise NotImplementedError(f"a16w4 gemm1 only supports k_batch=1, got {k_batch}")
+    if a_dtype == "fp8" and (a_scale is None or w1_sref is None):
+        raise ValueError("a16w4 gemm1 a_dtype='fp8' needs a_scale and w1_sref")
     if gate_mode != "separated":
         raise NotImplementedError(
             f"a16w4 gemm1 only supports gate_mode='separated', got {gate_mode!r}"
@@ -290,6 +342,7 @@ def flydsl_a16w4_gemm1(
             shared_k_wave=shared_k_wave,
             shared_w_dtype=sh_wd if sh_wd != "bf16" else None,
         ),
+        **_non_default_a_dtype(a_dtype),
     )
     max_m_blocks = int(sorted_expert_ids.numel())
     grid = gemm1_a16w4_grid(
@@ -319,6 +372,7 @@ def flydsl_a16w4_gemm1(
             sh_scale.data_ptr(),
             shared_inter_bf16.data_ptr(),
         )
+    _fp8_args = (a_scale.data_ptr(), w1_sref.data_ptr()) if a_dtype == "fp8" else ()
     _run_compiled(
         launch,
         a_bf16.data_ptr(),
@@ -334,6 +388,7 @@ def flydsl_a16w4_gemm1(
         _lbeta,
         1.0 / _lbeta,
         float(swiglu_limit),
+        *_fp8_args,
         inter_sorted_bf16.data_ptr(),
         *shared_ptrs,
         torch.cuda.current_stream() if stream is None else stream,
@@ -368,6 +423,9 @@ def flydsl_a16w4_gemm2(
     persist=None,
     epilog="atomic",
     use_valid_token_count=False,
+    a_dtype="bf16",
+    a_scale=None,
+    w2_sref=None,
     stream=None,
     reuse_lds=False,
     shared_inter_bf16=None,
@@ -394,9 +452,20 @@ def flydsl_a16w4_gemm2(
     prologue adds ``shared_inter_bf16 [M_logical, D_INTER] @ fused_shared_w2^T`` into every
     token; bf16 ``fused_shared_w2``, or fp8 e4m3 with ``fused_shared_w2_scale`` (MXFP8).
     ``shared_tile_n`` defaults to ``a16w4_default_shared_tile_n``.
+
+    ``a_dtype="fp8"`` (gfx942, mxfp4 W, atomic): ``inter_sorted_bf16`` holds the
+    intermediate quantized per sorted row to e4m3fnuz, ``a_scale`` its
+    ``[max_sorted]`` f32 row scales and ``w2_sref`` the ``[E, D_HIDDEN]`` u8 reference
+    exponents of ``w2_scale_u8``; the GEMM runs on fp8 MFMA.
     """
     if k_batch != 1:
         raise NotImplementedError(f"a16w4 gemm2 only supports k_batch=1, got {k_batch}")
+    if a_dtype == "fp8" and (a_scale is None or w2_sref is None):
+        raise ValueError("a16w4 gemm2 a_dtype='fp8' needs a_scale and w2_sref")
+    if a_dtype == "fp8" and a_scale.numel() < max_sorted:
+        raise ValueError(
+            f"a16w4 gemm2 fp8 a_scale has {a_scale.numel()} rows, needs {max_sorted}"
+        )
 
     BM = tile_m
     TILE_N = tile_n
@@ -470,6 +539,7 @@ def flydsl_a16w4_gemm2(
             shared_tile_k=shared_tile_k,
             shared_w_dtype=sh_wd if sh_wd != "bf16" else None,
         ),
+        **_non_default_a_dtype(a_dtype),
     )
     grid = gemm2_a16w4_grid(
         BM,
@@ -489,6 +559,7 @@ def flydsl_a16w4_gemm2(
             fused_shared_w2.data_ptr(),
             sh_scale.data_ptr(),
         )
+    _fp8_args = (a_scale.data_ptr(), w2_sref.data_ptr()) if a_dtype == "fp8" else ()
     _run_compiled(
         launch,
         inter_sorted_bf16.data_ptr(),
@@ -501,6 +572,7 @@ def flydsl_a16w4_gemm2(
         int(M_logical),
         int(max_m_blocks),
         int(grid),
+        *_fp8_args,
         flat_out.data_ptr(),
         *shared_ptrs,
         torch.cuda.current_stream() if stream is None else stream,

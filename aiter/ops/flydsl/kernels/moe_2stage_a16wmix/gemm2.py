@@ -17,8 +17,10 @@ from aiter.ops.flydsl.kernels.mxfp4_gemm_common import (
 )
 
 from .utils import (
+    _e8m0_byte_to_f32,
     _global_i32_at,
     _mma_bf16,
+    _mma_fp8,
     _raw,
     _udiv,
     _umod,
@@ -286,6 +288,9 @@ def _gemm2_body_a16w4(
     topk=1,
     dense=False,
     a_rows=None,
+    a_dtype="bf16",
+    arg_a_scale=None,
+    arg_sref=None,
 ):
     """a16w4/a16wi4/a16w16 stage2 body. K=inter_dim (contraction), N=model_dim (N_OUT).
 
@@ -295,15 +300,21 @@ def _gemm2_body_a16w4(
     ``dense=True`` is the shared-expert prologue. A is the shared bf16
     ``[a_rows, inter_dim]`` intermediate by token (a row past ``a_rows`` reads 0).
     ``arg_bq`` is the W2 of that expert. Each row adds into its token at weight 1.0.
+
+    ``a_dtype="fp8"`` (gfx942, mxfp4 W): A is the intermediate quantized per sorted row
+    (one row is one route and K is inter_dim, so a per-row scale is constant over K)
+    with f32 scales ``arg_a_scale[sorted_size]``; each accumulator is multiplied by its
+    row's scale and its column's 2^s_ref (``arg_sref``) before the epilogue.
     """
     _is_gfx942 = str(rocm_arch).startswith("gfx942")
-    elem_bytes = 2
+    _is_a_fp8 = a_dtype == "fp8"
+    elem_bytes = 1 if _is_a_fp8 else 2
     KH_TILE_BYTES = TILE_K * elem_bytes
     LDS_STRIDE = TILE_K
     K = INTER
     K_TILES_TOTAL = K // TILE_K
     m_repeat = BM // 16
-    k_unroll = KH_TILE_BYTES // 64
+    k_unroll = TILE_K // 32
     # 4 waves split the TILE_N tile (matches the atomic-epilog wave-split).
     _n_per_wave = TILE_N // 4
     num_acc_n = _n_per_wave // 16
@@ -341,6 +352,8 @@ def _gemm2_body_a16w4(
         w_dtype=w_dtype,
         b_cache_mod=b_cache_mod,
         rocm_arch=rocm_arch,
+        a_dtype=a_dtype,
+        arg_sref=arg_sref,
     )
 
     # ---- A path (shared with gemm1, see utils.make_a_loader) -------------------
@@ -350,7 +363,7 @@ def _gemm2_body_a16w4(
     c_k_div4 = (K * elem_bytes) // 4
     a_loader = make_a_loader(
         lds_raw_ptr,
-        num_i32=BM * LDS_STRIDE // 2,
+        num_i32=BM * LDS_STRIDE * elem_bytes // 4,
         BM=BM,
         TILE_K=TILE_K,
         KH_TILE_BYTES=KH_TILE_BYTES,
@@ -368,6 +381,7 @@ def _gemm2_body_a16w4(
         row_base_dwords=lambda row_local: (m_row + row_local) * fx.Int32(c_k_div4),
         dma_cache_mod=b_cache_mod,
         dma_via_vgpr=_is_gfx942,
+        a_dtype=a_dtype,
     )
 
     # ---- N-column addressing (W2 cols of model_dim; wave owns _n_per_wave) ------
@@ -390,12 +404,18 @@ def _gemm2_body_a16w4(
 
     # Arch-gate: gfx950 K=32 (one MFMA/K-step); gfx942 splits each v8bf16 into
     # two v4bf16 halves -> TWO 16x16x16 MFMAs into the same acc (no 16x16x32 on gfx942).
-    if const_expr(_is_gfx942):
+    # gfx942 fp8 does have 16x16x32, so that mode is one MFMA per K-step again.
+    if const_expr(_is_a_fp8):
+        mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.Float8E4M3FNUZ))
+    elif const_expr(_is_gfx942):
         mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
     else:
         mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.BFloat16))
 
-    _mma = functools.partial(_mma_bf16, mma_atom, _is_gfx942)
+    if const_expr(_is_a_fp8):
+        _mma = functools.partial(_mma_fp8, mma_atom)
+    else:
+        _mma = functools.partial(_mma_bf16, mma_atom, _is_gfx942)
 
     for kt in range_constexpr(K_TILES_TOTAL):
         base_k = fx.Int32(kt * TILE_K)
@@ -410,6 +430,28 @@ def _gemm2_body_a16w4(
                     a8 = a_loader.load(mi, ku)
                     _mma(accm[mi][ni], a8, bb)
         gpu.barrier()
+
+    if const_expr(_is_a_fp8):
+        # Undo the two factors the fp8 MFMA could not carry. Element v of accm[mi][ni]
+        # is sorted row m_row + mi*16 + lane_div_16*4 + v and column cols[ni]. Rows
+        # past the live ones read in-bounds scales (sized to the sorted buffer) and are
+        # dropped by the epilogue's token_id < i32_M test like in the bf16 path.
+        a_scale_ptr = global_typed_ptr(arg_a_scale, T.f32)
+        sref = [_e8m0_byte_to_f32(c.sref, fx.Int32(0)) for c in cols]
+        for mi in range_constexpr(m_repeat):
+            row_base = m_row + fx.Int32(mi * 16) + lane_div_16 * fx.Int32(4)
+            a_sc = [
+                fx.Float32(a_scale_ptr[row_base + fx.Int32(v)])
+                for v in range_constexpr(4)
+            ]
+            for ni in range_constexpr(num_acc_n):
+                va = Vec(fx.memref_load_vec(accm[mi][ni]))
+                accm[mi][ni].store(
+                    Vec.from_elements(
+                        [va[v] * (a_sc[v] * sref[ni]) for v in range_constexpr(4)],
+                        fx.Float32,
+                    )
+                )
 
     gpu.barrier()
     lds_acc_base_i32 = fx.Int32(fx.ptrtoint(lds_raw_ptr))
@@ -492,6 +534,7 @@ def compile_gemm2_a16w4_port(
     shared_tile_m=None,
     shared_tile_k=None,
     shared_w_dtype="bf16",
+    a_dtype="bf16",
 ):
     """a16w4/a16wi4/a16w16 (bf16 intermediate A x mxfp4/int4/bf16 W2) stage2 builder.
 
@@ -518,6 +561,12 @@ def compile_gemm2_a16w4_port(
     output into every token at weight 1.0. The routed tiles follow in their usual
     order. The shared tile is ``shared_tile_m x shared_tile_n x shared_tile_k``; an
     unset value uses the routed BM or TILE_K. The LDS size is the larger of the two.
+
+    ``a_dtype="fp8"`` (gfx942, mxfp4 W, non-persistent) builds the fp8 MFMA variant: A
+    is the intermediate quantized per sorted row to e4m3fnuz, and the kernel takes two
+    extra pointers, the f32 per-row A scale and the ``[E, N_OUT]`` u8 per-column
+    reference exponent. The default ``"bf16"`` kernel is unchanged. The shared-expert
+    prologue is bf16-A only.
     """
     assert w_dtype in (
         "fp4",
@@ -528,6 +577,16 @@ def compile_gemm2_a16w4_port(
         raise ValueError(
             f"{w_dtype} TILE_K must be a positive multiple of 128, got {TILE_K}"
         )
+    assert a_dtype in (
+        "bf16",
+        "fp8",
+    ), f"a_dtype must be 'bf16' or 'fp8', got {a_dtype!r}"
+    assert a_dtype == "bf16" or (
+        w_dtype == "fp4" and not persist and str(rocm_arch).startswith("gfx942")
+    ), (
+        f"a_dtype='fp8' needs mxfp4 W, non-persist, gfx942: "
+        f"{w_dtype=} {persist=} {rocm_arch=}"
+    )
     if epilog not in ("atomic", "reduce"):
         raise ValueError(f"epilog must be 'atomic' or 'reduce', got {epilog!r}")
     if reuse_lds and (
@@ -561,7 +620,7 @@ def compile_gemm2_a16w4_port(
     )
     assert BM % 16 == 0, f"BM must be a multiple of 16, got {BM}"
     _num_n_blocks = N_OUT // TILE_N
-    KH_TILE_BYTES = TILE_K * 2
+    KH_TILE_BYTES = TILE_K * (1 if a_dtype == "fp8" else 2)
 
     _a_bytes = BM * KH_TILE_BYTES
     if _use_reduce:
@@ -582,6 +641,9 @@ def compile_gemm2_a16w4_port(
             )
 
     if shared_tile_n is not None:
+        assert (
+            a_dtype == "bf16"
+        ), "the shared-expert prologue has no fp8-A path (arg_a_scale/arg_sref)"
         assert not _use_reduce, "the shared-expert prologue needs epilog='atomic'"
         if reuse_lds:
             raise NotImplementedError("the shared-expert prologue has no reuse_lds")
@@ -606,7 +668,10 @@ def compile_gemm2_a16w4_port(
             D_INTER % SH_TK == 0
         ), f"D_INTER must be a multiple of shared_tile_k, got {D_INTER}"
     _wd_tag = "" if w_dtype == "fp4" else f"_{w_dtype}"
-    _name = f"gemm2_a16w4{_wd_tag}_port_ne{NE}_h{N_OUT}_i{_K}_bm{BM}_tn{TILE_N}"
+    _ad_tag = "" if a_dtype == "bf16" else f"_a{a_dtype}"
+    _name = (
+        f"gemm2_a16w4{_wd_tag}{_ad_tag}_port_ne{NE}_h{N_OUT}_i{_K}_bm{BM}_tn{TILE_N}"
+    )
     if reuse_lds and not _use_reduce:
         _name += "_ldsreuse"
     if b_cache_mod != 2:
@@ -625,6 +690,124 @@ def compile_gemm2_a16w4_port(
     @fx.struct
     class SharedStorage:
         raw: fx.Array[fx.Uint8, _lds_bytes, 16]
+
+    if a_dtype == "fp8":
+        # Same kernel as below plus the A-scale and s_ref pointers; a separate
+        # definition so the bf16 kernel's argument list stays as it is.
+        @flyc.kernel(name=_name, known_block_size=[256, 1, 1])
+        def gemm2_fp8_kernel(
+            arg_a: fx.Int64,
+            arg_bq: fx.Int64,
+            arg_bscale: fx.Int64,
+            arg_eids: fx.Int64,
+            arg_cumsum: fx.Int64,
+            arg_stids: fx.Int64,
+            arg_sweights: fx.Int64,
+            i32_M: fx.Int32,
+            i32_max_m_blocks: fx.Int32,
+            arg_a_scale: fx.Int64,
+            arg_sref: fx.Int64,
+            arg_out: fx.Int64,
+        ):
+            lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
+            tx_i32 = fx.Int32(gpu.thread_id("x"))
+            bx_i32 = fx.Int32(gpu.block_id("x"))
+            lane = tx_i32 % 64
+            wave = rocdl.readfirstlane(T.i32, tx_i32 // 64)
+            cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
+            total_m_blocks = cumsum0 // fx.Int32(BM)
+            bound = total_m_blocks * fx.Int32(_num_n_blocks)
+            row_limit = i32_M
+            if const_expr(use_valid_token_count):
+                valid_tokens = _global_i32_at(arg_cumsum, fx.Int32(1))
+                row_limit = (valid_tokens < i32_M).select(valid_tokens, i32_M)
+            _NXCD = 8
+            _xq = _udiv(bound, _NXCD)
+            _xr = _umod(bound, _NXCD)
+            _SW = xcd_swizzle
+
+            def _xcd_np(pid):
+                xc = _umod(pid, _NXCD)
+                wgid = xc * _xq + fx.min(xc, _xr) + _udiv(pid, _NXCD)
+                if const_expr(_SW <= 0):
+                    return wgid
+                _ng = fx.Int32(_SW * _num_n_blocks)
+                group_id = wgid // _ng
+                first_pid_m = group_id * fx.Int32(_SW)
+                remaining_m = total_m_blocks - first_pid_m
+                group_size_m = fx.min(remaining_m, fx.Int32(_SW))
+                wig = wgid % _ng
+                m_block = first_pid_m + (wig % group_size_m)
+                n_block = wig // group_size_m
+                return m_block * fx.Int32(_num_n_blocks) + n_block
+
+            if bx_i32 < bound:
+                _gemm2_body_a16w4(
+                    lds_raw_ptr,
+                    arg_a,
+                    arg_bq,
+                    arg_bscale,
+                    arg_eids,
+                    arg_stids,
+                    arg_sweights,
+                    arg_out,
+                    _xcd_np(bx_i32),
+                    lane,
+                    wave,
+                    row_limit,
+                    BM=BM,
+                    TILE_N=TILE_N,
+                    TILE_K=TILE_K,
+                    N_OUT=N_OUT,
+                    INTER=_K,
+                    NE=NE,
+                    b_cache_mod=b_cache_mod,
+                    w_dtype=w_dtype,
+                    rocm_arch=rocm_arch,
+                    use_reduce=_use_reduce,
+                    topk=_topk,
+                    a_dtype=a_dtype,
+                    arg_a_scale=arg_a_scale,
+                    arg_sref=arg_sref,
+                )
+
+        @flyc.jit
+        def launch_gemm2_fp8(
+            arg_a: fx.Int64,
+            arg_bq: fx.Int64,
+            arg_bscale: fx.Int64,
+            arg_eids: fx.Int64,
+            arg_cumsum: fx.Int64,
+            arg_stids: fx.Int64,
+            arg_sweights: fx.Int64,
+            i32_M: fx.Int32,
+            i32_max_m_blocks: fx.Int32,
+            i32_grid: fx.Int32,
+            arg_a_scale: fx.Int64,
+            arg_sref: fx.Int64,
+            arg_out: fx.Int64,
+            stream: fx.Stream,
+        ):
+            grid_x = fx.Int64(i32_grid)
+            gemm2_fp8_kernel(
+                arg_a,
+                arg_bq,
+                arg_bscale,
+                arg_eids,
+                arg_cumsum,
+                arg_stids,
+                arg_sweights,
+                i32_M,
+                i32_max_m_blocks,
+                arg_a_scale,
+                arg_sref,
+                arg_out,
+                value_attrs=(
+                    {"rocdl.waves_per_eu": waves_per_eu} if waves_per_eu else None
+                ),
+            ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
+
+        return launch_gemm2_fp8
 
     @flyc.kernel(name=_name, known_block_size=[256, 1, 1])
     def gemm2_kernel(
