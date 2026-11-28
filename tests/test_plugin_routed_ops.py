@@ -1041,6 +1041,7 @@ import aiter.ops.mhc
 import aiter.ops.mla_sparse_prefill
 import aiter.ops.pa_sparse_prefill_opus
 import aiter.ops.quant
+import aiter.ops.sample
 import aiter.ops.topk
 import aiter.ops.triton.attention.kda
 import aiter.ops.triton.attention.pa_mqa_logits
@@ -1379,6 +1380,23 @@ def _route_cases():
             1e-6,
             _z(1, 2, 8),
         ),
+        "spec_verify_pick": (
+            lambda: aiter.spec_verify_pick(
+                _z(2, dtype=torch.int32),
+                _z(2, dtype=torch.int32),
+                _z(4, 8, dtype=torch.bfloat16),
+                _z(2, 8),
+                _z(2, 8),
+                _z(2),
+                torch.tensor([0, 2], dtype=torch.int64),
+                torch.tensor([1, 3], dtype=torch.int64),
+                torch.tensor([1, 2], dtype=torch.int32),
+                greedy_eps=0.5,
+            ),
+            "greedy_eps",
+            0.5,
+            None,
+        ),
     }
 
 
@@ -1403,6 +1421,7 @@ _ROUTE_CASES = [
     "causal_conv1d_split_qkv",
     "fused_recurrent_kda",
     "fused_recurrent_kda_packed_decode",
+    "spec_verify_pick",
 ]
 
 
@@ -1428,7 +1447,7 @@ def test_the_public_name_hands_a_provider_the_whole_contract(monkeypatch, case):
     decision = plugin.last_decision()
     assert (decision.route, decision.provider) == ("provider", "aklr")
     assert len(provider.asked) == 1
-    args, _ = provider.asked[0]
+    args, kwargs = provider.asked[0]
     # The signature route() captured: the contract a provider implements.
     positional = [
         p.name
@@ -1439,9 +1458,15 @@ def test_the_public_name_hands_a_provider_the_whole_contract(monkeypatch, case):
         f"{op}: the provider was handed {len(args)} arguments, the contract has "
         f"{len(positional)}"
     )
-    assert (
-        args[positional.index(name)] == value
-    ), f"{op}: {name} did not arrive in its place in the contract"
+    if name in positional:
+        assert (
+            args[positional.index(name)] == value
+        ), f"{op}: {name} did not arrive in its place in the contract"
+    else:
+        # A keyword-only parameter of the contract reaches the provider by name.
+        assert (
+            kwargs[name] == value
+        ), f"{op}: keyword-only {name} did not arrive by keyword"
     if case == "mla_paged_decode":
         assert result[1] is None, "return_lse=False must give no lse"
     elif isinstance(served, torch.Tensor):

@@ -279,6 +279,13 @@
   "supersedes": [],
   "version": 1
  },
+ "spec_verify_pick": {
+  "fingerprint": "cfea9312f201e44c",
+  "signature": "out_t:positional:Tensor, out_b:positional:Tensor, input:positional:Tensor, expo_t:positional:Tensor, expo_b:positional:Tensor, temps:positional:Tensor, target_idx:positional:Tensor, bonus_idx:positional:Tensor, cu_draft:positional:Tensor, eps:keyword-only:float=1e-10, greedy_eps:keyword-only:float=1e-10, -> None",
+  "source": "aiter/ops/sample.py",
+  "supersedes": [],
+  "version": 1
+ },
  "top_k_per_row_decode": {
   "fingerprint": "1a9252653b1e4979",
   "signature": "logits:positional:torch.Tensor, next_n:positional:int, seqLens:positional:torch.Tensor, indices:positional:torch.Tensor, numRows:positional:int, stride0:positional:int, stride1:positional:int, k:positional:int=2048, stable:positional:bool=False, values:positional:torch.Tensor | None=None, max_row_len:positional:int | None=None, row_starts:keyword-only:torch.Tensor | None=None, plane_width:keyword-only:int | None=None, -> None",

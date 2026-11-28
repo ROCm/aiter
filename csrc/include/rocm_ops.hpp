@@ -2447,7 +2447,22 @@ namespace py = pybind11;
           py::arg("lambd")         = 1.0,                                            \
           py::arg("philox_seed")   = 0,                                              \
           py::arg("philox_offset") = 0,                                              \
-          py::arg("eps")           = 1e-10);
+          py::arg("eps")           = 1e-10);                                         \
+    m.def("spec_verify_pick",                                                        \
+          &aiter::spec_verify_pick,                                                  \
+          py::arg("out_t"),                                                          \
+          py::arg("out_b"),                                                          \
+          py::arg("input"),                                                          \
+          py::arg("expo_t"),                                                         \
+          py::arg("expo_b"),                                                         \
+          py::arg("temps"),                                                          \
+          py::arg("target_idx"),                                                     \
+          py::arg("bonus_idx"),                                                      \
+          py::arg("cu_draft"),                                                       \
+          py::arg("workspace"),                                                      \
+          py::arg("split_rows") = false,                                             \
+          py::arg("eps")        = 1e-10,                                             \
+          py::arg("greedy_eps") = 1e-10);
 
 #define HIPBSOLGEMM_PYBIND                                                         \
     m.def("hipb_create_extension", &hipb_create_extension, "create_extension");    \
