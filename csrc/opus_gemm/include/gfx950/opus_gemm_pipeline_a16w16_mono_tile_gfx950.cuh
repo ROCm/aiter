@@ -25,6 +25,7 @@
 
 #include <opus/opus.hpp>
 #include "opus_gemm_traits_a16w16_gfx950.cuh"
+#include "opus_gemm_k_tail_mask_gfx950.cuh"
 
 namespace opus_mono_tile_gfx950 {
 
@@ -300,6 +301,10 @@ void gemm_a16w16_mono_tile_kernel_gfx950(opus_gemm_mono_tile_kargs_gfx950 kargs)
     auto k_offset = [&](int tile_k) { return tile_k * T::B_K; };
 
     const int loops = (kargs.k + T::B_K - 1) / T::B_K;
+    // K-tail mask (ROCm/aiter#5954): the last K tile reads past logical K when
+    // K % B_K != 0. k_tail_partial is wave-uniform and false for aligned K.
+    const int k_valid_last = kargs.k - (loops - 1) * T::B_K;  // in [1, B_K]
+    const bool k_tail_partial = k_valid_last != T::B_K;
     int tic = 0, toc = 1;
 
     async_load<T::VEC_A>(g_a, s_a[tic].ptr, u_ga, u_sa, k_offset(0));
@@ -383,6 +388,10 @@ void gemm_a16w16_mono_tile_kernel_gfx950(opus_gemm_mono_tile_kargs_gfx950 kargs)
         v_a = load<T::VEC_A>(s_a[toc], u_ra);
         v_b = load<T::VEC_B>(sb_r1, u_rb);
         s_waitcnt_lgkmcnt(0_I);
+        if (k_tail_partial) {
+            opus_k_tail_gfx950::mask_k_tail_a<T>(v_a, k_valid_last, lane_id);
+            opus_k_tail_gfx950::mask_k_tail_b<T>(v_b, k_valid_last, lane_id);
+        }
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);

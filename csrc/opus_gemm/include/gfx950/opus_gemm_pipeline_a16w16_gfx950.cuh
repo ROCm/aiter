@@ -7,6 +7,7 @@
 #pragma once
 
 #include "opus_gemm_traits_a16w16_gfx950.cuh"
+#include "opus_gemm_k_tail_mask_gfx950.cuh"
 
 // ============================================================================
 // Layout functions for noscale kernels (TILE/WAVE from Traits)
@@ -300,6 +301,10 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
     };
 
     const int loops = ceil_div(kargs.k, T::B_K);
+    // K-tail mask (ROCm/aiter#5954): the last K tile reads past logical K when
+    // K % B_K != 0. k_tail_partial is wave-uniform and false for aligned K.
+    const int k_valid_last = kargs.k - (loops - 1) * T::B_K;  // in [1, B_K]
+    const bool k_tail_partial = k_valid_last != T::B_K;
     int tic = 0, toc = 1;
 
     // Prologue
@@ -459,6 +464,10 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
         toc ^= 1;
     }
 
+    // Last K tile. Aligned K runs the original straight-line chunk; a partial
+    // K runs a copy that also zeroes the K tail of the A/B fragments. The
+    // branch is outside the chunk (wave-uniform), so the aligned path keeps
+    // its original scheduling and register allocation.
     {
         v_b[0] = load<T::VEC_B>(s_b[tic][0], u_rb);
         v_a = load<T::VEC_A>(s_a[tic][0], u_ra);
@@ -466,6 +475,10 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
         __builtin_amdgcn_s_barrier();
 
         s_waitcnt_lgkmcnt(0_I);
+        if (k_tail_partial) {
+            opus_k_tail_gfx950::mask_k_tail_a<T>(v_a, k_valid_last, lane_id);
+            opus_k_tail_gfx950::mask_k_tail_b<T>(v_b[0], k_valid_last, lane_id);
+        }
         __builtin_amdgcn_s_setprio(1);
         v_c[0][0] = mma(v_a, v_b[0], v_c[0][0]);
         __builtin_amdgcn_s_setprio(0);
@@ -477,6 +490,9 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
         __builtin_amdgcn_s_barrier();
 
         s_waitcnt_lgkmcnt(0_I);
+        if (k_tail_partial) {
+            opus_k_tail_gfx950::mask_k_tail_b<T>(v_b[1], k_valid_last, lane_id);
+        }
         __builtin_amdgcn_s_setprio(1);
         v_c[0][1] = mma(v_a, v_b[1], v_c[0][1]);
         __builtin_amdgcn_s_setprio(0);
@@ -487,6 +503,9 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
         __builtin_amdgcn_s_barrier();
 
         s_waitcnt_lgkmcnt(0_I);
+        if (k_tail_partial) {
+            opus_k_tail_gfx950::mask_k_tail_a<T>(v_a, k_valid_last, lane_id);
+        }
         __builtin_amdgcn_s_setprio(1);
         v_c[1][0] = mma(v_a, v_b[0], v_c[1][0]);
         v_c[1][1] = mma(v_a, v_b[1], v_c[1][1]);

@@ -65,6 +65,8 @@ from opus_gemm_common import (
     GFX1250_SPLITK_FUSE_KIDS,
     _opus_sidecar_path,
     a16w16_flatmm_prefetch_k_iter,
+    a16w16_requires_even_k_tiles,
+    a16w16_requires_k_aligned,
     get_registry,
     group_kids,
 )
@@ -537,8 +539,13 @@ def kid_rejects_shape(k_inst, M, N, K, cu_num):
           - a16w16_flatmm:        K % B_K != 0 -> no K-tail mask, garbage
             accumulates at K tail iter.
           - a16w16_flatmm_splitk: NONE. The reduce-kernel tail path + the
-            splitk main kernel's mask_va_tail cover both edge cases, so
+            splitk main kernel's A/B K-tail mask cover both edge cases, so
             splitk is safe for any (M, N, K).
+          - gfx950 a16w16 split-barrier / persistent / mono_tile (and their
+            4g_safe forms) and flatmm_splitk zero the K tail of the A and B
+            register fragments in the last K tile, so K % B_K != 0 is NOT a
+            rejection reason for them (ROCm/aiter#5954). The even-loops rule
+            above is a separate pipeline-structure constraint and stays.
     """
     if k_inst.max_m is not None and M > k_inst.max_m:
         return True
@@ -570,6 +577,13 @@ def kid_rejects_shape(k_inst, M, N, K, cu_num):
     B_K = k_inst.B_K
     loops = _ceil_div(K, B_K)
 
+    # gfx950 tags outside A16W16_K_TAIL_MASKED_TAGS do not mask the K tail.
+    if a16w16_requires_k_aligned(k_inst) and K % B_K != 0:
+        return True
+    # split-barrier / persistent / mono_tile consume K tiles in pairs.
+    if a16w16_requires_even_k_tiles(k_inst) and (loops < 2 or loops % 2 != 0):
+        return True
+
     # The exact-N bf16-workspace restriction belongs only to the gfx942
     # reducer. gfx1250 #4246 has a different bf16 reducer and accepts padded N.
     if k_inst.arch_prefix == "gfx942" and _kid_uses_bf16_workspace(k_inst):
@@ -591,10 +605,9 @@ def kid_rejects_shape(k_inst, M, N, K, cu_num):
             return True
         if N % 16 != 0:
             return True
-        return bool(
-            not k_inst.has_oob
-            and (M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0)
-        )
+        # K tail: masked in-kernel (opus_gemm_k_tail_mask_gfx950.cuh), so a
+        # partial last K tile is valid for no-OOB kids too.
+        return bool(not k_inst.has_oob and (M % k_inst.B_M != 0 or N % k_inst.B_N != 0))
 
     if k_inst.kernel_tag in ("a16w16_wave_k_coop", "a16w16_wave_k_coop_accum"):
         waves_per_wg = k_inst.BLOCK_SIZE // 64
@@ -612,9 +625,7 @@ def kid_rejects_shape(k_inst, M, N, K, cu_num):
     if k_inst.kernel_tag == "a16w16_flatmm_splitk":
         if loops < _flatmm_splitk_pfk(k_inst):
             return True
-        if not k_inst.has_oob and (
-            M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0
-        ):
+        if not k_inst.has_oob and (M % k_inst.B_M != 0 or N % k_inst.B_N != 0):
             return True
         # Workspace + reduce buffer-resource size limit.
         padded_M = _ceil_div(M, k_inst.B_M) * k_inst.B_M
@@ -725,16 +736,15 @@ def kid_rejects_shape(k_inst, M, N, K, cu_num):
             return True
         if num_tiles_m % split_m != 0:
             return True
-        return bool(
-            not k_inst.has_oob
-            and (M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0)
-        )
+        # K tail: masked in-kernel (opus_gemm_k_tail_mask_gfx950.cuh), so a
+        # partial last K tile is valid for no-OOB kids too.
+        return bool(not k_inst.has_oob and (M % k_inst.B_M != 0 or N % k_inst.B_N != 0))
 
     if k_inst.kernel_tag == "a16w16_mono_tile":
-        # mono_tile is divisible-only (has_oob=False is intrinsic; the
-        # launcher asserts M%B_M==N%B_N==K%B_K==0) and has no splitk /
-        # K-tail mask path. Reject any non-aligned shape up front.
-        if M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0:
+        # mono_tile is M/N divisible-only (has_oob=False is intrinsic; the
+        # launcher asserts M%B_M==N%B_N==0). The K tail is masked in-kernel
+        # (opus_gemm_k_tail_mask_gfx950.cuh), so partial K is accepted.
+        if M % k_inst.B_M != 0 or N % k_inst.B_N != 0:
             return True
         # N%16 vector-store guard (same root cause as a16w16 family);
         # already implied by N%B_N==0 with B_N % 64 == 0, but keep the

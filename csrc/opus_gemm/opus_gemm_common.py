@@ -538,6 +538,50 @@ class OpusGemmInstance:
         return _opus_sf_shuf_sub()
 
 
+# gfx950 a16w16 tags whose pipelines zero the K tail (k >= K) of the A and B
+# register fragments in the last K tile (opus_gemm_k_tail_mask_gfx950.cuh), so a
+# partial last K tile is correct for them: the split-barrier, persistent,
+# mono_tile (each with a 4g_safe form) and flatmm_splitk pipelines (ROCm/aiter#5954).
+A16W16_K_TAIL_MASKED_TAGS = frozenset(
+    {"a16w16", "a16w16_persistent", "a16w16_mono_tile", "a16w16_flatmm_splitk"}
+)
+
+# gfx950 a16w16 tags whose hand-scheduled pipelines consume K tiles in pairs
+# (main loop of two tiles plus two epilogue tiles), so ceil(K / B_K) must be
+# even and at least 2. This is independent of K % B_K.
+A16W16_PAIRED_K_TILE_TAGS = frozenset(
+    {"a16w16", "a16w16_persistent", "a16w16_mono_tile"}
+)
+
+
+# A gfx950 kid carries an empty ``arch_prefix`` (the legacy registry) or
+# ``"gfx950"`` (kernels that spell the architecture, such as the 4-wave kids).
+# gfx942 and gfx1250 kids carry their own prefix.
+_GFX950_ARCH_PREFIXES = frozenset({"", "gfx950"})
+
+
+def a16w16_requires_k_aligned(instance: OpusGemmInstance) -> bool:
+    """Whether a gfx950 kid is only correct when K is a multiple of its B_K.
+
+    True for every gfx950 kid (either ``arch_prefix`` spelling) whose pipeline
+    does not mask the K tail, so a new kernel family is alignment-required until
+    its tag is added to ``A16W16_K_TAIL_MASKED_TAGS``. gfx942 and gfx1250 kids are
+    not covered by this rule.
+    """
+    return (
+        instance.arch_prefix in _GFX950_ARCH_PREFIXES
+        and instance.kernel_tag not in A16W16_K_TAIL_MASKED_TAGS
+    )
+
+
+def a16w16_requires_even_k_tiles(instance: OpusGemmInstance) -> bool:
+    """Whether a gfx950 kid needs an even ceil(K / B_K) of at least 2."""
+    return (
+        instance.arch_prefix in _GFX950_ARCH_PREFIXES
+        and instance.kernel_tag in A16W16_PAIRED_K_TILE_TAGS
+    )
+
+
 def a16w16_flatmm_prefetch_k_iter(instance: OpusGemmInstance) -> int:
     """Mirror gfx950 ``Traits::prefetch_k_iter`` for host-side planning.
 
@@ -1990,7 +2034,8 @@ a16w16_persistent_kernels_list_cpol_nooob = {
 # Locks: BLOCK_SIZE=512, T_M=2, T_N=4, T_K=1, W_M=W_N=16, W_K=32 (MFMA
 # 16x16x32 BF16), VEC=8. Single v_c accumulator over the full B_M x B_N
 # tile per K iter (no quad-subtile, no split barrier). Intrinsically
-# non-OOB (launcher enforces M%B_M==N%B_N==K%B_K==0) and HAS_BIAS=false
+# non-OOB (launcher enforces M%B_M==N%B_N==0; the K tail is masked in-kernel)
+# and HAS_BIAS=false
 # (launcher rejects non-empty bias up front). No splitK.
 #
 # B_M <= 192 hard cap. The 7 tiles below were picked to cover
