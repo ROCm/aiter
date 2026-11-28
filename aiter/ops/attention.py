@@ -3459,6 +3459,7 @@ def decode_update_mla_metadata_v1_kernel(
     tile_reduce_cnt,
     num_reject_tokens,
     has_num_reject_tokens: tl.constexpr,
+    whole_row: tl.constexpr = False,
 ):
     work_id = tl.program_id(0)
     num_workers = tl.load(work_indptr + cu_num)
@@ -3466,6 +3467,15 @@ def decode_update_mla_metadata_v1_kernel(
         return
     batch_id = tl.load(work_info + work_id * 8 + 0)
     real_batch_id = batch_id // qk_batch_ratio
+
+    if whole_row:
+        # The seed plan retains one unsplit item even when its current row is empty.
+        kv_start = tl.load(seqlens_kv_indptr + batch_id).to(tl.int32)
+        kv_end = tl.load(seqlens_kv_indptr + batch_id + 1).to(tl.int32)
+        tl.store(work_info + work_id * 8 + 4, kv_start)
+        tl.store(work_info + work_id * 8 + 5, kv_end)
+        tl.store(work_info + work_id * 8 + 6, 0)
+        return
 
     # seq_kv_start = tl.load(seqlens_kv_indptr + real_batch_id).to(tl.int32)
     seq_kv_end = tl.load(seqlens_kv_indptr + real_batch_id + 1).to(tl.int32)
@@ -3552,10 +3562,35 @@ def decode_update_mla_metadata_v1(
     dtype_q: torch.dtype = dtypes.bf16,
     dtype_kv: torch.dtype = dtypes.bf16,
     num_reject_tokens: torch.Tensor | None = None,
+    *,
+    whole_row: bool = False,
 ) -> None:
     """
     Update MLA metadata incrementally for decode steps where the batch
     composition has not changed. It will also convert qlen > 1 to qlen = 1.
+
+    With ``whole_row=True``, replace each row's KV range with
+    ``[seqlens_kv_indptr[b], seqlens_kv_indptr[b + 1])``. These are absolute
+    positions in the KV index tensor, including when its first indptr is nonzero.
+    Ranges may shrink to zero or grow from zero. Query locations, work assignment
+    and reduction maps stay unchanged. ``num_reject_tokens`` must be None.
+
+    Whole-row mode requires an unsplit, native-head plan with one query per row.
+    To obtain a stable plan, call ``get_mla_metadata_v1`` with the same zero-based
+    ``arange(batch_size + 1, dtype=int32)`` for BOTH query and temporary KV
+    indptr, and all-one last-page lengths. Use ``max_seqlen_qo=uni_seqlen_qo=1``,
+    ``page_size=1``, ``fast_mode=True``, ``intra_batch_mode=False``, ``topk=-1``,
+    and ``is_cp_round_robin=False``. Keep the same heads, dtypes, granularity and
+    buffers for updates. This seed reserves every row, including rows whose
+    actual KV range is initially empty. Update it before the first attention.
+
+    The caller must retain this producer provenance with the actual buffers.
+    Native head shape alone does not certify an arbitrary plan. Split plans,
+    plans with omitted rows, and plans rebuilt into the same buffers are not
+    valid inputs. Rebuild a seed plan when the query rows or their identity
+    change. This function does not scan device metadata or synchronize to
+    validate that contract. The attention backend must also support the chosen
+    head/dtype shape and empty KV rows; metadata support does not imply that.
     """
     assert kv_granularity % page_size == 0
     assert num_heads_k == 1
@@ -3564,6 +3599,11 @@ def decode_update_mla_metadata_v1(
     assert (
         max_seqlen_qo >= 1
     ), "pass the max_seqlen_qo get_mla_metadata_v1 was planned with (>= 1)"
+    if whole_row:
+        if max_seqlen_qo != 1 or num_reject_tokens is not None:
+            raise ValueError("whole_row requires qlen=1 and no rejection tokens")
+        if seqlens_qo_indptr.shape != seqlens_kv_indptr.shape:
+            raise ValueError("whole_row requires matching query and KV row counts")
     head_plan = _mla_metadata_head_plan(
         num_heads_per_head_k,
         max_seqlen_qo,
@@ -3572,6 +3612,10 @@ def decode_update_mla_metadata_v1(
         fast_mode=True,
         intra_batch_mode=False,
     )
+    if whole_row and (
+        head_plan.plan != _MlaHeadPlanKind.NATIVE or head_plan.qk_batch_ratio != 1
+    ):
+        raise ValueError("whole_row requires a native, unfolded head plan")
     qk_batch_ratio = head_plan.qk_batch_ratio
     num_heads_per_head_k = head_plan.kernel_num_heads
     cu_num = work_indptr.shape[0] - 1
@@ -3597,6 +3641,7 @@ def decode_update_mla_metadata_v1(
         tile_reduce_cnt,
         num_reject_tokens,
         num_reject_tokens is not None,
+        whole_row=whole_row,
     )
 
 
