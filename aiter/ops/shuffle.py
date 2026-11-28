@@ -174,6 +174,7 @@ def shuffle_weight(
     is_guinterleave=False,
     gate_up: bool = False,
     pad_k_to: int = 0,
+    pad_n_to: int = 0,
 ) -> torch.Tensor:
     x_type = x.dtype
     is_packed_fp4 = (
@@ -181,6 +182,22 @@ def shuffle_weight(
     )
     if is_packed_fp4:
         x = x.view(torch.uint8)
+
+    # pad_n_to pads the rows (dim -2) as one block; stacked gate/up weights need
+    # each half padded separately instead.
+    original_n = x.shape[-2]
+    if pad_n_to:
+        if pad_n_to < 0:
+            raise ValueError(f"pad_n_to must be non-negative, got {pad_n_to}")
+        if use_int4:
+            raise NotImplementedError("pad_n_to is not supported with use_int4=True")
+        if is_guinterleave:
+            raise NotImplementedError(
+                "pad_n_to is not supported with is_guinterleave=True"
+            )
+        padded_n = ((original_n + pad_n_to - 1) // pad_n_to) * pad_n_to
+        if padded_n != original_n:
+            x = F.pad(x.contiguous(), (0, 0, 0, padded_n - original_n), value=0)
 
     original_k = x.shape[-1]
     if pad_k_to:
@@ -241,6 +258,9 @@ def shuffle_weight(
     if pad_k_to:
         x_.aiter_original_k = original_k
         x_.aiter_padded_k = x.shape[-1]
+    if pad_n_to:
+        x_.aiter_original_n = original_n
+        x_.aiter_padded_n = x.shape[-2]
     return x_
 
 

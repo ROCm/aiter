@@ -24,26 +24,27 @@ template <typename A0DataType,
           bool PerTensorQuant,
           bool MulRoutedWeight,
           int ActOP,
-          bool RuntimeSwigluLimit>
-void ck_moe_stage1_gemm(const hipStream_t& stream,
-                        int tokens,
-                        int sorted_size,
-                        int N,
-                        int K,
-                        int topk,
-                        void*& hidden_states, // [m, k], input token
-                        void*& w1,            // [e, n, k]/[e, 2*n, k], pre-shuffle([e, nr, kr, w])
-                        void*& w2, // [expert, dim, inter_dim], pre-shuffle([e, nr, kr, w])
-                        void*& sorted_token_ids,  // [max_num_tokens_padded]
-                        void*& sorted_expert_ids, // [max_num_m_blocks]
-                        void*& sorted_weights,
-                        void*& num_valid_ids,          // [1]
-                        void*& out,                    // [max_num_tokens_padded, inter_dim]
-                        std::optional<void*> w1_scale, // [e, 1, n], gate(up) scale
-                        std::optional<void*> a1_scale, // [m, 1], token scale
-                        std::optional<int> splitk,     // splitk
-                        std::optional<bool> nt,
-                        [[maybe_unused]] float swiglu_limit)
+          bool RuntimeSwigluLimit,
+          ck::tensor_operation::device::GemmSpecialization GemmSpec>
+void ck_moe_stage1_gemm_impl(const hipStream_t& stream,
+                             int tokens,
+                             int sorted_size,
+                             int N,
+                             int K,
+                             int topk,
+                             void*& hidden_states, // [m, k], input token
+                             void*& w1, // [e, n, k]/[e, 2*n, k], pre-shuffle([e, nr, kr, w])
+                             void*& w2, // [expert, dim, inter_dim], pre-shuffle([e, nr, kr, w])
+                             void*& sorted_token_ids,  // [max_num_tokens_padded]
+                             void*& sorted_expert_ids, // [max_num_m_blocks]
+                             void*& sorted_weights,
+                             void*& num_valid_ids,          // [1]
+                             void*& out,                    // [max_num_tokens_padded, inter_dim]
+                             std::optional<void*> w1_scale, // [e, 1, n], gate(up) scale
+                             std::optional<void*> a1_scale, // [m, 1], token scale
+                             std::optional<int> splitk,     // splitk
+                             std::optional<bool> nt,
+                             [[maybe_unused]] float swiglu_limit)
 {
     const bool enabled = swiglu_limit > 0.0f && std::isfinite(swiglu_limit);
     TORCH_CHECK(enabled == RuntimeSwigluLimit,
@@ -76,7 +77,6 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
     using AElementOp  = PassThrough;
     using BElementOp  = PassThrough;
 
-    static constexpr auto GemmSpec = ck::tensor_operation::device::GemmSpecialization::Default;
     static constexpr ck::index_t MNPerXDL    = 16;
     static constexpr ck::index_t WAVES       = BLOCKSIZE / 64;
     static constexpr ck::index_t MXDLPerWave = MPerBlock / (MNPerXDL * MWaves);
@@ -173,44 +173,130 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
     invoker.Run(argument, StreamConfig{stream});
 }
 
+#define CK_MOE_STAGE1_GEMM_WRAPPER(NAME, SPEC)                                                  \
+    template <typename A0DataType,                                                              \
+              typename B0DataType,                                                              \
+              typename AccDataType,                                                             \
+              typename EDataType,                                                               \
+              typename CDEElementOp,                                                            \
+              PipelineVersion PipelineVer,                                                      \
+              int BLOCKSIZE,                                                                    \
+              int MPerBlock,                                                                    \
+              int NPerBlock,                                                                    \
+              int KPerBlock,                                                                    \
+              int MWaves,                                                                       \
+              int NWaves,                                                                       \
+              bool Nswizzle,                                                                    \
+              bool PerTensorQuant,                                                              \
+              bool MulRoutedWeight,                                                             \
+              int ActOP,                                                                        \
+              bool RuntimeSwigluLimit>                                                          \
+    void NAME(const hipStream_t& stream,                                                        \
+              int tokens,                                                                       \
+              int sorted_size,                                                                  \
+              int N,                                                                            \
+              int K,                                                                            \
+              int topk,                                                                         \
+              void*& hidden_states,                                                             \
+              void*& w1,                                                                        \
+              void*& w2,                                                                        \
+              void*& sorted_token_ids,                                                          \
+              void*& sorted_expert_ids,                                                         \
+              void*& sorted_weights,                                                            \
+              void*& num_valid_ids,                                                             \
+              void*& out,                                                                       \
+              std::optional<void*> w1_scale,                                                    \
+              std::optional<void*> a1_scale,                                                    \
+              std::optional<int> splitk,                                                        \
+              std::optional<bool> nt,                                                           \
+              float swiglu_limit)                                                               \
+    {                                                                                           \
+        ck_moe_stage1_gemm_impl<A0DataType,                                                     \
+                                B0DataType,                                                     \
+                                AccDataType,                                                    \
+                                EDataType,                                                      \
+                                CDEElementOp,                                                   \
+                                PipelineVer,                                                    \
+                                BLOCKSIZE,                                                      \
+                                MPerBlock,                                                      \
+                                NPerBlock,                                                      \
+                                KPerBlock,                                                      \
+                                MWaves,                                                         \
+                                NWaves,                                                         \
+                                Nswizzle,                                                       \
+                                PerTensorQuant,                                                 \
+                                MulRoutedWeight,                                                \
+                                ActOP,                                                          \
+                                RuntimeSwigluLimit,                                             \
+                                ck::tensor_operation::device::GemmSpecialization::SPEC>(        \
+            stream, tokens, sorted_size, N, K, topk, hidden_states, w1, w2, sorted_token_ids,  \
+            sorted_expert_ids, sorted_weights, num_valid_ids, out, w1_scale, a1_scale, splitk, \
+            nt, swiglu_limit);                                                                  \
+    }
+CK_MOE_STAGE1_GEMM_WRAPPER(ck_moe_stage1_gemm, Default)
+CK_MOE_STAGE1_GEMM_WRAPPER(ck_moe_stage1_gemm_nkpad, NKPadding)
+#undef CK_MOE_STAGE1_GEMM_WRAPPER
+
+#define CK_MOE_STAGE1_GEMM_INSTANTIATE(                                             \
+    FUNC, BLOCKSIZE, MPerfBlock, NPerBlock, KPerBlock, MWaves, NWaves, PipelineVer) \
+    template void FUNC<A0DataType,                                                  \
+                       B0DataType,                                                  \
+                       AccDataType,                                                 \
+                       EDataType,                                                   \
+                       CDEElementOp,                                                \
+                       PipelineVer,                                                 \
+                       BLOCKSIZE,                                                   \
+                       MPerfBlock,                                                  \
+                       NPerBlock,                                                   \
+                       KPerBlock,                                                   \
+                       MWaves,                                                      \
+                       NWaves,                                                      \
+                       Nswizzle,                                                    \
+                       PerTensorQuant,                                              \
+                       MulRoutedWeight,                                             \
+                       ActOP,                                                       \
+                       AITER_CK_MOE_RUNTIME_SWIGLU_LIMIT>(                          \
+        const hipStream_t& stream,                                                  \
+        int tokens,                                                                 \
+        int sorted_size,                                                            \
+        int N,                                                                      \
+        int K,                                                                      \
+        int topk,                                                                   \
+        void*& hidden_states,                                                       \
+        void*& w1,                                                                  \
+        void*& w2,                                                                  \
+        void*& sorted_token_ids,                                                    \
+        void*& sorted_expert_ids,                                                   \
+        void*& sorted_weights,                                                      \
+        void*& num_valid_ids,                                                       \
+        void*& out,                                                                 \
+        std::optional<void*> w1_scale,                                              \
+        std::optional<void*> a1_scale,                                              \
+        std::optional<int> splitk,                                                  \
+        std::optional<bool> nt,                                                     \
+        [[maybe_unused]] float swiglu_limit);
+
 #define CK_MOE_STAGE1_GEMM_DEFINE(                                            \
     BLOCKSIZE, MPerfBlock, NPerBlock, KPerBlock, MWaves, NWaves, PipelineVer) \
-    template void ck_moe_stage1_gemm<A0DataType,                              \
-                                     B0DataType,                              \
-                                     AccDataType,                             \
-                                     EDataType,                               \
-                                     CDEElementOp,                            \
-                                     PipelineVer,                             \
-                                     BLOCKSIZE,                               \
-                                     MPerfBlock,                              \
-                                     NPerBlock,                               \
-                                     KPerBlock,                               \
-                                     MWaves,                                  \
-                                     NWaves,                                  \
-                                     Nswizzle,                                \
-                                     PerTensorQuant,                          \
-                                     MulRoutedWeight,                         \
-                                     ActOP,                                   \
-                                     AITER_CK_MOE_RUNTIME_SWIGLU_LIMIT>(      \
-        const hipStream_t& stream,                                            \
-        int tokens,                                                           \
-        int sorted_size,                                                      \
-        int N,                                                                \
-        int K,                                                                \
-        int topk,                                                             \
-        void*& hidden_states,                                                 \
-        void*& w1,                                                            \
-        void*& w2,                                                            \
-        void*& sorted_token_ids,                                              \
-        void*& sorted_expert_ids,                                             \
-        void*& sorted_weights,                                                \
-        void*& num_valid_ids,                                                 \
-        void*& out,                                                           \
-        std::optional<void*> w1_scale,                                        \
-        std::optional<void*> a1_scale,                                        \
-        std::optional<int> splitk,                                            \
-        std::optional<bool> nt,                                               \
-        [[maybe_unused]] float swiglu_limit);
+    CK_MOE_STAGE1_GEMM_INSTANTIATE(ck_moe_stage1_gemm,                        \
+                                   BLOCKSIZE,                                 \
+                                   MPerfBlock,                                \
+                                   NPerBlock,                                 \
+                                   KPerBlock,                                 \
+                                   MWaves,                                    \
+                                   NWaves,                                    \
+                                   PipelineVer)
+
+#define CK_MOE_STAGE1_GEMM_NKPAD_DEFINE(                                      \
+    BLOCKSIZE, MPerfBlock, NPerBlock, KPerBlock, MWaves, NWaves, PipelineVer) \
+    CK_MOE_STAGE1_GEMM_INSTANTIATE(ck_moe_stage1_gemm_nkpad,                  \
+                                   BLOCKSIZE,                                 \
+                                   MPerfBlock,                                \
+                                   NPerBlock,                                 \
+                                   KPerBlock,                                 \
+                                   MWaves,                                    \
+                                   NWaves,                                    \
+                                   PipelineVer)
 
 template <typename A0DataType,
           typename B0DataType,
@@ -227,26 +313,27 @@ template <typename A0DataType,
           bool Nswizzle,
           bool PerTensorQuant,
           bool MulRoutedWeight,
-          int ActOP = 0>
-void ck_moe_stage2_gemm(const hipStream_t& stream,
-                        int tokens,
-                        int sorted_size,
-                        int N,
-                        int K,
-                        int topk,
-                        void*& inter_states, // [max_num_tokens_padded, k], input token
-                        void*& w1,           // [e, n, k]/[e, 2*n, k], pre-shuffle([e, nr, kr, w])
-                        void*& w2, // [expert, dim, inter_dim], pre-shuffle([e, nr, kr, w])
-                        void*& sorted_token_ids,       // [max_num_tokens_padded]
-                        void*& sorted_expert_ids,      // [max_num_m_blocks]
-                        void*& sorted_weights,         // [max_num_tokens_padded]
-                        void*& num_valid_ids,          //[1]
-                        void*& out,                    // [m, out_dim]
-                        std::optional<void*> w2_scale, // [e, 1, n], gate(up) scale
-                        std::optional<void*> a2_scale, // [max_num_tokens_padded, 1], token scale
-                        std::optional<int> splitk,     // splitk
-                        std::optional<bool> nt,
-                        [[maybe_unused]] float swiglu_limit)
+          int ActOP,
+          ck::tensor_operation::device::GemmSpecialization GemmSpec>
+void ck_moe_stage2_gemm_impl(const hipStream_t& stream,
+                             int tokens,
+                             int sorted_size,
+                             int N,
+                             int K,
+                             int topk,
+                             void*& inter_states, // [max_num_tokens_padded, k], input token
+                             void*& w1, // [e, n, k]/[e, 2*n, k], pre-shuffle([e, nr, kr, w])
+                             void*& w2, // [expert, dim, inter_dim], pre-shuffle([e, nr, kr, w])
+                             void*& sorted_token_ids,       // [max_num_tokens_padded]
+                             void*& sorted_expert_ids,      // [max_num_m_blocks]
+                             void*& sorted_weights,         // [max_num_tokens_padded]
+                             void*& num_valid_ids,          //[1]
+                             void*& out,                    // [m, out_dim]
+                             std::optional<void*> w2_scale, // [e, 1, n], gate(up) scale
+                             std::optional<void*> a2_scale, // [max_num_tokens_padded, 1], token scale
+                             std::optional<int> splitk,     // splitk
+                             std::optional<bool> nt,
+                             [[maybe_unused]] float swiglu_limit)
 {
     // ~~~~~~~~~~~~~~~~~~~~~~~~following start with ck things
     ck::index_t StrideA = K;
@@ -270,7 +357,6 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
     using AElementOp  = PassThrough;
     using BElementOp  = PassThrough;
 
-    static constexpr auto GemmSpec = ck::tensor_operation::device::GemmSpecialization::Default;
     // static constexpr ck::index_t BLOCKSIZE = 256;
     static constexpr ck::index_t WAVES               = BLOCKSIZE / 64;
     static constexpr ck::index_t MNPerXDL            = 16;
@@ -365,8 +451,70 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
     invoker.Run(argument, StreamConfig{stream});
 }
 
-#define CK_MOE_STAGE2_GEMM_DEFINE(BLOCKSIZE, MPerfBlock, NPerfBlock, KPerBlock, MWaves, NWaves, PipelineVer)                                                                                    \
-    template void ck_moe_stage2_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, BLOCKSIZE, MPerfBlock, NPerfBlock, KPerBlock, MWaves, NWaves, Nswizzle, PerTensorQuant, MulRoutedWeight, ActOP>( \
+#define CK_MOE_STAGE2_GEMM_WRAPPER(NAME, SPEC)                                                 \
+    template <typename A0DataType,                                                             \
+              typename B0DataType,                                                             \
+              typename AccDataType,                                                            \
+              typename EDataType,                                                              \
+              typename CDEElementOp,                                                           \
+              PipelineVersion PipelineVer,                                                     \
+              int BLOCKSIZE,                                                                   \
+              int MPerBlock,                                                                   \
+              int NPerBlock,                                                                   \
+              int KPerBlock,                                                                   \
+              int MWaves,                                                                      \
+              int NWaves,                                                                      \
+              bool Nswizzle,                                                                   \
+              bool PerTensorQuant,                                                             \
+              bool MulRoutedWeight,                                                            \
+              int ActOP = 0>                                                                   \
+    void NAME(const hipStream_t& stream,                                                       \
+              int tokens,                                                                      \
+              int sorted_size,                                                                 \
+              int N,                                                                           \
+              int K,                                                                           \
+              int topk,                                                                        \
+              void*& inter_states,                                                             \
+              void*& w1,                                                                       \
+              void*& w2,                                                                       \
+              void*& sorted_token_ids,                                                         \
+              void*& sorted_expert_ids,                                                        \
+              void*& sorted_weights,                                                           \
+              void*& num_valid_ids,                                                            \
+              void*& out,                                                                      \
+              std::optional<void*> w2_scale,                                                   \
+              std::optional<void*> a2_scale,                                                   \
+              std::optional<int> splitk,                                                       \
+              std::optional<bool> nt,                                                          \
+              float swiglu_limit)                                                              \
+    {                                                                                          \
+        ck_moe_stage2_gemm_impl<A0DataType,                                                    \
+                                B0DataType,                                                    \
+                                AccDataType,                                                   \
+                                EDataType,                                                     \
+                                CDEElementOp,                                                  \
+                                PipelineVer,                                                   \
+                                BLOCKSIZE,                                                     \
+                                MPerBlock,                                                     \
+                                NPerBlock,                                                     \
+                                KPerBlock,                                                     \
+                                MWaves,                                                        \
+                                NWaves,                                                        \
+                                Nswizzle,                                                      \
+                                PerTensorQuant,                                                \
+                                MulRoutedWeight,                                               \
+                                ActOP,                                                         \
+                                ck::tensor_operation::device::GemmSpecialization::SPEC>(       \
+            stream, tokens, sorted_size, N, K, topk, inter_states, w1, w2, sorted_token_ids,  \
+            sorted_expert_ids, sorted_weights, num_valid_ids, out, w2_scale, a2_scale, splitk, \
+            nt, swiglu_limit);                                                                 \
+    }
+CK_MOE_STAGE2_GEMM_WRAPPER(ck_moe_stage2_gemm, Default)
+CK_MOE_STAGE2_GEMM_WRAPPER(ck_moe_stage2_gemm_nkpad, NKPadding)
+#undef CK_MOE_STAGE2_GEMM_WRAPPER
+
+#define CK_MOE_STAGE2_GEMM_INSTANTIATE(FUNC, BLOCKSIZE, MPerfBlock, NPerfBlock, KPerBlock, MWaves, NWaves, PipelineVer)                                                                                    \
+    template void FUNC<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, BLOCKSIZE, MPerfBlock, NPerfBlock, KPerBlock, MWaves, NWaves, Nswizzle, PerTensorQuant, MulRoutedWeight, ActOP>( \
         const hipStream_t &stream,                                                                                                                                   \
         int tokens, int sorted_size, int N, int K,                                                                                                                   \
         int topk,                                                                                                                                                    \
@@ -382,3 +530,25 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
         std::optional<void *> a2_scale,                                                                                                                              \
         std::optional<int>   splitk,                                                                                                                                 \
         std::optional<bool> nt, [[maybe_unused]] float swiglu_limit);
+
+#define CK_MOE_STAGE2_GEMM_DEFINE(                                             \
+    BLOCKSIZE, MPerfBlock, NPerfBlock, KPerBlock, MWaves, NWaves, PipelineVer) \
+    CK_MOE_STAGE2_GEMM_INSTANTIATE(ck_moe_stage2_gemm,                         \
+                                   BLOCKSIZE,                                  \
+                                   MPerfBlock,                                 \
+                                   NPerfBlock,                                 \
+                                   KPerBlock,                                  \
+                                   MWaves,                                     \
+                                   NWaves,                                     \
+                                   PipelineVer)
+
+#define CK_MOE_STAGE2_GEMM_NKPAD_DEFINE(                                       \
+    BLOCKSIZE, MPerfBlock, NPerfBlock, KPerBlock, MWaves, NWaves, PipelineVer) \
+    CK_MOE_STAGE2_GEMM_INSTANTIATE(ck_moe_stage2_gemm_nkpad,                   \
+                                   BLOCKSIZE,                                  \
+                                   MPerfBlock,                                 \
+                                   NPerfBlock,                                 \
+                                   KPerBlock,                                  \
+                                   MWaves,                                     \
+                                   NWaves,                                     \
+                                   PipelineVer)

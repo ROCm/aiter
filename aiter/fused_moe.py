@@ -615,6 +615,35 @@ def _validate_flydsl_route_output_nbytes(route_output_nbytes: int) -> None:
         )
 
 
+def _logical_model_dim(hidden_states: torch.Tensor, model_dim: int) -> int:
+    # The CK 2-stage kernels take 16-bit w2 zero-padded to a multiple of 16 rows
+    # (shuffle_weight pad_n_to) while the activations and output keep the model's
+    # hidden size.
+    hidden = hidden_states.shape[-1]
+    if (
+        hidden_states.dtype in (dtypes.bf16, dtypes.fp16)
+        and hidden < model_dim
+        and model_dim == (hidden + 15) // 16 * 16
+    ):
+        return hidden
+    return model_dim
+
+
+def _logical_dims(hidden_states, w1, w2) -> tuple[int, int, int]:
+    E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    # 16-bit w1 padded with shuffle_weight pad_k_to can be wider than w2's padded
+    # rows, which get_inter_dim reads as an int4 packing ratio of 0.
+    if w1.dtype in (dtypes.bf16, dtypes.fp16) and w1.shape[-1] > w2.shape[1]:
+        inter_dim = w2.shape[-1]
+    return E, _logical_model_dim(hidden_states, model_dim), inter_dim
+
+
+def _has_ck_padded_weights(hidden_states, w1, w2, model_dim) -> bool:
+    return w1.dtype in (dtypes.bf16, dtypes.fp16) and (
+        w2.shape[1] != model_dim or w1.shape[-1] != hidden_states.shape[-1]
+    )
+
+
 @drop_presort_after
 def fused_moe(
     hidden_states,
@@ -906,7 +935,7 @@ def fused_moe_fake(
     device = topk_ids.device
     M, _topk = topk_ids.shape
     dtype = hidden_states.dtype if dtype is None else dtype
-    model_dim = w2.shape[1]
+    model_dim = _logical_model_dim(hidden_states, w2.shape[1])
     if ep_source_token_map is not None and output is not None:
         raise RuntimeError(
             "output= is incompatible with stage2_scatter: GEMM2 P2P-writes the "
@@ -1348,7 +1377,7 @@ def _fused_moe_impl(
             )
         topk = herd_topk
     config_M, config_topk = (M, topk) if _config_shape is None else _config_shape
-    E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    E, model_dim, inter_dim = _logical_dims(hidden_states, w1, w2)
     if not hidden_states.is_contiguous() and not _is_row_major_2d(hidden_states):
         hidden_states = hidden_states.contiguous()
 
@@ -1742,6 +1771,17 @@ def _fused_moe_impl(
             "No safe MXFP4 MoE backend for this shape and layout: CK-Tile "
             f"stage2 mis-indexes scales at inter_dim={inter_dim}, and the "
             "FlyDSL fallback cannot accept this invocation."
+        )
+    if _has_ck_padded_weights(hidden_states, w1, w2, model_dim) and not (
+        metadata.full_impl is None
+        and not metadata.run_1stage
+        and getattr(metadata.stage1, "func", metadata.stage1) is ck_moe_stage1
+        and stage2_func is aiter.ck_moe_stage2_fwd
+    ):
+        raise NotImplementedError(
+            f"MoE weights zero-padded past hidden size {model_dim} (w1 "
+            f"{tuple(w1.shape)}, w2 {tuple(w2.shape)}) are only supported by the "
+            "CK 2-stage kernels"
         )
 
     if (
@@ -6254,7 +6294,7 @@ def fused_moe_2stages(
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
     token_num, _ = hidden_states.shape
-    E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    E, model_dim, inter_dim = _logical_dims(hidden_states, w1, w2)
     dtype = moe_out.dtype
     device = hidden_states.device
     _sort_moe_buf = moe_out
