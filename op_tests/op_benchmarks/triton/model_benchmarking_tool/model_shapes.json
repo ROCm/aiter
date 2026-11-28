@@ -889,5 +889,26 @@
                 "dv": 512
             }
         ]
+    },
+    "Gemma-4 31B": {
+        "unified_attention": [
+            {
+                "comment": "Full/global attention (10 of 60 layers)",
+                "hq": 32,
+                "hkv": 4,
+                "dqk": 512,
+                "dv": 512,
+                "block_size": 64
+            },
+            {
+                "comment": "Sliding-window attention (50 of 60 layers)",
+                "hq": 32,
+                "hkv": 16,
+                "dqk": 256,
+                "dv": 256,
+                "sliding_window": 1024,
+                "block_size": 32
+            }
+        ]
     }
 }
