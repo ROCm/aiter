@@ -437,38 +437,38 @@ class _BLoader(NamedTuple):
     convert_scale: Callable | None = None
 
 
-# gfx942 MXFP4: E2M1 mag 0..7 as E4M3FNUZ fp8 bytes for one v_perm_b32.
-# byte[i] = {0x00, 0x38, 0x40, 0x44, 0x48, 0x4C, 0x50, 0x54}[mag.byte(i)]
-_FP4_E2M1_FP8_LUT_LO = 0x44403800  # mag 0..3
-_FP4_E2M1_FP8_LUT_HI = 0x54504C48  # mag 4..7
+# gfx942 MXFP4: E2M1 mag 0..7 as negative E4M3FNUZ fp8 bytes for one v_perm_b32.
+# byte[i] = {0x00, 0xB8, 0xC0, 0xC4, 0xC8, 0xCC, 0xD0, 0xD4}[mag.byte(i)]; mag 0 has no
+# sign bit, so E2M1 -0.0 decodes to 0x00 and never to FNUZ NaN (0x80).
+_FP4_E2M1_FP8_NEG_LUT_LO = 0xC4C0B800  # mag 0..3
+_FP4_E2M1_FP8_NEG_LUT_HI = 0xD4D0CCC8  # mag 4..7
+# v_perm_b32(hi, lo, sel) bytes 2,3 of lo then 2,3 of hi: (lo >> 16) | (hi & 0xFFFF0000).
+_PERM_SEL_BF16_HI_PAIR = 0x07060302
 
 
-def _fp4x4_e2m1_to_f32x4(nib_i32):
-    """4 E2M1 nibbles (low nibble of each byte) -> 4 unscaled f32.
+def _fp4x4_e2m1_to_fp8x4(nib_i32):
+    """4 E2M1 nibbles (low nibble of each byte) -> 4 E4M3FNUZ fp8 bytes in one i32.
 
-    One ``v_perm_b32`` gathers E4M3FNUZ fp8 codes, then ``cvt_pk_f32_fp8``.
-    Sign is forced off when mag==0 so E2M1 -0.0 does not become FNUZ NaN (0x80).
+    One ``v_perm_b32`` gathers the negative codes; the sign is then cleared for
+    positive nibbles by an AND with ``0x7F | (sign << 7)`` per byte.
     """
     mag = nib_i32 & fx.Int32(0x07070707)
-    magbyte = fx.Int32(
+    neg = fx.Int32(
         rocdl.perm_b32(
-            _raw(fx.Int32(_FP4_E2M1_FP8_LUT_HI)),
-            _raw(fx.Int32(_FP4_E2M1_FP8_LUT_LO)),
+            _raw(fx.Int32(_FP4_E2M1_FP8_NEG_LUT_HI)),
+            _raw(fx.Int32(_FP4_E2M1_FP8_NEG_LUT_LO)),
             _raw(mag),
         )
     )
-    nz = ((mag + fx.Int32(0x7F7F7F7F)).shrui(fx.Int32(7))) & fx.Int32(0x01010101)
-    signbit = (nib_i32 & fx.Int32(0x08080808)) << fx.Int32(4)
-    signmask = nz << fx.Int32(7)
-    fp8_i32 = magbyte | (signbit & signmask)
+    # Nibbles are < 16, so the shift never carries into the next byte.
+    return neg & ((nib_i32 << fx.Int32(4)) | fx.Int32(0x7F7F7F7F))
+
+
+def _fp8x4_to_f32x2_pair(fp8_i32):
+    """4 E4M3FNUZ fp8 -> (f32x2 of bytes 0,1, f32x2 of bytes 2,3) via cvt_pk_f32_fp8."""
     lo = fx.Vector(rocdl.cvt_pk_f32_fp8(T.f32x2, _raw(fp8_i32), False))
     hi = fx.Vector(rocdl.cvt_pk_f32_fp8(T.f32x2, _raw(fp8_i32), True))
-    return (
-        fx.Float32(lo[0]),
-        fx.Float32(lo[1]),
-        fx.Float32(hi[0]),
-        fx.Float32(hi[1]),
-    )
+    return lo, hi
 
 
 def _fp4_nibble_to_bf16x8(raw_i32, scale_f32):
@@ -476,26 +476,27 @@ def _fp4_nibble_to_bf16x8(raw_i32, scale_f32):
 
     gfx942 substitute for ``v_cvt_scalef32_pk_bf16_fp4``. Nibble i is bits
     ``[4*i : 4*i+4)``, matching gfx950 cvt sel order (sel 0 = byte0 = K0,K1).
-    E8M0 is a power of two; scale is applied on f32, then packed with the same
-    lshr-16 used by gfx942 int4.
+    E8M0 is a power of two; scale is applied on the f32x2 pairs (``v_pk_mul_f32``),
+    then each bf16 pair is packed with one ``v_perm_b32``.
     """
     packed = fx.Int32(raw_i32)
     even = packed & 0x0F0F0F0F  # K0,K2,K4,K6
     odd = packed.shrui(fx.Int32(4)) & 0x0F0F0F0F  # K1,K3,K5,K7
-    fe = _fp4x4_e2m1_to_f32x4(even)
-    fo = _fp4x4_e2m1_to_f32x4(odd)
     scale = fx.Float32(scale_f32)
+    e_lo, e_hi = _fp8x4_to_f32x2_pair(_fp4x4_e2m1_to_fp8x4(even))
+    o_lo, o_hi = _fp8x4_to_f32x2_pair(_fp4x4_e2m1_to_fp8x4(odd))
+    e_lo, e_hi, o_lo, o_hi = (v * scale for v in (e_lo, e_hi, o_lo, o_hi))
     f32s = []
-    for i in range_constexpr(4):
-        f32s.append(fe[i] * scale)
-        f32s.append(fo[i] * scale)
-    c16 = fx.Int32(16)
-    hi16 = fx.Int32(0xFFFF0000)
+    for ev, od in ((e_lo, o_lo), (e_hi, o_hi)):
+        for j in range_constexpr(2):
+            f32s.append(fx.Float32(ev[j]))
+            f32s.append(fx.Float32(od[j]))
+    sel = fx.Int32(_PERM_SEL_BF16_HI_PAIR)
     i32s = []
     for i in range_constexpr(4):
         b0 = f32s[2 * i].bitcast(fx.Int32)
         b1 = f32s[2 * i + 1].bitcast(fx.Int32)
-        i32s.append(b0.shrui(c16) | (b1 & hi16))
+        i32s.append(fx.Int32(rocdl.perm_b32(_raw(b1), _raw(b0), _raw(sel))))
     v4i32 = fx.Vector.from_elements([_raw(x) for x in i32s], fx.Int32)
     return v4i32.bitcast(fx.BFloat16)
 
