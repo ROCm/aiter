@@ -22,6 +22,17 @@ def _mxfp4_intermediate_enabled():
     return os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") == "1"
 
 
+def a16wmix_w_layout() -> str:
+    """Layout the a16w-mix gemm1 port reads, for every activation.
+
+    ``standard`` is the separated GGUU preshuffle
+    (``shuffle_weight_a16w4(w1, 16, False)``). Every activation the port
+    supports reads this layout. The port ignores ``gate_mode``.
+    Make this take the activation once one of them needs another layout.
+    """
+    return "standard"
+
+
 def resolve_swiglu_limit(
     swiglu_limit: "object" = None,
 ) -> "tuple[float | None, str]":

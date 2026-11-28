@@ -16,6 +16,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
     current_stream_arg,
     ptr_arg,
 )
+from aiter.ops.flydsl.moe_common import a16wmix_w_layout
 
 _KERNEL_PARAMS: dict[str, dict] = {}
 
@@ -816,8 +817,8 @@ def compile_flydsl_moe_stage1(
     if act == "silu_clamped" and not (a_dtype == "bf16" and b_dtype in ("fp4", "int4")):
         raise ValueError("silu_clamped requires bf16 A and fp4 or int4 W")
     # a16w-mix (bf16 A x {fp4 mxfp4, int4, bf16} W): build the ported gemm1
-    # (moe_2stage_a16wmix), consuming the standard GGUU W1+scale layout
-    # (w_layout="standard"), matching main. a16wi4 shares this compile entry so AOT
+    # (moe_2stage_a16wmix), consuming a16wmix_w_layout (GGUU / "standard" for
+    # SiTUv2), matching main. a16wi4 shares this compile entry so AOT
     # builds the same kernel the runtime early-return launches; its W1 is the
     # OLD-kernel int4 prep (pack_int8_to_packed_int4(shuffle_weight(w,(16,16)))) +
     # (E,G//2,N,2) bf16 scale.
@@ -839,7 +840,7 @@ def compile_flydsl_moe_stage1(
             xcd_swizzle=xcd_swizzle,
             waves_per_eu=waves_per_eu,
             w_dtype=b_dtype,
-            w_layout="standard",
+            w_layout=a16wmix_w_layout(),
             k_wave=k_wave,
             activation_bf16=activation_bf16,
             # The kernel derives its gfx942 fallbacks (K=16 MFMA split, bf16 pack,
@@ -1775,7 +1776,7 @@ def _flydsl_moe_stage1_impl(
             situ_linear_beta=situ_linear_beta,
             swiglu_limit=runtime_swiglu_limit(swiglu_limit, _act),
             w_dtype=b_dtype,
-            w_layout="standard",
+            w_layout=a16wmix_w_layout(),
             activation_bf16=activation_bf16,
             fused_shared_w1=fused_shared_w1,
             fused_shared_w1_scale=fused_shared_w1_scale,

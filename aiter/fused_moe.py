@@ -121,6 +121,7 @@ from aiter.ops.flydsl.moe_common import (
     GateMode,
     _flydsl_stage2_fp8_enabled,
     _mxfp4_intermediate_enabled,
+    a16wmix_w_layout,
     get_flydsl_activation_name,
 )
 from aiter.ops.flydsl.mxfp4_kname import (
@@ -1587,6 +1588,17 @@ def _fused_moe_impl(
         _a16w4_why = (
             "SiTUv2" if _is_a16w4_situv2 else f"Swiglu with inter_dim={inter_dim}"
         )
+        # Swiglu re-route has its own layout check (_flydsl_mxfp4_layout_is_compatible).
+        # This one is the SiTUv2 port only: that kernel reads GGUU and ignores gate_mode.
+        _layout_why = (
+            _a16w4_w1_layout_unsupported(
+                activation,
+                gate_mode,
+                getattr(w1, "gate_up_interleave", None),
+            )
+            if _is_a16w4_situv2
+            else None
+        )
         for _bad, _why in (
             (
                 get_gfx() not in ("gfx942", "gfx950"),
@@ -1601,6 +1613,7 @@ def _fused_moe_impl(
                 not (isShuffled and isG1U1 and not doweight_stage1),
                 "non-preshuffled / non-g1u1 weights or doweight_stage1=True",
             ),
+            (_layout_why is not None, _layout_why),
         ):
             if _bad:
                 raise NotImplementedError(
@@ -4234,6 +4247,50 @@ def _flydsl_mxfp4_layout_is_compatible(q_dtype_a, gate_mode, gate_up_interleave=
     ) or (q_dtype_a == dtypes.fp8 and gate_mode == GateMode.INTERLEAVE)
 
 
+def _a16w4_port_w_layout(activation):
+    """w_layout the a16w-mix port compiles for this activation, or None.
+
+    None means this activation is not the a16w4 SiTUv2 route. The string comes
+    from a16wmix_w_layout, which is also what the port is launched with.
+    """
+    if ActivationType(activation) != ActivationType.Situv2:
+        return None
+    return a16wmix_w_layout()
+
+
+def _a16w4_w1_layout_unsupported(activation, gate_mode, gate_up_interleave):
+    """Why the a16w-mix port cannot read this w1, or None.
+
+    The SiTUv2 port reads separated gate/up (GGUU) w1, the layout of
+    shuffle_weight_a16w4(w1, 16, False). It ignores gate_mode. An untagged w1
+    (gate_up_interleave None) with SEPARATED keeps running: the bytes of a GUGU
+    shuffle are not detectable.
+
+    caller_gugu below is true if either signal says GUGU. That is right for
+    the separated port only. A port that reads GUGU would have to accept a w1
+    only when gate_mode is INTERLEAVE and gate_up_interleave is True, so the
+    port_gugu branch is not a ready-made rule for it.
+    """
+    layout = _a16w4_port_w_layout(activation)
+    if layout is None:
+        return None
+    caller_gugu = (
+        GateMode(gate_mode) == GateMode.INTERLEAVE or gate_up_interleave is True
+    )
+    port_gugu = layout == "guinterleave"
+    if caller_gugu == port_gugu:
+        return None
+    if port_gugu:
+        return (
+            "separated (GGUU) w1; the a16w4 SiTUv2 kernel reads the "
+            "gate/up-interleaved layout"
+        )
+    return (
+        "gate/up-interleaved (GUGU) w1; the a16w4 SiTUv2 kernel reads the "
+        "separated layout from shuffle_weight_a16w4(w1, 16, False)"
+    )
+
+
 def _is_cktile_mxfp4_stage2_name(kernel_name):
     return kernel_name.startswith("cktile_") or (
         kernel_name == "swiglu_mxfp4_bf16_cktile"
@@ -6267,6 +6324,27 @@ def fused_moe_2stages(
             else torch.empty((token_num, model_dim), dtype=dtype, device=device)
         )
     is_shuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
+    # Direct callers skip _fused_moe_impl's rejection list. get_2stage_cfgs is
+    # cached and used by the tuner, so the layout check stays here, before it,
+    # and only when this call would actually launch the a16w4 SiTUv2 port.
+    if (
+        dtype in (dtypes.bf16, dtypes.fp16)
+        and QuantType(quant_type) == QuantType.per_1x32
+        and q_dtype_a == dtypes.bf16
+        and q_dtype_w == dtypes.fp4x2
+        and is_shuffled
+        and isG1U1
+        and not doweight_stage1
+    ):
+        _layout_why = _a16w4_w1_layout_unsupported(
+            activation,
+            gate_mode,
+            getattr(w1, "gate_up_interleave", None),
+        )
+        if _layout_why is not None:
+            raise NotImplementedError(
+                "a16w4 (bf16 A x MXFP4 W) SiTUv2 is not supported: " f"{_layout_why}."
+            )
     config_situ_beta, config_situ_linear_beta, normalized_swiglu_limit = (
         _normalize_mxfp4_activation_params(activation, beta, linear_beta, swiglu_limit)
     )
