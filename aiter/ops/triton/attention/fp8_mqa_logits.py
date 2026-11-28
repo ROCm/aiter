@@ -76,10 +76,14 @@ def _gfx950_kv_splits(seq_len, seq_len_kv, block_m, num_warps, waves_per_eu):
     num_blocks = triton.cdiv(seq_len, block_m)
     if num_blocks >= target_wgs:
         return 1
-    return min(
-        target_wgs // num_blocks,
-        max(1, triton.cdiv(seq_len_kv, MIN_SPLIT_KV)),
-    )
+    max_splits = target_wgs // num_blocks
+    num_splits = min(max_splits, max(1, triton.cdiv(seq_len_kv, MIN_SPLIT_KV)))
+    if num_blocks * num_splits * SPLIT_ROUNDS < target_wgs:
+        # Less than one round of workgroups: the splits own disjoint key
+        # columns (nothing is reduced across them), so 2048 keys still
+        # amortize a split's Q and weight loads.
+        num_splits = min(max_splits, max(1, triton.cdiv(seq_len_kv, 2048)))
+    return num_splits
 
 
 def _gfx942_tile_fits_lds(
