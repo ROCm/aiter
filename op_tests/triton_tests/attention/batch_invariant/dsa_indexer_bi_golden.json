@@ -1,0 +1,13 @@
+{
+  "contract_version": 1,
+  "gfx950": {
+    "H32": {
+      "logits": "f107bb84d49120eddf9cc683f78cc3816b65e25c173008e0b8e9fc25e6a153b6",
+      "indices": "24f7e1f1b281beb1244115e1d824bf1b6c6853f6d9095dcbaff49f443d7b8321"
+    },
+    "H64": {
+      "logits": "d2bc39261f3d3a7b5fbb0fd36f213f4e3c0763d8e58eb448f17bd3f32a44bbea",
+      "indices": "cdf17cdc50782271dfe5637539f65651f76579fd97148e6b93f816e014c9b90e"
+    }
+  }
+}

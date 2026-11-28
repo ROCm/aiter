@@ -1,0 +1,25 @@
+{
+    "logits": {
+        "rows_by_heads": {
+            "32": 4,
+            "64": 2
+        },
+        "num_warps": 2,
+        "waves_per_eu": 2,
+        "target_programs": 4096,
+        "min_split_tiles": 16
+    },
+    "topk": {
+        "res": 8192,
+        "num_warps": 16,
+        "chunk_min": 2048,
+        "chunk_max": 16384,
+        "chunk_warps": 4,
+        "target_programs": 8192,
+        "write_block": 2048,
+        "max_chunks": 16
+    },
+    "indexer": {
+        "workspace_bytes": 1073741824
+    }
+}
