@@ -13,7 +13,11 @@ import random
 
 import torch
 
-from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
+from aiter.ops.flydsl import (
+    flydsl_pa_mqa_logits_fp4,
+    flydsl_pa_mqa_logits_fp4_rowgroup,
+    make_fp4_mqa_plan,
+)
 from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4 import (
     default_varctx_parallel_unit_num,
 )
@@ -735,6 +739,77 @@ def _check_page8_packed(launch, plane, row_ends):
     assert bool((flat[~written] == sentinel).all()), "packed rows wrote past their span"
 
 
+def test_pa_mqa_logits_fp4_prefill_abs(prefixes, qlens, heads, rows_per_wave=None):
+    """Ragged prefill (sequence b: qlens[b] rows after prefixes[b] keys) on
+    64-row pages under the prefill plan, default and |s| epilogue, with and
+    without tile maxima: logits against an fp64 reference, tile maxima
+    against the logits'."""
+    setup_seed(SEED)
+    head_dim, page = DEFAULT_HEAD_DIM, 64
+    lens = [p + q for p, q in zip(prefixes, qlens)]
+    max_len = -(-max(lens) // page) * page
+    width = max_len // page
+    batch, rows = len(lens), sum(qlens)
+    kv_bf16 = torch.randn(batch * max_len, head_dim, device=dev).to(torch.bfloat16)
+    kv_fp4, kv_e8m0 = fp4_quant_e2m1_with_e8m0(kv_bf16)
+    block_tables = torch.randperm(batch * width, device=dev, dtype=torch.int32)
+    block_tables = block_tables.view(batch, width)
+    pages_kv, pages_ks = pack_kv_cache(kv_fp4, kv_e8m0, page)
+    kv_cache, kv_scale = torch.empty_like(pages_kv), torch.empty_like(pages_ks)
+    kv_cache[block_tables.reshape(-1).long()] = pages_kv
+    kv_scale[block_tables.reshape(-1).long()] = pages_ks
+    q_fp4, q_e8m0 = fp4_quant_e2m1_with_e8m0(
+        torch.randn(rows, heads, head_dim, device=dev)
+    )
+    q_scale = pack_q_scales(q_e8m0.view(rows, 1, heads, head_dim // 32))
+    weights = (torch.randn(rows, heads, device=dev) * 0.1).to(torch.bfloat16)
+    weight_scale = 1.5
+    qsl = torch.tensor([0] + qlens, device=dev).cumsum(0).to(torch.int32)
+    row_ends = torch.cat(
+        [torch.arange(p + 1, p + q + 1) for p, q in zip(prefixes, qlens)]
+    ).to(device=dev, dtype=torch.int32)
+    plan = make_fp4_mqa_plan(
+        num_seqs=batch, max_qlen=max(qlens), num_rows=rows, heads=heads,
+        page_size=page, max_seq_len=max_len, prefill=True,
+        rows_per_wave=rows_per_wave,
+    )  # fmt: skip
+
+    q_dq = fp4_dequant_e2m1_with_e8m0(q_fp4, q_e8m0).double()
+    k_dq = fp4_dequant_e2m1_with_e8m0(kv_fp4, kv_e8m0).double()
+    w = weights.double() * weight_scale
+    ref = torch.full((rows, max_len), float("-inf"), device=dev, dtype=torch.float64)
+    for b, (p, q) in enumerate(zip(prefixes, qlens)):
+        r0 = int(qsl[b])
+        k = k_dq[b * max_len : b * max_len + p + q]
+        s = torch.relu(torch.einsum("rhd,kd->rhk", q_dq[r0 : r0 + q], k))
+        ref[r0 : r0 + q, : p + q] = (s * w[r0 : r0 + q, :, None]).sum(1)
+    ref.masked_fill_(
+        torch.arange(max_len, device=dev) >= row_ends[:, None].long(), float("-inf")
+    )
+    live = ~torch.isinf(ref)
+    scale = ref.masked_fill(~live, 0).abs().amax(1, keepdim=True).clamp(min=1e-30)
+    tile0 = torch.arange(0, max_len, 16, device=dev)[None]
+    full = tile0 + 16 <= row_ends[:, None]
+    for abs_epilogue, tol in ((False, 2e-6), (True, 1e-5)):
+        tmax = torch.full((rows, max_len // 16), float("nan"), device=dev)
+        outs = []
+        for tile_max in (None, tmax):
+            outs.append(torch.full((rows, max_len), float("-inf"), device=dev))
+            flydsl_pa_mqa_logits_fp4_rowgroup(
+                plan, q_fp4, q_scale, kv_cache, kv_scale, block_tables, weights,
+                qsl, row_ends, weight_scale=weight_scale, out=outs[-1],
+                abs_epilogue=abs_epilogue, out_tile_max=tile_max,
+            )  # fmt: skip
+        out = outs[1]
+        assert torch.equal(outs[0], out), "tile_max changed the logits"
+        err = ((out.double() - ref).abs() / scale)[live].max().item()
+        assert err < tol, (abs_epilogue, err)
+        assert torch.isinf(out[~live]).all(), "a key past its row's bound was written"
+        want = out.view(rows, -1, 16).amax(2)
+        assert torch.equal(tmax[full], want[full]), "tile maxima differ"
+        assert tmax[tile0 >= row_ends[:, None]].isnan().all(), "tile past the bound"
+
+
 def _print_perf_summary():
     print("\n" + "=" * 96)
     print("Perf summary (flydsl-qfp4/kvfp4 across shapes)")
@@ -902,6 +977,11 @@ def main():
             head_dim=args.head_dim,
             bench=False,
         )
+        # 4 rows a wave in 2 streams, and 2 rows a wave in 1
+        for heads, rows_per_wave in ((64, None), (32, 2)):
+            test_pa_mqa_logits_fp4_prefill_abs(
+                [0, 3000, 1000, 0, 70], [200, 77, 5, 0, 3], heads, rows_per_wave
+            )
 
     if _PERF_SUMMARY:
         _print_perf_summary()
