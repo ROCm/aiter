@@ -31,6 +31,11 @@ if _base_version < _MIN_FLYDSL_VERSION:
     )
 
 _LAZY_IMPORTS = {
+    "gdn_fused_prefill_fwd": (".gdn_fused_prefill", "gdn_fused_prefill_fwd"),
+    "gdn_fused_prefill_supported": (
+        ".gdn_fused_prefill",
+        "gdn_fused_prefill_supported",
+    ),
     "flydsl_gemm_a16w16_tdm": (".gemm_a16w16_tdm", "gemm_a16w16_tdm"),
     "FP8_MQA_LOGITS_DEFAULT_VARIANT": (
         ".fp8_mqa_logits_kernels",
@@ -320,6 +325,8 @@ __all__ = [
     "gather_kv_b_proj_flydsl",
     "gather_kv_b_proj_flydsl_fp8_supported",
     "gather_kv_b_proj_flydsl_supported",
+    "gdn_fused_prefill_fwd",
+    "gdn_fused_prefill_supported",
     "make_fp4_mqa_plan",
     "minimax_m3_index_score_alloc",
     "minimax_m3_index_score_flydsl",
