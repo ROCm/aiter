@@ -4,12 +4,20 @@
 
 Each selected shape runs reference checks before timing.
 Use --check-only to check those shapes and backends without benchmarking.
+--backends asm runs mega_mhc with AITER_MEGA_MHC_ASM on, the gfx1250 default:
+shapes with an asm kernel run it, the others take the HIP fallback, and the
+asm_path column shows which one ran. hip forces AITER_MEGA_MHC_ASM=0.
+--asm-suite reuses one workspace per T across every mode, BF16 and both MXFP8
+scale layouts on both sides of the asm/HIP boundaries, then replays the same
+calls from one CUDA graph with new inputs.
 """
 
 import argparse
+import contextlib
 import copy
 import itertools
 import math
+import os
 from functools import cache
 
 import pandas as pd
@@ -17,6 +25,7 @@ import torch
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.mega_mhc import (
+    _asm_tile,
     _counter_state_ok,
     mega_mhc,
     mega_mhc_shuffle_fn,
@@ -29,6 +38,8 @@ from aiter.test_common import benchmark, device_memory_profiling, run_perftest
 ARGS = (1e-6, 1e-6, 1e-6, 2.0, 20)
 MODES = ("post", "no_post", "identity_pre", "no_post_identity")
 BACKENDS = ("hip", "flydsl", "triton")
+# asm shares mega_mhc and its arguments with hip.
+NATIVE_BACKENDS = ("hip", "asm")
 OUT_DTYPES = ("bf16", "mxfp8")
 # M covers decode through prefill; the ragged prefill sizes cover the split tail.
 # 1152 and 1280 (72 and 80 token tiles) take the gfx1250 three-way split.
@@ -52,6 +63,17 @@ DECODE_TOKEN_COUNTS = (
 PREFILL_TOKEN_COUNTS = (4096, 4097, 4160, 4224, 6000, 8192, 8200, 8320, 9000, 16384)
 TOKEN_COUNTS = DECODE_TOKEN_COUNTS + PREFILL_TOKEN_COUNTS
 HIDDEN_SIZES = (5120, 7168)
+# With asm: both sides of every dispatch boundary (tiles 16/32/64, the HIP
+# split-3 range and the tile-64 limit without post-mix).
+ASM_TOKEN_COUNTS = (256, 257, 512, 513, 1024, 1025, 1280, 1281, 3072, 3073)
+# --asm-suite: asm-only, asm/HIP mixed by mode, HIP-only (1025) and the tile-64
+# tail with a partial round.
+ASM_SUITE_TOKENS = (16, 512, 1025, 3073, 4160)
+ASM_SUITE_CALLS = tuple(
+    (mode, out_dtype, row_major)
+    for out_dtype, row_major in (("bf16", False), ("mxfp8", True), ("mxfp8", False))
+    for mode in MODES
+)
 
 
 def ref_mhc_fused_post_pre_delayed_rmsnorm(
@@ -195,9 +217,38 @@ def check(out, reference, scale_row_major=False):
         torch.testing.assert_close(out[i], reference[i], rtol=1e-3, atol=5e-4)
 
 
+@contextlib.contextmanager
+def asm_env(enabled):
+    """Set AITER_MEGA_MHC_ASM for one call, then restore it."""
+    previous = os.environ.get("AITER_MEGA_MHC_ASM")
+    os.environ["AITER_MEGA_MHC_ASM"] = "1" if enabled else "0"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("AITER_MEGA_MHC_ASM")
+        else:
+            os.environ["AITER_MEGA_MHC_ASM"] = previous
+
+
+def _asm_tile_for(m, hidden_size, mode, out_dtype, scalar_args, scale_row_major):
+    """Token tile of the asm kernel the asm backend runs, None if it has none."""
+    with asm_env(True):
+        return _asm_tile(
+            get_gfx_runtime(),
+            m,
+            hidden_size,
+            out_dtype,
+            "no_post" not in mode,
+            "identity" in mode,
+            scale_row_major=scale_row_major,
+            sinkhorn_repeat=scalar_args[4],
+        )
+
+
 @cache
 def backend_function(name):
-    if name == "hip":
+    if name in NATIVE_BACKENDS:
         return mega_mhc
     if name == "flydsl":
         from aiter.ops.flydsl.mega_mhc_kernels import flydsl_mega_mhc
@@ -263,7 +314,7 @@ class _BenchmarkBackend:
             "norm_weight": weight,
             "residual_out": residual_out,
         }
-        if self.name == "hip":
+        if self.name in NATIVE_BACKENDS:
             kw["workspace"] = self.workspace
             kw["w_preshuffle_bf16"] = True
             if self.res_preshuffle:
@@ -272,7 +323,10 @@ class _BenchmarkBackend:
                 kw["scale_row_major"] = True
         if self.name != "triton":
             kw["out_dtype"] = self.out_dtype
-        return self.backend(r, fn, scale, base, *self.scalar_args, **kw)
+        if self.name not in NATIVE_BACKENDS:
+            return self.backend(r, fn, scale, base, *self.scalar_args, **kw)
+        with asm_env(self.name == "asm"):
+            return self.backend(r, fn, scale, base, *self.scalar_args, **kw)
 
 
 def _run_rotating_perftest(caller, tensors, num_iters):
@@ -349,16 +403,30 @@ def benchmark_mega_mhc(
                 result[name] = "SKIP"
                 result[f"{name}_us"] = result[f"{name}_TB/s"] = float("nan")
                 continue
+        path = None
+        if name == "asm":
+            tile = None
+            if not res_preshuffle:
+                tile = _asm_tile_for(
+                    m, hidden_size, mode, out_dtype, args[4:], scale_row_major
+                )
+            path = f"asm{tile}" if tile else "hip"
+            result["asm_path"] = path
         backend_tensors = tensors
         workspace = None
-        shuffled = name == "hip" and res_preshuffle
-        if name == "hip":
+        shuffled = name in NATIVE_BACKENDS and res_preshuffle
+        if name in NATIVE_BACKENDS:
             # Rotate already-packed weights; deepcopy preserves their layout.
             fn_packed = mega_mhc_shuffle_fn(args[1])
             residual = shuffle_residual(tensors[0]) if shuffled else tensors[0]
             backend_tensors = (residual, fn_packed, *tensors[2:])
-            workspace = prepare_mega_mhc(args[0].device, m, hidden_size)
-        row_major = name == "hip" and scale_row_major
+            with asm_env(name == "asm"):
+                workspace = prepare_mega_mhc(args[0].device, m, hidden_size)
+            if name == "hip":
+                assert workspace.asm_partials is None
+            elif path != "hip":
+                assert workspace.asm_partials is not None
+        row_major = name in NATIVE_BACKENDS and scale_row_major
         caller = _BenchmarkBackend(
             name, args[4:], out_dtype, workspace, shuffled, row_major
         )
@@ -388,6 +456,102 @@ def benchmark_mega_mhc(
     return result
 
 
+def _asm_suite_call(workspace, inputs, out_dtype, scale_row_major):
+    args, kw, fn_packed = inputs
+    return mega_mhc(
+        args[0],
+        fn_packed,
+        *args[2:],
+        **kw,
+        workspace=workspace,
+        w_preshuffle_bf16=True,
+        out_dtype=out_dtype,
+        scale_row_major=scale_row_major,
+    )
+
+
+def _asm_suite_inputs(t, hidden_size, mode, seed):
+    args, kw, reference = case(t, hidden_size, mode, seed)
+    return (args, kw, mega_mhc_shuffle_fn(args[1])), reference
+
+
+def asm_suite(hidden_size, seed):
+    """Check serial workspace reuse and graph replay with AITER_MEGA_MHC_ASM on.
+
+    Per T, one workspace runs ASM_SUITE_CALLS twice, so asm and HIP calls of
+    every mode and output layout alternate on shared partials. A second
+    workspace on a side stream captures the same calls in one graph, which
+    replays twice with new inputs copied into the captured tensors.
+    """
+    device = torch.device("cuda")
+    rows = []
+    with asm_env(True):
+        for t in ASM_SUITE_TOKENS:
+            paths = [
+                _asm_tile_for(t, hidden_size, mode, out_dtype, ARGS, row_major)
+                for mode, out_dtype, row_major in ASM_SUITE_CALLS
+            ]
+            paths = [f"asm{tile}" if tile else "hip" for tile in paths]
+            workspace = prepare_mega_mhc(device, t, hidden_size)
+            for round_ in range(2):
+                for (mode, out_dtype, row_major), path in zip(ASM_SUITE_CALLS, paths):
+                    inputs, reference = _asm_suite_inputs(
+                        t, hidden_size, mode, seed + round_
+                    )
+                    out = _asm_suite_call(workspace, inputs, out_dtype, row_major)
+                    check(out, reference, row_major)
+            assert _counter_state_ok(workspace)
+            rows.append({"m": t, "check": "serial", "calls": 2 * len(paths)})
+
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                graph_workspace = prepare_mega_mhc(device, t, hidden_size)
+                static = [
+                    _asm_suite_inputs(t, hidden_size, mode, seed)[0]
+                    for mode, _, _ in ASM_SUITE_CALLS
+                ]
+                # Warm up on the capture stream before capture.
+                for (_, out_dtype, row_major), inputs in zip(ASM_SUITE_CALLS, static):
+                    _asm_suite_call(graph_workspace, inputs, out_dtype, row_major)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    outs = [
+                        _asm_suite_call(graph_workspace, inputs, out_dtype, row_major)
+                        for (_, out_dtype, row_major), inputs in zip(
+                            ASM_SUITE_CALLS, static
+                        )
+                    ]
+            torch.cuda.current_stream().wait_stream(stream)
+            for replay_seed in (seed + 7, seed + 8):
+                references = []
+                for (mode, _, _), (args, kw, fn_packed) in zip(ASM_SUITE_CALLS, static):
+                    new_args, new_kw, reference = case(
+                        t, hidden_size, mode, replay_seed
+                    )
+                    for old, new in zip(args[:4], new_args[:4]):
+                        old.copy_(new)
+                    fn_packed.copy_(mega_mhc_shuffle_fn(new_args[1]))
+                    for key, value in kw.items():
+                        if value is not None:
+                            value.copy_(new_kw[key])
+                    references.append(reference)
+                graph.replay()
+                torch.cuda.synchronize()
+                for (_, _, row_major), out, reference in zip(
+                    ASM_SUITE_CALLS, outs, references
+                ):
+                    check(out, reference, row_major)
+            assert _counter_state_ok(graph_workspace)
+            rows.append({"m": t, "check": "graph", "calls": 2 * len(paths)})
+            for row in rows[-2:]:
+                row["asm_calls"] = sum(path != "hip" for path in paths)
+                row["hip_calls"] = sum(path == "hip" for path in paths)
+                row["paths"] = ",".join(sorted(set(paths)))
+            del graph, outs, static
+    return rows
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Mega-MHC reference checks and HIP / FlyDSL / Triton timings",
@@ -399,8 +563,8 @@ def main():
         "--tokens",
         type=int,
         nargs="+",
-        default=TOKEN_COUNTS,
-        help="M: number of tokens (decode to prefill)",
+        help="M: number of tokens (decode to prefill); default: "
+        f"{TOKEN_COUNTS}, plus {ASM_TOKEN_COUNTS} with --backends asm",
     )
     parser.add_argument(
         "-n",
@@ -430,10 +594,10 @@ def main():
     )
     parser.add_argument(
         "--backends",
-        choices=BACKENDS,
+        choices=BACKENDS + ("asm",),
         nargs="+",
         help="default: HIP/FlyDSL/Triton on gfx950; HIP/Triton on gfx942/gfx1250; "
-        "Triton is omitted for MXFP8",
+        "Triton is omitted for MXFP8; asm: gfx1250 asm kernels",
     )
     parser.add_argument(
         "--res-preshuffle",
@@ -443,7 +607,7 @@ def main():
     parser.add_argument(
         "--scale-row-major",
         action="store_true",
-        help="HIP writes row-major [T, H/32] MXFP8 scales (gfx1250; gfx950 always)",
+        help="HIP/asm write row-major [T, H/32] MXFP8 scales (gfx1250; gfx950 always)",
     )
     parser.add_argument("--seed", type=int, default=0, help="shared input seed")
     parser.add_argument(
@@ -457,7 +621,16 @@ def main():
         action="store_true",
         help="check the selected shapes and backends, without timing",
     )
+    parser.add_argument(
+        "--asm-suite",
+        action="store_true",
+        help="gfx1250, asm on: workspace reuse across modes and output layouts, "
+        f"then graph replay, at M={ASM_SUITE_TOKENS}",
+    )
     args = parser.parse_args()
+    if args.tokens is None:
+        asm = "asm" in (args.backends or ())
+        args.tokens = sorted({*TOKEN_COUNTS, *(ASM_TOKEN_COUNTS if asm else ())})
     if any(m < 0 for m in args.tokens):
         parser.error("tokens must be nonnegative")
     if any(not 0 < h <= 65536 or h % 32 for h in args.hidden):
@@ -473,6 +646,14 @@ def main():
         parser.error("Mega-MHC mxfp8 requires gfx950 or gfx1250")
     if args.res_preshuffle and arch != "gfx1250":
         parser.error("Mega-MHC res_preshuffle requires gfx1250")
+    if args.asm_suite:
+        if arch != "gfx1250":
+            parser.error("--asm-suite requires gfx1250")
+        print(f"Mega-MHC asm suite | {arch} | {torch.cuda.get_device_name()}")
+        rows = [row for h in args.hidden for row in asm_suite(h, args.seed)]
+        print(pd.DataFrame(rows).to_string(index=False))
+        print(f"\nPassed: {sum(row['calls'] for row in rows)} checked calls.")
+        return
     backends = tuple(
         dict.fromkeys(
             args.backends or (BACKENDS if arch == "gfx950" else ("hip", "triton"))
@@ -489,6 +670,8 @@ def main():
     )
     if "flydsl" in backends and arch != "gfx950":
         parser.error("FlyDSL Mega-MHC requires gfx950")
+    if "asm" in backends and arch != "gfx1250":
+        parser.error("Mega-MHC asm kernels require gfx1250")
     for name in backends:
         try:
             backend_function(name)
@@ -534,6 +717,8 @@ def main():
     else:
         columns += [f"{name}_{unit}" for name in backends for unit in ("us", "TB/s")]
         columns += ["status"]
+    if "asm" in backends:
+        columns += ["asm_path"]
     title = "correctness" if args.check_only else "performance (us, TB/s)"
     print(f"\nMega-MHC {title}:", flush=True)
     print(

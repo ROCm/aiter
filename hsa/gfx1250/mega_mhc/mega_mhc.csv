@@ -1,0 +1,41 @@
+# gfx1250 Mega-MHC asm kernels.
+# kind: ps = persistent (min(ps_clusters, ceil(T/tile_tokens)) x 16 TG), ns = ceil(T/tile_tokens) clusters x 16 TG.
+# Every kernel: block 128, cluster 16x1x1, split_arg 16, 192 B kernarg, H 5120; sqc=1 appends 16*T FP32 to the partials.
+# out_mxfp8=1 writes BF16 norm + E4M3fn q + E8M0 scales, row-major [T][H/32] if scale_row_major=1, else M32K4 [pad32(T)].
+kind,tile_tokens,persistent,ps_clusters,sqc,out_mxfp8,scale_row_major,has_post,identity_pre,cs,knl_name,co_name
+ns,16,0,0,1,0,0,1,0,2,mhc_ns16_bf16_hp1_ip0_cs2,mhc_ns16_bf16_hp1_ip0_cs2.co
+ns,16,0,0,1,0,0,1,1,2,mhc_ns16_bf16_hp1_ip1_cs2,mhc_ns16_bf16_hp1_ip1_cs2.co
+ns,16,0,0,1,0,0,0,0,2,mhc_ns16_bf16_hp0_ip0_cs2,mhc_ns16_bf16_hp0_ip0_cs2.co
+ns,16,0,0,1,0,0,0,1,2,mhc_ns16_bf16_hp0_ip1_cs2,mhc_ns16_bf16_hp0_ip1_cs2.co
+ns,16,0,0,1,1,1,1,0,2,mhc_ns16_mxfp8_hp1_ip0_cs2,mhc_ns16_mxfp8_hp1_ip0_cs2.co
+ns,16,0,0,1,1,1,1,1,2,mhc_ns16_mxfp8_hp1_ip1_cs2,mhc_ns16_mxfp8_hp1_ip1_cs2.co
+ns,16,0,0,1,1,1,0,0,2,mhc_ns16_mxfp8_hp0_ip0_cs2,mhc_ns16_mxfp8_hp0_ip0_cs2.co
+ns,16,0,0,1,1,1,0,1,2,mhc_ns16_mxfp8_hp0_ip1_cs2,mhc_ns16_mxfp8_hp0_ip1_cs2.co
+ns,16,0,0,1,1,0,1,0,2,mhc_ns16_mxfp8m32k4_hp1_ip0_cs2,mhc_ns16_mxfp8m32k4_hp1_ip0_cs2.co
+ns,16,0,0,1,1,0,1,1,2,mhc_ns16_mxfp8m32k4_hp1_ip1_cs2,mhc_ns16_mxfp8m32k4_hp1_ip1_cs2.co
+ns,16,0,0,1,1,0,0,0,2,mhc_ns16_mxfp8m32k4_hp0_ip0_cs2,mhc_ns16_mxfp8m32k4_hp0_ip0_cs2.co
+ns,16,0,0,1,1,0,0,1,2,mhc_ns16_mxfp8m32k4_hp0_ip1_cs2,mhc_ns16_mxfp8m32k4_hp0_ip1_cs2.co
+ns,32,0,0,1,0,0,1,0,2,mhc_ns32_bf16_hp1_ip0_cs2,mhc_ns32_bf16_hp1_ip0_cs2.co
+ns,32,0,0,1,0,0,1,1,2,mhc_ns32_bf16_hp1_ip1_cs2,mhc_ns32_bf16_hp1_ip1_cs2.co
+ns,32,0,0,1,0,0,0,0,2,mhc_ns32_bf16_hp0_ip0_cs2,mhc_ns32_bf16_hp0_ip0_cs2.co
+ns,32,0,0,1,0,0,0,1,2,mhc_ns32_bf16_hp0_ip1_cs2,mhc_ns32_bf16_hp0_ip1_cs2.co
+ns,32,0,0,1,1,1,1,0,2,mhc_ns32_mxfp8_hp1_ip0_cs2,mhc_ns32_mxfp8_hp1_ip0_cs2.co
+ns,32,0,0,1,1,1,1,1,2,mhc_ns32_mxfp8_hp1_ip1_cs2,mhc_ns32_mxfp8_hp1_ip1_cs2.co
+ns,32,0,0,1,1,1,0,0,2,mhc_ns32_mxfp8_hp0_ip0_cs2,mhc_ns32_mxfp8_hp0_ip0_cs2.co
+ns,32,0,0,1,1,1,0,1,2,mhc_ns32_mxfp8_hp0_ip1_cs2,mhc_ns32_mxfp8_hp0_ip1_cs2.co
+ns,32,0,0,1,1,0,1,0,2,mhc_ns32_mxfp8m32k4_hp1_ip0_cs2,mhc_ns32_mxfp8m32k4_hp1_ip0_cs2.co
+ns,32,0,0,1,1,0,1,1,2,mhc_ns32_mxfp8m32k4_hp1_ip1_cs2,mhc_ns32_mxfp8m32k4_hp1_ip1_cs2.co
+ns,32,0,0,1,1,0,0,0,2,mhc_ns32_mxfp8m32k4_hp0_ip0_cs2,mhc_ns32_mxfp8m32k4_hp0_ip0_cs2.co
+ns,32,0,0,1,1,0,0,1,2,mhc_ns32_mxfp8m32k4_hp0_ip1_cs2,mhc_ns32_mxfp8m32k4_hp0_ip1_cs2.co
+ps,64,1,16,1,0,0,1,0,2,mhc_ps_bf16_hp1_ip0_cs2,mhc_ps_bf16_hp1_ip0_cs2.co
+ps,64,1,16,1,0,0,1,1,2,mhc_ps_bf16_hp1_ip1_cs2,mhc_ps_bf16_hp1_ip1_cs2.co
+ps,64,1,16,1,0,0,0,0,2,mhc_ps_bf16_hp0_ip0_cs2,mhc_ps_bf16_hp0_ip0_cs2.co
+ps,64,1,16,1,0,0,0,1,2,mhc_ps_bf16_hp0_ip1_cs2,mhc_ps_bf16_hp0_ip1_cs2.co
+ps,64,1,16,1,1,1,1,0,2,mhc_ps_mxfp8_hp1_ip0_cs2,mhc_ps_mxfp8_hp1_ip0_cs2.co
+ps,64,1,16,1,1,1,1,1,2,mhc_ps_mxfp8_hp1_ip1_cs2,mhc_ps_mxfp8_hp1_ip1_cs2.co
+ps,64,1,16,1,1,1,0,0,2,mhc_ps_mxfp8_hp0_ip0_cs2,mhc_ps_mxfp8_hp0_ip0_cs2.co
+ps,64,1,16,1,1,1,0,1,2,mhc_ps_mxfp8_hp0_ip1_cs2,mhc_ps_mxfp8_hp0_ip1_cs2.co
+ps,64,1,16,1,1,0,1,0,2,mhc_ps_mxfp8m32k4_hp1_ip0_cs2,mhc_ps_mxfp8m32k4_hp1_ip0_cs2.co
+ps,64,1,16,1,1,0,1,1,2,mhc_ps_mxfp8m32k4_hp1_ip1_cs2,mhc_ps_mxfp8m32k4_hp1_ip1_cs2.co
+ps,64,1,16,1,1,0,0,0,2,mhc_ps_mxfp8m32k4_hp0_ip0_cs2,mhc_ps_mxfp8m32k4_hp0_ip0_cs2.co
+ps,64,1,16,1,1,0,0,1,2,mhc_ps_mxfp8m32k4_hp0_ip1_cs2,mhc_ps_mxfp8m32k4_hp0_ip1_cs2.co
