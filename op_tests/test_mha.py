@@ -1106,6 +1106,55 @@ def test_mha_bwd_sink_null_gives_same_as_no_sink(dtype):
     )
 
 
+@pytest.mark.skipif(
+    get_gfx() not in ("gfx942", "gfx950"), reason="fmha_v3_bwd asm kernels"
+)
+def test_fmha_v3_bwd_rng_state_optional_without_dropout():
+    """Without dropout, fmha_v3_bwd must accept rng_state=None.
+
+    The varlen and CK backward wrappers allocate a placeholder rng_state when none is
+    passed; the batch asm wrapper left it undefined and failed on its data_ptr(). This
+    is reachable from callers that bring their own forward (e.g. mha_v4) and call the
+    backward without the rng_state that aiter's own forward returns.
+    """
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    batch, seqlen, nhead, hdim = 2, 256, 4, 128
+    softmax_scale = hdim**-0.5
+    q, k, v, dout = _sink_make_qkvo(
+        batch, seqlen, seqlen, nhead, nhead, hdim, hdim, dtypes.bf16, device
+    )
+    q, k, v = (t.detach() for t in (q, k, v))
+    out, lse = _sink_run_fwd(q, k, v, softmax_scale, False)
+
+    def bwd(rng_state):
+        # dropout_p, scale, causal, window left/right, deterministic, atomic fp32, bf16 cvt
+        return mha_ops.fmha_v3_bwd(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            lse,
+            0.0,
+            softmax_scale,
+            False,
+            -1,
+            -1,
+            False,
+            True,
+            1,
+            rng_state=rng_state,
+        )
+
+    dq1, dk1, dv1, _ = bwd(torch.empty(2, dtype=torch.int64, device=device))
+    dq2, dk2, dv2, _ = bwd(None)
+
+    torch.testing.assert_close(dq2, dq1, msg="dQ differs with rng_state=None")
+    torch.testing.assert_close(dk2, dk1, msg="dK differs with rng_state=None")
+    torch.testing.assert_close(dv2, dv1, msg="dV differs with rng_state=None")
+
+
 # OPUS gfx950 dense (batch) cases, shared by the D=128 and D_QK=192/D_V=128 tests.
 # Causal is bottom-right aligned, so seqlen_q > seqlen_kv gives O=0 / LSE=-inf rows.
 #   (batch, seqlen_q, seqlen_kv, nheads, nheads_k)
