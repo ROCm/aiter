@@ -1,0 +1,12 @@
+{
+  "full": {
+    "M_LEQ_2": {"KPG": 2, "QPG": 1, "QN": 128, "GPG": 1, "KN": 16},
+    "M_LEQ_4": {"KPG": 2, "QPG": 2, "QN": 64, "GPG": 1, "KN": 16},
+    "M_LEQ_8": {"KPG": 2, "QPG": 2, "QN": 64, "GPG": 1, "KN": 16},
+    "M_LEQ_16": {"KPG": 4, "QPG": 4, "QN": 32, "GPG": 2, "KN": 32},
+    "any": {"KPG": 4, "QPG": 4, "QN": 32, "GPG": 2, "KN": 32}
+  },
+  "key_only": {
+    "any": {"KPG": 4, "BN": 16}
+  }
+}
