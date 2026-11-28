@@ -21,11 +21,11 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     positive_int,
     pow2_int,
 )
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    do_bench_aiter_triton,
-    generate_rotating_buffers_pool,
-    get_caller_name_no_ext,
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
 )
+from op_tests.triton_tests.attention.test_lse_merge import _partials
 
 # (batch, sequence, heads, splits)
 DEFAULT_SHAPES = [
@@ -37,17 +37,20 @@ DEFAULT_SHAPES = [
     (1, 16384, 8, 4),
 ]
 DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
-_OUT_VALS_KEYS = ["partial_out", "partial_lse", "out", "lse"]
 
 
-def _inputs(batch, sequence, heads, splits, head_dim, dtype):
-    partial_out = torch.randn(
-        (batch * splits, sequence, heads, head_dim), dtype=dtype, device="cuda"
-    )
-    partial_lse = torch.randn(
-        (batch * splits, heads, sequence), dtype=torch.float32, device="cuda"
+def _pool_keys(write_lse):
+    return ["partial_out", "partial_lse", "out"] + (["lse"] if write_lse else [])
+
+
+def _inputs(batch, sequence, heads, splits, head_dim, dtype, write_lse):
+    """Partials from the unit test, plus the outputs. lse is made only if it is written."""
+    partial_out, partial_lse = _partials(
+        batch, splits, sequence, heads, head_dim, dtype
     )
     out = torch.empty((batch, sequence, heads, head_dim), dtype=dtype, device="cuda")
+    if not write_lse:
+        return partial_out, partial_lse, out
     lse = torch.empty((batch, heads, sequence), dtype=torch.float32, device="cuda")
     return partial_out, partial_lse, out, lse
 
@@ -78,22 +81,21 @@ def benchmark(args):
         plot_name=get_caller_name_no_ext(),
         args={},
     )
-    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
-    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
 
     @triton.testing.perf_report([config])
     def bench_lse_merge(batch, sequence, heads, splits, write_lse):
         gen = functools.partial(
-            _inputs, batch, sequence, heads, splits, args.head_dim, dtype
+            _inputs, batch, sequence, heads, splits, args.head_dim, dtype, write_lse
         )
-        rot_bufs = generate_rotating_buffers_pool(
-            [gen], [_OUT_VALS_KEYS], **kwargs_rot_bufs
-        )
+        bencher.build_pool([gen], [_pool_keys(write_lse)])
 
-        def merge(partial_out, partial_lse, out, lse):
-            lse_merge(partial_out, partial_lse, out, lse if write_lse else None)
+        def merge(partial_out, partial_lse, out, lse=None):
+            lse_merge(partial_out, partial_lse, out, lse)
 
-        ms = do_bench_aiter_triton(merge, rot_bufs, **kwargs_do_bench_graph)
+        ms = bencher.bench(merge)
         if args.metric == "time":
             return ms * 1e3
         moved = _bytes_moved(

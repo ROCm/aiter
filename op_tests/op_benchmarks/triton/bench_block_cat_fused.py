@@ -5,19 +5,27 @@
 Benchmark for the fused cat([leaky_relu(l12[..., :W1]), l12[..., W1:] * l4]) op.
 """
 
-import argparse
+import functools
 import sys
 
 import torch
 import triton
 
 from aiter.ops.triton.fusions.block_cat_fused import block_cat_fused
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+    override_parser_action,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     print_vgpr,
 )
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 from op_tests.triton_tests.fusions.test_block_cat_fused import (
-    eager_block_cat,
     generate_block_cat_fused_inputs,
 )
 
@@ -26,7 +34,6 @@ arg_to_torch_dtype = {
     "bf16": torch.bfloat16,
 }
 
-_PROVIDERS = ("fused", "eager")
 _ROWS = (16384, 65536, 262144, 960000)
 
 
@@ -47,42 +54,41 @@ def _bytes_moved(M, W12, W1, elem_size, mode):
     return M * n * elem_size
 
 
-def bench_block_cat_fused_fn(M, W12, provider, metric, args):
+def _generate_fwd_bwd_inputs(M, W12, W1, dtype):
+    l12, l4 = generate_block_cat_fused_inputs((M, W12), W1, dtype)
+    l12.requires_grad_(True)
+    l4.requires_grad_(True)
+    return l12, l4, torch.randn_like(l12)
+
+
+def bench_block_cat_fused_ms(bencher, M, W12, args):
     dtype = arg_to_torch_dtype[args.dtype]
     W1 = args.W1
-    l12, l4 = generate_block_cat_fused_inputs((M, W12), W1, dtype)
-    op = block_cat_fused if provider == "fused" else eager_block_cat
-    grad_to_none = None
 
     if args.mode == "fwd":
+        gen = functools.partial(generate_block_cat_fused_inputs, (M, W12), W1, dtype)
+        keys = ["l12", "l4"]
 
-        def fn():
-            return op(l12, l4, args.slope, W1)
+        def fn(l12, l4):
+            block_cat_fused(l12, l4, args.slope, W1)
 
     else:
-        l12.requires_grad_(True)
-        l4.requires_grad_(True)
-        grad_out = torch.randn_like(l12)
-        grad_to_none = [l12, l4]
+        gen = functools.partial(_generate_fwd_bwd_inputs, M, W12, W1, dtype)
+        keys = ["l12", "l4", "grad_out"]
 
-        def fn():
-            op(l12, l4, args.slope, W1).backward(grad_out)
+        # autograd.grad returns new gradients and does not add into .grad, so
+        # graph replays do not time a gradient accumulation.
+        def fn(l12, l4, grad_out):
+            out = block_cat_fused(l12, l4, args.slope, W1)
+            torch.autograd.grad(out, (l12, l4), grad_out)
 
-    ms = triton.testing.do_bench(
-        fn, warmup=args.warmup, rep=args.rep, grad_to_none=grad_to_none
-    )
-    if metric == "time":
-        return ms * 1000  # us
-    if metric == "bandwidth":
-        mem = _bytes_moved(M, W12, W1, l12.element_size(), args.mode)
-        return mem / (ms * 1e-3) * 1e-9  # GB/s
-    raise ValueError(f"unknown metric {metric}")
+    bencher.build_pool([gen], [keys])
+    return bencher.bench(fn)
 
 
 def run_benchmark(args):
-    providers = _PROVIDERS if args.provider == "all" else (args.provider,)
     metrics = ("time", "bandwidth") if args.metric == "all" else (args.metric,)
-    line_vals = [f"{p}_{m}" for m in metrics for p in providers]
+    line_vals = [f"fused_{m}" for m in metrics]
 
     benchmark = triton.testing.Benchmark(
         x_names=["M", "W12"],
@@ -98,20 +104,29 @@ def run_benchmark(args):
         args={},
     )
 
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
+    # Time each shape once and report every metric from that time.
+    timings = {}
+
     @triton.testing.perf_report([benchmark])
     def bench_fn(M, W12, provider):
-        name, metric = provider.rsplit("_", 1)
-        return bench_block_cat_fused_fn(M, W12, name, metric, args)
+        metric = provider.rsplit("_", 1)[1]
+        if (M, W12) not in timings:
+            timings[(M, W12)] = bench_block_cat_fused_ms(bencher, M, W12, args)
+        ms = timings[(M, W12)]
+        if metric == "time":
+            return ms * 1000  # us
+        elem_size = arg_to_torch_dtype[args.dtype].itemsize
+        mem = _bytes_moved(M, W12, args.W1, elem_size, args.mode)
+        return mem / (ms * 1e-3) * 1e-9  # GB/s
 
     bench_fn.run(save_path="." if args.o else None, print_data=True)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        prog="Benchmark block_cat_fused",
-        description="Benchmark the Triton fused block_cat op against the eager chain",
-        allow_abbrev=False,
-    )
+    parser = get_parser(kernel_name="block_cat_fused")
     parser.add_argument("-M", type=int, default=None, help="Number of rows")
     parser.add_argument("--W12", type=int, default=576, help="Width of l12")
     parser.add_argument(
@@ -126,24 +141,19 @@ def parse_args():
         help="Forward only, or forward plus backward",
     )
     parser.add_argument(
-        "--provider",
-        type=str,
-        default="all",
-        choices=[*_PROVIDERS, "all"],
-        help="fused op, eager cat/leaky_relu/mul chain, or both",
-    )
-    parser.add_argument(
         "--dtype", type=str, default="bf16", choices=list(arg_to_torch_dtype)
     )
-    parser.add_argument(
-        "--metric",
-        type=str,
-        default="all",
+    override_parser_action(
+        parser,
+        action="--metric",
         choices=["all", "time", "bandwidth"],
-        help="Metric to report (default: all)",
+        default="all",
+        help="Metric to report",
     )
-    parser.add_argument("--warmup", type=int, default=25)
-    parser.add_argument("--rep", type=int, default=100)
+    # At the largest row count one fwd_bwd input set is about 3 GB. A floor of
+    # 4 pool entries would make that 12 GB. Inputs this large do not fit in
+    # the cache anyway, so a floor of 2 is enough.
+    override_parser_action(parser, action="--rot-bufs-min-pool-len", default=2)
     parser.add_argument(
         "-print_vgpr",
         action="store_true",
