@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Public OPUS GEMM/BMM interfaces backed by shared exact-kid launchers."""
+"""Public OPUS interfaces: GEMM/BMM backed by shared exact-kid launchers, and the gated
+MHA backward."""
 
 from __future__ import annotations
 
 import torch
 from torch import Tensor
 
+from ._gated_mha_bwd import gated_mha_bwd
 from .dispatch import _opus_dispatch
 
 
@@ -103,6 +105,7 @@ def gemm_a16w16_opus(
 
 
 __all__ = [
+    "gated_mha_bwd",
     "gemm_a16w16_opus",
     "opus_bmm",
     "opus_gemm",
