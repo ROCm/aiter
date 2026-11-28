@@ -3804,7 +3804,8 @@ if __name__ == "__main__":
     block_df = []
     # partial rope: Qwen3.5-style has head_size=256 and rotary_dim=64
     # GLM 4.7 has head_size=128 and rotary_dim=64
-    partial_rotary_configs = {256: 64, 128: 64, 64: 16}
+    # 192, 96 and 48: the NeoX partner lane distance is not a power of two.
+    partial_rotary_configs = {256: (64, 192), 128: (64, 96), 64: (16, 48)}
 
     for is_neox_style in args.is_neox_styles:
         for num_token in args.token:
@@ -3850,10 +3851,9 @@ if __name__ == "__main__":
                                     max_positions=args.max_positions,
                                 )
                                 df.append(ret)
-                                partial_rotary_dim = partial_rotary_configs.get(
-                                    head_size
-                                )
-                                if partial_rotary_dim is not None:
+                                for partial_rotary_dim in partial_rotary_configs.get(
+                                    head_size, ()
+                                ):
                                     assert partial_rotary_dim < head_size
                                     ret = test_qk_norm_rope_cache_quant(
                                         args.dtype,
@@ -3971,9 +3971,7 @@ if __name__ == "__main__":
     for head_size in args.head_sizes:
         for num_tokens in args.token:
             rotary_dims = {head_size}
-            partial_rotary_dim = partial_rotary_configs.get(head_size)
-            if partial_rotary_dim is not None:
-                rotary_dims.add(partial_rotary_dim)
+            rotary_dims.update(partial_rotary_configs.get(head_size, ()))
             for rotary_dim in sorted(rotary_dims):
                 for is_neox_style in args.is_neox_styles:
                     ret = test_minimax_qk_norm_rope(
