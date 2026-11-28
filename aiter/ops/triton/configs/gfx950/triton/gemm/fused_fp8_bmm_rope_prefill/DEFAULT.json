@@ -1,0 +1,39 @@
+{
+  "M_BOUNDS": [
+    11071
+  ],
+  "M_LEQ_11071": {
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 64,
+    "num_warps": 8,
+    "num_stages": 2,
+    "waves_per_eu": 0,
+    "matrix_instr_nonkdim": 32,
+    "cache_modifier": null,
+    "ROPE_BLOCK_T": 8,
+    "N_INNER": 8,
+    "M_PER_CTA": 2,
+    "LDB": 1,
+    "IL_R": 0,
+    "ILB_NUM": 3,
+    "ILB_DEN": 2,
+    "XCD_COLOC": 1
+  },
+  "any": {
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 64,
+    "num_warps": 8,
+    "num_stages": 2,
+    "waves_per_eu": 0,
+    "matrix_instr_nonkdim": 32,
+    "cache_modifier": null,
+    "ROPE_BLOCK_T": 8,
+    "N_INNER": 8,
+    "M_PER_CTA": 2,
+    "LDB": 1,
+    "IL_R": 0,
+    "ILB_NUM": 3,
+    "ILB_DEN": 2,
+    "XCD_COLOC": 1
+  }
+}

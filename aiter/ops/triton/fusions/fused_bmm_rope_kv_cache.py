@@ -9,12 +9,15 @@ from aiter.ops.triton._triton_kernels.fusions.fused_bmm_rope_kv_cache import (
     _fused_fp4_bmm_reduce_kernel,
     _fused_fp4_bmm_rope_cat_and_cache_mla_kernel,
     _fused_fp8_bmm_rope_cat_and_cache_mla_kernel,
+    _fused_fp8_bmm_rope_prefill_kernel,
     _get_fp4_config,
     _get_fp8_config,
+    _get_fp8_prefill_config,
 )
 from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import get_splitk
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import deserialize_str
+from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -381,6 +384,124 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
     return q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out
 
 
+def _fused_fp8_bmm_rope_prefill(
+    q_nope: torch.Tensor,
+    w_k_t: torch.Tensor,
+    w_k_scale: torch.Tensor,
+    q_pe: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    positions: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    group_size: int,
+    config: dict,
+    k_scale: torch.Tensor | None,
+    is_neox: bool,
+    q_out_dtype: torch.dtype,
+    reuse_freqs_front_part: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Launch the gfx950 pure-prefill kernel. The caller selects this route."""
+    qh, M, K = q_nope.shape
+    N = w_k_t.shape[2]
+    d_pe = q_pe.shape[2]
+
+    # A projection program has `rows` query rows and `cols` output columns.
+    rows = config["BLOCK_SIZE_M"] * config["M_PER_CTA"]
+    cols = config["BLOCK_SIZE_N"] * config["N_INNER"]
+    # The kernel has no column mask.
+    assert N % cols == 0, f"N must be a multiple of the column tile: {N} % {cols}"
+    assert rows >= config["ROPE_BLOCK_T"], "a row tile must hold one rotary block"
+
+    num_pid_n = N // cols
+    grid_mn = triton.cdiv(M, rows) * num_pid_n
+    bmm_programs = qh * grid_mn
+    rope_programs = triton.cdiv(M, config["ROPE_BLOCK_T"])
+    grid = (bmm_programs + rope_programs, 1, 1)
+
+    q_out = torch.empty((M, qh, N + d_pe), dtype=q_out_dtype, device=q_nope.device)
+    decode_q_pe_out = torch.empty(
+        (0, qh, d_pe), dtype=q_nope.dtype, device=q_nope.device
+    )
+    k_pe_out = torch.empty(k_rope.shape, dtype=k_rope.dtype, device=k_rope.device)
+    q_nope_zeros_out = torch.empty((0, qh, N), dtype=q_nope.dtype, device=q_nope.device)
+
+    _fused_fp8_bmm_rope_prefill_kernel[grid](
+        a_ptr=q_nope,
+        b_ptr=w_k_t,
+        b_scale_ptr=w_k_scale,
+        c_ptr=q_out,
+        q_pe_ptr=q_pe,
+        k_nope_ptr=k_nope,
+        k_pe_ptr=k_rope,
+        pos_ptr=positions,
+        cos_ptr=cos,
+        sin_ptr=sin,
+        k_pe_out_ptr=k_pe_out,
+        kv_cache_ptr=kv_cache,
+        slot_mapping_ptr=slot_mapping,
+        k_scale_ptr=k_scale,
+        M=M,
+        QH=qh,
+        bmm_programs=bmm_programs,
+        grid_mn=grid_mn,
+        num_pid_n=num_pid_n,
+        stride_ab=q_nope.stride(0),
+        stride_am=q_nope.stride(1),
+        stride_ak=q_nope.stride(2),
+        stride_bb=w_k_t.stride(0),
+        stride_bk=w_k_t.stride(1),
+        stride_bn=w_k_t.stride(2),
+        stride_cb=q_out.stride(1),
+        stride_cm=q_out.stride(0),
+        stride_cn=q_out.stride(2),
+        q_pe_stride_b=q_pe.stride(0),
+        q_pe_stride_h=q_pe.stride(1),
+        q_pe_stride_d=q_pe.stride(2),
+        k_nope_stride_b=k_nope.stride(0),
+        k_nope_stride_d=k_nope.stride(2),
+        k_pe_stride_b=k_rope.stride(0),
+        k_pe_stride_d=k_rope.stride(2),
+        pos_stride_b=positions.stride(0),
+        cos_stride_b=cos.stride(0),
+        cos_stride_d=cos.stride(-1),
+        k_pe_out_stride_b=k_pe_out.stride(0),
+        k_pe_out_stride_d=k_pe_out.stride(2),
+        kv_cache_stride_b=kv_cache.stride(0),
+        kv_cache_stride_d=kv_cache.stride(2),
+        BLOCK_SIZE_M=config["BLOCK_SIZE_M"],
+        BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
+        BLOCK_SIZE_K=group_size,
+        K_TAIL=K - group_size,
+        N_INNER=config["N_INNER"],
+        M_PER_CTA=config["M_PER_CTA"],
+        LDB=config["LDB"],
+        ROPE_BLOCK_T=config["ROPE_BLOCK_T"],
+        BLOCK_QH=qh,
+        IL_R=config["IL_R"],
+        NUM_XCDS=get_num_xcds(),
+        ILB_NUM=config["ILB_NUM"],
+        ILB_DEN=config["ILB_DEN"],
+        XCD_COLOC=config["XCD_COLOC"],
+        REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
+        IS_NEOX=is_neox,
+        BLOCK_D_nope=N,
+        BLOCK_D_pe=d_pe,
+        BLOCK_D_HALF_pe=d_pe // 2,
+        HAVE_K_SCALE=(k_scale is not None),
+        DTYPE_MAX=torch.finfo(w_k_t.dtype).max,
+        cache_modifier=config["cache_modifier"],
+        num_warps=config["num_warps"],
+        num_stages=config["num_stages"],
+        waves_per_eu=config["waves_per_eu"],
+        matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
+    )
+
+    return q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out
+
+
 def fused_fp8_bmm_rope_cat_and_cache_mla(
     q_nope: torch.Tensor,
     w_k: torch.Tensor,
@@ -444,6 +565,15 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
         - decode_q_pe_out: Decoded query PE output, shape (num_decode_toks_for_zeros, QH, d_pe)
         - k_pe_out: Key PE output, shape (B_slot, KH, qk_rope_head_dim)
         - kv_cache: Updated KV cache (modified in-place)
+
+    Limits: on gfx950, a pure-prefill call uses a different kernel. The call
+    must have a tuned config in the FUSED-FP8-BMM-ROPE-PREFILL family (today
+    kv_lora_rank=512, P=192 and 11072 to 32768 tokens), no explicit config, no
+    decode tokens, QH=8, KH=1, RoPE dim 64, P in two K groups (group_size=128
+    for P=192), transpose_bm=True, one K row and one slot for each token, BF16
+    inputs, and FP8 e4m3 weights and q_out. w_k must be contiguous. q_nope
+    must be dense, or a view of a (B, QH, P) or (B, QH, P + d_pe) tensor.
+    Other calls use the generic kernel.
     """
     _LOGGER.info(
         "FUSED_FP8_BMM_ROPE_CAT_AND_CACHE_MLA: q_nope=%s w_k=%s w_k_scale=%s q_pe=%s k_nope=%s k_rope=%s positions=%s cos=%s sin=%s kv_cache=%s slot_mapping=%s transpose_bm=%s group_size=%d is_neox=%s",
@@ -517,6 +647,51 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
     M = b
     N = kv_lora_rank
     K = k
+
+    # Large pure-prefill calls on gfx950 have their own kernel. Its config files
+    # give the (N, K) shapes and the token range that it is tuned for.
+    if (
+        config is None
+        and arch_info.get_arch() == "gfx950"
+        and qh == 8
+        and kh == 1
+        and group_size < K <= 2 * group_size
+        and d_pe == qk_rope_head_dim == 64
+        and b_slot == b == bk
+        and num_decode_toks_for_zeros == 0
+        and transpose_bm
+        and q_out_dtype == torch.float8_e4m3fn
+        and w_k.dtype == torch.float8_e4m3fn
+        and all(x.dtype == torch.bfloat16 for x in (q_nope, q_pe, k_nope, k_rope))
+        and w_k.is_contiguous()
+        and q_nope.stride()
+        in (
+            (M * K, K, 1),
+            (K, qh * K, 1),
+            (K + d_pe, qh * (K + d_pe), 1),
+        )
+    ):
+        prefill_config, is_tuned = _get_fp8_prefill_config(M, N, K)
+        if is_tuned:
+            return _fused_fp8_bmm_rope_prefill(
+                q_nope,
+                w_k_t,
+                w_k_scale,
+                q_pe,
+                k_nope,
+                k_rope,
+                kv_cache,
+                slot_mapping,
+                positions,
+                cos,
+                sin,
+                group_size,
+                prefill_config,
+                k_scale,
+                is_neox,
+                q_out_dtype,
+                reuse_freqs_front_part,
+            )
 
     if config is None:
         config, _ = _get_fp8_config(M, N, K)

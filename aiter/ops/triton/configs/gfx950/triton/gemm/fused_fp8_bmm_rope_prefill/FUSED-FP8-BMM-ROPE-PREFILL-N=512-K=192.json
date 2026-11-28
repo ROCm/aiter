@@ -1,0 +1,60 @@
+{
+  "DEFAULT_FALLBACK": true,
+  "M_BOUNDS": [
+    11071,
+    16383,
+    24575,
+    32768
+  ],
+  "M_LEQ_16383": {
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 64,
+    "num_warps": 4,
+    "num_stages": 2,
+    "waves_per_eu": 4,
+    "matrix_instr_nonkdim": 32,
+    "cache_modifier": null,
+    "ROPE_BLOCK_T": 8,
+    "N_INNER": 8,
+    "M_PER_CTA": 1,
+    "LDB": 0,
+    "IL_R": 4,
+    "ILB_NUM": 0,
+    "ILB_DEN": 1,
+    "XCD_COLOC": 0
+  },
+  "M_LEQ_24575": {
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 64,
+    "num_warps": 8,
+    "num_stages": 2,
+    "waves_per_eu": 0,
+    "matrix_instr_nonkdim": 32,
+    "cache_modifier": null,
+    "ROPE_BLOCK_T": 8,
+    "N_INNER": 8,
+    "M_PER_CTA": 2,
+    "LDB": 1,
+    "IL_R": 0,
+    "ILB_NUM": 4,
+    "ILB_DEN": 5,
+    "XCD_COLOC": 1
+  },
+  "M_LEQ_32768": {
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 64,
+    "num_warps": 8,
+    "num_stages": 2,
+    "waves_per_eu": 0,
+    "matrix_instr_nonkdim": 32,
+    "cache_modifier": null,
+    "ROPE_BLOCK_T": 8,
+    "N_INNER": 8,
+    "M_PER_CTA": 2,
+    "LDB": 1,
+    "IL_R": 0,
+    "ILB_NUM": 3,
+    "ILB_DEN": 2,
+    "XCD_COLOC": 1
+  }
+}
