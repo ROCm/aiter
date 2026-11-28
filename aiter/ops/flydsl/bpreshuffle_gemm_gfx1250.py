@@ -11,6 +11,12 @@ import torch
 from torch import Tensor
 
 from .mxfp8_bpreshuffle_gemm_gfx1250 import BLOCK_K as SCALE_BLOCK_SIZE
+from .mxfp8_bpreshuffle_gemm_gfx1250 import (
+    cluster_m_grid_ok,
+    fused_splitk_ok,
+    fused_splitk_partial_shape,
+    resolve_cluster_m,
+)
 
 # Lazily bound flydsl symbols (kept out of import path when flydsl is absent).
 _launch_gemm_a8w8 = None
@@ -73,6 +79,7 @@ def run_preshuffle_gemm_a8_gfx1250(
     cluster_m: int = 1,
     cluster_n: int = 1,
     split_k: int = 1,
+    fused_splitk: bool = False,
 ) -> Tensor:
     """Run the gfx1250 WMMA a8w8 bpreshuffle (ptpc) GEMM; writes into ``Out``.
 
@@ -110,6 +117,11 @@ def run_preshuffle_gemm_a8_gfx1250(
     split_k = max(1, int(split_k))
     cluster_m = max(1, int(cluster_m))
     cluster_n = max(1, int(cluster_n))
+    if N % (tile_n * cluster_n) != 0:
+        raise RuntimeError(
+            f"[FlyDSL gfx1250] N={N} must be a multiple of "
+            f"tile_n*cluster_n={tile_n}*{cluster_n}={tile_n * cluster_n}"
+        )
 
     if split_k > _MAX_SPLIT_K:
         raise RuntimeError(
@@ -158,10 +170,24 @@ def run_preshuffle_gemm_a8_gfx1250(
 
     lda = XQ.stride(0)
     ldc = Out.stride(0)
+    fused = fused_splitk and fused_splitk_ok(
+        tile_m, tile_n, m_warp, n_warp, cluster_m, cluster_n, split_k
+    )
+    if fused and not cluster_m_grid_ok(M, tile_m, cluster_m):
+        raise RuntimeError(
+            f"[FlyDSL gfx1250] fused split-K needs ceil(M/tile_m) to be a multiple "
+            f"of cluster_m={cluster_m}, got M={M}, tile_m={tile_m}"
+        )
+    if fused:
+        partial_shape = fused_splitk_partial_shape(M, N, tile_m, tile_n, split_k)
+    elif split_k > 1:
+        partial_shape = (split_k, M, ldc)
+    else:
+        partial_shape = None
     partials = (
-        torch.empty((split_k, M, ldc), dtype=torch.float32, device=Out.device)
-        if split_k > 1
-        else None
+        None
+        if partial_shape is None
+        else torch.empty(partial_shape, dtype=torch.float32, device=Out.device)
     )
     gemm_out = Out if partials is None else partials
     out_is_f16 = 1 if out_dtype == "f16" else 0
@@ -174,11 +200,12 @@ def run_preshuffle_gemm_a8_gfx1250(
         n_warp,
         out_is_f16,
         nb,
-        cluster_m,
+        cluster_m * cluster_n * (split_k if fused else 1) > 1,  # use_cluster
         cluster_n,
         False,  # is_mxscale
         SCALE_BLOCK_SIZE,
         split_k,
+        fused,
         False,  # batched
         0,  # preload_ks
         False,  # a_preshuffle
@@ -201,13 +228,15 @@ def run_preshuffle_gemm_a8_gfx1250(
         0,
         lda,
         ldc,
-        *gemm_spec[:14],
+        _ptr_arg(Out),
+        cluster_m,
+        *gemm_spec[:15],
         1,  # batch (runtime)
-        *gemm_spec[14:],
+        *gemm_spec[15:],
         _ptr_arg(Out),  # arg_scale_out
         specialization_key=gemm_spec,
     )
-    if partials is not None:
+    if partials is not None and not fused:
         dense = ldc == N
         _run_compiled(
             _compile_splitk_reduce(
@@ -230,14 +259,18 @@ _KERNEL_NAME_RE = re.compile(
     r"t(?P<tile_m>\d+)x(?P<tile_n>\d+)x(?P<tile_k>\d+)_"
     r"mw(?P<m_warp>\d+)_nw(?P<n_warp>\d+)_"
     r"nb(?P<num_buffers>\d+)_sk(?P<split_k>\d+)_"
-    r"cm(?P<cluster_m>\d+)_cn(?P<cluster_n>\d+)$"
+    r"cm(?P<cluster_m>\d+)_cn(?P<cluster_n>\d+)(?P<fused_splitk>_fsk)?$"
 )
 
 
 def parse_wmma_kernel_name(name: str):
     """Parse a flydsl_bpreshuffle_wmma_ kernelName into its config dict, or None."""
     m = _KERNEL_NAME_RE.fullmatch(name)
-    return {k: int(v) for k, v in m.groupdict().items()} if m else None
+    if m is None:
+        return None
+    cfg = {k: int(v) for k, v in m.groupdict().items() if k != "fused_splitk"}
+    cfg["fused_splitk"] = m["fused_splitk"] is not None
+    return cfg
 
 
 def run_gemm_a8w8_bpreshuffle_gfx1250(
@@ -252,6 +285,11 @@ def run_gemm_a8w8_bpreshuffle_gfx1250(
     cfg = parse_wmma_kernel_name(kernel_name)
     if cfg is None:
         raise ValueError(f"[FlyDSL gfx1250] unrecognised kernelName: {kernel_name!r}")
+    cluster_m = cfg["cluster_m"]
+    if cfg["fused_splitk"]:
+        cluster_m = (
+            resolve_cluster_m(Out.shape[0], cfg["tile_m"], cluster_m) or cluster_m
+        )
     return run_preshuffle_gemm_a8_gfx1250(
         XQ,
         WQ,
@@ -263,8 +301,9 @@ def run_gemm_a8w8_bpreshuffle_gfx1250(
         cfg["tile_k"],
         num_buffers=cfg["num_buffers"],
         split_k=cfg["split_k"],
-        cluster_m=cfg["cluster_m"],
+        cluster_m=cluster_m,
         cluster_n=cfg["cluster_n"],
         m_warp=cfg["m_warp"],
         n_warp=cfg["n_warp"],
+        fused_splitk=cfg["fused_splitk"],
     )

@@ -1723,9 +1723,9 @@ def _flydsl_mxfp8_fallback_kernel(
     tile_n must be a multiple of 32.
     """
     from ..ops.flydsl.gemm_tune.flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common import (
+        fallback_kernels,
         is_compute_kernel,
         kernel_fits_shape,
-        kernels_list,
     )
 
     # A-preshuffle packs adjacent row pairs, so an odd M has no valid pairing.
@@ -1733,7 +1733,7 @@ def _flydsl_mxfp8_fallback_kernel(
         return None
     fits = [
         ki
-        for ki in kernels_list.values()
+        for ki in fallback_kernels()
         if kernel_fits_shape(ki, m, n, k)
         and not (mx32 and (ki.a_preshuffle or ki.tile_n % 32))
     ]

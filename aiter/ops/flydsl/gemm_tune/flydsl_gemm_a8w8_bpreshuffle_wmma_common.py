@@ -5,9 +5,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from aiter.jit.utils.chip_info import get_gfx, get_lds_capacity_bytes
+from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import fused_splitk_ok
 
 NAME_PREFIX = "flydsl_bpreshuffle_wmma"
 
@@ -45,6 +46,7 @@ class WmmaKernelInstance:
     cluster_n: int = 1
     m_warp: int = 2
     n_warp: int = 2
+    fused_splitk: bool = False
 
     @property
     def name(self) -> str:
@@ -52,6 +54,7 @@ class WmmaKernelInstance:
             f"{NAME_PREFIX}_t{self.tile_m}x{self.tile_n}x{self.tile_k}_"
             f"mw{self.m_warp}_nw{self.n_warp}_nb{self.num_buffers}_sk{self.split_k}_"
             f"cm{self.cluster_m}_cn{self.cluster_n}"
+            + ("_fsk" if self.fused_splitk else "")
         )
 
 
@@ -118,6 +121,11 @@ def _build_kernels_list() -> dict[int, WmmaKernelInstance]:
                                     continue
                                 kl[idx] = ki
                                 idx += 1
+    # Fused twins go last so every existing kernelId keeps its kernel.
+    for ki in tuple(kl.values()):
+        if ki.split_k > 1:
+            kl[idx] = replace(ki, fused_splitk=True)
+            idx += 1
     return kl
 
 
@@ -127,6 +135,16 @@ kernels_list: dict[int, WmmaKernelInstance] = _build_kernels_list()
 def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
     """Return True iff ``ki`` can be launched for runtime shape ``(M, N, K)``."""
 
+    if ki.fused_splitk and not fused_splitk_ok(
+        ki.tile_m,
+        ki.tile_n,
+        ki.m_warp,
+        ki.n_warp,
+        ki.cluster_m,
+        ki.cluster_n,
+        ki.split_k,
+    ):
+        return False
     if not _tile_valid(ki.tile_m, ki.tile_n, ki.tile_k, ki.m_warp, ki.n_warp):
         return False
     if not _cluster_valid(ki.cluster_m, ki.cluster_n):
