@@ -3,6 +3,7 @@
 """FlyDSL prefill causal-conv1d kernel with fused split q/k/v output."""
 
 import functools
+import os
 from collections.abc import Sequence
 
 import flydsl.compiler as flyc
@@ -17,6 +18,9 @@ from ..prefill_batch_metadata import CausalConvPrefillMetadata
 from .kernels.causal_conv1d_prefill import create_causal_conv1d_prefill_kernel
 
 PAD_SLOT_ID = -1
+_VEC_ENV = "AITER_CONV1D_PREFILL_VEC"
+# Tile of the vectorized prefill kernel (MI355X, dim 10240, width 4).
+_VEC_BLOCK, _VEC_TOKENS, _VEC_PREFETCH = 256, 16, 4
 
 
 def build_causal_conv1d_flydsl_module(
@@ -530,6 +534,112 @@ def causal_conv1d_split_qkv_flydsl_fn(
     return query, key, value
 
 
+def _vec_enabled() -> bool:
+    """Opt-in gate for the vectorized prefill kernel. Not memoized, so the env
+    var can be toggled at runtime."""
+    return os.environ.get(_VEC_ENV, "") == "1"
+
+
+@functools.cache
+def _vec_kernels():
+    """The vectorized kernel's module, or None (warned once) if it cannot be
+    imported, in which case the base kernel serves every call."""
+    try:
+        from .kernels import causal_conv1d_prefill_vec
+    except ImportError as exc:
+        from aiter import logger
+
+        logger.warning(
+            "%s=1 but the vectorized prefill conv cannot be imported (%s); "
+            "using the base kernel",
+            _VEC_ENV,
+            exc,
+        )
+        return None
+    return causal_conv1d_prefill_vec
+
+
+def _vec_supported(x: torch.Tensor, out: torch.Tensor, width: int) -> bool:
+    """16-bit operands with unit channel stride, 8-channel-aligned token rows
+    and a 16-byte aligned base (one buffer access per 8 channels), and token
+    strides whose run offsets fit the 32-bit buffer offsets."""
+    dim = x.shape[0]
+    return (
+        x.dtype in (torch.bfloat16, torch.float16)
+        and dim % 8 == 0
+        and all(t.stride(0) == 1 and t.stride(1) % 8 == 0 for t in (x, out))
+        and x.data_ptr() % 16 == 0
+        and out.data_ptr() % 16 == 0
+        and (_VEC_TOKENS + width) * max(x.stride(1), out.stride(1)) + dim < 2**31
+    )
+
+
+def _flat(t: torch.Tensor) -> torch.Tensor:
+    """1-D view from ``t``'s first element over its strided extent."""
+    span = 1 + sum((n - 1) * s for n, s in zip(t.shape, t.stride()))
+    return t.as_strided((span,), (1,))
+
+
+def _prefill_vec(
+    vec,
+    x,
+    weight,
+    bias,
+    conv_states,
+    query_start_loc,
+    cache_indices,
+    has_initial_state,
+    silu,
+    pad_slot_id,
+    out,
+    batch,
+    max_len,
+):
+    launch = vec.create_causal_conv1d_prefill_vec_kernel(
+        x.shape[0],
+        weight.shape[1],
+        weight.stride(),
+        conv_states.stride() if conv_states is not None else (0, 0, 0),
+        bias is not None,
+        conv_states is not None,
+        cache_indices is not None,
+        has_initial_state is not None,
+        silu,
+        pad_slot_id,
+        _VEC_BLOCK,
+        _VEC_TOKENS,
+        _VEC_PREFETCH,
+        x.dtype,
+        silu and x.dtype == torch.bfloat16,
+    )
+    # Absent optional pointers are never dereferenced by the specialized kernel.
+    args = (
+        _flat(x),
+        _flat(weight),
+        bias if bias is not None else _flat(x),
+        _flat(conv_states) if conv_states is not None else _flat(x),
+        query_start_loc,
+        cache_indices if cache_indices is not None else query_start_loc,
+        has_initial_state if has_initial_state is not None else query_start_loc,
+        _flat(out),
+    )
+    with torch.cuda.device(x.device):
+        stream = torch.cuda.current_stream(x.device)
+        # Sizes and token strides are runtime values; one compiled callable per
+        # operand dtype set (int32/int64 indices, bool or integer flags).
+        key = (x.device.index, tuple(t.dtype for t in args))
+        _run_compiled(
+            launch,
+            *args,
+            batch,
+            max_len,
+            x.stride(1),
+            out.stride(1),
+            fx.Stream(stream),
+            specialization_key=key,
+        )
+
+
 def causal_conv1d_prefill_flydsl_fn(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -556,6 +666,12 @@ def causal_conv1d_prefill_flydsl_fn(
     prefetch is the number of token loads grouped before consumption. The default
     channel mapping pairs adjacent BF16/FP16 channels for channel-contiguous inputs
     with at least 8192 packed tokens; other inputs use one channel per thread.
+
+    With ``AITER_CONV1D_PREFILL_VEC=1`` and ``channels_per_thread`` unset, BF16/FP16
+    inputs with unit channel stride, 8-channel-aligned token rows and a 16-byte
+    aligned base run ``kernels/causal_conv1d_prefill_vec.py`` instead (8 channels
+    a thread, its own fixed tile); its outputs and states are bit for bit this
+    kernel's.
     """
     if x.ndim != 2 or weight.ndim != 2:
         raise ValueError("expected x [channels,total_tokens], weight [channels,width]")
@@ -653,6 +769,29 @@ def causal_conv1d_prefill_flydsl_fn(
     max_len = max(seq_lens_cpu, default=0)
     if not max_len or not dim:
         return out
+    silu = activation in (True, "silu", "swish")
+    if (
+        channels_per_thread is None
+        and _vec_enabled()
+        and _vec_supported(x, out, width)
+        and (vec := _vec_kernels()) is not None
+    ):
+        _prefill_vec(
+            vec,
+            x,
+            weight,
+            bias,
+            conv_states,
+            query_start_loc,
+            cache_indices,
+            has_initial_state,
+            silu,
+            pad_slot_id,
+            out,
+            batch,
+            max_len,
+        )
+        return out
     lanes = channels_per_thread
     if lanes is None:
         lanes = (
@@ -690,7 +829,7 @@ def causal_conv1d_prefill_flydsl_fn(
         conv_states is not None,
         cache_indices is not None,
         has_initial_state is not None,
-        activation in (True, "silu", "swish"),
+        silu,
         pad_slot_id,
         block,
         tokens,

@@ -13,7 +13,9 @@ Usage:
 """
 
 import argparse
+import contextlib
 import itertools
+import os
 
 import pandas as pd
 import pytest
@@ -24,9 +26,11 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.causal_conv1d_flydsl import causal_conv1d_prefill_flydsl_fn
+from aiter.ops.flydsl.kernels import causal_conv1d_prefill_vec
 from aiter.ops.flydsl.kernels.causal_conv1d_prefill import (
     create_causal_conv1d_prefill_kernel,
 )
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -168,6 +172,122 @@ def check_against_reference(inputs, msg, activation="silu", **kwargs):
     )
 
 
+@contextlib.contextmanager
+def vec_conv(enabled):
+    """AITER_CONV1D_PREFILL_VEC set to 1 (or unset) inside the block."""
+    old = os.environ.pop("AITER_CONV1D_PREFILL_VEC", None)
+    if enabled:
+        os.environ["AITER_CONV1D_PREFILL_VEC"] = "1"
+    try:
+        yield
+    finally:
+        os.environ.pop("AITER_CONV1D_PREFILL_VEC", None)
+        if old is not None:
+            os.environ["AITER_CONV1D_PREFILL_VEC"] = old
+
+
+@contextlib.contextmanager
+def nan_outputs():
+    """Outputs start NaN-filled, so a store the kernel skips shows."""
+    empty_like = torch.empty_like
+
+    def nan_empty_like(*args, **kwargs):
+        t = empty_like(*args, **kwargs)
+        return t.fill_(float("nan")) if t.is_floating_point() else t
+
+    torch.empty_like = nan_empty_like
+    try:
+        yield
+    finally:
+        torch.empty_like = empty_like
+
+
+# (sequence lengths, dim, width, dtype, token stride, has_initial_state, extras):
+# Qwen3.8 TP1 conv views (dim 10240 inside the 16384-wide projection), varlen
+# batches with an empty sequence and sequences shorter than the halo, a padded
+# slot, bias, fp16 (exact SiLU), no SiLU, widths 2/3/5, int64 indices with
+# integer history flags, and token rows not 16-byte aligned (base kernel).
+VEC_CASES = [
+    ([16384], 10240, 4, torch.bfloat16, 16384, [True], {}),
+    ([6169], 10240, 4, torch.bfloat16, 16384, [False], {}),
+    (
+        [1, 2, 3, 0, 4, 70, 129, 64, 65, 1000],
+        1024,
+        4,
+        torch.bfloat16,
+        1024,
+        [True, False, True, True, True, False, True, True, False, True],
+        {},
+    ),
+    ([50, 300], 512, 4, torch.bfloat16, 512, [True, True], {"pad_first": True}),
+    ([700, 33], 512, 4, torch.bfloat16, 512, [True, True], {"bias": True}),
+    ([515, 2], 512, 4, torch.float16, 640, [True, True], {}),
+    ([3, 200], 512, 2, torch.bfloat16, 512, [True, True], {}),
+    ([1, 300], 512, 3, torch.bfloat16, 512, [True, True], {}),
+    ([2, 77], 512, 5, torch.bfloat16, 512, [True, True], {}),
+    ([257, 1], 512, 4, torch.bfloat16, 512, [True, True], {"activation": None}),
+    ([2, 129], 512, 4, torch.bfloat16, 512, [True, False], {"int64": True}),
+    ([5, 40], 512, 4, torch.bfloat16, 516, [True, True], {"fallback": True}),
+]
+
+
+def check_vec_matches_base():
+    """AITER_CONV1D_PREFILL_VEC=1 gives the base kernel's outputs and states bit
+    for bit, and the vectorized kernel ran on every case it supports."""
+    vec_launches = causal_conv1d_prefill_vec.create_causal_conv1d_prefill_vec_kernel
+    for lens, dim, width, dtype, stride, initial, extra in VEC_CASES:
+        inputs = make_inputs(
+            lens, dim, width, dtype, "token_major", extra.get("bias", False)
+        )
+        buf = torch.randn(sum(lens), stride, dtype=dtype)
+        buf[:, :dim] = inputs["x"].t()
+        inputs["x"] = buf[:, :dim].t()
+        inputs["has_initial_state"] = torch.tensor(initial)
+        if extra.get("pad_first"):
+            inputs["cache_indices"][0] = PAD_SLOT_ID
+        if extra.get("int64"):
+            inputs["cache_indices"] = inputs["cache_indices"].long()
+            inputs["has_initial_state"] = inputs["has_initial_state"].int()
+        activation = extra.get("activation", "silu")
+        results = []
+        for enabled in (False, True):
+            state = inputs["conv_states"].clone()
+            calls = vec_launches.cache_info()
+            with vec_conv(enabled), nan_outputs():
+                out = causal_conv1d_prefill_flydsl_fn(
+                    **{**inputs, "conv_states": state}, activation=activation
+                )
+            ran = sum(vec_launches.cache_info()[:2]) - sum(calls[:2])
+            expected = int(enabled and not extra.get("fallback", False))
+            assert ran == expected, f"{lens}: vectorized kernel ran {ran} times"
+            results.append((out, state))
+        (ref, ref_state), (out, state) = results
+        live = live_token_mask(inputs)
+        assert torch.equal(out[:, live], ref[:, live]), f"{lens}: output differs"
+        assert torch.equal(state, ref_state), f"{lens}: conv_states differ"
+
+
+def silu_mismatches(margin):
+    """Inputs among all 2^32 fp32 bit patterns where the vectorized kernel's
+    bf16(fast SiLU with its fallback) != bf16(exact SiLU)."""
+    per, iters, block, vec = 1 << 28, 8, 256, causal_conv1d_prefill_vec.VEC
+    nblocks = per // (iters * block * vec)
+    counts = torch.zeros(nblocks * block, dtype=torch.int32)
+    launch = causal_conv1d_prefill_vec.create_silu_check_kernel(margin, iters, block)
+    mismatches = 0
+    for c in range((1 << 32) // per):
+        base = c * per - (1 << 32) if c * per >= 1 << 31 else c * per
+        _run_compiled(launch, counts, base, nblocks, torch.cuda.current_stream())
+        mismatches += int(counts.sum())
+    return mismatches
+
+
+def check_fast_silu_exhaustive():
+    assert silu_mismatches(causal_conv1d_prefill_vec.FAST_TIE_MARGIN) == 0
+    # Without the tie fallback the same count finds mismatches.
+    assert silu_mismatches(-1) > 0
+
+
 @benchmark()
 def test_causal_conv1d_prefill(
     batch, seqlen, dim, width, dtype, layout, with_initial_state
@@ -176,9 +296,10 @@ def test_causal_conv1d_prefill(
         [seqlen] * batch, dim, width, dtype, layout, False, with_initial_state
     )
     candidates = {
-        "flydsl": lambda state: causal_conv1d_prefill_flydsl_fn(
+        name: lambda state: causal_conv1d_prefill_flydsl_fn(
             **{**inputs, "conv_states": state}
-        ),
+        )
+        for name in ("flydsl", "flydsl vec")
     }
 
     tokens = batch * seqlen
@@ -189,20 +310,21 @@ def test_causal_conv1d_prefill(
 
     ret = {"gfx": get_gfx()}
     for name, fn in candidates.items():
-        err = check_against_reference(inputs, name)
-        assert err <= _TOL_ERR_RATIO, f"{name}: mismatch ratio {err:.3e}"
-        timing_state = inputs["conv_states"].clone()
-        _, us = run_perftest(
-            fn,
-            timing_state,
-            num_rotate_args=max(
-                1,
-                min(
-                    _MAX_PERF_ROTATIONS,
-                    _PERF_ROTATION_BUDGET // max(1, timing_state.nbytes),
+        with vec_conv(name == "flydsl vec"):
+            err = check_against_reference(inputs, name)
+            assert err <= _TOL_ERR_RATIO, f"{name}: mismatch ratio {err:.3e}"
+            timing_state = inputs["conv_states"].clone()
+            _, us = run_perftest(
+                fn,
+                timing_state,
+                num_rotate_args=max(
+                    1,
+                    min(
+                        _MAX_PERF_ROTATIONS,
+                        _PERF_ROTATION_BUDGET // max(1, timing_state.nbytes),
+                    ),
                 ),
-            ),
-        )
+            )
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
@@ -294,6 +416,14 @@ def test_new_token_count_reuses_kernel(layout):
         assert info.misses == misses, f"{layout} {total=} built a new kernel"
 
 
+def test_vec_matches_base():
+    check_vec_matches_base()
+
+
+def test_vec_fast_silu_exhaustive():
+    check_fast_silu_exhaustive()
+
+
 def test_rejects_unsupported_width():
     inputs = make_inputs([8], 64, 4, torch.bfloat16, "token_major")
     inputs["weight"] = torch.randn(64, 6, dtype=torch.bfloat16)
@@ -346,6 +476,8 @@ def main():
     )
     args = parser.parse_args()
 
+    check_vec_matches_base()
+    check_fast_silu_exhaustive()
     rows = []
     for dtype, batch, shape, layout, initial in itertools.product(
         args.dtype,
