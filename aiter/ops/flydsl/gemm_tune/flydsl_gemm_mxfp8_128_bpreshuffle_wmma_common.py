@@ -81,6 +81,7 @@ class WmmaKernelInstance:
     m_run_cap: int = 32
     c_vmem_store: bool = False
     xcd_swizzle: int = 0
+    rotate_n: bool = False
 
     def name_for(self, a_preshuffle: bool = False) -> str:
         return (
@@ -92,6 +93,7 @@ class WmmaKernelInstance:
             + (f"_mr{self.m_run_cap}" if self.m_run_cap != 32 else "")
             + (f"_xcd{self.xcd_swizzle}" if self.xcd_swizzle else "")
             + ("_cv" if self.c_vmem_store else "")
+            + ("_rn" if self.rotate_n else "")
         )
 
     @property

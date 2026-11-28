@@ -114,6 +114,7 @@ def launch_gemm_a8w8_256x256(
     m_run_cap: Constexpr[int] = 32,
     c_vmem_store: Constexpr[bool] = False,
     xcd_swizzle: Constexpr[int] = 0,
+    rotate_n: Constexpr[bool] = False,
     batch: fx.Int32 = 1,
 ):
     """N must be a multiple of ``tile_n`` (of ``tile_n * cluster_n`` when
@@ -133,7 +134,12 @@ def launch_gemm_a8w8_256x256(
     ``xcd_swizzle`` (``_xcd<n>``; split_k 1, not batched): remap launch tiles
     so each XCD owns a contiguous block (cluster-preserving). ``n==1`` is
     that remap only; ``n>=cluster_m`` (multiple of ``cluster_m``) also
-    M-major-groups by ``n`` M tiles for L2 reuse."""
+    M-major-groups by ``n`` M tiles for L2 reuse.
+    ``rotate_n`` (``_rn``; persistent C relocation only): each cluster row
+    starts its N strip at a different tile, so concurrent clusters read
+    different B tiles instead of all waiting on the same cold ones. It also
+    gives mid-K nb2 persistent kernels the single-stage A-scale panel that C
+    relocation needs."""
 
     assert (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers) in (
         (256, 256, 128, 2, 2, 4),
@@ -205,7 +211,8 @@ def launch_gemm_a8w8_256x256(
     KPAIR = 1 if num_buffers == 4 and tile_n == 256 else 2
     UNROLL = KPAIR * num_buffers
     SUPER_K = tile_k * KPAIR
-    # Short-K: panel=4 (persistent: 1, for c_relocate). Mid-K: panel=8.
+    # Short-K: panel=4 (persistent: 1, for c_relocate). Mid-K: panel=8
+    # (persistent with rotate_n: 1).
     # Long-K / nb3 keep legacy 8/4. nb4 with one K-tile per slot takes panel=16:
     # at panel=1 each stage is a 256-row x 4-byte A-scale TDM, and the A/B
     # fragment reads of waves 0 and 2 stall on LDS (~1.9x slower at K=8192).
@@ -215,7 +222,9 @@ def launch_gemm_a8w8_256x256(
     SA_PANEL_STAGES = (
         (
             1
-            if k_tiles_class == 0 and num_buffers == 2 and persistent_n_tiles > 1
+            if (k_tiles_class == 0 or (k_tiles_class == 1 and rotate_n))
+            and num_buffers == 2
+            and persistent_n_tiles > 1
             else (
                 _SA_PANEL_CLASS0
                 if k_tiles_class == 0 and num_buffers == 2
@@ -325,6 +334,9 @@ def launch_gemm_a8w8_256x256(
         and Q_END <= lds_cap
         and q_fits
     )
+    assert not rotate_n or c_relocate, (
+        "rotate_n needs persistent C relocation (nb2/nb4 _ps, <= 64 K-tiles for nb2)"
+    )
     if c_relocate:
         ARENA_B = max(ARENA_B, Q_END)
     # C goes LDS -> VGPR -> buffer_store, so the next tile's slot-1 refill waits
@@ -366,6 +378,7 @@ def launch_gemm_a8w8_256x256(
         + (f"_mr{m_run_cap}" if m_run_cap != 32 else "")
         + (f"_xcd{xcd_swizzle}" if xcd_swizzle else "")
         + ("_cv" if c_vmem_store else "")
+        + ("_rn" if rotate_n else "")
     )
 
     def _run_tile(
@@ -446,8 +459,17 @@ def launch_gemm_a8w8_256x256(
             _cx2 = _m_crow2 - m_chunk * _n_cx
             bid_x = _cx2 * _cm + _lx
             bid_y = _cy2 * _cn + _ly
+        # Position of this tile in the CTA's N strip; with rotate_n the strip
+        # starts at the cluster row's index (cluster-uniform, so multicast
+        # peers stay on one tile block) and wraps.
+        tile_pos = tile_idx
         if const_expr(persistent_n_tiles > 1):
-            bid_y = bid_y + tile_idx * fx.Int32(fx.grid_dim.y)
+            if const_expr(rotate_n):
+                cluster_row = m_chunk * (
+                    fx.Int32(fx.grid_dim.x) // cluster_m
+                ) + bid_x // fx.Int32(cluster_m)
+                tile_pos = (tile_idx + cluster_row) % fx.Int32(persistent_n_tiles)
+            bid_y = bid_y + tile_pos * fx.Int32(fx.grid_dim.y)
         wave = rocdl.readfirstlane(T.i32, tid // WAVE)
         lane = tid % WAVE
         lane16 = lane % 16
@@ -572,6 +594,12 @@ def launch_gemm_a8w8_256x256(
             pref_on = fx.Int64(n_adv) * k64 + (
                 BB_SLOT if BB_OK else C_EARLY_SLOTS - 1
             ) * B_LDS_ROW < fx.Int64(2**32)
+            if const_expr(rotate_n):
+                # The wrap steps back (persistent_n_tiles - 1) N strides.
+                pref_on = pref_on & (
+                    fx.Int64(n_adv) * k64 * (persistent_n_tiles - 1)
+                    < fx.Int64(2**32)
+                )
 
         gA = _gv(gA_base, a_off0, (A_LDS_ROWS, A_PAIR * tile_k), (A_PAIR * tile_k, 1))
         gB = _gv(
@@ -746,6 +774,10 @@ def launch_gemm_a8w8_256x256(
         )
 
         def _prepare_tdm(slot, tile_delta, sa_panel=0, sa_refill=1):
+            # tile_delta may be (delta, base_hi) to override the address high word.
+            base_hi = tdm_base_hi
+            if const_expr(isinstance(tile_delta, tuple)):
+                tile_delta, base_hi = tile_delta
             if const_expr(SA_PANEL_STAGES > 1):
                 panel_wave = (wave >= 2) if const_expr(SB_PANEL) else (wave == 2)
                 slot = panel_wave.select(sa_panel % SA_RING, fx.Int32(slot))
@@ -757,7 +789,7 @@ def launch_gemm_a8w8_256x256(
             desc = tdm_ops.update_tensor_descriptor_2d_addr64(
                 desc,
                 tdm_base_lo,
-                tdm_base_hi,
+                base_hi,
                 tile_delta,
             )
             if const_expr(SA_PANEL_STAGES > 1):
@@ -1713,13 +1745,31 @@ def launch_gemm_a8w8_256x256(
             had_prev_tile = (tile_idx > 0) & pref_on
             n_pref = (drain_s < C_EARLY_SLOTS).select(drain_s, fx.Int32(C_EARLY_SLOTS))
             prev_pref = had_prev_tile.select(n_pref, fx.Int32(0))
+            pref_shift = tdm_tile_shift
+            if const_expr(rotate_n):
+                # The wrap steps back (persistent_n_tiles - 1) N strides: the
+                # negative delta goes in as its unsigned 32-bit value, and one is
+                # borrowed from the address high word to cancel the carry.
+                wrap = (tile_pos == fx.Int32(persistent_n_tiles - 1)) & (
+                    tdm_tile_shift != fx.Int32(0)
+                )
+                pref_shift = wrap.select(
+                    tdm_tile_shift * fx.Int32(1 - persistent_n_tiles), tdm_tile_shift
+                )
+                hi_borrow = (
+                    ((tdm_base_hi & fx.Int32(0x3FFFFFFF)) - fx.Int32(1))
+                    & fx.Int32(0x3FFFFFFF)
+                ) | (tdm_base_hi & fx.Int32(-0x40000000))
+                pref_hi = wrap.select(hi_borrow, tdm_base_hi)
             pref_delta = [
                 (fx.Int32(s) * tdm_global_step < last_delta).select(
                     fx.Int32(s) * tdm_global_step, last_delta
                 )
-                + tdm_tile_shift
+                + pref_shift
                 for s in range_constexpr(BB_SLOT + 1 if BB_OK else C_EARLY_SLOTS)
             ]
+            if const_expr(rotate_n):
+                pref_delta = [(d, pref_hi) for d in pref_delta]
         # bb_on: this K split has four drain K-steps and a steady loop. defer: this
         # tile's slots C_EARLY_SLOTS.. wait for the previous C store until its first
         # refill. pref_bb: this wave lands the next tile's K-tile 2 in the drain.

@@ -149,6 +149,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     m_run_cap: int = 32,
     c_vmem_store: bool = False,
     xcd_swizzle: int = 0,
+    rotate_n: bool = False,
 ) -> Tensor:
     """Run the gfx1250 WMMA mxfp8_128 / mxfp8_32 bpreshuffle GEMM.
 
@@ -179,6 +180,9 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     remap launch tiles onto XCDs in contiguous blocks. ``n==1`` is that order
     only; ``n>=cluster_m`` (multiple of ``cluster_m``) also M-major-groups by
     ``n``.
+
+    ``rotate_n`` (kernelName ``_rn``; compute, ``_ps``, batch 1): each cluster
+    row starts its persistent N strip at a different tile.
     """
     compute_bound = is_compute_wmma_kernel_name(kernel_name)
     if m_run_cap != 32 and not compute_bound:
@@ -211,6 +215,11 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             "[FlyDSL gfx1250 mxfp8] xcd_swizzle (_xcd) needs a compute-bound "
             f"split_k=1 batch-1 kernel and either 1 or a multiple of "
             f"cluster_m={cluster_m}"
+        )
+    if rotate_n and not (compute_bound and persistent_n_tiles > 1 and batch == 1):
+        raise RuntimeError(
+            "[FlyDSL gfx1250 mxfp8] rotate_n (_rn) needs a compute-bound "
+            "persistent (_ps) kernel with batch 1"
         )
     mx32 = scale_block == MX32_BLOCK_K
     if not mx32 and scale_block != BLOCK_K:
@@ -469,6 +478,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             m_run_cap,
             c_vmem_store,
             xcd_swizzle,
+            rotate_n,
         )
         _run_compiled(
             _launch_gemm_a8w8_compute_bound,
@@ -531,6 +541,7 @@ NAME_SUFFIX_RE = (
     r"(?:_mr(?P<m_run_cap>\d+))?"
     r"(?:_xcd(?P<xcd_swizzle>\d+))?"
     r"(?P<c_vmem_store>_cv)?"
+    r"(?P<rotate_n>_rn)?"
 )
 MX32_NAME_SUFFIX_RE = NAME_SUFFIX_RE + r"(?P<a_scale_preshuffled>_aspre)?"
 _KERNEL_NAME_RE = re.compile(rf"^{re.escape(WMMA_NAME_PREFIX)}_{NAME_SUFFIX_RE}")
@@ -553,6 +564,7 @@ def _parse_name(match):
     a_scale_preshuffled = groups.pop("a_scale_preshuffled", None) is not None
     fused_splitk = groups.pop("fused_splitk", None) is not None
     c_vmem_store = groups.pop("c_vmem_store", None) is not None
+    rotate_n = groups.pop("rotate_n", None) is not None
     persistent_n_tiles = groups.pop("persistent_n_tiles", None)
     m_run_cap = groups.pop("m_run_cap", None)
     xcd_swizzle = groups.pop("xcd_swizzle", None)
@@ -564,6 +576,7 @@ def _parse_name(match):
     cfg["m_run_cap"] = int(m_run_cap) if m_run_cap else 32
     cfg["xcd_swizzle"] = int(xcd_swizzle) if xcd_swizzle else 0
     cfg["c_vmem_store"] = c_vmem_store
+    cfg["rotate_n"] = rotate_n
     return cfg
 
 
@@ -735,6 +748,7 @@ def run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
         m_run_cap=cfg["m_run_cap"],
         c_vmem_store=cfg["c_vmem_store"],
         xcd_swizzle=cfg["xcd_swizzle"],
+        rotate_n=cfg["rotate_n"],
     )
 
 
@@ -787,6 +801,7 @@ def run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250(
         m_run_cap=cfg["m_run_cap"],
         c_vmem_store=cfg["c_vmem_store"],
         xcd_swizzle=cfg["xcd_swizzle"],
+        rotate_n=cfg["rotate_n"],
         scale_block=MX32_BLOCK_K,
         a_scale_preshuffled=a_scale_preshuffled,
         w_scale_32x32=w_scale_32x32,
