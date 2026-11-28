@@ -103,6 +103,15 @@ def nextPow2(n):
     return 1 << (n - 1).bit_length()
 
 
+def _tuned_token(M):
+    """``get_2stage_cfgs``' token for M: the bucket, or a tier this module's table
+    (aiter/configs/tuned_fmoe.csv) has rows at, the rule ``fused_moe`` keys on."""
+    from aiter.moev2.dispatch.tuned import extra_m_tiers
+    from aiter.moev2.shapes import tuned_M
+
+    return tuned_M(M, extra_m_tiers(f"{AITER_ROOT_DIR}/aiter/configs/tuned_fmoe.csv"))
+
+
 def get_padded_M(M):
     padded_m = M
     if M >= 1 and M <= 16:
@@ -165,7 +174,7 @@ def fused_moe_dp_share_expert(
     q_dtype_a = dtypes.fp4x2 if quant_type == QuantType.per_1x32 else q_dtype_a
 
     metadata = get_2stage_cfgs(
-        get_padded_M(M),  # consider token_num > 1024 as prefill
+        _tuned_token(M),  # consider token_num > 1024 as prefill
         model_dim,
         inter_dim,
         E,
@@ -586,7 +595,7 @@ def fused_moe_2stages(
     device = hidden_states.device
 
     metadata = get_2stage_cfgs(
-        get_padded_M(token_num),  # consider token_num > 1024 as prefill
+        _tuned_token(token_num),  # consider token_num > 1024 as prefill
         model_dim,
         inter_dim,
         E,

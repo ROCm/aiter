@@ -47,6 +47,17 @@ def nextPow2(n):
 _PADDED_M_TIERS = [32768, 131072]
 
 
+def tuned_M(M, tiers=()):
+    """The token a tuned-row lookup keys on for M: ``get_padded_M(M)``, or the
+    smallest of ``tiers`` (``extra_m_tiers`` of the table looked up) that lies in
+    the upper half of M's bucket and is >= M."""
+    padded = get_padded_M(M)
+    for tier in tiers:
+        if M <= tier < padded and tier > padded // 2:
+            return tier
+    return padded
+
+
 def get_padded_M(M):
     """Map runtime M to a tuning bucket.
 

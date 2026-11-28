@@ -27,6 +27,34 @@ from aiter.ops.flydsl.mxfp4_kname import _is_mxfp4_kname
 
 from ..shapes import _PADDED_M_TIERS
 
+# Prefill-range rows only: a table row at a token count that is not a
+# get_padded_M bucket becomes a lookup tier (`extra_m_tiers`) above this many
+# tokens. Below it the existing off-bucket rows (decode-size rows of other
+# models) stay unreachable, as before tiers existed.
+EXTRA_TIER_MIN_TOKENS = 1024
+
+
+@functools.cache
+def extra_m_tiers(tune_file: str) -> tuple[int, ...]:
+    """Token counts at which ``tune_file`` has tuned rows between two
+    ``get_padded_M`` buckets, in the prefill range: the tiers ``tuned_M`` may key
+    a lookup on. A tier serves only the shapes that have a row there; any other
+    shape is looked up at its bucket (``get_2stage_cfgs``)."""
+    import pandas as pd
+
+    tokens = pd.read_csv(tune_file, usecols=["token"])["token"].dropna()
+    return tuple(
+        sorted(
+            {
+                int(t)
+                for t in tokens
+                if EXTRA_TIER_MIN_TOKENS < int(t) < _PADDED_M_TIERS[0]
+                and int(t) & (int(t) - 1)
+            }
+        )
+    )
+
+
 _CACHES: list = []
 
 

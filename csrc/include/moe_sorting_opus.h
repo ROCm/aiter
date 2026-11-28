@@ -1516,7 +1516,8 @@ moe_sorting_get_workspace_size(
 {
 #if 1
     // return 0;
-    if(dispatch_policy_ == 0)
+    // 3: as 0, with the multi-phase expert-scatter phase split by token chunk (P23S)
+    if(dispatch_policy_ == 0 || dispatch_policy_ == 3)
     {
         if(moe_sorting_auto_is_oneshot(tokens_, num_experts_, device_id_))
         {
@@ -3394,6 +3395,333 @@ struct MoeSortingMultiPhaseKernel_P23
     }
 };
 
+// MoeSortingMultiPhaseKernel_P23 split by token chunk (dispatch_policy 3).
+// Same outputs as P23, byte for byte, for the 8-bit mesh without local expert masking or local
+// topk ids. P23 gives each expert one block that walks the whole mesh row and writes its tokens from
+// 16-token runs per thread, so an expert holding most tokens keeps one CU busy long after the rest
+// finish. Here every (expert, kChunk-token chunk) pair gets a block: it issues all of its loads at
+// once (expert counts, the mesh bytes before its chunk, its own chunk), derives the expert's start,
+// the routes before the chunk and each thread's position in one block scan, and stages the chunk's
+// ids in LDS so sorted ids / weights / m_indices go out as contiguous stores. The weights are
+// gathered in that store loop: one load per row across the block, not a chain per thread.
+template <typename Problem_>
+struct MoeSortingMultiPhaseKernel_P23S
+{
+    using Problem = opus::remove_cvref_t<Problem_>;
+
+    using IndexType  = typename Problem::IndexType;
+    using WeightType = typename Problem::WeightType;
+    using MeshType   = typename Problem::MeshType;
+    static_assert(sizeof(MeshType) == 1, "P23S reads the 8-bit mesh");
+    static_assert(!Problem::LocalExpertMasking, "P23S has no local expert masking");
+
+    static constexpr opus::index_t kBlockSize           = 256;
+    static constexpr opus::index_t kWaves               = kBlockSize / 64;
+    static constexpr opus::index_t kPack                = 16; // mesh bytes (tokens) per thread
+    static constexpr opus::index_t kChunk               = kBlockSize * kPack;
+    static constexpr opus::index_t kMaxChunks           = 8;  // tokens <= 32768
+    static constexpr opus::index_t kMaxExpertsPerThread = 8;  // num_experts <= 2048
+    static constexpr opus::index_t OCCUPANCY            = 2;
+
+    using Hargs = MoeSortingHostArgs;
+    struct Kargs
+    {
+        const void* p_weights;
+        const void* p_local_tokens;
+        const void* p_expert_mesh;
+        const void* p_expert_cumsum; // [expert] route counts written by P1
+        void* p_total_tokens_post_pad;
+        void* p_sorted_expert_ids;
+        void* p_sorted_token_ids;
+        void* p_sorted_weights;
+        void* p_moe_buf;
+        void* p_m_indices;
+        void* p_reverse_sorted;
+        opus::index_t tokens;
+        opus::index_t num_experts;
+        opus::index_t mesh_stride;
+        opus::index_t n_chunks;
+        opus::mdiv unit_size_mdiv;
+        opus::mdiv topk_mdiv;
+        opus::index_t moe_buf_interm_dim;
+        opus::index_t moe_buf_elem_bytes;
+    };
+
+    OPUS_H static constexpr opus::index_t NumChunks(opus::index_t tokens)
+    {
+        return (impl::moe_sorting_mp_mesh_stride(tokens) + kChunk - 1) / kChunk;
+    }
+
+    OPUS_H static bool IsSupported(const Hargs& h)
+    {
+        return h.p_local_topk_ids == nullptr && NumChunks(h.tokens) <= kMaxChunks &&
+               h.num_experts <= kBlockSize * kMaxExpertsPerThread;
+    }
+
+    OPUS_H static constexpr auto MakeKargs(const Hargs& h)
+    {
+        Kargs k;
+        k.p_weights       = h.p_weights;
+        k.p_local_tokens  = h.p_local_tokens;
+        k.p_expert_mesh   = h.p_ws;
+        k.p_expert_cumsum = reinterpret_cast<void*>(
+            reinterpret_cast<char*>(h.p_ws) +
+            impl::moe_sorting_mp_mesh_smem_size(h.tokens, h.num_experts, h.topk));
+        k.p_total_tokens_post_pad = h.p_total_tokens_post_pad;
+        k.p_sorted_expert_ids     = h.p_sorted_expert_ids;
+        k.p_sorted_token_ids      = h.p_sorted_token_ids;
+        k.p_sorted_weights        = h.p_sorted_weights;
+        k.p_moe_buf               = h.p_moe_buf;
+        k.p_m_indices             = h.p_m_indices;
+        k.p_reverse_sorted        = h.p_reverse_sorted;
+        k.tokens                  = h.tokens;
+        k.num_experts             = h.num_experts;
+        k.mesh_stride             = impl::moe_sorting_mp_mesh_stride(h.tokens);
+        k.n_chunks                = NumChunks(h.tokens);
+        k.unit_size_mdiv          = opus::mdiv{static_cast<uint32_t>(h.unit_size)};
+        k.topk_mdiv               = opus::mdiv{static_cast<uint32_t>(h.topk)};
+        k.moe_buf_interm_dim      = h.moe_buf_interm_dim;
+        k.moe_buf_elem_bytes      = h.moe_buf_elem_bytes;
+        return k;
+    }
+
+    OPUS_H static constexpr auto get_num_cu()
+    {
+        hipDeviceProp_t dev_prop;
+        hipDevice_t dev;
+        OPUS_HIP_CHECK_ERROR(hipGetDevice(&dev));
+        OPUS_HIP_CHECK_ERROR(hipGetDeviceProperties(&dev_prop, dev));
+        return dev_prop.multiProcessorCount;
+    }
+
+    OPUS_H static constexpr auto GridSize(const Hargs& h)
+    {
+        return dim3(h.num_experts * NumChunks(h.tokens) + get_num_cu() * OCCUPANCY);
+    }
+
+    OPUS_H static constexpr auto BlockSize(const Hargs&) { return dim3(kBlockSize); }
+
+    OPUS_H static constexpr auto GetSmemSize(const Hargs&)
+    {
+        return kChunk * sizeof(uint32_t) + (3 * kWaves + 4) * sizeof(int);
+    }
+
+    OPUS_D static int nonzero_bytes(uint32_t w)
+    {
+        return __builtin_popcount((((w & 0x7f7f7f7fu) + 0x7f7f7f7fu) | w) & 0x80808080u);
+    }
+
+    OPUS_D void operator()(Kargs kargs) const
+    {
+        const opus::index_t tokens = [&]() {
+            if constexpr(Problem::LocalToken)
+                return reinterpret_cast<const opus::index_t*>(kargs.p_local_tokens)[0];
+            else
+                return kargs.tokens;
+        }();
+        const opus::index_t n_work = kargs.num_experts * kargs.n_chunks;
+        if(static_cast<opus::index_t>(blockIdx.x) >= n_work)
+        {
+            impl::moe_buf_set_zero_kernel_2d<kBlockSize>(kargs.p_moe_buf,
+                                                         tokens,
+                                                         kargs.moe_buf_interm_dim,
+                                                         kargs.moe_buf_elem_bytes,
+                                                         blockIdx.x - n_work,
+                                                         gridDim.x - n_work);
+            return;
+        }
+        const bool block0     = blockIdx.x == 0;
+        const int eid         = blockIdx.x / kargs.n_chunks;
+        const int chunk       = blockIdx.x - eid * kargs.n_chunks;
+        const int n_packs     = (tokens + kPack - 1) / kPack;
+        const int last_chunk  = (n_packs - 1) / kBlockSize; // -1 when there are no tokens
+        if(!block0 && chunk > last_chunk)
+            return;
+        const opus::index_t mesh_stride = [&]() {
+            if constexpr(Problem::LocalToken)
+                return impl::moe_sorting_mp_mesh_stride(tokens);
+            else
+                return kargs.mesh_stride;
+        }();
+
+        const int tid  = threadIdx.x;
+        const int lane = tid % opus::get_warp_size();
+        const int wave = tid / opus::get_warp_size();
+        const int unit = kargs.unit_size_mdiv.divisor;
+        const int topk = kargs.topk_mdiv.divisor;
+
+        // Every global load first.
+        const IndexType* p_cnt = static_cast<const IndexType*>(kargs.p_expert_cumsum);
+        const int ept          = (kargs.num_experts + kBlockSize - 1) / kBlockSize;
+        const int e_first      = tid * ept;
+        IndexType cnt[kMaxExpertsPerThread];
+#pragma unroll
+        for(int i = 0; i < kMaxExpertsPerThread; i++)
+        {
+            const int e = e_first + i;
+            cnt[i]      = (i < ept && e < kargs.num_experts) ? p_cnt[e] : 0;
+        }
+        const IndexType cnt_eid = p_cnt[eid];
+
+        using r_t      = opus::vector_t<uint32_t, 4>;
+        const r_t* row = reinterpret_cast<const r_t*>(
+            static_cast<const MeshType*>(kargs.p_expert_mesh) +
+            static_cast<opus::long_index_t>(eid) * mesh_stride);
+        const int my_pack = chunk * kBlockSize + tid;
+        r_t cur = 0;
+        if(my_pack < n_packs)
+            cur = row[my_pack];
+        r_t pre[kMaxChunks - 1];
+#pragma unroll
+        for(int c = 0; c < kMaxChunks - 1; c++)
+        {
+            const int p = c * kBlockSize + tid;
+            pre[c]      = 0;
+            if(c < chunk && p < n_packs)
+                pre[c] = row[p];
+        }
+
+        if constexpr(Problem::SkipExpertsWithZeroTokens)
+        {
+            if(!block0 && cnt_eid == 0)
+                return;
+        }
+
+        int before = 0;
+#pragma unroll
+        for(int c = 0; c < kMaxChunks - 1; c++)
+        {
+            opus::static_for<4>([&](auto w) { before += nonzero_bytes(pre[c][w.value]); });
+        }
+        int mine = 0;
+        opus::static_for<4>([&](auto w) { mine += nonzero_bytes(cur[w.value]); });
+
+        int blocks[kMaxExpertsPerThread];
+        int padded[kMaxExpertsPerThread];
+        int pad_sum = 0;
+#pragma unroll
+        for(int i = 0; i < kMaxExpertsPerThread; i++)
+        {
+            blocks[i] = kargs.unit_size_mdiv.div(cnt[i] + unit - 1);
+            padded[i] = Problem::SkipExpertsWithZeroTokens ? blocks[i] : max(blocks[i], 1);
+            if(!(i < ept && e_first + i < kargs.num_experts))
+                padded[i] = 0;
+            pad_sum += padded[i];
+        }
+
+        // One block scan for three values: padded blocks of my experts (exclusive prefix),
+        // my routes in this chunk (exclusive prefix and total), routes before the chunk (total).
+        extern __shared__ char smem[];
+        uint32_t* s_ids = reinterpret_cast<uint32_t*>(smem);
+        int* s          = reinterpret_cast<int*>(s_ids + kChunk);
+
+        int a = pad_sum, b = mine, c = before;
+        impl::moe_sorting_wave_cumsum<int, opus::get_warp_size()>(a);
+        impl::moe_sorting_wave_cumsum<int, opus::get_warp_size()>(b);
+        impl::moe_sorting_wave_cumsum<int, opus::get_warp_size()>(c);
+        if(lane == opus::get_warp_size() - 1)
+        {
+            s[wave]              = a;
+            s[kWaves + wave]     = b;
+            s[2 * kWaves + wave] = c;
+        }
+        __syncthreads();
+        int a_off = 0, b_off = 0, a_tot = 0, b_tot = 0, c_tot = 0;
+        opus::static_for<kWaves>([&](auto w_) {
+            constexpr int w = w_.value;
+            const int sa    = s[w];
+            const int sb    = s[kWaves + w];
+            a_off += wave > w ? sa : 0;
+            b_off += wave > w ? sb : 0;
+            a_tot += sa;
+            b_tot += sb;
+            c_tot += s[2 * kWaves + w];
+        });
+        int run = a_off + a - pad_sum; // first owned expert's start, in blocks
+        IndexType* p_sorted_expert_ids = reinterpret_cast<IndexType*>(kargs.p_sorted_expert_ids);
+#pragma unroll
+        for(int i = 0; i < kMaxExpertsPerThread; i++)
+        {
+            const int e = e_first + i;
+            if(i < ept && e < kargs.num_experts)
+            {
+                if(e == eid)
+                {
+                    s[3 * kWaves + 0] = run;
+                    s[3 * kWaves + 1] = run + padded[i];
+                }
+                if(block0)
+                {
+                    for(int j = 0; j < blocks[i]; j++)
+                        p_sorted_expert_ids[run + j] = e;
+                }
+                run += padded[i];
+            }
+        }
+        if(block0 && tid == 0)
+        {
+            IndexType* p_total = reinterpret_cast<IndexType*>(kargs.p_total_tokens_post_pad);
+            p_total[0]         = a_tot * unit;
+            p_total[1]         = tokens;
+        }
+        __syncthreads();
+        const int e_start = s[3 * kWaves + 0] * unit;
+        const int e_end   = s[3 * kWaves + 1] * unit;
+        if constexpr(Problem::SkipExpertsWithZeroTokens)
+        {
+            if(e_start == e_end)
+                return;
+        }
+        if(chunk > last_chunk)
+            return;
+
+        const int base                  = e_start + c_tot;
+        const WeightType* p_weights     = static_cast<const WeightType*>(kargs.p_weights);
+        IndexType* p_reverse_sorted     = reinterpret_cast<IndexType*>(kargs.p_reverse_sorted);
+        int pos                         = b_off + b - mine;
+        opus::static_for<kPack>([&](auto j_) {
+            constexpr int j  = j_.value;
+            const uint32_t m = (cur[j / 4] >> (8 * (j % 4))) & 0xffu;
+            if(m != 0)
+            {
+                const int i_token = my_pack * kPack + j;
+                const int i_topk  = static_cast<int>(m) - 1;
+                s_ids[pos]        = MOE_SORTING_MOCK_ID(i_token, i_topk);
+                if(p_reverse_sorted)
+                    p_reverse_sorted[i_token * topk + i_topk] = base + pos;
+                pos++;
+            }
+        });
+        __syncthreads();
+
+        IndexType* p_sorted_token_ids = reinterpret_cast<IndexType*>(kargs.p_sorted_token_ids);
+        WeightType* p_sorted_weights  = reinterpret_cast<WeightType*>(kargs.p_sorted_weights);
+        IndexType* p_m_indices        = reinterpret_cast<IndexType*>(kargs.p_m_indices);
+        for(int i = tid; i < b_tot; i += kBlockSize)
+        {
+            const uint32_t id            = s_ids[i];
+            const int i_token            = static_cast<int>(id & 0x00ffffffu);
+            const int i_topk             = static_cast<int>(id >> 24);
+            p_sorted_token_ids[base + i] = id;
+            p_sorted_weights[base + i]   = p_weights[i_token * topk + i_topk];
+            if(p_m_indices)
+                p_m_indices[base + i] = id & 0x00ffffffu;
+        }
+        if(chunk == last_chunk)
+        {
+            // Out of range for consumers bounding rows by the tensor's height;
+            // see moe_align_block_size_kernel_ex.
+            for(int i = base + b_tot + tid; i < e_end; i += kBlockSize)
+            {
+                p_sorted_token_ids[i] = MOE_SORTING_MOCK_ID(kargs.tokens, topk);
+                p_sorted_weights[i]   = static_cast<WeightType>(0.0);
+                if(p_m_indices)
+                    p_m_indices[i] = tokens; // pad = tokens -> OOB row for gemm1
+            }
+        }
+    }
+};
+
 #undef MOE_SORTING_MOCK_ID
 
 } // namespace aiter
@@ -3580,6 +3908,40 @@ moe_sorting_opus_mp(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::st
         const auto lds_size                = kernel::GetSmemSize(a);                            \
         return aiter::make_kernel(kernel{}, grids, blocks, lds_size, kargs);                    \
     }()
+
+#define OPUS_MOE_SORTING_MP_23S(mesh_type_, unroll_num_, local_token_)                     \
+    [&]() {                                                                                \
+        using ms_problem    = aiter::MoeSortingProblemMp<ms_index_t,                       \
+                                                      ms_weight_type,                   \
+                                                      mesh_type_,                       \
+                                                      unroll_num_,                      \
+                                                      false,                            \
+                                                      local_token_>;                    \
+        using kernel        = aiter::MoeSortingMultiPhaseKernel_P23S<ms_problem>;          \
+        auto kargs          = kernel::MakeKargs(a);                                        \
+        const dim3 grids    = kernel::GridSize(a);                                         \
+        const dim3 blocks   = kernel::BlockSize(a);                                        \
+        const auto lds_size = kernel::GetSmemSize(a);                                      \
+        return aiter::make_kernel(kernel{}, grids, blocks, lds_size, kargs);               \
+    }()
+
+#define OPUS_MOR_SORTING_MP_DISPATCH_P23S_(mesh_type_, token_vec_0_, token_vec_1_)               \
+    if(is_local_token)                                                                         \
+    {                                                                                          \
+        return aiter::launch_kernel(s,                                                         \
+                                    maybe_clear_workspace,                                     \
+                                    OPUS_MOE_SORTING_MP_0_V1(mesh_type_, token_vec_0_, false, true), \
+                                    OPUS_MOE_SORTING_MP_1(mesh_type_, token_vec_1_, false, true),    \
+                                    OPUS_MOE_SORTING_MP_23S(mesh_type_, 16, true));            \
+    }                                                                                          \
+    else                                                                                       \
+    {                                                                                          \
+        return aiter::launch_kernel(s,                                                         \
+                                    maybe_clear_workspace,                                     \
+                                    OPUS_MOE_SORTING_MP_0_V1(mesh_type_, token_vec_0_, false, false), \
+                                    OPUS_MOE_SORTING_MP_1(mesh_type_, token_vec_1_, false, false),    \
+                                    OPUS_MOE_SORTING_MP_23S(mesh_type_, 16, false));           \
+    }
 
 #define OPUS_MOR_SORTING_MP_DISPATCH_SMALL_(mesh_type_, token_vec_0_, token_vec_1_, token_vec_23_) \
     if(t.local_expert_masking)                                                                     \
@@ -3780,6 +4142,19 @@ moe_sorting_opus_mp(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::st
                     aiter::impl::moe_sorting_mesh_byte_size(a.tokens, a.num_experts, a.topk);
                 if(mesh_byte_size == 1)
                 {
+                    using p23s_t = aiter::MoeSortingMultiPhaseKernel_P23S<
+                        aiter::MoeSortingProblemMp<ms_index_t, ms_weight_type, uint8_t, 16, false, false>>;
+                    if(t.dispatch_policy == 3 && !t.local_expert_masking && p23s_t::IsSupported(a))
+                    {
+                        if(a.tokens * a.topk % 4 == 0)
+                        {
+                            OPUS_MOR_SORTING_MP_DISPATCH_P23S_(uint8_t, 4, 16)
+                        }
+                        else
+                        {
+                            OPUS_MOR_SORTING_MP_DISPATCH_P23S_(uint8_t, 1, 16)
+                        }
+                    }
                     if(a.tokens * a.topk % 4 == 0)
                     {
                         OPUS_MOR_SORTING_MP_DISPATCH_(uint8_t, 4, 16, 16)

@@ -4,6 +4,7 @@
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl.expr import math as fmath
+from flydsl.expr import rocdl
 from flydsl.expr.typing import Float4E2M1FN, Float8E4M3FN, T
 
 from aiter.ops.flydsl.kernels import buffer_ops
@@ -11,7 +12,9 @@ from aiter.ops.flydsl.kernels import buffer_ops
 from . import dpp_utils
 from .act import sigmoid_batch, sigmoid_f32, tanh_f32
 from .act import silu_mul_batch as _silu_mul_batch
+from .kernels_common import LOG2E
 from .layout_utils import crd2idx
+from .tensor_shim import _to_raw
 
 kStages = 2
 kBS_stride_k0_dw = 64
@@ -278,6 +281,32 @@ def _situ_mul_batch(gate_values, up_values, beta=1.0, linear_beta=1.0):
     ]
 
 
+def _situ_fast_mul_batch(gate_values, up_values, beta=4.0, linear_beta=1.0):
+    # beta == 4 only: tanh(g/4) and sigmoid(g) share e = exp(-|g|/2), sigmoid's
+    # exp(-|g|) being e*e, so the three quotients become one reciprocal of a
+    # product in [1, 8]. Not bitwise equal to _situ_mul_batch (rounding order);
+    # a zero gate or up gives -0 like tanh_f32.
+    assert float(beta) == 4.0, beta
+    k_gate = fx.Float32(-0.5 * LOG2E)
+    k_up = fx.Float32(-2.0 * LOG2E / float(linear_beta))
+    scale = fx.Float32(float(beta) * float(linear_beta))
+    one = fx.Float32(1.0)
+    zero = fx.Float32(0.0)
+    es = [fx.exp2(fx.max(g, -g) * k_gate, fastmath="afn") for g in gate_values]
+    fs = [fx.exp2(fx.max(u, -u) * k_up, fastmath="afn") for u in up_values]
+    e2s = [e * e for e in es]
+    dens = [(one + e) * (one + e2) * (one + f) for e, e2, f in zip(es, e2s, fs)]
+    rcps = [fx.Float32(rocdl.rcp(T.f32, _to_raw(d))) for d in dens]
+    out = []
+    for g, u, e, e2, f, r in zip(gate_values, up_values, es, e2s, fs, rcps):
+        t = one - e
+        ga = (g > zero).select(t, -(t * e2))
+        tu = one - f
+        ua = (u > zero).select(tu, -tu)
+        out.append(scale * (ga * ua) * r)
+    return out
+
+
 def _activation_mul_batch(
     gate_values,
     up_values,
@@ -288,6 +317,13 @@ def _activation_mul_batch(
 ):
     if act == "swiglu":
         return _swiglu_mul_batch(gate_values, up_values, limit=swiglu_limit)
+    if act == "situv2f":
+        return _situ_fast_mul_batch(
+            gate_values,
+            up_values,
+            beta=situ_beta,
+            linear_beta=situ_linear_beta,
+        )
     if act == "situv2":
         return _situ_mul_batch(
             gate_values,

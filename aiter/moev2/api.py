@@ -24,9 +24,10 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.presorted_moe import drop_presort_after
 
 from . import paths
+from .dispatch.tuned import extra_m_tiers
 from .policy import _normalize_mxfp4_activation_params, resolve_activation_dtype
 from .problem import MoeProblem
-from .shapes import get_padded_M
+from .shapes import tuned_M
 
 if TYPE_CHECKING:
     from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
@@ -57,8 +58,11 @@ def dispatch_key(c: Call):
     situ_beta, situ_linear_beta, _ = _normalize_mxfp4_activation_params(
         c.activation, c["beta"], c["linear_beta"], c["swiglu_limit"]
     )
+    from aiter.jit.core import AITER_CONFIGS
+
     args = (
-        get_padded_M(c.M),
+        # the token `_fused_moe_impl` keys on (`aiter.fused_moe._tuned_M`)
+        tuned_M(c.M, extra_m_tiers(AITER_CONFIGS.AITER_CONFIG_FMOE_FILE)),
         c.model_dim,
         c.inter_dim,
         c.E,
