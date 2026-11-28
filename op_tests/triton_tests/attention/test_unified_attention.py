@@ -2661,3 +2661,110 @@ def test_unified_attn_split_rebalance_reduce_configs_k4v8(
     )
     assert not new[live].isnan().any()
     assert torch.equal(old[live].view(torch.int16), new[live].view(torch.int16))
+
+
+@pytest.mark.parametrize("sliding_window", [None, 512])
+@pytest.mark.parametrize("use_sinks", [False, True])
+@pytest.mark.parametrize("num_heads", [(8, 1), (64, 8), (4, 1)])
+# 64 reduces all segments at once, 256 merges them in blocks
+@pytest.mark.parametrize("head_size", [64, 256])
+@torch.inference_mode()
+def test_triton_unified_attn_3d_empty_row_is_zero(
+    head_size: int,
+    num_heads: tuple[int, int],
+    use_sinks: bool,
+    sliding_window: int | None,
+    monkeypatch,
+) -> None:
+    # A kv_len 0 row (a padded decode slot) has no KV segment, so the reduce sees an
+    # all -inf maximum and exp2(-inf - -inf) is NaN. It must store 0, as for an
+    # all-zero exp sum, and leave the other rows as they are without that row.
+    if DEVICE_ARCH not in ("gfx942", "gfx950", "gfx1250"):
+        pytest.skip(f"skip {DEVICE_ARCH}")
+    torch.manual_seed(0)
+    seq_lens = [(1, 120000)] + [(1, 2000)] * 6 + [(1, 0)]
+    (
+        query,
+        _,
+        _,
+        k,
+        v,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        _,
+        _,
+        scale,
+        window_size,
+        block_tables,
+        _,
+        _,
+        q_descale,
+        k_descale,
+        v_descale,
+        _,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=8192,
+        block_size=128,
+        head_size=head_size,
+        num_heads=num_heads,
+        sliding_window=sliding_window,
+        q_dtype=torch.bfloat16,
+        kv_dtype=e4m3_dtype,
+        out_dtype=torch.bfloat16,
+        device="cuda",
+    )
+
+    import aiter.ops.triton.attention.unified_attention as module
+
+    # A sliding window routes decode to the 2D kernel, which has no reduce.
+    monkeypatch.setattr(module, "use_2d_kernel", lambda params, backend="triton": False)
+    launched = []
+
+    def spy(name):
+        kernel = getattr(module, name)
+
+        def run_kernel(*args, **kwargs):
+            launched.append(name)
+            return kernel(*args, **kwargs)
+
+        monkeypatch.setattr(module, name, run_kernel)
+
+    spy("_unified_attention_3d_triton")
+    spy("_reduce_segments_triton")
+
+    def run(num_seqs):
+        out = torch.full_like(output[:num_seqs], 123.0)
+        unified_attention(
+            q=query[:num_seqs],
+            k=k,
+            v=v,
+            out=out,
+            cu_seqlens_q=cu_query_lens[: num_seqs + 1],
+            seqused_k=kv_lens[:num_seqs],
+            max_seqlen_q=1,
+            max_seqlen_k=1 << 20,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window_size,
+            block_table=block_tables[:num_seqs],
+            softcap=0,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            sinks=sinks if use_sinks else None,
+            backend="triton",
+        )
+        torch.cuda.synchronize()
+        return out
+
+    with_empty = run(len(seq_lens))
+    assert "_unified_attention_3d_triton" in launched, "the 3D kernel did not run"
+    assert "_reduce_segments_triton" in launched, "the Triton reduce did not run"
+    live = run(len(seq_lens) - 1)
+    assert not with_empty[:-1].isnan().any()
+    # The batch size sets the segment count, so the live rows differ by rounding.
+    torch.testing.assert_close(with_empty[:-1], live, rtol=2e-2, atol=1e-3)
+    assert (with_empty[-1] == 0).all(), "the empty row is not zero"
