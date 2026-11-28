@@ -179,7 +179,7 @@ def test_gemm_a8w8_bpreshuffle_pads_activation_for_ck(monkeypatch):
     w_scale = torch.ones((16, 1), device="cuda", dtype=torch.float32)
     seen = {}
 
-    def fake_config(m, n, k, q_dtype_w, tuned_file):
+    def fake_config(m, n, k, q_dtype_w, tuned_file, record_untuned=True):
         seen["config_shape"] = (m, n, k)
         return {"libtype": "ck", "splitK": 0}
 
@@ -209,7 +209,7 @@ def test_gemm_a8w8_bpreshuffle_pads_activation_for_cktile(monkeypatch):
     w_scale = torch.ones((16, 1), device="cuda", dtype=torch.float32)
     seen = {}
 
-    def fake_config(m, n, k, q_dtype_w, tuned_file):
+    def fake_config(m, n, k, q_dtype_w, tuned_file, record_untuned=True):
         seen["config_shape"] = (m, n, k)
         return {"libtype": "cktile", "splitK": 0}
 
@@ -239,7 +239,7 @@ def test_gemm_a8w8_bpreshuffle_falls_back_to_padded_k_config(monkeypatch):
     w_scale = torch.ones((16, 1), device="cuda", dtype=torch.float32)
     seen = {"config_shapes": []}
 
-    def fake_config(m, n, k, q_dtype_w, tuned_file):
+    def fake_config(m, n, k, q_dtype_w, tuned_file, record_untuned=True):
         seen["config_shapes"].append((m, n, k))
         if k == 128:
             return {"libtype": "cktile", "splitK": 0}
@@ -271,7 +271,7 @@ def test_gemm_a8w8_bpreshuffle_pads_activation_for_untuned_cktile(monkeypatch):
     w_scale = torch.ones((16, 1), device="cuda", dtype=torch.float32)
     seen = {"config_shapes": []}
 
-    def fake_config(m, n, k, q_dtype_w, tuned_file):
+    def fake_config(m, n, k, q_dtype_w, tuned_file, record_untuned=True):
         seen["config_shapes"].append((m, n, k))
 
     def fake_cktile(XQ, WQ, x_scale, w_scale, Y, splitK):
@@ -304,7 +304,7 @@ def test_gemm_a8w8_bpreshuffle_pads_activation_for_flydsl(monkeypatch):
     w_scale = torch.ones((16, 1), device="cuda", dtype=torch.float32)
     seen = {}
 
-    def fake_config(m, n, k, q_dtype_w, tuned_file):
+    def fake_config(m, n, k, q_dtype_w, tuned_file, record_untuned=True):
         seen["config_shape"] = (m, n, k)
         return {"libtype": "flydsl", "splitK": 0, "kernelName": "fake"}
 
