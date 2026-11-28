@@ -604,6 +604,13 @@ def causal_conv1d_prefill_flydsl_fn(
             tensor.shape != (batch,) or not tensor.is_contiguous()
         ):
             raise ValueError(f"{name} must be contiguous [batch]")
+    # A one-element tensor is contiguous whatever its stride (column 0 of a
+    # [1, k] slot table is), but kernel specialization keys on a unit-stride
+    # axis. Rebase such a view onto stride 1; no data moves.
+    cache_indices, has_initial_state = (
+        t.as_strided(t.shape, (1,)) if t is not None and t.stride(0) != 1 else t
+        for t in (cache_indices, has_initial_state)
+    )
     if cache_indices is not None and cache_indices.dtype not in (
         torch.int32,
         torch.int64,
