@@ -166,6 +166,9 @@ def _conv_qkv_load(
     pos_stride,
     LP: gl.constexpr,
     W: gl.constexpr,
+    CW_GROUP: gl.constexpr,
+    CW_WIDTH: gl.constexpr,
+    CW_CH: gl.constexpr,
     CR: gl.constexpr,
     K: gl.constexpr,
     V: gl.constexpr,
@@ -189,7 +192,8 @@ def _conv_qkv_load(
             mask = rep_k + ch_k * 0 == 0
         hist_off = conv_ch * ch_stride
 
-        w_off = conv_ch + qkv * (W - 1) * LP
+        # = qkv * CW_GROUP + (conv_ch - qkv * LP) * CW_CH
+        w_off = qkv * (CW_GROUP - LP * CW_CH) + conv_ch * CW_CH
         loads = loads + (
             (
                 gl.amd.gfx1250.buffer_load(x_ptr, x_off, mask=mask, other=0),
@@ -203,14 +207,14 @@ def _conv_qkv_load(
                 gl.amd.gfx1250.buffer_load(w_ptr, w_off, mask=mask, other=0).to(
                     gl.float32
                 ),
-                gl.amd.gfx1250.buffer_load(w_ptr, w_off + LP, mask=mask, other=0).to(
-                    gl.float32
-                ),
                 gl.amd.gfx1250.buffer_load(
-                    w_ptr, w_off + 2 * LP, mask=mask, other=0
+                    w_ptr, w_off + CW_WIDTH, mask=mask, other=0
                 ).to(gl.float32),
                 gl.amd.gfx1250.buffer_load(
-                    w_ptr, w_off + 3 * LP, mask=mask, other=0
+                    w_ptr, w_off + 2 * CW_WIDTH, mask=mask, other=0
+                ).to(gl.float32),
+                gl.amd.gfx1250.buffer_load(
+                    w_ptr, w_off + 3 * CW_WIDTH, mask=mask, other=0
                 ).to(gl.float32),
                 hist_off,
                 mask,
@@ -384,6 +388,9 @@ def fused_recurrent_kda_packed_decode_kernel(
     stride_cs_slot,
     stride_cs_dim,
     stride_cs_pos,
+    stride_cw_group: gl.constexpr,
+    stride_cw_width: gl.constexpr,
+    stride_cw_ch: gl.constexpr,
     scale: gl.constexpr,
     H: gl.constexpr,
     HV: gl.constexpr,
@@ -661,6 +668,9 @@ def fused_recurrent_kda_packed_decode_kernel(
                 stride_cs_pos,
                 H * K,
                 W,
+                stride_cw_group,
+                stride_cw_width,
+                stride_cw_ch,
                 CR,
                 K,
                 V,
@@ -835,6 +845,9 @@ def fused_recurrent_kda_packed_decode_kernel(
                                 stride_cs_pos,
                                 H * K,
                                 W,
+                                stride_cw_group,
+                                stride_cw_width,
+                                stride_cw_ch,
                                 CR,
                                 K,
                                 V,
