@@ -50,7 +50,7 @@ _TUNE = {
     "prefill_tile": None,
     "prefill_lds_prefetch": None,  # LDS operands fetched n WMMAs ahead (None = rule)
     "prefill_lds_sched": None,  # scheduling groups for that order (None = off)
-    "target_wgs": 160,  # decode workgroups the segments aim for
+    "target_wgs": 0,  # decode workgroups the segments aim for (0 = rule)
     "max_segments": 32,  # KV segments per sequence at most
     # decode rows of a mixed batch: KV segments + merge (True) or one segment
     # per sequence writing the rows itself (False)
@@ -229,11 +229,13 @@ def _prefill_tile(arch, max_q, max_k, H, D, batch, total_q):
     return num_waves, block_n, vt_rows, 1, True, False, None, pad, head_group
 
 
-def _num_segments(batch, HKV, max_seqlen_k, block_n):
-    """KV segments for the decode kernel: enough one-wave workgroups to reach
-    ``target_wgs`` (gfx1151: 20 WGPs x 8), at least one tile per segment, at
-    most ``max_segments``."""
-    want = -(-int(_TUNE["target_wgs"]) // max(1, batch * HKV))
+def _num_segments(batch, HKV, max_seqlen_k, block_n, D):
+    """KV segments for the decode kernel: enough workgroups to reach the
+    target (gfx1151 sweeps: 160 at head_dim 256, 128 at head_dim 128, where
+    16 x 2 speculative tokens run 0.97x the Triton kernel unsplit and 0.91x
+    split in two), at least one tile per segment, at most ``max_segments``."""
+    target = int(_TUNE["target_wgs"]) or (160 if D > 128 else 128)
+    want = -(-target // max(1, batch * HKV))
     tiles = -(-max_seqlen_k // block_n)
     return int(max(1, min(want, tiles, int(_TUNE["max_segments"]))))
 
@@ -394,7 +396,7 @@ def flydsl_unified_attention_gfx11(
 
     # The short sequences: their keys split into segments so that the grid
     # fills the GPU (the batch may hold long sequences too: an upper bound).
-    nseg = _num_segments(batch, HKV, max_k, bn)
+    nseg = _num_segments(batch, HKV, max_k, bn, D)
     if max_q > short and not _TUNE["mixed_segments"]:
         nseg = 1
     if nseg == 1:
