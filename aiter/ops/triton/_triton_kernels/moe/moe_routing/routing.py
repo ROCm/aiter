@@ -462,6 +462,8 @@ def _ep_gate_prep_scan_kernel(
     # ticket. Dead gates are skipped entirely -- the sentinel bin is never
     # counted, so it needs no slot in the prefix sum.
     tl.atomic_add(HistAtomic + expt, 1, mask=valid, sem="release", scope="gpu")
+    # Finish all waves' histogram atomics before this CTA takes its ticket.
+    tl.debug_barrier()
 
     # Grid-wide join. `acquire` pairs with the release above, so the CTA that
     # sees N_CTAS-1 predecessors also sees all their histogram increments.
