@@ -174,11 +174,11 @@
   "version": 1
  },
  "mla_paged_decode": {
-  "fingerprint": "4816b5f7ca2ae47e",
-  "signature": "q_nope:positional:torch.Tensor, q_pe:positional:torch.Tensor, kv_c:positional:torch.Tensor, o:positional:torch.Tensor, page_table:positional:torch.Tensor, seq_info:positional:torch.Tensor, sm_scale:positional:float, k_pe:positional:torch.Tensor | None=None, kv_pe_offset:positional:int=512, use_2d_view:positional:bool=True, kv_scale:positional:float=1.0, min_kv_seq_len:positional:int=1, return_lse:positional:bool=False, -> torch.Tensor",
+  "fingerprint": "bbd0243a6ff93b7e",
+  "signature": "q_nope:positional:torch.Tensor, q_pe:positional:torch.Tensor, kv_c:positional:torch.Tensor, o:positional:torch.Tensor, page_table:positional:torch.Tensor, seq_info:positional:torch.Tensor, sm_scale:positional:float, k_pe:positional:torch.Tensor | None=None, kv_pe_offset:positional:int=512, use_2d_view:positional:bool=True, kv_scale:positional:float=1.0, min_kv_seq_len:positional:int=1, return_lse:positional:bool=False, q_scale:positional:float=1.0, -> torch.Tensor",
   "source": "aiter/ops/triton/gluon/mla_gluon.py",
   "supersedes": [],
-  "version": 1
+  "version": 2
  },
  "mla_prefill_ps": {
   "fingerprint": "a8f86416b991f0e6",

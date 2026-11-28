@@ -1108,12 +1108,24 @@ def _paged_seq_info(block_table, seq_lens, use_2d_view):
 
 
 def _mla_gluon_paged(
-    mla_gluon, q_nope, q_pe, kv_c, page_table, seq_info, use_2d_view, kv_scale, info
+    mla_gluon,
+    q_nope,
+    q_pe,
+    kv_c,
+    page_table,
+    seq_info,
+    use_2d_view,
+    kv_scale,
+    info,
+    q_scale=1.0,
+    sm_scale=None,
 ):
     """mla_gluon with q [batch, qlen, nhead, d]; returns (o, lse) in that shape."""
     batch, qlen, nhead, kv_lora_rank = q_nope.shape
     if qlen == 1:
         q_nope, q_pe = q_nope[:, 0], q_pe[:, 0]
+    if sm_scale is None:
+        sm_scale = 1.0 / (kv_c.shape[-1] ** 0.5)
     o = torch.empty(q_nope.shape, dtype=torch.bfloat16, device="cuda")
     o, lse = mla_gluon(
         q_nope=q_nope,
@@ -1122,13 +1134,14 @@ def _mla_gluon_paged(
         o=o,
         page_table=page_table,
         seq_info=seq_info,
-        sm_scale=1.0 / (kv_c.shape[-1] ** 0.5),
+        sm_scale=sm_scale,
         k_pe=None,
         kv_pe_offset=kv_lora_rank,
         use_2d_view=use_2d_view,
         kv_scale=kv_scale,
         return_lse=True,
         kv_split_info=info,
+        q_scale=q_scale,
     )
     return o.view(batch, qlen, nhead, kv_lora_rank), lse.view(batch, qlen, nhead)
 
@@ -1280,6 +1293,110 @@ def test_mla_gluon_decode_split_rebalance_attn_sink(qlen, nhead, kv_dtype):
         o.view(o_ref.shape).float(), o_ref, atol=2**-6 * scale, rtol=2**-6
     )
     torch.testing.assert_close(lse.view(lse_ref.shape), lse_ref, atol=1e-3, rtol=0)
+
+
+def _fp8_query(q, q_scale):
+    """q / q_scale in float8_e4m3fn, and its dequantized fp32 value."""
+    q_fp8 = (q.float() / q_scale).to(torch.float8_e4m3fn)
+    return q_fp8, q_fp8.float() * q_scale
+
+
+@pytest.mark.parametrize("qlen", [1, 2])
+@pytest.mark.parametrize("nhead", [8, 16, 32])
+@pytest.mark.parametrize("use_2d_view", [True, False])
+@pytest.mark.parametrize("split_rebalance", [False, True])
+def test_mla_gluon_decode_fp8_query(qlen, nhead, use_2d_view, split_rebalance):
+    """fp8 query (fp8 QK and PV) against an fp32 reference on the same fp8 data."""
+    if DEVICE_ARCH != "gfx950":
+        pytest.skip("Gluon MLA decode is gfx950-only")
+    from aiter.ops.triton.gluon.mla_gluon import mla_gluon, mla_gluon_split_metadata
+
+    random.seed(0)
+    torch.manual_seed(0)
+    lens = [random.randint(qlen, 3000) for _ in range(60)]
+    lens[1] = 12000
+    if qlen == 1:
+        lens[2] = 0
+    kv_dtype = torch.float8_e4m3fn
+    kv_c, block_table, q_nope, q_pe = _split_rebalance_inputs(
+        len(lens), qlen, nhead, kv_dtype, max(lens)
+    )
+    seq_lens = torch.tensor(lens, dtype=torch.int32, device="cuda")
+    page_table, seq_info = _paged_seq_info(block_table, seq_lens, use_2d_view)
+    kv_scale, q_scale = 0.5, 0.25
+    q_nope, q_nope_ref = _fp8_query(q_nope, q_scale)
+    q_pe, q_pe_ref = _fp8_query(q_pe, q_scale)
+    info = None
+    if split_rebalance:
+        info = mla_gluon_split_metadata(
+            seq_info, nhead, kv_dtype, qlen=qlen, use_2d_view=use_2d_view
+        )
+    sm_scale = 1.0 / (kv_c.shape[-1] ** 0.5)
+    o, lse = _mla_gluon_paged(
+        mla_gluon,
+        q_nope,
+        q_pe,
+        kv_c,
+        page_table,
+        seq_info,
+        use_2d_view,
+        kv_scale,
+        info,
+        q_scale=q_scale,
+    )
+    o_ref, lse_ref = _mla_gluon_ref(
+        q_nope_ref, q_pe_ref, kv_c, lens, block_table, sm_scale, kv_scale
+    )
+    # fp8 probabilities have 3 mantissa bits, so the output error is larger
+    # than for a bf16 query (about the error of an fp8 attention with fp8 P).
+    # The mean bound catches a bias that the max bound allows.
+    scale = o_ref.abs().max().item()
+    torch.testing.assert_close(o.float(), o_ref, atol=2**-4 * scale, rtol=0)
+    mean_err = (o.float() - o_ref).abs().mean().item()
+    assert mean_err <= 2**-7 * scale, f"mean err {mean_err:.3e} (scale {scale:.3e})"
+    torch.testing.assert_close(lse, lse_ref, atol=1e-3, rtol=0)
+
+
+def test_mla_gluon_fp8_query_rejects():
+    """An fp8 query runs only in the bh16bn128 decode, with a bf16 o."""
+    if DEVICE_ARCH != "gfx950":
+        pytest.skip("Gluon MLA decode is gfx950-only")
+    from aiter.ops.triton.gluon.mla_gluon import mla_gluon
+
+    fp8 = torch.float8_e4m3fn
+    batch, seq_len = 4, 256
+
+    def call(nhead=8, q_dtype=fp8, q_pe_dtype=fp8, kv_dtype=fp8, o_dtype=None, **kw):
+        f32 = torch.float32
+        q_nope = torch.randn((batch, nhead, 512), dtype=f32, device="cuda").to(q_dtype)
+        q_pe = torch.randn((batch, nhead, 64), dtype=f32, device="cuda").to(q_pe_dtype)
+        kv_c = torch.randn((batch * seq_len, 576), dtype=f32, device="cuda").to(
+            kv_dtype
+        )
+        o_dtype = o_dtype or torch.bfloat16
+        mla_gluon(
+            q_nope=q_nope,
+            q_pe=q_pe,
+            kv_c=kv_c,
+            o=torch.empty((batch, nhead, 512), dtype=o_dtype, device="cuda"),
+            page_table=torch.arange(
+                batch * seq_len, dtype=torch.int32, device="cuda"
+            ).view(batch, seq_len),
+            seq_info=torch.full((batch,), seq_len, dtype=torch.int32, device="cuda"),
+            sm_scale=0.1,
+            **kw,
+        )
+
+    with pytest.raises(AssertionError, match="needs fp8 KV"):
+        call(kv_dtype=torch.bfloat16)
+    with pytest.raises(AssertionError, match="bh16bn128"):
+        call(nhead=128)
+    with pytest.raises(AssertionError, match="one dtype"):
+        call(q_pe_dtype=torch.bfloat16)
+    with pytest.raises(AssertionError, match="o must be bf16"):
+        call(o_dtype=torch.float32)
+    with pytest.raises(AssertionError, match="q_scale is for an fp8 query"):
+        call(q_dtype=torch.bfloat16, q_pe_dtype=torch.bfloat16, q_scale=0.5)
 
 
 def test_mla_gluon_split_metadata_not_applicable():

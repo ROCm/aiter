@@ -175,6 +175,8 @@ The wrapper dispatches by `(nhead, kv_c.dtype)` to one of three compile-time reg
 
 **Split rebalance (bh16 decode, opt-in):** the bh16 regimes give each sequence the same number of KV splits, so with mixed KV lengths a call waits on its longest sequence. `mla_gluon_split_metadata(seq_info, nhead, kv_dtype, qlen=1, use_2d_view=True, out=None)` cuts the batch's KV into BLOCK_N-aligned segments of one length that fit in one wave of work items, so a long sequence gets more splits than a short one. Build it once for each decode step and give the result to each call as `mla_gluon(..., kv_split_info=...)`. It returns `None` when the rebalance does not apply (bh64, or not more work items than sequences). `mla_gluon_split_metadata_info(max_batch_size, nhead, kv_dtype, qlen=1)` gives the shapes and dtypes of the `out=` buffers, for example for CUDA graphs. A call with `kv_split_info` does not go through the `mla_paged_decode` plugin route.
 
+**fp8 query (bh16bn128 decode):** `q_nope` and `q_pe` can be `float8_e4m3fn`, with `q_scale` as their dequant scale (`mla_gluon(..., q_scale=...)`). QK and PV then run as fp8 MFMA, and the softmax probabilities are scaled by 448 and cast to fp8, as in an fp8 attention. `o` stays bf16. The query dtype selects the mode; a bf16 query runs as before and needs `q_scale=1.0`.
+
 All three regimes run the full decode and dsv4 prefill. `return_lse=True` also returns the merged fp32 lse `[batch, nhead]`, so `mla_gluon(...)` returns `(o, final_lse)` instead of `(o, None)`.
 
 Modified from [FlashMLA](https://github.com/deepseek-ai/FlashMLA/blob/main/benchmark/bench_flash_mla.py).
@@ -182,7 +184,7 @@ Modified from [FlashMLA](https://github.com/deepseek-ai/FlashMLA/blob/main/bench
 | Parameter | `bh64` regime | `bh16bn128` regime | `bh16bn64` regime |
 |-----------|---------------|--------------------|--------------------|
 | Arch | gfx950 (CDNA4) | gfx950 (CDNA4) | gfx950 (CDNA4) |
-| Q dtype | bf16 | bf16 | bf16 |
+| Q dtype | bf16 | bf16 or fp8 (decode) | bf16 |
 | KV dtype | bf16 | fp8 | bf16 |
 | Output | bf16 | bf16 | bf16 |
 | batch_size | 64, 128, or 256 | 1 | &ge; 1 |
