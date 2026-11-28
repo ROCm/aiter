@@ -306,19 +306,25 @@ def make_shared_weights(
     and the N-layer residual chain diverges to NaN after a few layers."""
     gen = make_generator(seed, device=dev)
 
-    def _w(experts, rows, cols):
-        # fill() only row-chunks its fp32 staging for 2-D shapes, so ask for the
-        # flat [experts*rows, cols] and view it back: at E=384 that caps the
-        # staging near 1 GiB instead of materializing the set in fp32.
-        w = fill((experts * rows, cols), data_dist, gen, dtype=dtype, device=dev)
+    # torch's device RNG sizes its grid by the CU count, so one large draw differs
+    # between a DPX partition (96 CUs) and an SPX GPU (192 CUs); small per-chunk
+    # reseeded draws stay bit-identical across both.
+    chunk = 1 << 16
+
+    def _w(experts, rows, cols, tag):
+        w = torch.empty(experts * rows * cols, dtype=dtype, device=dev)
+        for i, c0 in enumerate(range(0, w.numel(), chunk)):
+            gen.manual_seed(seed * 1000003 + tag * 100000007 + i)
+            n = min(chunk, w.numel() - c0)
+            w[c0 : c0 + n] = fill((n,), data_dist, gen, dtype=dtype, device=dev)
         return w.mul_(_WEIGHT_AMPL).view(experts, rows, cols)
 
-    w1 = _w(E, 2 * idim, hdim)
-    w2 = _w(E, hdim, idim)
+    w1 = _w(E, 2 * idim, hdim, 1)
+    w2 = _w(E, hdim, idim, 2)
     sw1 = sw2 = None
     if n_shared > 0:
-        sw1 = _w(n_shared, 2 * idim, hdim)
-        sw2 = _w(n_shared, hdim, idim)
+        sw1 = _w(n_shared, 2 * idim, hdim, 3)
+        sw2 = _w(n_shared, hdim, idim, 4)
     return w1, w2, sw1, sw2
 
 
@@ -612,10 +618,11 @@ class RefModel:
                 w2_g = self.sw2[g - n_routed : g - n_routed + 1]
             w1_qt, w1_s = _mxfp4_quant(w1_g)
             w2_qt, w2_s = _mxfp4_quant(w2_g)
-            w1d = _mxfp4_dequant(w1_qt, w1_s, (1, *w1_g.shape[1:]))[0]
-            w2d = _mxfp4_dequant(w2_qt, w2_s, (1, *w2_g.shape[1:]))[0]
+            # mxfp4-dequant values are exact in bf16; cache bf16 so 384 experts fit in 144 GiB
+            w1d = _mxfp4_dequant(w1_qt, w1_s, (1, *w1_g.shape[1:]))[0].to(dtypes.bf16)
+            w2d = _mxfp4_dequant(w2_qt, w2_s, (1, *w2_g.shape[1:]))[0].to(dtypes.bf16)
             wd = self._cache[g] = (w1d, w2d)
-        return wd
+        return wd[0].float(), wd[1].float()
 
     @staticmethod
     def _ffn(x, w1d, w2d):
