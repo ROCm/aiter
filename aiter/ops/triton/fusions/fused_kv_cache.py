@@ -43,6 +43,22 @@ DEVICE_ARCH = arch_info.get_arch()
 _BLOCK_H_MIN_TOKENS = int(os.environ.get("AITER_FUSED_KV_CACHE_MIN_TOKENS", "128"))
 
 
+def q_nope_prestored_supported() -> bool:
+    """Return True when ``fused_qk_rope_cat_and_cache_mla`` accepts
+    ``q_nope_prestored=True`` on this device.
+
+    The option needs the gfx1250 Gluon head-tile kernel. A caller must also
+    keep the wrapper's other limits for it: one KV head, one slot for each
+    token (``len(slot_mapping) == B``, pure decode), no zero-filled decode
+    outputs (``num_decode_toks_for_zeros == 0``) and a ``q_out`` that already
+    holds q_nope.
+    """
+    return (
+        DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
+        and gluon_qpe_htile_kernel is not None
+    )
+
+
 def fused_qk_rope_cat_and_cache_mla_fake_tensor(
     q_nope: torch.Tensor,
     q_pe: torch.Tensor,
@@ -151,6 +167,7 @@ def fused_qk_rope_cat_and_cache_mla(
       ``q_out`` is not None, a single KV head (KH==1, i.e. MLA), and the
       gfx1250 pure-decode MLA path; q_pe/KV results are bit-identical to the
       full path.
+      Check ``q_nope_prestored_supported()`` before writing q_nope into ``q_out``.
     - seg_page_size: When > 0 (gfx1250 only, KH == 1), kv_cache is written as
       seg-packed pages of that many tokens, each [tokens x D1 nope | tokens x
       D2 rope], the layout of the gfx1250 asm MLA decode kernel. q_out may then
@@ -477,8 +494,7 @@ def _cat_and_cache_mla(
         # q_pe and the KV cache are bit-identical to the full-rope path.
         assert kh == 1, "q_nope_prestored supports a single KV head (MLA) only"
         assert (
-            DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
-            and gluon_qpe_htile_kernel is not None
+            q_nope_prestored_supported()
             and b_slot == b
             and num_decode_toks_for_zeros == 0
         ), "q_nope_prestored is currently supported on gfx1250 pure-decode MLA only"
