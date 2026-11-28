@@ -34,16 +34,19 @@ from aiter.ops.flydsl.kernels.flash_attn_paged_reduce_gfx11 import (
 __all__ = ["flydsl_unified_attention_gfx11", "gfx11_paged_supported"]
 
 _DTYPE_STR = {torch.bfloat16: "bf16", torch.float16: "f16"}
-# The decode side's tile and grid choices (the prefill tile comes from the
-# varlen rule). One place, so a sweep can set them.
+# Tile and grid choices. 0 / None = the shape rules below (from the gfx1151
+# sweeps); a sweep sets explicit values here.
 _TUNE = {
-    "decode_block_n": 16,  # keys per decode tile (16 or 32)
-    "decode_vt_rows": 8,  # keys per LDS write in the V^T staging (2, 4, 8)
-    # waves per decode workgroup, each with head_dim / d_split columns; 0 picks
-    # by head dim (2 at head_dim > 128: 16 x 256 fp32 of O alone fill half of
-    # a wave's registers)
-    "decode_d_split": 0,
-    "decode_q_reload": False,  # Q operand re-read per tile instead of in VGPRs
+    "decode_block_n": 0,  # keys per decode tile (16 or 32)
+    "decode_vt_rows": 0,  # keys per LDS write in the V^T staging (2, 4, 8)
+    "decode_d_split": 0,  # waves per decode workgroup splitting the head dim
+    "decode_q_reload": None,  # Q operand re-read per tile instead of in VGPRs
+    "decode_vt_pad": None,  # V^T row padding in LDS, 0 or 8 (None = rule)
+    "decode_skew_rows": None,  # V^T skew period in rows, 0 / 4 / 8 / 16 (None = rule)
+    "decode_s_slots": 0,  # partial-S exchange slots, 1 or 2 (0 = rule)
+    # prefill tile override: None = the rule, else (num_waves, block_n,
+    # vt_rows, d_split, double_buffer[, q_reload[, waves_per_eu]])
+    "prefill_tile": None,
     "target_wgs": 160,  # decode workgroups the segments aim for
     "max_segments": 32,  # KV segments per sequence at most
     # decode rows of a mixed batch: KV segments + merge (True) or one segment
@@ -64,6 +67,10 @@ def _prefill_kernel(
     num_waves,
     block_n,
     vt_rows,
+    d_split,
+    double_buffer,
+    q_reload,
+    waves_per_eu,
     head_group,
 ):
     # device_index intentionally participates in the cache key.
@@ -77,7 +84,11 @@ def _prefill_kernel(
         num_waves=num_waves,
         block_n=block_n,
         vt_rows=vt_rows,
+        d_split=d_split,
+        q_reload=q_reload,
+        double_buffer=double_buffer,
         head_group=head_group,
+        waves_per_eu=waves_per_eu,
         num_kv_heads=HKV,
     )
 
@@ -95,6 +106,9 @@ def _decode_kernel(
     vt_rows,
     d_split,
     q_reload,
+    vt_pad,
+    skew_rows,
+    s_slots,
     direct,
 ):
     return build_flash_attn_paged_decode_module_gfx11(
@@ -108,6 +122,9 @@ def _decode_kernel(
         d_split=d_split,
         q_reload=q_reload,
         direct=direct,
+        vt_pad=vt_pad,
+        skew_rows=skew_rows,
+        s_slots=s_slots,
         num_kv_heads=HKV,
     )
 
@@ -127,13 +144,74 @@ def _short_limit(H, HKV):
     return 16 // group if group <= 16 and 16 % group == 0 else 0
 
 
-def _d_split(D):
-    """Waves a decode workgroup splits the head dim over: the tuned value, or
-    by head dim; 1 when the head dim does not divide into 16-column slices."""
-    n = int(_TUNE["decode_d_split"]) or (2 if D > 128 else 1)
+def _fit_d_split(D, n):
+    """``n`` waves per row group, halved until the head dim splits into
+    16-column slices."""
     while n > 1 and D % (16 * n):
         n //= 2
     return n
+
+
+def _decode_tile(D, batch, HKV):
+    """(block_n, vt_rows, d_split, q_reload) of the decode kernel. gfx1151
+    sweep, head_dim 256 (8 / 2 heads): up to 32 (sequence, KV head) pairs
+    16-key tiles over two waves; beyond that 32-key tiles over four waves with
+    the Q operand re-read per tile (1.3-1.8x the Triton kernel at batch
+    32-256, 1.2-1.5x with two waves). Head_dim 128 (32 / 8 heads): 16-key
+    tiles over two waves (speculative 8 x 4 1.85x instead of 1.43x, the rest
+    within 2% of any other variant; large batches are DRAM bound)."""
+    if D > 128:
+        bn, vt, ds, qr = (16, 8, 2, False) if batch * HKV <= 32 else (32, 8, 4, True)
+    else:
+        bn, vt, ds, qr = 16, 8, 2, False
+    bn = int(_TUNE["decode_block_n"]) or bn
+    vt = int(_TUNE["decode_vt_rows"]) or vt
+    ds = _fit_d_split(D, int(_TUNE["decode_d_split"]) or ds)
+    if _TUNE["decode_q_reload"] is not None:
+        qr = bool(_TUNE["decode_q_reload"])
+    # V^T layout: no row padding, skew every 8 rows (16-key tiles) or 4 (32).
+    pad = 0 if _TUNE["decode_vt_pad"] is None else int(_TUNE["decode_vt_pad"])
+    skr = 8 if bn == 16 else 4
+    if _TUNE["decode_skew_rows"] is not None:
+        skr = int(_TUNE["decode_skew_rows"])
+    slots = int(_TUNE["decode_s_slots"]) or 2
+    return bn, vt, ds, qr, (pad, skr, slots)
+
+
+def _prefill_tile(arch, max_q, max_k, H, D, batch, total_q):
+    """(num_waves, block_n, vt_rows, d_split, double_buffer, q_reload,
+    head_group) of the
+    prefill kernel. Head dim above 128 (gfx1151 sweep, 8 / 2 heads, head_dim
+    256): a batch of few query rows or short contexts runs 64-row workgroups
+    of 16-key double-buffered tiles with the head dim over two waves (twice
+    the workgroups: prefill 512 1.6x the Triton kernel instead of 1.0x, six
+    short sequences 2.2x instead of 1.4x); long prefills keep the varlen
+    rule's 128-row, 32-key tile, which is faster per key despite spilling.
+    Head dim up to 128 (32 / 8 heads, head_dim 128): no head-dim split (the
+    exchange costs more than it saves); contexts of 4096 keys and up run
+    256-row, 64-key tiles (16 waves; each K / V tile staged once per 256
+    rows: a 256-query chunk over 8192 keys 1.02x instead of 0.79x), batches
+    of short sequences 64-row, 64-key tiles (4 waves: six short sequences
+    1.13x instead of 0.94x), contexts of 2048 keys and up the 256-row tile
+    again, the rest the varlen rule."""
+    if _TUNE["prefill_tile"] is not None:
+        nw, bn, vt, ds, db, *rest = _TUNE["prefill_tile"]
+        qr = bool(rest[0]) if rest else False
+        wpe = int(rest[1]) if len(rest) > 1 and rest[1] else None
+        return int(nw), int(bn), int(vt), int(ds), bool(db), qr, wpe, None
+    if D > 128:
+        if (total_q <= 768 or max_k <= 512) and D % 32 == 0:
+            return 8, 16, 8, 2, True, False, None, None
+    elif max_k >= 4096:
+        return 16, 64, 8, 1, True, False, None, None
+    elif max_q <= 256:
+        return 4, 64, 8, 1, True, False, None, None
+    elif max_k >= 2048:
+        return 16, 64, 8, 1, True, False, None, None
+    num_waves, block_n, head_group, vt_rows = _gfx11_varlen_config(
+        arch, max_q, max_k, H, D, batch, True
+    )
+    return num_waves, block_n, vt_rows, 1, True, False, None, head_group
 
 
 def _num_segments(batch, HKV, max_seqlen_k, block_n):
@@ -245,15 +323,12 @@ def flydsl_unified_attention_gfx11(
     stream = torch.cuda.current_stream(q.device)
     short = _short_limit(H, HKV)
     max_q, max_k = int(max_seqlen_q), int(max_seqlen_k)
-    bn = int(_TUNE["decode_block_n"])
-    vt = int(_TUNE["decode_vt_rows"])
-    ds = _d_split(D)
-    qr = bool(_TUNE["decode_q_reload"])
+    bn, vt, ds, qr, (vpad, skr, slots) = _decode_tile(D, batch, HKV)
 
     if max_q > short:
         # The long sequences (prefill chunks): the kernel skips the short ones.
-        num_waves, block_n, head_group, vt_rows = _gfx11_varlen_config(
-            arch, max_q, max_k, H, D, batch, True
+        num_waves, block_n, vt_rows, pds, dbuf, pqr, wpe, head_group = _prefill_tile(
+            arch, max_q, max_k, H, D, batch, total_q
         )
         exe = _prefill_kernel(
             dev,
@@ -266,6 +341,10 @@ def flydsl_unified_attention_gfx11(
             num_waves,
             block_n,
             vt_rows,
+            pds,
+            dbuf,
+            pqr,
+            wpe,
             head_group,
         )
         exe(
@@ -293,7 +372,21 @@ def flydsl_unified_attention_gfx11(
     if nseg == 1:
         # Enough workgroups without splitting: the rows are written directly.
         dec = _decode_kernel(
-            dev, H, HKV, D, page, dtype_str, scale, bn, vt, ds, qr, True
+            dev,
+            H,
+            HKV,
+            D,
+            page,
+            dtype_str,
+            scale,
+            bn,
+            vt,
+            ds,
+            qr,
+            vpad,
+            skr,
+            slots,
+            True,
         )
         dec(
             q,
@@ -312,7 +405,9 @@ def flydsl_unified_attention_gfx11(
             stream=stream,
         )
         return out
-    dec = _decode_kernel(dev, H, HKV, D, page, dtype_str, scale, bn, vt, ds, qr, False)
+    dec = _decode_kernel(
+        dev, H, HKV, D, page, dtype_str, scale, bn, vt, ds, qr, vpad, skr, slots, False
+    )
     dpad = dec.dpad2
     # Partials per (sequence, token slot): the long sequences' slots stay
     # unused, so the buffers do not grow with the prefill tokens.

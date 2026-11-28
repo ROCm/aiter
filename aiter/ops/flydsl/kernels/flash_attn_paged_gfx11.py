@@ -44,7 +44,6 @@ from .flash_attn_func_gfx11 import (
     LDS_PAD,
     WAVE_SIZE,
     WMMA_MNK,
-    lds_bytes,
 )
 from .flash_attn_varlen_func_gfx11 import NEG_BIG, POS_BIG
 from .kernels_common import LOG2E as _LOG2E
@@ -70,6 +69,8 @@ def build_flash_attn_paged_module_gfx11(
     num_waves=8,
     block_n=32,
     vt_rows=2,
+    d_split=1,
+    q_reload=False,
     double_buffer=True,
     head_group=None,
     waves_per_eu=None,
@@ -92,9 +93,19 @@ def build_flash_attn_paged_module_gfx11(
         page_size: cache rows per block (a multiple of 8).
         causal: bottom-right aligned causal mask (see the module docstring);
             the only form ``unified_attention`` takes.
-        num_waves: waves per workgroup; each wave owns 16 query rows.
+        num_waves: waves per workgroup; ``d_split`` waves share 16 query rows,
+            so the workgroup covers ``16 * num_waves / d_split`` rows.
         block_n: keys per main-loop tile (multiple of 16).
         vt_rows: keys packed per LDS write in the V -> V^T transpose (2, 4, 8).
+        d_split: waves per 16-row group, each with ``head_dim / d_split``
+            columns of Q, K, V and O^T (1, 2 or 4; ``head_dim`` a multiple of
+            ``16 * d_split`` when > 1). They add up their partial S^T through
+            LDS once per tile. At head_dim 256 one wave's 16 x 256 fp32 of O^T
+            alone fill half its registers; two waves per row group stop the
+            spilling.
+        q_reload: read the Q operand from the (cached) global tensor on every
+            tile instead of keeping it in VGPRs: 16 x head_dim bf16 per wave
+            of registers freed, one more workgroup per WGP at head_dim 128.
         double_buffer: ping-pong the K/V^T tile in LDS (one barrier per tile).
             Dropped automatically when two buffers do not fit in LDS.
         head_group: heads walked together by consecutive workgroups (divides
@@ -129,28 +140,59 @@ def build_flash_attn_paged_module_gfx11(
     HEAD_GROUP = head_group if head_group >= 1 and num_heads % head_group == 0 else 1
     DP = -(-D // WMMA_MNK) * WMMA_MNK
     ND = DP // WMMA_MNK
-    BLOCK_M = WMMA_MNK * num_waves
+    DS = int(d_split)
+    if DS not in (1, 2, 4) or (DS > 1 and D % (WMMA_MNK * DS) != 0):
+        raise ValueError(f"d_split={d_split} does not divide head_dim={D} into 16s")
+    if num_waves % DS != 0:
+        raise ValueError(f"num_waves={num_waves} is not a multiple of d_split={DS}")
+    NDW = ND // DS  # 16-column chunks per wave
+    DW = NDW * WMMA_MNK  # columns per wave
+    RG = num_waves // DS  # 16-row groups per workgroup
+    BLOCK_M = WMMA_MNK * RG
     BLOCK_N = block_n
     NK = BLOCK_N // WMMA_MNK
     THREADS = num_waves * WAVE_SIZE
     TOK = H * D  # elements between consecutive Q / O tokens (THD)
     TOK_KV = HKV * D  # elements of one K / V cache row
     PAGE_ELEMS = PAGE * TOK_KV  # elements of one cache block
+    # A tile's rows lie in NP consecutive pages when the tile is a multiple of
+    # the page or the page a multiple of the tile: the block ids are then
+    # wave-uniform (scalar loads, fetched one tile ahead) and a row's offset
+    # from its page base is a 32-bit lane constant.
+    SCALAR_PAGES = BLOCK_N % PAGE == 0 or PAGE % BLOCK_N == 0
+    NP = BLOCK_N // PAGE if BLOCK_N % PAGE == 0 else 1
+    PAGE_OFF = PAGE % BLOCK_N == 0 and PAGE != BLOCK_N  # tiles start inside a page
     is_bf16 = dtype_str == "bf16"
     elem = fx.BFloat16 if is_bf16 else fx.Float16
 
-    if lds_bytes(D, BLOCK_N, False) > LDS_LIMIT_BYTES:
-        # A launch over the LDS limit leaves the HIP context unusable; refuse here.
-        raise ValueError(
-            f"head_dim={D}, block_n={BLOCK_N} exceeds {LDS_LIMIT_BYTES} B of LDS"
-        )
-    double_buffer = double_buffer and lds_bytes(D, BLOCK_N, True) <= LDS_LIMIT_BYTES
-    NBUF = 2 if double_buffer else 1
-
+    # Partial S^T exchange (DS > 1): one slot per wave of the lane's NK x 8 fp32,
+    # in `elem` units, after the K / V^T buffers. One slot is enough: a wave
+    # rewrites it only after the tile's final barrier, by which time its
+    # partners have read it.
+    S_LANE = NK * 8  # fp32 per lane
+    S_SLOT = S_LANE * WAVE_SIZE  # fp32 per wave
+    S_ELEMS = num_waves * S_SLOT * 2 if DS > 1 else 0
+    S_BYTES = S_ELEMS * 2
     K_ROW = DP + LDS_PAD
     V_ROW = BLOCK_N + LDS_PAD
     K_SIZE = BLOCK_N * K_ROW
-    BUF = K_SIZE + DP * V_ROW
+    # V^T rows are skewed by 8 elements every 16 rows: the staging stores write
+    # 8-column blocks, i.e. rows 8 apart, which with a plain row pitch (8 rows
+    # = a multiple of 128 bytes) alternate between two bank groups - an 8-way
+    # conflict on every V^T store. Skewing per 16 rows spreads the stores over
+    # all bank groups while an operand read (16 consecutive rows) keeps one
+    # skew and stays conflict-free.
+    VT_SIZE = DP * V_ROW + (DP // 16) * 8
+    BUF = K_SIZE + VT_SIZE
+    if BUF * 2 + S_BYTES > LDS_LIMIT_BYTES:
+        # A launch over the LDS limit leaves the HIP context unusable; refuse here.
+        raise ValueError(
+            f"head_dim={D}, block_n={BLOCK_N}, num_waves={num_waves}, d_split={DS} "
+            f"exceeds {LDS_LIMIT_BYTES} B of LDS"
+        )
+    double_buffer = double_buffer and BUF * 4 + S_BYTES <= LDS_LIMIT_BYTES
+    NBUF = 2 if double_buffer else 1
+    S_BASE = BUF * NBUF  # elem offset of the exchange slots (even)
 
     DBLKS = D // 8  # 8-element chunks per row
     K_CHUNKS = BLOCK_N * DBLKS
@@ -165,7 +207,7 @@ def build_flash_attn_paged_module_gfx11(
 
     @fx.struct
     class SharedStorage:
-        kv: fx.Array[elem, BUF * NBUF, 16]
+        kv: fx.Array[elem, BUF * NBUF + S_ELEMS, 16]
 
     def _wmma(a, b, acc):
         if const_expr(is_bf16):
@@ -265,6 +307,10 @@ def build_flash_attn_paged_module_gfx11(
             l16 = lane % 16
             hh = lane // 16
             is_h0 = hh == 0
+            # Row group and head-dim slice of this wave (DS waves per group).
+            rg = wave // DS
+            dw = wave % DS
+            col0 = dw * DW  # this wave's first head-dim column
 
             n_kv_tiles = (seq_kv + (BLOCK_N - 1)) // BLOCK_N
             # A block past this sequence's last query block does nothing: it walks no
@@ -301,6 +347,32 @@ def build_flash_attn_paged_module_gfx11(
             )
             # Rows past seq_kv are clamped onto the sequence's last key (its page).
             last_key = seq_kv - 1
+
+            if const_expr(SCALAR_PAGES):
+                # Block ids of a tile's pages as scalar loads (the row is per
+                # sequence, so the index is wave-uniform); a page past the keys
+                # is clamped onto the last one (valid memory, rows masked).
+                bt_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                    buf_base_i64(BLOCK_TABLE) + fx.Int64(bat) * fx.Int64(bt_stride) * 4,
+                    num_records_bytes=fx.Int64(bt_stride) * 4,
+                )
+                last_page = last_key // PAGE
+                last_page = (last_page > 0).select(last_page, fx.Int32(0))
+
+                def tile_blocks(tile):
+                    p0 = (tile * BLOCK_N) // PAGE
+                    out = []
+                    for i in range_constexpr(NP):
+                        p = p0 + i
+                        p = (p < last_page).select(p, last_page)
+                        out.append(
+                            fx.Int32(
+                                buffer_ops.buffer_load(
+                                    bt_rsrc, p, vec_width=1, is_scalar=True
+                                )
+                            )
+                        )
+                    return out
 
             def g_load8(buf, off):
                 return buf_copy_load(buf, off, elem=elem, unit_elems=8)
@@ -340,17 +412,23 @@ def build_flash_attn_paged_module_gfx11(
 
             # ---- Q -> VGPRs as WMMA B operands (zero past seq_q / past head_dim) ----
             zero_e8 = Vec.filled(8, 0.0, elem)
-            q_row = qblk * BLOCK_M + wave * 16 + l16
-            q_base = tok_off(q_row)
-            q_vecs = []
-            for c in range_constexpr(ND):
-                lo = zero_e8
-                hi = zero_e8
-                if const_expr(16 * c < D):
-                    lo = g_load8(q_buf, q_base + 16 * c)
-                if const_expr(16 * c + 8 < D):
-                    hi = g_load8(q_buf, q_base + 16 * c + 8)
-                q_vecs.append(Vec(lo).shuffle(Vec(hi), CONCAT16))
+            q_row = qblk * BLOCK_M + rg * 16 + l16
+            q_base = tok_off(q_row) + col0
+
+            def load_q():
+                vecs = []
+                for c in range_constexpr(NDW):
+                    lo = zero_e8
+                    hi = zero_e8
+                    if const_expr(16 * c < D):  # a partial last chunk only at DS 1
+                        lo = g_load8(q_buf, q_base + 16 * c)
+                    if const_expr(16 * c + 8 < D):
+                        hi = g_load8(q_buf, q_base + 16 * c + 8)
+                    vecs.append(Vec(lo).shuffle(Vec(hi), CONCAT16))
+                return vecs
+
+            if const_expr(not q_reload):
+                q_vecs = load_q()
 
             if const_expr(causal):
                 # Keys this block's last row can see: its row index + diag, clamped
@@ -378,22 +456,64 @@ def build_flash_attn_paged_module_gfx11(
                     blk = (blk < V_BLOCKS).select(blk, V_BLOCKS - 1)
                 return blk
 
-            def gload_tile(tile):
+            if const_expr(SCALAR_PAGES):
+                # Per-lane, loop-invariant: which of the tile's pages a lane's
+                # chunk sits in and its byte offset inside that page.
+                def geo(row, d0):
+                    if const_expr(NP > 1):
+                        return row // PAGE, ((row % PAGE) * TOK_KV + d0) * 2
+                    return None, (row * TOK_KV + d0) * 2
+
+                k_geos = []
+                for i in range_constexpr(K_PER_THR):
+                    chunk = k_chunk(i)
+                    k_geos.append(geo(chunk // DBLKS, (chunk % DBLKS) * 8))
+                v_geos = []
+                for i in range_constexpr(V_PER_THR):
+                    blk = v_block(i)
+                    # The vt_rows rows of a block start at a multiple of vt_rows,
+                    # which divides the page: they share a page.
+                    v_geos.append(geo((blk // DBLKS) * vt_rows, (blk % DBLKS) * 8))
+
+                def page_addr(base, blks, s_off, pg, voff):
+                    """64-bit address: the lane's page base (SGPRs) + its offset."""
+                    sel = base + fx.Int64(blks[0]) * (PAGE_ELEMS * 2) + s_off
+                    for i in range_constexpr(1, NP):
+                        b_i = base + fx.Int64(blks[i]) * (PAGE_ELEMS * 2) + s_off
+                        sel = (pg == i).select(b_i, sel)
+                    return sel + fx.Int64(voff)
+
+            def gload_tile(tile, blks=None):
                 key0 = tile * BLOCK_N
+                if const_expr(SCALAR_PAGES):
+                    s_off = fx.Int64(0)
+                    if const_expr(PAGE_OFF):
+                        s_off = fx.Int64((key0 % PAGE) * (TOK_KV * 2))
                 kregs = []
                 for i in range_constexpr(K_PER_THR):
                     chunk = k_chunk(i)
                     row = chunk // DBLKS
                     d0 = (chunk % DBLKS) * 8
-                    kregs.append(load8_at(kv_row(k_base, key0 + row), d0))
+                    if const_expr(SCALAR_PAGES):
+                        pg, voff = k_geos[i]
+                        kregs.append(
+                            load8_at(page_addr(k_base, blks, s_off, pg, voff), 0)
+                        )
+                    else:
+                        kregs.append(load8_at(kv_row(k_base, key0 + row), d0))
                 vregs = []
                 for i in range_constexpr(V_PER_THR):
                     blk = v_block(i)
                     kb0 = key0 + (blk // DBLKS) * vt_rows
                     d0 = (blk % DBLKS) * 8
-                    # The vt_rows rows of a block start at a multiple of vt_rows,
-                    # so they share a page: one block-table lookup for all of them.
-                    addr0 = kv_row(v_base, kb0, vt_rows)
+                    if const_expr(SCALAR_PAGES):
+                        pg, voff = v_geos[i]
+                        addr0 = page_addr(v_base, blks, s_off, pg, voff)
+                        d0 = 0
+                    else:
+                        # The vt_rows rows of a block start at a multiple of vt_rows,
+                        # so they share a page: one block-table lookup for all of them.
+                        addr0 = kv_row(v_base, kb0, vt_rows)
                     rows = []
                     for r in range_constexpr(vt_rows):
                         v = Vec(load8_at(addr0, r * TOK_KV + d0))
@@ -425,7 +545,14 @@ def build_flash_attn_paged_module_gfx11(
                             lo_w.append((a & 0xFFFF) | (b << 16))
                             hi_w.append(a.shrui(fx.Int32(16)) | (b & fx.Int32(-65536)))
                         for half, ws in ((0, lo_w), (1, hi_w)):
-                            dst = bb + K_SIZE + (d0 + 2 * t + half) * V_ROW + krow0
+                            # row d0 + 2t + half, skewed by 8 per 16 rows (d0 / 16)
+                            dst = (
+                                bb
+                                + K_SIZE
+                                + (d0 + 2 * t + half) * V_ROW
+                                + ((blk % DBLKS) // 2) * 8
+                                + krow0
+                            )
                             lds_view(dst, vt_rows).store(
                                 Vec.from_elements(ws, fx.Int32).bitcast(elem)
                             )
@@ -467,9 +594,51 @@ def build_flash_attn_paged_module_gfx11(
                 # would be rounding noise and exp2 of it 1 or inf. Starting such a
                 # row at +BIG makes every p exactly 0, so l and O stay 0.
                 m0 = (q_lim < 0).select(fx.Float32(POS_BIG), m0)
-            init = [m0, fx.Float32(0.0)] + [zero8 for _ in range_constexpr(ND)]
+            init = [m0, fx.Float32(0.0)] + [zero8 for _ in range_constexpr(NDW)]
 
-            store_tile(gload_tile(fx.Int32(0)), 0)
+            if const_expr(DS > 1):
+                # ---- partial S^T exchange between the row group's waves ----
+                s_ptr = fx.recast_iter(fx.Float32, lds_ptr)
+
+                def s_view(off_f32, n):
+                    return fx.make_view(
+                        fx.add_offset(s_ptr, fx.make_int_tuple(fx.Int32(off_f32))),
+                        fx.make_layout(n, 1),
+                    )
+
+                def s_slot(w):
+                    return S_BASE // 2 + w * S_SLOT + lane * S_LANE
+
+                def exchange_s(s_accs):
+                    """Add the partners' partial S^T to this wave's (one barrier)."""
+                    mine = s_slot(wave)
+                    for kb in range_constexpr(NK):
+                        s_view(mine + kb * 8, 8).store(Vec(s_accs[kb]))
+                    _lds_barrier()
+                    out = [Vec(s) for s in s_accs]
+                    for i in range_constexpr(1, DS):
+                        other = s_slot(rg * DS + (dw + i) % DS)
+                        for kb in range_constexpr(NK):
+                            o_s = Vec(s_view(other + kb * 8, 8).load())
+                            out[kb] = Vec.from_elements(
+                                [
+                                    fx.Float32(out[kb][si]) + fx.Float32(o_s[si])
+                                    for si in range_constexpr(8)
+                                ],
+                                fx.Float32,
+                            )
+                    return out
+
+            if const_expr(SCALAR_PAGES):
+                # The loop carries the block ids of the tile it prefetches next,
+                # fetched one iteration earlier (scalar loads off the critical
+                # path).
+                blks0 = tile_blocks(fx.Int32(0))
+                store_tile(gload_tile(fx.Int32(0), blks0), 0)
+                t1 = (n_tiles > 1).select(fx.Int32(1), fx.Int32(0))
+                init = init + tile_blocks(t1)
+            else:
+                store_tile(gload_tile(fx.Int32(0)), 0)
             _lds_barrier()
 
             def tile_step(j32, state, mask_tail):
@@ -478,24 +647,41 @@ def build_flash_attn_paged_module_gfx11(
                 KV tile can hold such keys, so the main loop runs without it."""
                 m_old = fx.Float32(state[0])
                 l_old = fx.Float32(state[1])
-                o_acc = [Vec(state[2 + i]) for i in range_constexpr(ND)]
+                o_acc = [Vec(state[2 + i]) for i in range_constexpr(NDW)]
                 cur = 0
                 if const_expr(double_buffer):
                     cur = (j32 & 1) * BUF
 
                 nxt = j32 + 1
                 nxt = (nxt < n_tiles).select(nxt, j32)
-                next_regs = gload_tile(nxt)
+                carry = []
+                if const_expr(SCALAR_PAGES):
+                    # state: the block ids of tile j + 1, whose loads go out now;
+                    # fetch those of tile j + 2 for the next iteration.
+                    blks = [fx.Int32(state[2 + NDW + i]) for i in range_constexpr(NP)]
+                    next_regs = gload_tile(nxt, blks)
+                    nxt2 = j32 + 2
+                    nxt2 = (nxt2 < n_tiles).select(nxt2, nxt)
+                    carry = tile_blocks(nxt2)
+                else:
+                    next_regs = gload_tile(nxt)
+                if const_expr(q_reload):
+                    qv = load_q()  # L0 / L1 hits: the rows were read last tile
+                else:
+                    qv = q_vecs
                 # Keep the prefetch at the top of the body; the machine scheduler would
                 # otherwise sink it next to its LDS store and lose the overlap.
                 fx.rocdl.sched_barrier(0)
 
-                # ---- S^T = K Q^T; c outer so consecutive WMMAs hit independent accs ----
+                # ---- S^T = K Q^T over this wave's columns; c outer so consecutive
+                # WMMAs hit independent accs ----
                 s_accs = [zero8 for _ in range_constexpr(NK)]
-                for c in range_constexpr(ND):
+                for c in range_constexpr(NDW):
                     for kb in range_constexpr(NK):
-                        a = lds_v16(cur + (kb * 16 + l16) * K_ROW + 16 * c)
-                        s_accs[kb] = _wmma(a, q_vecs[c], s_accs[kb])
+                        a = lds_v16(cur + (kb * 16 + l16) * K_ROW + col0 + 16 * c)
+                        s_accs[kb] = _wmma(a, qv[c], s_accs[kb])
+                if const_expr(DS > 1):
+                    s_accs = exchange_s(s_accs)
 
                 s_vals = []
                 for kb in range_constexpr(NK):
@@ -554,8 +740,16 @@ def build_flash_attn_paged_module_gfx11(
                             fx.Int32(fx.rocdl.perm_b32(partp[j2], ownp[j2], sel_odd))
                         )
                     p_vec = Vec.from_elements(dwords, fx.Int32).bitcast(elem)
-                    for dc in range_constexpr(ND):
-                        a = lds_v16(cur + K_SIZE + (dc * 16 + l16) * V_ROW + kb * 16)
+                    for dc in range_constexpr(NDW):
+                        # row col0 + 16 dc + l16, skewed by 8 per 16 rows
+                        a = lds_v16(
+                            cur
+                            + K_SIZE
+                            + (col0 + dc * 16 + l16) * V_ROW
+                            + col0 // 2
+                            + dc * 8
+                            + kb * 16
+                        )
                         o_acc[dc] = Vec(_wmma(a, p_vec, o_acc[dc]))
 
                 if const_expr(double_buffer):
@@ -568,7 +762,7 @@ def build_flash_attn_paged_module_gfx11(
                     store_tile(next_regs, 0)
                     _lds_barrier()
 
-                return [m_new, l_new] + o_acc
+                return [m_new, l_new] + o_acc + carry
 
             # Only the last KV tile can hold keys at or past seq_kv, and only when the
             # tiles walked here reach it (causal rows may stop earlier). The tiles
@@ -588,8 +782,11 @@ def build_flash_attn_paged_module_gfx11(
             # l is 0 only when no key was seen (a sequence without keys): O = 0 then.
             inv = (l_fin > 0.0).select(fx.Float32(1.0) / l_fin, fx.Float32(0.0))
             # Recomputed rather than kept live across the main loop (VGPR pressure).
-            q_base = tok_off(qblk * BLOCK_M + (tid // WAVE_SIZE) * 16 + (tid % 16))
-            for dc in range_constexpr(ND):
+            q_base = (
+                tok_off(qblk * BLOCK_M + ((tid // WAVE_SIZE) // DS) * 16 + (tid % 16))
+                + ((tid // WAVE_SIZE) % DS) * DW
+            )
+            for dc in range_constexpr(NDW):
                 if const_expr(dc * 16 < D):
                     o = Vec(results[2 + dc])
                     # Lane L holds d = 16*dc + 2*si + L/16. After a swap with lane L^16
@@ -700,6 +897,8 @@ def build_flash_attn_paged_module_gfx11(
 
     _launch.block_m = BLOCK_M
     _launch.block_n = BLOCK_N
+    _launch.d_split = DS
+    _launch.q_reload = bool(q_reload)
     _launch.double_buffer = double_buffer
     _launch.page_size = PAGE
     return _launch

@@ -41,7 +41,7 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from . import buffer_ops
-from .flash_attn_func_gfx11 import LDS_LIMIT_BYTES, LDS_PAD, WAVE_SIZE, WMMA_MNK
+from .flash_attn_func_gfx11 import LDS_LIMIT_BYTES, WAVE_SIZE, WMMA_MNK
 from .flash_attn_varlen_func_gfx11 import NEG_BIG, POS_BIG
 from .kernels_common import LOG2E as _LOG2E
 from .tensor_shim import (
@@ -68,6 +68,9 @@ def build_flash_attn_paged_decode_module_gfx11(
     d_split=1,
     q_reload=False,
     direct=False,
+    vt_pad=0,
+    skew_rows=8,
+    s_slots=2,
     waves_per_eu=None,
     num_kv_heads=None,
     fast_fp_math=True,
@@ -138,16 +141,30 @@ def build_flash_attn_paged_decode_module_gfx11(
     is_bf16 = dtype_str == "bf16"
     elem = fx.BFloat16 if is_bf16 else fx.Float16
 
-    V_ROW = BLOCK_N + LDS_PAD
-    VT_SIZE = DW * V_ROW  # elements of one wave's V^T slice in LDS
+    # One wave's V^T slice in LDS: DW rows of V_ROW elements, row r's keys
+    # starting at (r // skew_rows) * 8. The staging stores write 8-column
+    # blocks, i.e. rows 8 apart, and the operand reads 16 consecutive rows;
+    # the skew keeps both spread over the LDS bank groups without padding
+    # the rows (16-key rows: skew every 8 rows; 32-key rows: every 4). LDS
+    # size decides the workgroups per WGP here, so no byte is spare.
+    if vt_pad not in (0, 8) or skew_rows not in (0, 4, 8, 16):
+        raise ValueError(f"unsupported vt_pad={vt_pad} / skew_rows={skew_rows}")
+    V_ROW = BLOCK_N + int(vt_pad)
+    SR = int(skew_rows)
+    SKEW = 8 if SR else 0
+    VT_SIZE = DW * V_ROW + ((DW // SR) * SKEW if SR else 0)
     DBLKS = DW // 8  # 8-column blocks of a wave's slice
     V_BLOCKS = (BLOCK_N // vt_rows) * DBLKS  # vt_rows keys x 8 d per block
     V_PER_THR = -(-V_BLOCKS // WAVE_SIZE)  # each wave stages its own slice
-    # Partial S^T exchange (NWD > 1): two parity slots x NWD waves x the
-    # lane's NK x 8 fp32, in `elem` units.
+    # Partial S^T exchange (NWD > 1): s_slots (1 or 2) x NWD waves x the
+    # lane's NK x 8 fp32, in `elem` units. With one slot a second barrier
+    # after the reads protects it; with two the tile parity does.
+    if int(s_slots) not in (1, 2):
+        raise ValueError(f"s_slots must be 1 or 2, got {s_slots}")
+    NSLOT = int(s_slots)
     S_LANE = NK * 8  # fp32 per lane
     S_SLOT = S_LANE * WAVE_SIZE  # fp32 per wave slot
-    S_ELEMS = 2 * NWD * S_SLOT * 2 if NWD > 1 else 0
+    S_ELEMS = NSLOT * NWD * S_SLOT * 2 if NWD > 1 else 0
     S_BASE = NWD * VT_SIZE  # elem offset of the exchange area (even)
     LDS_ELEMS = S_BASE + S_ELEMS
     if LDS_ELEMS * 2 > LDS_LIMIT_BYTES:
@@ -406,6 +423,8 @@ def build_flash_attn_paged_decode_module_gfx11(
                         hi_w.append(a.shrui(fx.Int32(16)) | (b & fx.Int32(-65536)))
                     for half, ws in ((0, lo_w), (1, hi_w)):
                         dst = vt_base + (d0 + 2 * t + half) * V_ROW + krow0
+                        if const_expr(SR > 0):
+                            dst = dst + ((d0 + (2 * t + half)) // SR) * SKEW
                         lds_view(dst, vt_rows).store(
                             Vec.from_elements(ws, fx.Int32).bitcast(elem)
                         )
@@ -422,6 +441,8 @@ def build_flash_attn_paged_decode_module_gfx11(
 
             def s_slot(parity, w):
                 return S_BASE // 2 + (parity * NWD + w) * S_SLOT + lane * S_LANE
+
+        lskew = (l16 // SR) * SKEW if SR else 0  # the lane's operand-row skew
 
         # ---- P^T operand assembly ----
         def pack2(a, b):
@@ -477,7 +498,7 @@ def build_flash_attn_paged_decode_module_gfx11(
 
             if const_expr(NWD > 1):
                 # Sum the waves' partial S^T: each writes its slot, all read.
-                parity = j32 % 2
+                parity = j32 % 2 if NSLOT == 2 else 0
                 mine = s_slot(parity, wave)
                 for kb in range_constexpr(NK):
                     s_view(mine + kb * 8, 8).store(s_acc[kb])
@@ -495,6 +516,9 @@ def build_flash_attn_paged_decode_module_gfx11(
                             ],
                             fx.Float32,
                         )
+                if const_expr(NSLOT == 1):
+                    # Everyone has read the slots before anyone rewrites them.
+                    _barrier()
 
             s_vals = []
             for kb in range_constexpr(NK):
@@ -547,7 +571,10 @@ def build_flash_attn_paged_decode_module_gfx11(
                     )
                 p_vec = Vec.from_elements(dwords, fx.Int32).bitcast(elem)
                 for dc in range_constexpr(NDW):
-                    a = lds_v16(vt_base + (dc * 16 + l16) * V_ROW + kb * 16)
+                    a_off = vt_base + (dc * 16 + l16) * V_ROW + kb * 16
+                    if const_expr(SR > 0):
+                        a_off = a_off + (dc * 16 // SR) * SKEW + lskew
+                    a = lds_v16(a_off)
                     o_acc[dc] = Vec(_wmma(a, p_vec, o_acc[dc]))
 
             # The V^T reads above complete before the next tile overwrites them.
