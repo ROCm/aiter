@@ -13,7 +13,7 @@ and put `not independently refuted` on the review line. `rules.md` § Refutation
 ```
 
 **You are that "reader who has not seen your reasoning".** The materials are in `{{WORK}}`:
-`card.md`, `pr.diff`, `merge_target.txt`, `merge-target/` (the base-side worktree), `head/` (the PR head file tree).
+`card.md`, `pr.diff`, `merge_target.txt`, `tuning_coverage.txt`, `merge-target/` (the base-side worktree), `head/` (the PR head file tree).
 
 **Do NOT read** `verdicts.txt`, `answers.txt`, `ai_diagnostic.txt`, `refutations.txt` —
 those are the card author's reasoning; reading them destroys your independence.
@@ -50,6 +50,7 @@ Open each cited file:line and check it; look for a guard, call site, test or doc
 use the already-merged implementation in `merge-target/` to judge whether it is a **pre-existing repo convention** rather than a defect of this PR;
 check the time order of the PR base vs the relevant commits — "the author got it wrong" and "the PR is stale" are two different things;
 confirm the trigger condition is actually reachable.
+For tuning-coverage (A5) findings, `{{WORK}}/tuning_coverage.txt` is a best-effort hint, not proof: check the cited row in `pr.diff` and `head/`. Kill the finding if the row was not changed by this PR, or if its counterpart exists in another tuned file the runtime merges or in a shared untuned input; keep it if the PR changed one side of a pair and not the other.
 
 **FlyDSL facts that kill a finding.** Each of these produced wrong findings on aiter FlyDSL PRs; check the finding against them:
 - `flyc.compile(exe, *args)` with live args already launches once; a finding asking for an extra `cf(*args)` on that path is wrong (it would launch twice).

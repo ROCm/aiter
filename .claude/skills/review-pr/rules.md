@@ -50,6 +50,12 @@ FP self-check: a new branch that is fully gated by `if constexpr(NewFeature)` an
 Real examples: PR#5708 narrowed `enable_bias` from `_needs_swiglu_bias_support()` to `activation == Swiglu && _needs_swiglu_bias_support()` — could have regressed Situv2 bias on Opus/FlyDSL paths (analyzed as safe, but not tested). PR#5985 widened `kStoreTakesDivisor` to include `fp16_t` — broke the reciprocal scale on gfx942 fp16 MXFP8 quant (scale_err=55/56 groups), because the software convert path expected the reciprocal but received the raw divisor. PR#5914 added optional fp8 Q output to fused_qk_norm_rope kernel using a runtime pointer check (`if (q_out_fp8 != nullptr)`) instead of a template parameter — VGPR usage rose from 96 to 98 at head_size=512, crossing an allocation granule and dropping occupancy from 5 to 4 waves/SIMD for every existing caller passing nullptr; fixed by introducing a `HAS_Q_FP8` template parameter so the non-fp8 instantiation is byte-identical to the original.
 → `🔴/⚠️ A4: new [feature] branch added to [kernel] — shared [code/constant] changed, verify existing [paths] are not regressed`
 
+**A5 — Tuned/untuned rows changed on one side only** ⚠️
+A PR that adds tuned rows for some shapes should add the same untuned input rows; one that removes rows on one side should remove them on the other (or say why not).
+**Evidence:** `$WORK/tuning_coverage.txt` lists, per name-paired CSV, the PR's added/removed rows that have no counterpart: `TUNED_NOT_IN_UNTUNED`, `UNTUNED_NOT_IN_TUNED`, `TUNED_REMOVED_UNTUNED_KEPT`, `UNTUNED_REMOVED_TUNED_KEPT`. `CHECKED` = pair matched; `UNPAIRED`/`NOT_CHECKED` = not compared; `SKIPPED:` = the helper failed.
+FP self-check: the helper is best-effort. Confirm against `pr.diff` and `head/` that the row is not in another tuned file the runtime merges or a shared untuned input (an `[also at head in ...]` hint usually means a move), and never flag rows the PR did not touch.
+→ `⚠️ A5: [file:line] [adds/removes] workload [key] without the matching [untuned/tuned] row in [paired file] — update the paired CSV or explain`
+
 ---
 
 ### B — Silent Bypass

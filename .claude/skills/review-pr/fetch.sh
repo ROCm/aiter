@@ -928,6 +928,15 @@ rm -f "$WORK/.err"
 # breakage happens.
 git -C "$PROJECT_ROOT" cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null \
   || git -C "$PROJECT_ROOT" fetch -q "$REPO_URL" "$BASE_SHA" 2>/dev/null || true
+# Compare the PR's tuned/untuned row changes for name-paired CSVs (best-effort hints).
+# The checker reads Git blobs, not PR code or the reviewer's working tree.
+if ! python3 "$SKILLS_ROOT/review-pr/tuning_coverage.py" \
+    "$PROJECT_ROOT" "$BASE_SHA" "$HEAD_SHA" > "$WORK/tuning_coverage.txt"; then
+  grep -q '^SKIPPED:' "$WORK/tuning_coverage.txt" 2>/dev/null \
+    || echo "SKIPPED: tuning coverage checker failed; review these files manually" \
+      >> "$WORK/tuning_coverage.txt"
+fi
+cat "$WORK/tuning_coverage.txt"
 # Day-old worktrees are finished reviews; drop them, or this accumulates 182M each. Scoped
 # to this box's scratch base (${TMPDIR:-/tmp}) so a user worktree merely named review-pr-*
 # elsewhere is never force-removed.
@@ -1030,6 +1039,6 @@ echo "WORK=$WORK"
 echo "artifacts: pr.diff pr_meta.json base_head.txt rules.txt rules_expanded.txt \
 test_quality.txt twins.txt ci_coverage.txt perf_claims.txt struct_abi.txt comment_only.txt \
 guards.txt siblings.txt kernel_tests.txt applies.txt symbols.txt merge_target.txt \
-flydsl_bounds.txt aot_pairing.txt size.txt reviewers.txt \
+flydsl_bounds.txt aot_pairing.txt tuning_coverage.txt size.txt reviewers.txt \
 validation_requirement.json \
 auto_validation_outcome.txt${HAVE_EVIDENCE:+ evidence.txt}"

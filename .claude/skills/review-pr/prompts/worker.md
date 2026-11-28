@@ -149,7 +149,7 @@ question names this PR, and an over-bar PR carries a split.
 `{{WORK}}` holds all of Step 1's output: `pr.diff`, `pr_meta.json`, `rules.txt`, `rules_expanded.txt`,
 `applies.txt`, `merge_target.txt`, `guards.txt`, `siblings.txt`, `symbols.txt`, `twins.txt`,
 `test_quality.txt`, `kernel_tests.txt`, `ci_coverage.txt`, `perf_claims.txt`, `struct_abi.txt`,
-`comment_only.txt`, `evidence.txt`, `size.txt`, `reviewers.txt`, `validation_requirement.json`,
+`comment_only.txt`, `tuning_coverage.txt`, `evidence.txt`, `size.txt`, `reviewers.txt`, `validation_requirement.json`,
 plus `merge-target/` (the base-side worktree) and `head/` (the PR head file tree).
 You write `design.txt` yourself (Step 7.8) — it is not in this list because Step 1 does not produce it.
 

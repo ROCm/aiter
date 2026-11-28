@@ -105,6 +105,7 @@ def run_gates(work, proj):
         "refutations.txt",
         "independent.txt",
         "late_findings.txt",
+        "tuning_coverage.txt",
     ]:
         pathlib.Path(W(f)).touch(exist_ok=True)
     pathlib.Path(W("card.md")).touch(exist_ok=True)
@@ -125,6 +126,7 @@ def run_gates(work, proj):
                 W("answers.txt"),
                 W("pr.diff"),
                 W("late_findings.txt"),
+                W("tuning_coverage.txt"),
             ],
         ),
         (
