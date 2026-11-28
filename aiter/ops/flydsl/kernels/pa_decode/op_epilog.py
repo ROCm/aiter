@@ -32,7 +32,8 @@ class PaDecodeEpilogue:
         self.pout = fx.recast_iter(self.traits.OUT_DTYPE, self.ctx.pout_ptr)
         if const_expr(self.traits.buffer_plan_output):
             # Widen before multiplying: packed storage can exceed 2 GiB.
-            pout_slot = fx.Int64(self.ctx.kv_h) * fx.Int64(gpu.grid_dim.x) + fx.Int64(
+            slots = getattr(gpu.grid_dim, "y" if self.traits.SPLIT_MAJOR else "x")
+            pout_slot = fx.Int64(self.ctx.kv_h) * fx.Int64(slots) + fx.Int64(
                 self.ctx.part
             )
             pout_slot_bytes = self.traits.TOTAL_ROWS * self.traits.head_dim * 2
