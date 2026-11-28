@@ -435,7 +435,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             kernel = kernel_list[i]
             maxsplitK = (
                 0
-                if preshuffleB
+                if preshuffleB or not getattr(kernel, "supports_splitk", True)
                 else (
                     aiter.compute_gemm_SplitK(
                         M,

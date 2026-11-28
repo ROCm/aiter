@@ -4,6 +4,7 @@
 import argparse
 import os
 import sys
+import threading
 
 # Add parent directory to path to ensure we use local aiter module
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -287,6 +288,113 @@ def run_flydsl(
     out = torch.empty((m, n), dtype=dtype, device=x.device)
     return gemm_a8w8_blockscale_flydsl(
         x, weight, x_scale, w_scale, out, {"kernelName": kernel_name}, preshuffle_b
+    )
+
+
+def test_splitk_deterministic(
+    m, n, k, splitK, backend, kernel_name, repeats=20, ref_kernel_name=None
+):
+    """A tuned split-K kernel gives the same bits on every call.
+
+    With more than two K batches the partials are reduced in K order instead of
+    added atomically into the output, whose result depends on arrival order.
+    `ref_kernel_name` (default: `kernel_name`) is the splitK=0 reference.
+    """
+    scale_n = (n + block_shape[0] - 1) // block_shape[0]
+    scale_k = (k + block_shape[1] - 1) // block_shape[1]
+    torch.manual_seed(0)
+    x = (torch.randn((m, k), device="cuda") / 4).to(dtypes.fp8)
+    weight = (torch.randn((n, k), device="cuda") / 4).to(dtypes.fp8)
+    x_scale = torch.rand([m, scale_k], dtype=dtypes.fp32, device="cuda") + 0.5
+    w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device="cuda") + 0.5
+
+    def run(split, name=kernel_name):
+        out = torch.empty((m, n), dtype=dtypes.bf16, device="cuda")
+        if backend == "cktile":
+            return gemm_a8w8_blockscale_cktile(
+                x, weight, x_scale, w_scale, out, False, split, name
+            )
+        return gemm_a8w8_blockscale_ck(x, weight, x_scale, w_scale, out, split, name)
+
+    first = run(splitK)
+    mismatches = sum(not torch.equal(run(splitK), first) for _ in range(repeats))
+    err = checkAllclose(
+        run(0, ref_kernel_name or kernel_name),
+        first,
+        msg=f"{backend} splitK={splitK} vs splitK=0",
+        rtol=1e-2,
+        atol=1e-2,
+        catastrophic_check=True,
+    )
+    print(
+        f"test_splitk_deterministic(m={m}, n={n}, k={k}, splitK={splitK}, "
+        f"{backend}): mismatching calls={mismatches}/{repeats}, err={err:.4g}"
+    )
+    assert mismatches == 0, (
+        f"{backend} {kernel_name} splitK={splitK} (m={m}, n={n}, k={k}) differed "
+        f"from its first output on {mismatches}/{repeats} calls"
+    )
+    assert err < 0.05
+
+
+def test_splitk_concurrent_graphs(m, n, k, splitK, kernel_name, calls=8, replays=50):
+    """Graphs captured on one stream and replayed concurrently match eager.
+
+    PyTorch captures every graph on its default capture stream. The fused
+    split-K kernel counts arrivals per output tile, so two graphs that share
+    counters corrupt each other when their replays overlap.
+    """
+    scale_n = (n + block_shape[0] - 1) // block_shape[0]
+    scale_k = (k + block_shape[1] - 1) // block_shape[1]
+
+    def make_run(seed):
+        torch.manual_seed(seed)
+        x = (torch.randn((m, k), device="cuda") / 4).to(dtypes.fp8)
+        weight = (torch.randn((n, k), device="cuda") / 4).to(dtypes.fp8)
+        x_scale = torch.rand([m, scale_k], dtype=dtypes.fp32, device="cuda") + 0.5
+        w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device="cuda") + 0.5
+
+        def run():
+            out = torch.empty((m, n), dtype=dtypes.bf16, device="cuda")
+            return gemm_a8w8_blockscale_ck(
+                x, weight, x_scale, w_scale, out, splitK, kernel_name
+            )
+
+        return run
+
+    runs = [make_run(seed) for seed in (0, 1)]
+    refs = [run().clone() for run in runs]
+    graphs = []
+    for run in runs:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outs = [run() for _ in range(calls)]
+        graphs.append((graph, outs))
+    torch.cuda.synchronize()
+
+    mismatches = [0, 0]
+
+    def replay(i):
+        stream = torch.cuda.Stream()
+        graph, outs = graphs[i]
+        with torch.cuda.stream(stream):
+            for _ in range(replays):
+                graph.replay()
+                stream.synchronize()
+                mismatches[i] += sum(not torch.equal(o, refs[i]) for o in outs)
+
+    threads = [threading.Thread(target=replay, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    print(
+        f"test_splitk_concurrent_graphs(m={m}, n={n}, k={k}, splitK={splitK}): "
+        f"mismatching outputs={sum(mismatches)}/{2 * calls * replays}"
+    )
+    assert sum(mismatches) == 0, (
+        f"{kernel_name} splitK={splitK} (m={m}, n={n}, k={k}): "
+        f"{sum(mismatches)} outputs of concurrently replayed graphs differ from eager"
     )
 
 
@@ -596,6 +704,38 @@ for splitK in [1, 2]:
 # Two K loops per split for the default CK-Tile tile, the shortest split it runs.
 for m, n, k, splitK in [(8, 256, 512, 1), (8, 256, 1024, 2), (32, 512, 2048, 3)]:
     test_splitk_correctness(m=m, n=n, k=k, splitK=splitK)
+
+if get_gfx() == "gfx950":
+    print("\nRunning split-K determinism checks ...")
+    _ck16x64 = "a8w8_blockscale_1x128x128_256x16x64x256_16x16_16x16_1x1_16x16x1_16x16x1_1x16x1x16_4_1x1_intrawave_v1"
+    _ck16x128 = "a8w8_blockscale_1x128x128_256x16x128x256_16x16_16x16_1x2_16x16x1_16x16x1_1x16x1x16_8_1x2_intrawave_v1"
+    _ck16x64k128 = "a8w8_blockscale_1x128x128_256x16x64x128_8x16_16x16_1x1_16x16x1_8x32x1_1x16x1x16_4_1x1_intrawave_v1"
+    _ck_v3 = "a8w8_blockscale_1x128x128_256x128x128x128_16x16_32x32_2x2_8x32x1_8x32x1_1x32x1x8_8_1x1_intrawave_v3"
+    _tile4w = "a8w8_blockscale_cktile_32x128x128_1x4x1_16x16x64_intrawave_0x1x0_4"
+    _tile8w = "a8w8_blockscale_cktile_192x256x128_4x2x1_16x16x128_intrawave_0x1x0_1"
+    # (M, N, K, splitK, backend, kernel): tuned gfx950 split-K rows plus a v3
+    # pipeline and an 8-wave CK-Tile kernel.
+    for m, n, k, splitK, backend, kernel_name in [
+        (1, 8192, 3072, 2, "ck", _ck16x128),
+        (6, 8192, 3072, 3, "ck", _ck16x64k128),
+        (1, 2048, 3072, 2, "ck", _ck16x64),
+        (64, 3072, 4096, 3, "ck", _ck16x64),
+        (64, 2048, 3072, 2, "ck", _ck_v3),
+        (6, 2048, 3072, 3, "cktile", _tile4w),
+        (16, 2048, 3072, 3, "cktile", _tile4w),
+        (64, 2048, 3072, 2, "cktile", _tile8w),
+        (64, 2048, 3072, 3, "cktile", _tile8w),
+    ]:
+        test_splitk_deterministic(m, n, k, splitK, backend, kernel_name)
+    test_splitk_concurrent_graphs(16, 34816, 5120, 2, _ck16x64)
+    # Slice-K kernels of tuned rows (KSplit 1 and 2) against a CK splitK=0 kernel.
+    for m, n, k, kernel_name in [
+        (1, 2048, 3072, "a8w8_blockscale_slicek_16x16x128_16w_u2_ks1"),
+        (80, 128, 7168, "a8w8_blockscale_slicek_16x16x128_16w_u4_ks2"),
+    ]:
+        test_splitk_deterministic(
+            m, n, k, 0, "ck", kernel_name, repeats=100, ref_kernel_name=_ck16x64
+        )
 
 # Save results from benchmarks
 if args.output:

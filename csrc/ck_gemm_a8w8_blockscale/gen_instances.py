@@ -24,6 +24,7 @@ from chip_info import (
 )
 from gemm_a8w8_blockscale_instance import (
     KernelInstance,
+    SliceKInstance,
     candidate_kernels_by_name,
     candidate_kernels_dict,
     default_kernels_dict,
@@ -59,12 +60,55 @@ class gemm_a8w8_blockscale_codegen:
             )
         return default_kernels_dict
 
-    def gen_ck_instance(self, k: KernelInstance):
-        """
-        Generate kernel instance code for ck gemm a8w8 blockscale
-        """
+    def gen_slicek_impl(self, k: SliceKInstance) -> str:
+        return f"""// SPDX-License-Identifier: MIT
+// Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-        LEGACY_INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
+#include "gemm_a8w8_blockscale_common.cuh"
+#include "gemm_a8w8_blockscale_slicek.cuh"
+
+template <typename DDataType, typename EDataType>
+torch::Tensor
+{k.name}(
+    torch::Tensor &XQ,
+    torch::Tensor &WQ,
+    torch::Tensor &x_scale,
+    torch::Tensor &w_scale,
+    torch::Tensor &Y,
+    int KBatch
+    )
+{{
+    return gemm_a8w8_blockscale_slicek_impl<DDataType, EDataType,
+        {k.MRep}, {k.NRep}, {k.NWaves}, {k.Unroll}, {k.KSplit}>(
+        XQ, WQ, x_scale, w_scale, Y, KBatch);
+}}
+"""
+
+    def gen_legacy_impl(self, k: KernelInstance) -> str:
+        instance_params = f"""                    {k.BLOCK_SIZE},
+                    {k.ScaleBlockM}, {k.ScaleBlockN}, {k.ScaleBlockK},
+                    {k.MPerBLOCK}, {k.NPerBLOCK}, {k.KPerBLOCK},
+                    {k.AK1}, {k.BK1},
+                    {k.MPerXDL}, {k.NPerXDL},
+                    {k.WAVE_MAP_M}, {k.WAVE_MAP_N},
+                    S<{(", ").join(str(x) for x in k.ABLOCK_TRANSFER)}>,
+                    S<{(", ").join(str(x) for x in k.BBLOCK_TRANSFER)}>,
+                    {k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE},
+                    {k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE},
+                    S<{(", ").join(str(x) for x in k.CBLOCK_TRANSFER)}>,
+                    S<{(", ").join(str(x) for x in k.CBLOCK_SPV)}>,
+                    ck::BlockGemmPipelineScheduler::{k.PIPELINE_Sched},
+                    ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
+                    spec"""
+        # Mirrors minimum_occupancy in DeviceGemmMultiD_ABScale_Xdl_CShuffle_V3.
+        min_occupancy = (
+            1
+            if k.PIPELINE_Sched == "Intrawave"
+            and k.MPerBLOCK * k.NPerBLOCK // k.BLOCK_SIZE > 64
+            else 2
+        )
+
+        return f"""// SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "gemm_a8w8_blockscale_common.cuh"
@@ -94,23 +138,16 @@ torch::Tensor
     auto run_kernel = [&]<CKGemmSpec spec> [[clang::always_inline]] (std::integral_constant<CKGemmSpec, spec>) {{
         using LegacyGemmInstance = DeviceLegacyGemmHelperF8BlockScale<
                     DDataType, EDataType,
-                    {k.BLOCK_SIZE},
-                    {k.ScaleBlockM}, {k.ScaleBlockN}, {k.ScaleBlockK},
-                    {k.MPerBLOCK}, {k.NPerBLOCK}, {k.KPerBLOCK},
-                    {k.AK1}, {k.BK1},
-                    {k.MPerXDL}, {k.NPerXDL},
-                    {k.WAVE_MAP_M}, {k.WAVE_MAP_N},
-                    S<{(", ").join(str(x) for x in k.ABLOCK_TRANSFER)}>,
-                    S<{(", ").join(str(x) for x in k.BBLOCK_TRANSFER)}>,
-                    {k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE},
-                    {k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE},
-                    S<{(", ").join(str(x) for x in k.CBLOCK_TRANSFER)}>,
-                    S<{(", ").join(str(x) for x in k.CBLOCK_SPV)}>,
-                    ck::BlockGemmPipelineScheduler::{k.PIPELINE_Sched},
-                    ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
-                    spec>;
+{instance_params}>;
+        // The same kernel with FP32 output, for the deterministic split-K partials.
+        using PartialsGemmInstance = DeviceLegacyGemmHelperF8BlockScale<
+                    DDataType, FP32,
+{instance_params}>;
 
-        return gemm_a8w8_blockscale_impl<DDataType, EDataType, LegacyGemmInstance>(XQ, WQ, x_scale, w_scale, Y, KBatch);
+        return gemm_a8w8_blockscale_impl<DDataType, EDataType, LegacyGemmInstance,
+                    PartialsGemmInstance,
+                    ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
+                    {min_occupancy}, {k.KPerBLOCK}, {k.MPerBLOCK}, {k.NPerBLOCK}>(XQ, WQ, x_scale, w_scale, Y, KBatch);
     }};
 
     if(gemm_spec == GemmSpecialization::Default)
@@ -144,6 +181,15 @@ torch::Tensor
 }}
 """
 
+    def gen_ck_instance(self, k: KernelInstance | SliceKInstance):
+        """
+        Generate kernel instance code for ck gemm a8w8 blockscale
+        """
+        LEGACY_INSTANCE_IMPL = (
+            self.gen_slicek_impl(k)
+            if isinstance(k, SliceKInstance)
+            else self.gen_legacy_impl(k)
+        )
         Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(
             LEGACY_INSTANCE_IMPL
         )
