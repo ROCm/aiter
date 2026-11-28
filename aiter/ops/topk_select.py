@@ -10,7 +10,10 @@ none able to cover the whole domain:
              across as many workgroups as it takes to fill the part. Owns k=1,
              and is the only one to take bf16/fp16 as well as fp32.
     small_k  one chunk per lane, so k <= wave_size, and a survivor buffer that
-             grows with the row bound. Unbeatable on short rows and tiny k.
+             grows with the row bound. Unbeatable on short rows and tiny k. At
+             k=16 on gfx950 it is a one-wave-per-row build where that wins
+             (narrow rows, and wider ones as the row count grows; 1.2-2.8x on
+             prefill-shaped rows), which also keeps ties exactly.
     plain    the C++/ASM radix selector. Bounded at k=2048. Scales with rows
              better than anything else, so it owns the wide-M middle.
     decode   a grid-wide radix select: histogram, reduce, gather. Owns the very
@@ -25,8 +28,10 @@ silently. The differences are listed on `topk_select` itself.
 
 Ties: as in DeepSelect, no prefix index may be assumed by default. `plain` has
 no tie order at all (measured: 40 equal scores, 8 places, a set that is neither
-the lowest nor the highest); `small_k` resolves toward the larger column and
-`stream` toward the smaller, whether or not they were asked to. `decode` gives
+the lowest nor the highest); `small_k` resolves toward the larger column
+(exactly so for its one-wave build; its chunked build, other k and wider rows,
+may keep a different tied column at the k-th place) and `stream` toward the
+smaller, whether or not they were asked to. `decode` gives
 the smaller column only when asked, since that is a mode of its kernel and the
 mode costs up to 20%; `tie='low'` is the request. `tie=` also narrows the
 backend set to those that can promise a direction, which costs speed.
@@ -1240,6 +1245,19 @@ def topk_select(
             DeepSelect does, and lets every backend run. ``'low'`` and ``'high'``
             promise the smallest or largest column and restrict the backend set,
             which can cost up to 1.9x. Either implies ``deterministic``.
+
+            ``'high'`` is served by ``small_k``, but the column-aware tie-break
+            that actually returns the larger tied column lives only in its
+            one-wave k=16 build (gfx950, width <= 8192). For ``k != 16``, a
+            non-gfx950 part, or width > 8192, ``small_k`` falls through to its
+            chunked build, which keeps the right multiset of scores but drops
+            tied chunks by lane id, so the tied column it returns is not
+            guaranteed to be the largest. The selected *set* of scores is the
+            same either way; only which equal-scored column is kept can differ.
+            On those same one-wave shapes ``small_k`` also ranks NaN lowest (an
+            accepted divergence from the ``nan_high`` order the other backends
+            document): a NaN-scored entry is never pulled ahead of a valid one,
+            and is selected only when fewer than ``k`` valid entries exist.
         deterministic: the *set* of selected columns is a function of the row
             alone -- the same input selects the same columns on every call, and a
             row selects the same columns wherever it sits in the batch. The order
@@ -1500,7 +1518,11 @@ def _dispatch(
                 nan_high=True,
             )
     elif backend == "small_k":
-        topk_per_row_small_k(input, row_lens, idx, topk)
+        # `tie=` and `deterministic` promise a selection that is a function of the row alone: the
+        # one-wave build everywhere it serves, not only at the row counts where it is faster.
+        topk_per_row_small_k(
+            input, row_lens, idx, topk, exact=deterministic or tie is not None
+        )
     elif backend == "plain":
         # plain takes a [start, end) pair, not a length, and an empty
         # `rowStarts` with a real `rowEnds` reads as "no range" -- silently over
