@@ -297,6 +297,71 @@ def test_fused_add_rmsnorm(M, N, in_dtype_str):
     torch.testing.assert_close(dg_triton, dg_torch, rtol=rtol, atol=atol)
 
 
+@pytest.mark.parametrize("in_dtype_str", ["fp32", "bf16"])
+@pytest.mark.parametrize("M, N", [(4, 64), (33, 1000)])
+@pytest.mark.parametrize("strided", ["input", "residual_in", "residual_out"])
+def test_fused_add_rmsnorm_row_strides(M, N, in_dtype_str, strided):
+    # One tensor is a column slice of a wider buffer, so its row stride is 2 * N.
+    dtype = str_to_torch_dtype[in_dtype_str]
+    torch.manual_seed(0)
+
+    def make(name):
+        rows = torch.randn(
+            M, 2 * N if name == strided else N, dtype=dtype, device="cuda"
+        )
+        return rows[:, :N]
+
+    x, res_in = make("input"), make("residual_in")
+    weight = torch.randn(N, dtype=dtype, device="cuda")
+    res_out = make("residual_out")
+    out = torch.empty(M, N, dtype=dtype, device="cuda")
+    rmsnorm2d_fwd_with_add(out, x, res_in, res_out, weight, 1e-5)
+
+    y_torch, res_torch, *_ = run_torch(x, weight, 1e-5, residual=res_in)
+    torch.testing.assert_close(res_out, res_torch, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(out, y_torch, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("quant", ["smoothquant", "dynamicquant"])
+@pytest.mark.parametrize("in_dtype_str", ["fp32", "bf16"])
+@pytest.mark.parametrize("M, N", [(4, 64), (33, 1000), (2, 40000)])
+@pytest.mark.parametrize("strided", ["input", "residual_in", "residual_out"])
+def test_fused_add_rmsnorm_quant_row_strides(M, N, in_dtype_str, strided, quant):
+    # Same as test_fused_add_rmsnorm_row_strides, for the quantized kernel. N = 40000
+    # takes its blocked path.
+    dtype = str_to_torch_dtype[in_dtype_str]
+    torch.manual_seed(0)
+
+    def make(name):
+        rows = torch.randn(
+            M, 2 * N if name == strided else N, dtype=dtype, device="cuda"
+        )
+        return rows[:, :N]
+
+    x, res_in = make("input"), make("residual_in")
+    weight = torch.randn(N, dtype=dtype, device="cuda")
+    res_out = make("residual_out")
+    out = torch.empty(M, N, dtype=torch.int8, device="cuda")
+    y_scale = torch.empty(M, 1, dtype=torch.float32, device="cuda")
+    x_scale = None
+    if quant == "smoothquant":
+        x_scale = torch.randn(N, dtype=torch.float32, device="cuda")
+        rmsnorm2d_fwd_with_add_smoothquant(
+            out, x, res_in, res_out, x_scale, y_scale, weight, 1e-5
+        )
+    else:
+        rmsnorm2d_fwd_with_add_dynamicquant(
+            out, x, res_in, res_out, y_scale, weight, 1e-5
+        )
+
+    y_torch, res_torch, y_scale_torch, *_ = run_torch(
+        x, weight, 1e-5, residual=res_in, x_scale=x_scale, y_scale_dtype=torch.float32
+    )
+    torch.testing.assert_close(res_out, res_torch, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(out, y_torch, atol=1, rtol=0)
+    torch.testing.assert_close(y_scale, y_scale_torch, atol=1e-3, rtol=1e-3)
+
+
 @pytest.mark.parametrize("in_dtype_str", ["fp16", "bf16"])
 def test_fused_add_rmsnorm_gemma_norm(in_dtype_str):
     in_dtype = str_to_torch_dtype[in_dtype_str]

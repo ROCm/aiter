@@ -437,6 +437,8 @@ def _fused_add_rmsnorm_kernel(
     # how much to increase `input_ptr` by to get the element one row down.
     input_row_stride,
     output_row_stride,
+    res_in_row_stride,
+    res_out_row_stride,
     # Matrix dimensions
     n_rows,
     n_cols,
@@ -470,8 +472,8 @@ def _fused_add_rmsnorm_kernel(
         for row_idx in tl.range(row_start, n_rows, program_stride, num_stages=1):
             row_input_ptr = input_ptr + row_idx * input_row_stride
             row_output_ptr = output_ptr + row_idx * output_row_stride
-            row_res_in_ptr = res_in_ptr + row_idx * input_row_stride
-            row_res_out_ptr = res_out_ptr + row_idx * input_row_stride
+            row_res_in_ptr = res_in_ptr + row_idx * res_in_row_stride
+            row_res_out_ptr = res_out_ptr + row_idx * res_out_row_stride
 
             # Accumulate sum of squares
             n_cols_blks = tl.cdiv(n_cols, BLOCK_SIZE) - 1
@@ -547,12 +549,12 @@ def _fused_add_rmsnorm_kernel(
             input_ptrs = input_ptr + row_idx * input_row_stride + col_offsets
             input_ptrs = tl.multiple_of(input_ptrs, (16,))
             row = tl.load(input_ptrs, mask=mask, other=0.0, cache_modifier=".cg")
-            res_in_ptrs = res_in_ptr + row_idx * input_row_stride + col_offsets
+            res_in_ptrs = res_in_ptr + row_idx * res_in_row_stride + col_offsets
             res_in_ptrs = tl.multiple_of(res_in_ptrs, (16,))
             res_in = tl.load(res_in_ptrs, mask=mask, other=0.0, cache_modifier=".cg")
             row += res_in
             # Stores residual_out
-            res_out_ptrs = res_out_ptr + row_idx * input_row_stride + col_offsets
+            res_out_ptrs = res_out_ptr + row_idx * res_out_row_stride + col_offsets
             res_out_ptrs = tl.multiple_of(res_out_ptrs, (16,))
             tl.store(res_out_ptrs, row.to(res_out_ptr.type.element_ty), mask=mask)
             row = row.to(tl.float32)
@@ -601,6 +603,8 @@ def _quant_fused_add_rmsnorm_kernel(
     input_row_stride,
     output_row_stride,
     aux_row_stride,
+    res_in_row_stride,
+    res_out_row_stride,
     # Matrix dimensions
     n_rows,
     n_cols,
@@ -640,8 +644,8 @@ def _quant_fused_add_rmsnorm_kernel(
         for row_idx in tl.range(row_start, n_rows, program_stride, num_stages=1):
             row_input_ptr = input_ptr + row_idx * input_row_stride
             row_output_ptr = output_ptr + row_idx * output_row_stride
-            row_res_in_ptr = res_in_ptr + row_idx * input_row_stride
-            row_res_out_ptr = res_out_ptr + row_idx * input_row_stride
+            row_res_in_ptr = res_in_ptr + row_idx * res_in_row_stride
+            row_res_out_ptr = res_out_ptr + row_idx * res_out_row_stride
             row_aux_ptr = aux_ptr + row_idx * aux_row_stride
 
             # Accumulate sum of squares
@@ -773,12 +777,12 @@ def _quant_fused_add_rmsnorm_kernel(
             input_ptrs = input_ptr + row_idx * input_row_stride + col_offsets
             input_ptrs = tl.multiple_of(input_ptrs, (16,))
             row = tl.load(input_ptrs, mask=mask, other=0.0, cache_modifier=".cg")
-            res_in_ptrs = res_in_ptr + row_idx * input_row_stride + col_offsets
+            res_in_ptrs = res_in_ptr + row_idx * res_in_row_stride + col_offsets
             res_in_ptrs = tl.multiple_of(res_in_ptrs, (16,))
             res_in = tl.load(res_in_ptrs, mask=mask, other=0.0, cache_modifier=".cg")
             row += res_in
             # Stores residual_out
-            res_out_ptrs = res_out_ptr + row_idx * input_row_stride + col_offsets
+            res_out_ptrs = res_out_ptr + row_idx * res_out_row_stride + col_offsets
             res_out_ptrs = tl.multiple_of(res_out_ptrs, (16,))
             tl.store(res_out_ptrs, row.to(res_out_ptr.type.element_ty), mask=mask)
             row = row.to(tl.float32)

@@ -374,3 +374,73 @@ def test_layernorm_fused_add_dynamicquant(M, N, dtype_str, scale_dtype_str, eps=
     torch.testing.assert_close(y_triton, y_torch, atol=1, rtol=0)
     torch.testing.assert_close(res_triton, res_torch, atol=atol, rtol=rtol)
     torch.testing.assert_close(y_scale_triton, y_scale_torch, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("dtype_str", ["fp32", "bf16"])
+@pytest.mark.parametrize("M, N", [(4, 64), (33, 1000)])
+@pytest.mark.parametrize("strided", ["input", "residual_in", "residual_out"])
+def test_fused_add_layernorm_row_strides(M, N, dtype_str, strided, eps=1e-5):
+    # One tensor is a column slice of a wider buffer, so its row stride is 2 * N.
+    dtype = str_to_torch_dtype[dtype_str]
+    torch.manual_seed(0)
+
+    def make(name):
+        rows = torch.randn(
+            M, 2 * N if name == strided else N, dtype=dtype, device="cuda"
+        )
+        return rows[:, :N]
+
+    x, res_in = make("input"), make("residual_in")
+    w = torch.rand(N, dtype=dtype, device="cuda")
+    b = torch.rand(N, dtype=dtype, device="cuda")
+    res_out = make("residual_out")
+    out = torch.empty(M, N, dtype=dtype, device="cuda")
+    layernorm2d_fwd_with_add(out, x, res_in, res_out, w, b, eps)
+
+    y_torch, res_torch, *_ = run_torch(x, w, b, eps, residual=res_in)
+    torch.testing.assert_close(res_out, res_torch, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(out, y_torch, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("quant", ["smoothquant", "dynamicquant"])
+@pytest.mark.parametrize("dtype_str", ["fp32", "bf16"])
+@pytest.mark.parametrize("M, N", [(4, 64), (33, 1000), (2, 40000)])
+@pytest.mark.parametrize("strided", ["input", "residual_in", "residual_out"])
+def test_fused_add_layernorm_quant_row_strides(
+    M, N, dtype_str, strided, quant, eps=1e-5
+):
+    # Same as test_fused_add_layernorm_row_strides, for the quantized kernel. N = 40000
+    # takes its blocked path.
+    dtype = str_to_torch_dtype[dtype_str]
+    torch.manual_seed(0)
+
+    def make(name):
+        rows = torch.randn(
+            M, 2 * N if name == strided else N, dtype=dtype, device="cuda"
+        )
+        return rows[:, :N]
+
+    x, res_in = make("input"), make("residual_in")
+    w = torch.rand(N, dtype=dtype, device="cuda")
+    b = torch.rand(N, dtype=dtype, device="cuda")
+    res_out = make("residual_out")
+    out = torch.empty(M, N, dtype=torch.int8, device="cuda")
+    y_scale = torch.empty(M, 1, dtype=torch.float32, device="cuda")
+    x_scale = None
+    if quant == "smoothquant":
+        x_scale = torch.rand(N, dtype=torch.float32, device="cuda")
+        layernorm2d_fwd_with_add_smoothquant(
+            out, x, res_in, res_out, x_scale, y_scale, w, b, eps
+        )
+    else:
+        layernorm2d_fwd_with_add_dynamicquant(
+            out, x, res_in, res_out, y_scale, w, b, eps
+        )
+
+    y_torch, res_torch, y_scale_torch = run_torch(
+        x, w, b, eps, residual=res_in, x_scale=x_scale, y_scale_dtype=torch.float32
+    )
+    atol, rtol = (1e-5, 1e-5) if dtype == torch.float32 else (1e-2, 1e-2)
+    torch.testing.assert_close(res_out, res_torch, atol=atol, rtol=rtol)
+    torch.testing.assert_close(out, y_torch, atol=1, rtol=0)
+    torch.testing.assert_close(y_scale, y_scale_torch, atol=1e-3, rtol=1e-3)
