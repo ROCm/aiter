@@ -5,6 +5,11 @@ MULTIGPU=${MULTIGPU:-FALSE}
 SHARD_TOTAL=${SHARD_TOTAL:-5}
 SHARD_IDX=${SHARD_IDX:-0}
 export CLANG_TOOLCHAIN_PROGRAM_TIMEOUT="${CLANG_TOOLCHAIN_PROGRAM_TIMEOUT:-300}"
+# Files whose checkAllclose failures fail the test (see aiter/test_common.py).
+# Add a file once it has no failed! or warning! lines on MI300X and MI35X. A
+# clean log is necessary but not sufficient: a call with tol_err_ratio >= 1 or
+# printLog=False can never fail strict mode, so check the file for those too.
+export AITER_STRICT_ALLCLOSE="${AITER_STRICT_ALLCLOSE:-test_rmsnorm2d.py}"
 
 # FlyDSL AOT cache: re-trace every entry a test loads from disk and compare it
 # byte for byte with the cached object, so an input missing from a cache key
@@ -83,6 +88,17 @@ fi
 echo "Running ${sharded_files[@]} in shard $SHARD_IDX of $SHARD_TOTAL."
 echo "Using CLANG_TOOLCHAIN_PROGRAM_TIMEOUT=${CLANG_TOOLCHAIN_PROGRAM_TIMEOUT}" | tee -a latest_test.log
 echo "Using GPU_ARCHS=${GPU_ARCHS:-native}" | tee -a latest_test.log
+echo "Using AITER_STRICT_ALLCLOSE=${AITER_STRICT_ALLCLOSE}" | tee -a latest_test.log
+if [[ -n "$AITER_STRICT_ALLCLOSE" && "$AITER_STRICT_ALLCLOSE" != "1" ]]; then
+    IFS=',' read -r -a strict_names <<< "$AITER_STRICT_ALLCLOSE"
+    for name in "${strict_names[@]}"; do
+        name=$(basename "$(echo "$name" | xargs)")
+        [[ -z "$name" ]] && continue
+        if [[ -z "$(find op_tests tests -type f -name "$name" -print -quit)" ]]; then
+            echo "WARNING: AITER_STRICT_ALLCLOSE entry '$name' matches no test file" | tee -a latest_test.log
+        fi
+    done
+fi
 
 for file in "${sharded_files[@]}"; do
     # Print a clear separator and test file name for readability
@@ -294,6 +310,9 @@ for file in "${sharded_files[@]}"; do
         : > full_matrix.log
         tee_targets+=("full_matrix.log")
     fi
+    # Under pytest or torchrun, argv[0] is not the test file, so name it here
+    # for AITER_STRICT_ALLCLOSE.
+    export AITER_TEST_FILE="$file"
     # Capture start time (nanoseconds since epoch)
     start_time_ns=$(date +%s%N)
     if ! "${test_cmd[@]}" 2>&1 | tee -a "${tee_targets[@]}"; then
@@ -337,6 +356,7 @@ for f in "${sharded_files[@]}"; do
     fi
 done
 if [[ "$mla_in_shard" == "true" && "$MULTIGPU" != "TRUE" ]]; then
+    export AITER_TEST_FILE="op_tests/test_mla.py"
     for args in \
         "-c 49152 -b 1 -n 16,1 -kvd bf16" \
         "-c 98304 -b 1 -n 16,1 -kvd fp8" \

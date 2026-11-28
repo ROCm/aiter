@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+import atexit
 import copy
 import multiprocessing as mp
 import os
+import sys
 from functools import wraps
 
 import numpy as np
@@ -450,6 +452,75 @@ def get_trace_perf(prof, num_iters, warm_iter=1):
 
 _CATASTROPHIC_REL_THRESHOLD = 0.5
 
+_STRICT_ALLCLOSE_ENV = "AITER_STRICT_ALLCLOSE"
+
+
+def _strict_allclose_default():
+    """Per-file opt-in that turns ``checkAllclose`` verdicts into test failures.
+
+    The variable holds a comma-separated list of test file names, so a file can
+    be gated as soon as its tolerances are known to be right, without waiting
+    for the rest of the suite. ``1`` enables every file at once, which is useful
+    for surveying but not for gating: on a recent green run that would have
+    turned 13 of 17 shards red, and 79% of what it raised was in files whose own
+    accuracy criterion had already passed.
+
+    The file under test comes from ``AITER_TEST_FILE``, which the CI runner
+    exports for each file, because under ``python3 -m pytest`` or torchrun
+    argv[0] is not the test file. Without it (a test run by hand as
+    ``python3 op_tests/test_x.py``), argv[0] is used.
+
+    Read at call time rather than import time so a single test can set it.
+    """
+    value = os.environ.get(_STRICT_ALLCLOSE_ENV, "").strip()
+    if not value:
+        return False
+    if value == "1":
+        return True
+    current = os.path.basename(os.environ.get("AITER_TEST_FILE") or sys.argv[0])
+    return any(
+        current == os.path.basename(name.strip())
+        for name in value.split(",")
+        if name.strip()
+    )
+
+
+_strict_failures = []
+
+
+def _record_strict_failure(message):
+    """Log a strict failure now and fail the process once, at exit.
+
+    Raising at the first mismatch would skip the rest of a file that loops over
+    shapes and dtypes: CI would report one failure per run, the test's own
+    summary table would never print, and a survey of how much fails today would
+    undercount. Collecting instead means one run shows everything.
+
+    An explicit ``strict=True`` at a call site still raises immediately -- that
+    is an assertion the test author wrote, and it should behave like one.
+    """
+    logger.error(f"[strict] {message}")
+    _strict_failures.append(message)
+
+
+@atexit.register
+def _fail_on_recorded_strict_failures():
+    """Turn collected strict failures into a non-zero exit.
+
+    ``sys.exit`` and ``raise SystemExit`` do not work here: inside an atexit
+    handler both leave the exit code at 0. ``os._exit`` is the only thing that
+    sets it, and it skips buffer flushing, so flush first.
+    """
+    if not _strict_failures:
+        return
+    total = len(_strict_failures)
+    logger.error(f"[strict] {total} comparison(s) failed:")
+    for message in _strict_failures:
+        logger.error(f"[strict]   {message}")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(1)
+
 
 def _relmag_catastrophic(actual_max_delta, b):
     """Relative-magnitude catastrophic heuristic.
@@ -476,6 +547,18 @@ def _relmag_catastrophic(actual_max_delta, b):
     return actual_max_delta > ref_abs_max * _CATASTROPHIC_REL_THRESHOLD
 
 
+def _nonfinite_mask(a, b, mask=None):
+    """True where either operand is NaN or Inf, optionally only where ``mask``
+    (bool, True = compared) selects the element.
+
+    ``torch.isfinite`` is safe on integer / byte tensors (returns all True).
+    Detection only: what to do about it (the catastrophic verdict, or strict
+    mode's immediate-vs-deferred failure) is the caller's decision.
+    """
+    bad = ~(torch.isfinite(a) & torch.isfinite(b))
+    return bad if mask is None else bad & mask
+
+
 def _check_catastrophic(actual_max_delta, a, b, max_abs_delta, catastrophic_check):
     """Decide whether a checkAllclose mismatch is "catastrophic" (fail-fast).
 
@@ -498,7 +581,7 @@ def _check_catastrophic(actual_max_delta, a, b, max_abs_delta, catastrophic_chec
     if max_abs_delta is not None:
         return actual_max_delta > max_abs_delta
     if catastrophic_check:
-        if not torch.isfinite(a).all() or not torch.isfinite(b).all():
+        if _nonfinite_mask(a, b).any():
             return True
         return _relmag_catastrophic(actual_max_delta, b)
     return False
@@ -511,7 +594,7 @@ def _catastrophic_check_silent(a, b, max_abs_delta, catastrophic_check):
     if max_abs_delta is not None:
         return (a - b).abs().max().item() > max_abs_delta
     if catastrophic_check:
-        if not torch.isfinite(a).all() or not torch.isfinite(b).all():
+        if _nonfinite_mask(a, b).any():
             return True
         return _relmag_catastrophic((a - b).abs().max().item(), b)
     return False
@@ -529,7 +612,40 @@ def checkAllclose(
     max_abs_delta=None,
     catastrophic_check=False,
     mask=None,
+    strict=None,
 ):
+    """``strict`` raises on the same mismatch this function already reports as
+    ``failed!``, instead of only logging it. ``None`` defers to
+    ``AITER_STRICT_ALLCLOSE``.
+
+    With ``printLog=False`` -- the tuner's ranking path, which needs the ratio
+    back rather than an exception -- the mismatch raise does not happen, for an
+    explicit ``strict=True`` as much as for the environment default. The
+    non-finite rejection below does still apply there, because it runs before
+    that early return.
+
+    Strict mode also rejects NaN and Inf regardless of ``tol_err_ratio``.
+    Neither is reliably visible to a ratio gate: on a 524,288-element MoE
+    output, 5% of the tensor can be NaN and still sit inside the default 0.05
+    allowance, and matching Infs compare equal under ``torch.isclose`` so they
+    produce no mismatch to count in the first place.
+
+    An explicit ``strict=True`` raises at the call site. The environment opt-in
+    instead collects failures and fails the process at exit, so a file that
+    loops over shapes reports all of them in one run rather than stopping at
+    the first.
+    """
+    # An explicit argument is an assertion the test author wrote, so it raises
+    # where it stands. The environment opt-in defers; see _record_strict_failure.
+    strict_raises = strict is not None
+    if strict is None:
+        strict = printLog and _strict_allclose_default()
+
+    def _strict_fail(message):
+        if strict_raises:
+            raise AssertionError(message)
+        _record_strict_failure(message)
+
     isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
     # mask (bool, broadcastable to a/b): True = compare, False = ignore.
     # Error ratio is taken over the checked elements only.
@@ -548,6 +664,16 @@ def checkAllclose(
             return 0
     else:
         denom = a.numel()
+
+    # Checked before the all-close branch: torch.isclose(inf, inf) is True, so a
+    # tensor of matching Infs never reaches the mismatch path at all.
+    if strict:
+        nonfinite = _nonfinite_mask(a, b, mask)
+        if nonfinite.any():
+            _strict_fail(
+                f"{msg}non-finite values in the comparison "
+                f"({int(nonfinite.sum().item())} of {denom} elements)"
+            )
 
     if isClose.all():
         if printLog:
@@ -625,6 +751,11 @@ def checkAllclose(
             raise AssertionError(
                 f"{msg}catastrophic error: max abs delta {actual_max_delta:.4f}, "
                 f"{percent:.1%} ({num} of {denom}) elements mismatch"
+            )
+        if strict and percent > tol_err_ratio:
+            _strict_fail(
+                f"{msg}{percent:.1%} ({num} of {denom}) elements exceed "
+                f"{atol=} {rtol=}, max abs delta {actual_max_delta:.4f}"
             )
         return percent
 
