@@ -988,6 +988,48 @@ def mla_decode_prepare_page_csr(
     return kv_indptr, kv_indices, kv_last_page_lens
 
 
+def _k3_verify_hk_applies(
+    q,
+    kv_buffer,
+    o,
+    max_seqlen_q,
+    page_size,
+    nhead_kv,
+    logit_cap,
+    q_scale,
+    causal,
+    return_lse,
+    return_logits,
+    cp_world_size,
+    kv_layout,
+    kv_csr_layout,
+) -> bool:
+    """Whether mla_decode_fwd routes this call to the gfx950 HipKittens verify
+    kernel: bf16 q [batch * 8, 12, 576], FP8 e4m3 KV, page size 1, causal, no
+    LSE / logits outputs."""
+    from aiter.mla_verify import mla_verify_hk_supported
+
+    return (
+        q.dim() == 3
+        and q.dtype == dtypes.bf16
+        and q_scale is None
+        and q.shape[-1] == 576
+        and o.shape[-1] == 512
+        and q.shape[0] % 8 == 0
+        and nhead_kv == 1
+        and logit_cap == 0.0
+        and causal
+        and not return_lse
+        and not return_logits
+        and cp_world_size == 1
+        and kv_layout == "token_major"
+        and kv_csr_layout == "page"
+        and mla_verify_hk_supported(
+            q.shape[1], max_seqlen_q, kv_buffer.dtype, page_size
+        )
+    )
+
+
 # Routed on the public entry point: it is the op's one spelling, it takes no
 # backend pin, and `@compile_ops` sits on the asm bindings beneath it. The
 # contract is the whole signature, schedule metadata included: a provider with
@@ -1099,6 +1141,37 @@ def mla_decode_fwd(
     ``[total_q, nhead]`` when ``return_lse`` is set; without it the second
     element is unspecified (None or scratch).
     """
+    if _k3_verify_hk_applies(
+        q,
+        kv_buffer,
+        o,
+        max_seqlen_q,
+        page_size,
+        nhead_kv,
+        logit_cap,
+        q_scale,
+        causal,
+        return_lse,
+        return_logits,
+        cp_world_size,
+        kv_layout,
+        kv_csr_layout,
+    ):
+        # gfx950 K3 target verify: the HipKittens verify kernel (HK backend).
+        from aiter.mla_verify import mla_verify_hk
+
+        if kv_scale is None:
+            kv_scale = torch.ones(1, dtype=dtypes.fp32, device=q.device)
+        mla_verify_hk(
+            q,
+            kv_buffer,
+            kv_indptr,
+            kv_indices,
+            sm_scale if sm_scale is not None else q.shape[-1] ** -0.5,
+            kv_scale.reshape(1),
+            out=o,
+        )
+        return None, None
     if kv_layout == "nvfp4_n128":
         from aiter.ops.mla_nvfp4 import mla_decode_nvfp4_fwd
 
