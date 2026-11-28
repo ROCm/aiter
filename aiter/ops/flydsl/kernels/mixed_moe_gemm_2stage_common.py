@@ -426,7 +426,6 @@ def compile_mixed_moe_gemm1_common(
     pp_b_loads = [p["b_loads"] for p in pipe_phases]
     pp_has_scale = [p["has_scale"] for p in pipe_phases]
 
-    fp4_ratio = 2 if a_dtype == "fp4" else 1
     gui_ratio = 1 if gate_up_interleave else 2
 
     if True:
@@ -661,10 +660,12 @@ def compile_mixed_moe_gemm1_common(
                 body_lds_x_ping = lds_x_ping
                 body_b_has_full_operand = is_f8_b or shared_b
                 body_b_load_mult = 2 if body_b_has_full_operand else 1
-                body_vmcnt_before_barrier = (
-                    tile_m // 32 // fp4_ratio
-                    + tile_n // 32 * gui_ratio * body_b_load_mult
-                )
+                # Leave only the previous half's B loads in flight. B loads are
+                # issued in phases >= 1, behind sched_barrier(0), so they are
+                # always younger than the A LDS-DMA. The scale loads share the
+                # DMA's scheduling region and LLVM may place them between the
+                # A DMAs, so counting them in vmcnt can leave a DMA in flight.
+                body_vmcnt_before_barrier = tile_n // 32 * gui_ratio * body_b_load_mult
                 expert_off_idx = expert_idx * (2 * inter_dim)
                 if const_expr(shared_b):
                     weight_expert_off_idx = fx.Index(0)
