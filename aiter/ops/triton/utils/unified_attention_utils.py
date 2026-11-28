@@ -73,6 +73,8 @@ _AXIS_KIND = {
     "BS": "num",  # block_size, the KV page size
     "SW": "opt_num",  # keys a row can see, 0 when off; bare SW = any window
     "SKLT": "bool",  # max_seqlen_k < 2048
+    "QQB": "bool",  # qq_bias given without a sliding window (tree verify)
+    "QP": "num",  # qblock_programs: 2d programs of a uniform-query batch at BLOCK_M 16
     "SHUF": "bool",  # shuffled_kv_cache
     "DT": "enum",  # (q dtype tag, K cache dtype tag[, V cache dtype tag when it differs])
     # 2d programs per CU, rounded up to a power of 2, so P bounds must be powers of 2
@@ -83,6 +85,16 @@ _AXIS_KIND = {
     "SIMPLE": "bool",  # single-sequence, plain causal MHA prefill
     "EQ": "bool",  # equal query and KV lengths
 }
+
+
+def qblock_programs(params) -> int:
+    block_m = max(16, triton.next_power_of_2(params.num_queries_per_kv))
+    block_q = block_m // params.num_queries_per_kv
+    return (
+        params.num_seqs
+        * triton.cdiv(params.max_seqlen_q, block_q)
+        * params.num_kv_heads
+    )
 
 
 def get_dtype_str(dtype: torch.dtype) -> str:
@@ -282,6 +294,8 @@ def _axis_values(
         "BS": block_size,
         "SW": max(1, min(sliding_window, max_seqlen_k)) if sliding_window > 0 else 0,
         "SKLT": max_seqlen_k < 2048,
+        "QQB": False,
+        "QP": 0,
         "SHUF": shuffled_kv_cache,
         "DT": (get_dtype_str(q_dtype), get_dtype_str(kv_dtype))
         + ((get_dtype_str(v_dtype),) if v_dtype is not None else ()),
@@ -333,6 +347,12 @@ def _prefill_axes(params) -> tuple:
         ("SIMPLE", simple),
         ("EQ", params.max_seqlen_q == params.max_seqlen_k),
     )
+
+
+def _qq_bias_axes(params) -> tuple:
+    if not getattr(params, "use_qq_bias", False) or params.sliding_window > 0:
+        return ()
+    return (("QQB", True), ("QP", qblock_programs(params)))
 
 
 def _programs_per_cu(params) -> int:
@@ -441,7 +461,8 @@ def get_unified_attention_config(
         v_cache_dtype=getattr(params, "v_cache_dtype", None),
         extra_axes=(
             _prefill_axes(params) if op == "attn_2d" and backend == "gluon" else ()
-        ),
+        )
+        + _qq_bias_axes(params),
     )
     # NUM_SEGMENTS is derived out here rather than in the cached lookup: it
     # reads the launch's program count, which is not part of the cache key.
@@ -465,7 +486,8 @@ def explain(op: str, params, backend: str = "triton", arch: str | None = None) -
         v_dtype=getattr(params, "v_cache_dtype", None),
         extra_axes=(
             _prefill_axes(params) if op == "attn_2d" and backend == "gluon" else ()
-        ),
+        )
+        + _qq_bias_axes(params),
     )
     key, config = _lookup(table, axes, values)
     derived = compute_segment_params(

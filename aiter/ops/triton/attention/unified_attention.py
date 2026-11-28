@@ -23,6 +23,7 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.ops.triton.utils.unified_attention_utils import (
     get_dtype_str,
     get_unified_attention_config,
+    qblock_programs,
 )
 
 # gfx1250
@@ -234,6 +235,7 @@ def gfx950_gluon_supported(
     softcap: float = 0.0,
     use_alibi_slopes: bool = False,
     use_qq_bias: bool = False,
+    sliding_window: int = 0,
 ) -> bool:
     """Return True if `unified_attention` runs these arguments on the gfx950 Gluon kernel.
 
@@ -248,7 +250,9 @@ def gfx950_gluon_supported(
             shuffled_kv_cache is True.
         softcap (float): Softcap of the call. The Gluon kernel supports only 0.
         use_alibi_slopes (bool): True if the call gives alibi_slopes.
-        use_qq_bias (bool): True if the call gives qq_bias.
+        use_qq_bias (bool): True if the call gives qq_bias. Admitted for a bf16 q and KV
+            cache without a sliding window or shuffled KV cache.
+        sliding_window (int): Keys a row can see, 1 + window_size[0]; 0 or less when off.
 
     Returns:
         bool: True if the gfx950 Gluon kernel supports the call.
@@ -266,7 +270,15 @@ def gfx950_gluon_supported(
         and _unified_attention_kernel_gfx950 is not None
         # softcap hits an AMDGPU backend assert (GCNRewritePartialRegUses) on Triton 3.8
         and not softcap
-        and not use_qq_bias
+        and (
+            not use_qq_bias
+            or (
+                q_dtype == torch.bfloat16
+                and kv_cache_dtype == q_dtype
+                and not shuffled_kv_cache
+                and sliding_window <= 0
+            )
+        )
         and not use_alibi_slopes
         and head_size <= 256
         and triton.next_power_of_2(head_size) == head_size
@@ -289,6 +301,7 @@ def _gfx950_gluon_supported(params: _UAParams):
         softcap=params.softcap,
         use_alibi_slopes=params.use_alibi_slopes,
         use_qq_bias=params.use_qq_bias,
+        sliding_window=params.sliding_window,
     )
 
 
@@ -455,6 +468,17 @@ def use_2d_kernel(params: _UAParams, backend: str = "triton"):
     if params.head_size >= 512 and not get_arch().is_rdna and not params.all_decode:
         return True
 
+    if (
+        params.use_qq_bias
+        and DEVICE_ARCH == "gfx950"
+        and params.head_size >= 128
+        and params.max_seqlen_q >= 2
+        and (params.max_seqlen_q >= 3 or params.head_size >= 256)
+        and params.max_seqlen_q <= 32
+        and qblock_programs(params) >= params.target_num_prgms // 2
+    ):
+        return True
+
     gate = params.target_num_prgms
     if DEVICE_ARCH == "gfx1100":
         # On gfx1100 the 3D split-KV kernel only pays off while the 2D launch
@@ -533,6 +557,12 @@ def unified_attention(
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
     SLIDING_WINDOW = 1 + window_size[0]
+
+    if use_qq_bias and qq_bias.ndim == 3:
+        assert qq_bias.shape[0] >= len(seqused_k), "3-D qq_bias needs one slab per seq"
+        assert qq_bias.shape[-1] >= max_seqlen_q and qq_bias.stride(-1) == 1
+        assert qq_bias.shape[-2] >= max_seqlen_q, "3-D qq_bias needs max_seqlen_q rows"
+        assert qq_bias.stride(-2) == qq_bias.shape[-1], "3-D qq_bias rows must be dense"
 
     q_dtype = q.dtype
     kv_cache_dtype = k.dtype
@@ -814,6 +844,7 @@ def unified_attention(
                 segm_expsum,
                 NUM_SEGMENTS,
                 TILE_SIZE,
+                config.get("UNMASKED_SPLIT_MIN_TILES"),
             )
 
         if NUM_SEGMENTS == 1:
@@ -965,6 +996,7 @@ def is_3d_gluon_available(params: _UAParams, backend: str):
         use_gluon_arch = (
             _unified_attention_kernel_3d_gfx1250 is not None
             and params.shuffled_kv_cache
+            and (not params.use_qq_bias or params.qq_bias.ndim == 2)
         )
     elif DEVICE_ARCH == "gfx950":
         use_gluon_arch = _gfx950_gluon_supported(params)
@@ -1021,6 +1053,12 @@ def _reject_nvfp4_kv_on_triton(params: _UAParams):
         )
 
 
+def _qq_bias_stride_batch(params: _UAParams):
+    if params.use_qq_bias and params.qq_bias.ndim == 3:
+        return params.qq_bias.stride(0)
+    return 0
+
+
 def _unified_attention_2d_triton(params: _UAParams):
     _reject_nvfp4_kv_on_triton(params)
     if params.shuffled_kv_cache and (
@@ -1071,7 +1109,8 @@ def _unified_attention_2d_triton(params: _UAParams):
         query_stride_1=params.q.stride(1),
         output_stride_0=params.out.stride(0),
         output_stride_1=params.out.stride(1),
-        qq_bias_stride_0=params.qq_bias.stride(0) if params.use_qq_bias else 0,
+        qq_bias_stride_0=params.qq_bias.stride(-2) if params.use_qq_bias else 0,
+        qq_bias_stride_batch=_qq_bias_stride_batch(params),
         BLOCK_SIZE=params.block_size,
         HEAD_SIZE=params.head_size,
         HEAD_SIZE_PADDED=triton.next_power_of_2(params.head_size),
@@ -1107,6 +1146,7 @@ def _unified_attention_3d_triton(
     segm_expsum,
     NUM_SEGMENTS,
     TILE_SIZE,
+    split_min_tiles,
 ):
     _reject_nvfp4_kv_on_triton(params)
     config = get_unified_attention_config("attn_3d", params, backend="triton")
@@ -1115,6 +1155,14 @@ def _unified_attention_3d_triton(
     )
     config["BLOCK_Q"] = config["BLOCK_M"] // params.num_queries_per_kv
     assert config["BLOCK_Q"] >= 1
+    if (
+        params.use_qq_bias
+        and not (params.shuffled_kv_cache or params.sliding_window > 0)
+        and split_min_tiles is not None
+        and triton.cdiv(params.max_seqlen_k, NUM_SEGMENTS * TILE_SIZE)
+        >= split_min_tiles
+    ):
+        config.setdefault("SPLIT_UNMASKED_LOOP", True)
 
     if params.all_decode:
         total_num_q_blocks = params.num_seqs
@@ -1150,7 +1198,8 @@ def _unified_attention_3d_triton(
         block_table_stride=params.block_table.stride(0),
         query_stride_0=params.q.stride(0),
         query_stride_1=params.q.stride(1),
-        qq_bias_stride_0=params.qq_bias.stride(0) if params.use_qq_bias else 0,
+        qq_bias_stride_0=params.qq_bias.stride(-2) if params.use_qq_bias else 0,
+        qq_bias_stride_batch=_qq_bias_stride_batch(params),
         BLOCK_SIZE=params.block_size,
         HEAD_SIZE=params.head_size,
         HEAD_SIZE_PADDED=triton.next_power_of_2(params.head_size),
@@ -1769,6 +1818,10 @@ def _unified_attention_gfx950(
         partial_m_ptr=partial_m,
         partial_l_ptr=partial_l,
         partial_acc_ptr=partial_acc,
+        qq_bias_ptr=params.qq_bias,
+        qq_bias_stride_0=params.qq_bias.stride(-2) if params.use_qq_bias else 0,
+        qq_bias_stride_batch=_qq_bias_stride_batch(params),
+        USE_QQ_BIAS=params.use_qq_bias,
         enable_fp_fusion=True,
     )
 

@@ -1314,6 +1314,7 @@ class AttentionProgram:
         output_stride_1,
         split_idx=0,
         NUM_SPLITS: gl.constexpr = 1,
+        USE_QQ_BIAS: gl.constexpr = False,
     ):
         num_tiles = (max_seq_prefix_len + cfg.TILE_SIZE - 1) // cfg.TILE_SIZE
         tile_start = 0
@@ -1339,8 +1340,11 @@ class AttentionProgram:
 
             context_len_q_pos_qk = context_len + query_pos_qk
 
-            min_causal_pos = context_len + q_block_local_idx * cfg.BLOCK_Q
-            safe_tile_end = (min_causal_pos + 1) // cfg.TILE_SIZE
+            if USE_QQ_BIAS:
+                safe_tile_end = context_len // cfg.TILE_SIZE
+            else:
+                min_causal_pos = context_len + q_block_local_idx * cfg.BLOCK_Q
+                safe_tile_end = (min_causal_pos + 1) // cfg.TILE_SIZE
 
         else:
             context_len_q_pos_qk = max_seq_prefix_len - 1
@@ -1639,8 +1643,76 @@ class AttentionProgram:
         gl.store(partial_l_ptr + ml_offs, L, mask=row_mask)
 
 
+@aggregate
+@strip_annotate
+class QQBias:
+    cfg: AttentionConfig
+    qq_bias_ptr: gl.tensor
+    block_offset: gl.tensor
+    row_stride: gl.tensor
+    rows_left: gl.tensor
+    context_len: gl.tensor
+    scale: gl.tensor
+
+    @gluon.constexpr_function
+    def __init__(
+        self, cfg, qq_bias_ptr, block_offset, row_stride, rows_left, context_len, scale
+    ):
+        self.cfg = cfg
+        self.qq_bias_ptr = qq_bias_ptr
+        self.block_offset = block_offset
+        self.row_stride = row_stride
+        self.rows_left = rows_left
+        self.context_len = context_len
+        self.scale = scale
+
+    @gluon.jit
+    def initialize(
+        cfg,
+        qq_bias_ptr,
+        qq_bias_stride_0,
+        qq_bias_stride_batch,
+        seq_idx,
+        q_block_local_idx,
+        cur_batch_query_len,
+        context_len,
+        SM_scale,
+    ):
+        first_row = q_block_local_idx * cfg.BLOCK_Q
+        return QQBias(
+            cfg,
+            qq_bias_ptr,
+            seq_idx * qq_bias_stride_batch + first_row * qq_bias_stride_0,
+            qq_bias_stride_0,
+            cur_batch_query_len - first_row,
+            context_len,
+            cfg.RCP_LN2 / SM_scale,
+        )
+
+    @gluon.jit
+    def load(self, j):
+        layout: gl.constexpr = self.cfg.qk_layout
+        rows = (
+            gl.arange(0, self.cfg.BLOCK_M, layout=gl.SliceLayout(1, layout))
+            // self.cfg.NUM_QUERIES_PER_KV
+        )
+        key = (
+            j * self.cfg.TILE_SIZE
+            + gl.arange(0, self.cfg.TILE_SIZE, layout=gl.SliceLayout(0, layout))
+            - self.context_len
+        )
+        is_query_key = (key >= 0) & (key < self.row_stride)
+        bias = gl.amd.cdna4.buffer_load(
+            ptr=self.qq_bias_ptr,
+            offsets=self.block_offset + rows[:, None] * self.row_stride + key[None, :],
+            mask=(rows < self.rows_left)[:, None] & is_query_key[None, :],
+            other=0.0,
+        )
+        return bias * self.scale
+
+
 @gluon.jit
-def attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc):
+def attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc, bias=None):
     # One shared buffer, and every warp reads the whole tile because operand B is
     # replicated across warps
     # barriers are needed for correctness but I expect compiler to insert them automatically.
@@ -1680,6 +1752,8 @@ def attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc):
             )
             S = pgm.compute_qk(k)
             S = pgm.apply_mask_qk(S, j)
+            if bias is not None:
+                S = S + bias.load(j)
             S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
             p, alpha, M = pgm.softmax_part0(S, M)
             p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=q.dtype)
@@ -1703,6 +1777,8 @@ def attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc):
     )
     S = pgm.compute_qk(k)
     S = pgm.apply_mask_qk(S, j)
+    if bias is not None:
+        S = S + bias.load(j)
     S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
     p, alpha, M = pgm.softmax_part0(S, M)
     p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=q.dtype)
@@ -1716,7 +1792,7 @@ def attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc):
 
 
 @gluon.jit
-def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
+def attention_loop_standard(pgm, kv_loader, q, M, L, acc, bias=None):
     """Double-buffered attention loop, safe/masked tile split.
 
     Per iter:
@@ -1801,6 +1877,8 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
 
             S = pgm.compute_qk(k)
             S = pgm.apply_mask_qk(S, j)
+            if bias is not None:
+                S = S + bias.load(j)
             S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
             p, alpha, M = pgm.softmax_part0(S, M)
             p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
@@ -1833,6 +1911,8 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
     )
     S = pgm.compute_qk(k)
     S = pgm.apply_mask_qk(S, pgm.tile_end - 1)
+    if bias is not None:
+        S = S + bias.load(pgm.tile_end - 1)
     S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
     p, alpha, M = pgm.softmax_part0(S, M)
     p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
@@ -1874,7 +1954,7 @@ def find_seq_idx(
     return left - 1
 
 
-@gluon.jit(do_not_specialize=["num_blocks"])
+@gluon.jit(do_not_specialize=["num_blocks", "qq_bias_stride_0"])
 def _unified_attention_gluon_kernel(
     query_ptr,  # [num_tokens, num_query_heads, head_size]
     key_cache_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
@@ -1935,8 +2015,13 @@ def _unified_attention_gluon_kernel(
     PRELOAD_PAGES: gl.constexpr = 0,
     PRELOAD_TABLE_STRIDE: gl.constexpr = 0,
     USE_EXPLICIT_FMA: gl.constexpr = False,
+    qq_bias_ptr=None,
+    qq_bias_stride_0=0,
+    qq_bias_stride_batch=0,
+    USE_QQ_BIAS: gl.constexpr = False,
 ):
     NUM_WARPS: gl.constexpr = gl.num_warps()
+    gl.static_assert(CAUSAL or not USE_QQ_BIAS, "USE_QQ_BIAS requires CAUSAL")
     if ALL_DECODE:
         q_block_global_idx = gl.num_programs(0) - 1 - gl.program_id(0)
         kv_head_idx = gl.program_id(1)
@@ -2082,7 +2167,22 @@ def _unified_attention_gluon_kernel(
         output_stride_1,
         split_idx,
         NUM_SPLITS,
+        USE_QQ_BIAS,
     )
+
+    bias = None
+    if USE_QQ_BIAS:
+        bias = QQBias.initialize(
+            cfg,
+            qq_bias_ptr,
+            qq_bias_stride_0,
+            qq_bias_stride_batch,
+            seq_idx,
+            q_block_local_idx,
+            cur_batch_query_len,
+            context_len,
+            pgm.SM_scale,
+        )
 
     if NUM_SPLITS > 1 and pgm.tile_start >= pgm.tile_end:
         # past this block's causal or window edge, but reduce_segments still
@@ -2189,9 +2289,9 @@ def _unified_attention_gluon_kernel(
     )
     acc = gl.zeros([BLOCK_M, HEAD_SIZE], dtype=gl.float32, layout=cfg.pv_layout)
     if NUM_BUFFERS == 1:
-        M, L, acc = attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc)
+        M, L, acc = attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc, bias)
     else:
-        M, L, acc = attention_loop_standard(pgm, kv_loader, q, M, L, acc)
+        M, L, acc = attention_loop_standard(pgm, kv_loader, q, M, L, acc, bias)
 
     if NUM_SPLITS > 1:
         pgm.store_partial(

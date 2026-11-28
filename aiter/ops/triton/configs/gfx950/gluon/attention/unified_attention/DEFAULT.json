@@ -21,6 +21,7 @@
       "DT"
     ],
     "kv_split": [
+      "QQB",
       "SW",
       "D",
       "Q",
@@ -306,6 +307,18 @@
       "SEGMENT_TILE_MAX": 64,
       "TILE_SIZE_MIN": 64,
       "TILE_SIZE_MAX": 64
+    },
+    "QQB.Q_RANGE_2_32": {
+      "SEGMENTS_PER_CU": 4,
+      "MFMA_DIM": 16,
+      "MIN_SEGMENTS": 1,
+      "SPLIT_MIN_TILES": 4,
+      "SPLIT_MIN_SHARE": 2,
+      "SEGMENT_TILE_MIN": 64,
+      "SEGMENT_TILE_MAX": 64,
+      "TILE_SIZE_MIN": 64,
+      "TILE_SIZE_MAX": 64,
+      "MAX_SEGMENTS": 128
     },
     "SW": {
       "SEGMENTS_PER_CU": 2,

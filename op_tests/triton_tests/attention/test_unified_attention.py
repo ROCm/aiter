@@ -29,6 +29,7 @@ from op_tests.triton_tests.quant.test_quant_mxfp4 import (
 )
 from op_tests.triton_tests.utils.test_common_utils import (
     assert_no_gpu_memory_fault,
+    is_gpu_memory_fault,
     run_in_subprocess,
 )
 
@@ -644,6 +645,7 @@ def test_triton_unified_attn(
             softcap=soft_cap,
             use_qq_bias=False,
             use_alibi_slopes=False,
+            sliding_window=0,
             head_size=head_size,
             head_size_v=head_size,
             shuffled_kv_cache=shuffled_kv_cache,
@@ -2661,3 +2663,341 @@ def test_unified_attn_split_rebalance_reduce_configs_k4v8(
     )
     assert not new[live].isnan().any()
     assert torch.equal(old[live].view(torch.int16), new[live].view(torch.int16))
+
+
+def _random_tree(num_nodes, gen):
+    parent = [-1]
+    for i in range(1, num_nodes):
+        p = int(torch.randint(0, i, (1,), generator=gen))
+        parent.append(p)
+    mask = torch.zeros(num_nodes, num_nodes, dtype=torch.bool)
+    for q in range(num_nodes):
+        k = q
+        while k != -1:
+            mask[q, k] = True
+            k = parent[k]
+    return mask
+
+
+def _tree_case(
+    ctxs, D, num_heads, block_size, kv_dtype, use_sinks, seed=0, head_size=64
+):
+    gen = torch.Generator().manual_seed(seed)
+    torch.manual_seed(seed)
+    bs = len(ctxs)
+    hq, hkv = num_heads
+    seq_lens = [c + D for c in ctxs]
+    max_blocks = max((s + block_size - 1) // block_size for s in seq_lens)
+    num_blocks = max_blocks * bs
+    q = torch.randn(bs * D, hq, head_size, device="cuda").to(torch.bfloat16)
+    k_orig = torch.randn(num_blocks, block_size, hkv, head_size, device="cuda")
+    v_orig = torch.randn_like(k_orig)
+    k_cache = k_orig.to(kv_dtype)
+    v_cache = v_orig.to(kv_dtype)
+    k_descale = v_descale = None
+    if kv_dtype != torch.bfloat16:
+        k_descale = torch.tensor([0.7], device="cuda")
+        v_descale = torch.tensor([0.9], device="cuda")
+    perm = torch.randperm(num_blocks, generator=gen).to(torch.int32).cuda()
+    block_table = perm.view(bs, max_blocks).contiguous()
+    mask = torch.stack([_random_tree(D, gen) for _ in range(bs)]).cuda()
+    sinks = torch.randn(hq, device="cuda") if use_sinks else None
+    return {
+        "q": q,
+        "k_cache": k_cache,
+        "v_cache": v_cache,
+        "k_descale": k_descale,
+        "v_descale": v_descale,
+        "block_table": block_table,
+        "mask": mask,
+        "sinks": sinks,
+        "ctxs": ctxs,
+        "D": D,
+        "seq_lens": torch.tensor(seq_lens, dtype=torch.int32, device="cuda"),
+        "cu_seqlens_q": torch.arange(
+            0, (bs + 1) * D, D, dtype=torch.int32, device="cuda"
+        ),
+        "scale": head_size**-0.5,
+    }
+
+
+def _tree_reference(c):
+    q = c["q"].float()
+    k_cache = c["k_cache"].float()
+    v_cache = c["v_cache"].float()
+    if c["k_descale"] is not None:
+        k_cache = k_cache * c["k_descale"]
+        v_cache = v_cache * c["v_descale"]
+    D = c["D"]
+    hq = q.shape[1]
+    hkv = k_cache.shape[2]
+    block_size = k_cache.shape[1]
+    outs = []
+    for b, ctx in enumerate(c["ctxs"]):
+        n = ctx + D
+        nblk = (n + block_size - 1) // block_size
+        idx = c["block_table"][b, :nblk].long()
+        k = k_cache[idx].reshape(-1, hkv, k_cache.shape[-1])[:n]
+        v = v_cache[idx].reshape(-1, hkv, v_cache.shape[-1])[:n]
+        k = k.repeat_interleave(hq // hkv, dim=1)
+        v = v.repeat_interleave(hq // hkv, dim=1)
+        qb = q[b * D : (b + 1) * D] * c["scale"]
+        attn = torch.einsum("qhd,khd->hqk", qb, k)
+        allowed = torch.ones(D, n, dtype=torch.bool, device="cuda")
+        allowed[:, ctx:] = c["mask"][b]
+        attn = attn.masked_fill(~allowed[None], float("-inf"))
+        if c["sinks"] is not None:
+            s = c["sinks"][:, None, None].expand(-1, D, 1)
+            attn = torch.cat((attn, s), dim=-1)
+        p = torch.softmax(attn, dim=-1)
+        if c["sinks"] is not None:
+            p = p[..., :-1]
+        outs.append(torch.einsum("hqk,khd->qhd", p, v))
+    return torch.cat(outs, dim=0)
+
+
+def _tree_bias(c):
+    return torch.where(c["mask"], 0.0, float("-inf")).float()
+
+
+def _run_tree(c, force=None, bias="tree", backend="triton"):
+    import aiter.ops.triton.attention.unified_attention as ua
+
+    out = torch.empty_like(c["q"])
+    calls = []
+    real_2d, real_3d, real_pick = (
+        ua._unified_attention_2d_triton,
+        ua._unified_attention_3d_triton,
+        ua.use_2d_kernel,
+    )
+
+    def spy_2d(params):
+        calls.append("2d")
+        return real_2d(params)
+
+    def spy_3d(*a, **k):
+        calls.append("3d")
+        return real_3d(*a, **k)
+
+    ua._unified_attention_2d_triton = spy_2d
+    ua._unified_attention_3d_triton = spy_3d
+    if force is not None:
+        ua.use_2d_kernel = lambda params, backend="triton": force == "2d"
+    try:
+        ua.unified_attention(
+            q=c["q"],
+            k=c["k_cache"],
+            v=c["v_cache"],
+            out=out,
+            cu_seqlens_q=c["cu_seqlens_q"],
+            max_seqlen_q=c["D"],
+            seqused_k=c["seq_lens"],
+            max_seqlen_k=int(c["seq_lens"].max()),
+            softmax_scale=c["scale"],
+            causal=True,
+            window_size=(-1, -1),
+            block_table=c["block_table"],
+            softcap=0,
+            q_descale=None,
+            k_descale=c["k_descale"],
+            v_descale=c["v_descale"],
+            qq_bias=_tree_bias(c) if bias == "tree" else bias,
+            sinks=c["sinks"],
+            backend=backend,
+        )
+    finally:
+        ua._unified_attention_2d_triton = real_2d
+        ua._unified_attention_3d_triton = real_3d
+        ua.use_2d_kernel = real_pick
+    return out, calls
+
+
+def _tree_tolerance(kv_dtype):
+    return (1.5e-1, 1.5e-1) if kv_dtype != torch.bfloat16 else (2e-2, 2e-2)
+
+
+_TREE_SHAPES = [(7, (8, 1), 1, False), (16, (64, 8), 16, True)]
+
+
+@pytest.mark.skipif(IS_DEVICE_ARCH_GFX12, reason="tree bias is a triton-path feature")
+@pytest.mark.parametrize("D, num_heads, block_size, use_sinks", _TREE_SHAPES)
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, e4m3_dtype])
+@pytest.mark.parametrize(
+    "force, ctxs",
+    [
+        ("2d", [0, 1, 61, 300]),
+        ("3d", [600, 1000, 1]),
+        ("3d", [300 + 3 * i for i in range(64)]),
+    ],
+)
+@torch.inference_mode()
+def test_tree_bias_matches_dense_reference(
+    D, num_heads, block_size, use_sinks, kv_dtype, force, ctxs
+):
+    c = _tree_case(ctxs, D, num_heads, block_size, kv_dtype, use_sinks, seed=D)
+    out, calls = _run_tree(c, force=force)
+    assert set(calls) == {force}
+    atol, rtol = _tree_tolerance(kv_dtype)
+    torch.testing.assert_close(out.float(), _tree_reference(c), atol=atol, rtol=rtol)
+
+
+@pytest.mark.skipif(IS_DEVICE_ARCH_GFX12, reason="tree bias is a triton-path feature")
+@pytest.mark.parametrize("D", [1, 2, 3])
+@pytest.mark.parametrize("head_size", [128, 256])
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, e4m3_dtype])
+@pytest.mark.parametrize("num_seqs", [1, 8, 64, 128, 256, 512])
+@torch.inference_mode()
+def test_tree_bias_default_dispatch_matches_dense_reference(
+    D, head_size, kv_dtype, num_seqs
+):
+    ctxs = [300 + 7 * i for i in range(num_seqs)]
+    c = _tree_case(ctxs, D, (24, 4), 16, kv_dtype, False, seed=D, head_size=head_size)
+    out, _ = _run_tree(c)
+    atol, rtol = _tree_tolerance(kv_dtype)
+    torch.testing.assert_close(out.float(), _tree_reference(c), atol=atol, rtol=rtol)
+
+
+@pytest.mark.skipif(DEVICE_ARCH != "gfx950", reason="gfx950 tree configs")
+@pytest.mark.parametrize("num_seqs, D", [(32, 8), (64, 16)])
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, e4m3_dtype])
+@torch.inference_mode()
+def test_tree_bias_head_256_large_batch(num_seqs, D, kv_dtype):
+    ctxs = [300 + 11 * i for i in range(num_seqs)]
+    c = _tree_case(ctxs, D, (24, 4), 16, kv_dtype, False, seed=D, head_size=256)
+    out, calls = _run_tree(c, force="2d")
+    assert set(calls) == {"2d"}
+    atol, rtol = _tree_tolerance(kv_dtype)
+    torch.testing.assert_close(out.float(), _tree_reference(c), atol=atol, rtol=rtol)
+
+
+@pytest.mark.skipif(DEVICE_ARCH != "gfx950", reason="gfx950 gluon kernel")
+@pytest.mark.parametrize("D, num_heads, block_size, use_sinks", _TREE_SHAPES)
+@pytest.mark.parametrize("head_size", [64, 128, 256])
+@pytest.mark.parametrize(
+    "force, ctxs",
+    [
+        ("2d", [0, 1, 63, 64, 127, 4100]),
+        ("3d", [1, 600, 4095, 4096, 4097]),
+    ],
+)
+@torch.inference_mode()
+def test_tree_bias_gluon_matches_dense_reference(
+    D, num_heads, block_size, use_sinks, head_size, force, ctxs
+):
+    import aiter.ops.triton.attention.unified_attention as ua
+
+    c = _tree_case(
+        ctxs,
+        D,
+        num_heads,
+        block_size,
+        torch.bfloat16,
+        use_sinks,
+        seed=D,
+        head_size=head_size,
+    )
+    calls = []
+    names = {t: f"_unified_attention_{t}_gfx950" for t in ("2d", "3d")}
+    real = {t: getattr(ua, n) for t, n in names.items()}
+    for t, n in names.items():
+        setattr(ua, n, lambda *a, _t=t, **k: (calls.append(_t), real[_t](*a, **k))[1])
+    try:
+        out, _ = _run_tree(c, force=force, backend="gluon")
+    finally:
+        for t, n in names.items():
+            setattr(ua, n, real[t])
+    assert calls == [force]
+    torch.testing.assert_close(out.float(), _tree_reference(c), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(IS_DEVICE_ARCH_GFX12, reason="tree bias is a triton-path feature")
+@pytest.mark.parametrize("force", ["2d", "3d"])
+@torch.inference_mode()
+def test_shared_2d_bias_keeps_broadcast_semantics(force):
+    c = _tree_case([300, 700], 8, (8, 1), 16, torch.bfloat16, False)
+    c["mask"][1] = c["mask"][0]
+    shared = _tree_bias(c)[0]
+    out3, _ = _run_tree(c, force=force)
+
+    import aiter.ops.triton.attention.unified_attention as ua
+
+    out2 = torch.empty_like(c["q"])
+    real = ua.use_2d_kernel
+    ua.use_2d_kernel = lambda params, backend="triton": force == "2d"
+    try:
+        ua.unified_attention(
+            q=c["q"],
+            k=c["k_cache"],
+            v=c["v_cache"],
+            out=out2,
+            cu_seqlens_q=c["cu_seqlens_q"],
+            max_seqlen_q=c["D"],
+            seqused_k=c["seq_lens"],
+            max_seqlen_k=int(c["seq_lens"].max()),
+            softmax_scale=c["scale"],
+            causal=True,
+            window_size=(-1, -1),
+            block_table=c["block_table"],
+            softcap=0,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            qq_bias=shared,
+            backend="triton",
+        )
+    finally:
+        ua.use_2d_kernel = real
+    torch.testing.assert_close(out2.float(), out3.float(), atol=0, rtol=0)
+
+
+def _run_tree_bias_guard(mode):
+    from op_tests.test_batch_prefill import make_guarded_int32_tensor
+
+    c = _tree_case([40, 300, 70], 7, (8, 1), 16, torch.bfloat16, False)
+    bits = _tree_bias(c).view(torch.int32)
+    guarded = make_guarded_int32_tensor(
+        bits.reshape(-1), device=torch.cuda.current_device()
+    )
+    bias = guarded.view(torch.float32).view(c["mask"].shape)
+    if mode == "control":
+        sink = torch.zeros(1, device="cuda")
+        _read_at[(1,)](bias, sink, bias.numel())
+        torch.cuda.synchronize()
+        return
+    out, _ = _run_tree(c, bias=bias)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out.float(), _tree_reference(c), atol=2e-2, rtol=2e-2)
+
+
+@triton.jit
+def _read_at(ptr, out_ptr, offset):
+    tl.store(out_ptr, tl.load(ptr + offset))
+
+
+def _run_tree_bias_guard_child(mode):
+    aiter_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    )
+    child = (
+        "import sys, torch\n"
+        f"sys.path.insert(0, {aiter_root!r})\n"
+        "from op_tests.triton_tests.attention.test_unified_attention import "
+        "_run_tree_bias_guard as run\n"
+        "with torch.inference_mode():\n"
+        f"    run({mode!r})\n"
+    )
+    return run_in_subprocess(child, timeout=600)
+
+
+@pytest.mark.skipif(IS_DEVICE_ARCH_GFX12, reason="tree bias is a triton-path feature")
+def test_guard_page_faults_on_overread():
+    result = _run_tree_bias_guard_child("control")
+    assert is_gpu_memory_fault(result.returncode, result.stderr)
+
+
+@pytest.mark.skipif(IS_DEVICE_ARCH_GFX12, reason="tree bias is a triton-path feature")
+def test_padded_query_rows_do_not_read_past_the_bias():
+    result = _run_tree_bias_guard_child("bias")
+    assert_no_gpu_memory_fault(
+        result, "unified attention read past the end of the qq_bias"
+    )
