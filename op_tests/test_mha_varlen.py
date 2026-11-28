@@ -668,6 +668,93 @@ def flash_attn_varlen_func_benchmark(
     )
 
 
+PAGED_KV_HEAD_CONFIGS = [(64, 8, 2), (96, 8, 2), (128, 8, 2), (256, 8, 8)]
+
+
+@pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
+@pytest.mark.parametrize("d, nheads, nheads_k", PAGED_KV_HEAD_CONFIGS)
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("return_lse", [False, True])
+@pytest.mark.parametrize("seqlens_q", [[1, 5, 16], [1, 1, 1]])
+def test_flash_attn_varlen_func_paged_kv(
+    dtype, d, nheads, nheads_k, causal, return_lse, seqlens_q
+):
+    """block_table path must match the fp32 PyTorch reference.
+
+    Cache slots that the block table does not reference hold +/-100, so a
+    kernel that reads the wrong page or past a sequence end fails.
+    """
+    torch.random.manual_seed(0)
+    page_size = 128
+    seqlens_k = [300, 129, 16]
+    num_pages = [(s + page_size - 1) // page_size for s in seqlens_k]
+    total_pages = sum(num_pages) + 4
+    k = torch.randn(sum(seqlens_k), nheads_k, d, device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+    k_cache = torch.full(
+        (total_pages, page_size, nheads_k, d), 100.0, device="cuda", dtype=dtype
+    )
+    v_cache = torch.full_like(k_cache, -100.0)
+    pages = torch.randperm(total_pages, device="cuda", dtype=torch.int32)
+    block_table = torch.zeros(
+        len(seqlens_q), max(num_pages), device="cuda", dtype=torch.int32
+    )
+    page, start = 0, 0
+    for i, (n, s) in enumerate(zip(num_pages, seqlens_k)):
+        block_table[i, :n] = pages[page : page + n]
+        page += n
+        for j, p in enumerate(block_table[i, :n].tolist()):
+            lo, hi = start + j * page_size, min(start + (j + 1) * page_size, start + s)
+            k_cache[p, : hi - lo] = k[lo:hi]
+            v_cache[p, : hi - lo] = v[lo:hi]
+        start += s
+    cu_seqlens_q = torch.tensor(
+        [0] + list(itertools.accumulate(seqlens_q)), dtype=torch.int32, device="cuda"
+    )
+    cu_seqlens_k = torch.tensor(
+        [0] + list(itertools.accumulate(seqlens_k)), dtype=torch.int32, device="cuda"
+    )
+    q = torch.randn(sum(seqlens_q), nheads, d, device="cuda", dtype=dtype)
+
+    out = aiter.flash_attn_varlen_func(
+        q,
+        k_cache,
+        v_cache,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max(seqlens_q),
+        max(seqlens_k),
+        causal=causal,
+        return_lse=return_lse,
+        block_table=block_table,
+    )
+    if return_lse:
+        out, lse = out
+
+    seqs = [
+        (q[cq : cq + sq][None], k[ck : ck + sk][None], v[ck : ck + sk][None])
+        for cq, sq, ck, sk in zip(
+            cu_seqlens_q.tolist(), seqlens_q, cu_seqlens_k.tolist(), seqlens_k
+        )
+    ]
+
+    def ref(**kwargs):
+        return torch.cat(
+            [run_torch(*s, None, None, causal=causal, **kwargs)[0] for s in seqs]
+        )
+
+    out_ref = ref()
+    out_pt = ref(upcast=False, reorder_ops=True)
+    out_diff = (out - out_ref).abs().max().item()
+    out_tol = max(4 * (out_pt - out_ref).abs().max().item(), 0.01)
+    assert out_diff <= out_tol, f"forward diff {out_diff} exceeds tolerance {out_tol}"
+    if return_lse:
+        lse_ref = torch.cat(
+            [opus_ref_lse(qi, ki, causal)[0] for qi, ki, _ in seqs], dim=1
+        )
+        opus_check_lse("paged_kv", lse, lse_ref)
+
+
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("gqa_ratio", [1, 8])
 @pytest.mark.parametrize("deterministic", [True, False])
@@ -1128,6 +1215,17 @@ if __name__ == "__main__":
 
     df_padding = pd.DataFrame(padding_collected)
     aiter.logger.info(f"mha_varlen_seq_padding summary:\n{df_padding}")
+
+    for dtype, heads, causal, return_lse, seqlens_q in itertools.product(
+        args.dtype,
+        PAGED_KV_HEAD_CONFIGS,
+        args.causal,
+        [False, True],
+        [[1, 5, 16], [1, 1, 1]],
+    ):
+        test_flash_attn_varlen_func_paged_kv(
+            dtypes.d_dtypes[dtype], *heads, causal, return_lse, seqlens_q
+        )
 
 
 # ---------------------------------------------------------------------------
