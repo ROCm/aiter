@@ -1229,6 +1229,18 @@ def get_module_custom_op(md_name: str) -> None:
         else:
             __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
         logger.info(f"import [{md_name}] under {__mds[md_name].__file__}")
+        _publish_tuned_cu_fallbacks(__mds[md_name])
+
+
+def _publish_tuned_cu_fallbacks(module) -> None:
+    """Give a module with a tuned C++ dispatch the compute partitions of the node."""
+    set_tuned_cu_fallback = getattr(module, "set_tuned_cu_fallback", None)
+    if set_tuned_cu_fallback is None:
+        return
+    from aiter.jit.utils.chip_info import get_tuned_cu_fallbacks
+
+    for gfx, cu_num, full_chip_cu_num in get_tuned_cu_fallbacks():
+        set_tuned_cu_fallback(gfx, cu_num, full_chip_cu_num)
 
 
 def _so_offload_archs(so_path):

@@ -945,6 +945,14 @@ namespace py = pybind11;
           py::arg("kernelId") = 0,                       \
           py::arg("splitK")   = 0);
 
+#define TUNED_CU_FALLBACK_PYBIND   \
+    m.def("set_tuned_cu_fallback", \
+          &set_tuned_cu_fallback,  \
+          "set_tuned_cu_fallback", \
+          py::arg("gfx"),          \
+          py::arg("cu_num"),       \
+          py::arg("full_chip_cu_num"));
+
 #define GEMM_A8W8_PYBIND                    \
     m.def("gemm_a8w8",                      \
           &gemm_a8w8,                       \

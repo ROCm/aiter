@@ -14,7 +14,7 @@ from ..jit.core import (
     AITER_LOG_TUNED_CONFIG,
     compile_ops,
 )
-from ..jit.utils.chip_info import get_cu_num
+from ..jit.utils.chip_info import find_tuned_cu_row, get_cu_num
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..utility import dtypes
 
@@ -82,12 +82,17 @@ def get_CKBatchedGEMM_config(
             get_CKBatchedGEMM_config.has_gfx = False
     gfx = get_gfx()
     cu_num = get_cu_num()
-    key = (
-        (gfx, cu_num, B, M, N, K)
-        if get_CKBatchedGEMM_config.has_gfx
-        else (cu_num, B, M, N, K)
-    )
-    config = get_CKBatchedGEMM_config.ck_batched_gemm_dict.get(key, None)
+    tuned = get_CKBatchedGEMM_config.ck_batched_gemm_dict
+    if get_CKBatchedGEMM_config.has_gfx:
+        config = find_tuned_cu_row(
+            tuned,
+            lambda cu: (gfx, cu, B, M, N, K),
+            gfx,
+            cu_num,
+            AITER_CONFIGS.AITER_CONFIG_BF16_BATCHED_GEMM_FILE,
+        )
+    else:
+        config = tuned.get((cu_num, B, M, N, K), None)
     if config is not None:
         if AITER_LOG_TUNED_CONFIG:
             logger.info(

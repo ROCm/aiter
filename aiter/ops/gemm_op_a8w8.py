@@ -33,6 +33,7 @@ from ..ops.gemm_op_common import (
 from ..plugin import route as _route
 from ..utility import dtypes
 from ..utility.graph_alloc import capture_scoped_cache, persistent_alloc
+from .gemm_op_common import find_tuned_row
 from .mxfp8fp4gemm_common import (
     _MXFP8_GEMM_CONFIG_KEYS,
     get_mxfp8_asm_dir,
@@ -590,7 +591,7 @@ _CKGEMM_HAS_GFX: dict = {}
 
 @functools.lru_cache(maxsize=1024)
 def get_CKGEMM_config(
-    M: int, N: int, K: int, tuned_file=None, *, gfx=None, cu_num=None
+    M: int, N: int, K: int, tuned_file=None, *, gfx=None, cu_num=None, device=None
 ):
     if tuned_file is None:
         tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_FILE
@@ -623,19 +624,28 @@ def get_CKGEMM_config(
         and gfx not in {key[0] for key in _CKGEMM_CONFIG_CACHE[tuned_file]}
     ):
         gfx = base_gfx_arch(gfx)
-    padded_M = M
-    config = None
-    for gl in [None, 0, 1]:
-        padded_M = M if gl is None else get_padded_m(M, N, K, gl)
-        key = (gfx, cu_num, padded_M, N, K) if has_gfx else (cu_num, padded_M, N, K)
-        config = _CKGEMM_CONFIG_CACHE[tuned_file].get(key, None)
-        if config is not None:
-            if AITER_LOG_TUNED_CONFIG:
-                logger.info(
-                    f"shape is M:{M}, N:{N}, K:{K}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in {tuned_file} , kernel name is {config['kernelName']}!"
-                )
-            break
-    if config is None:
+    config, padded_M = find_tuned_row(
+        _CKGEMM_CONFIG_CACHE[tuned_file],
+        # The rows of a table without gfx can be of any gfx: exact CU count only.
+        (
+            (lambda cu, pm: (gfx, cu, pm, N, K))
+            if has_gfx
+            else (lambda _, pm: (cu_num, pm, N, K))
+        ),
+        gfx,
+        cu_num,
+        M,
+        N,
+        K,
+        tuned_file,
+        device,
+    )
+    if config is not None:
+        if AITER_LOG_TUNED_CONFIG:
+            logger.info(
+                f"shape is M:{M}, N:{N}, K:{K}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in {tuned_file} , kernel name is {config['kernelName']}!"
+            )
+    else:
         logger.info(
             f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in {tuned_file}, will use default config!"
         )
@@ -686,26 +696,30 @@ def get_GEMM_config_with_quant_type(
         and gfx not in {key[0] for key in _GEMM_QUANT_TYPE_CACHE[tuned_file]}
     ):
         gfx = base_gfx_arch(gfx)
-    padded_M = M
-    config = None
-    for gl in [None, 0, 1]:
-        padded_M = M if gl is None else get_padded_m(M, N, K, gl)
-        key = (
-            (gfx, cu_num, padded_M, N, K, str(q_dtype_w))
+    config, padded_M = find_tuned_row(
+        _GEMM_QUANT_TYPE_CACHE[tuned_file],
+        # The rows of a table without gfx can be of any gfx: exact CU count only.
+        (
+            (lambda cu, pm: (gfx, cu, pm, N, K, str(q_dtype_w)))
             if has_gfx
-            else (cu_num, padded_M, N, K, str(q_dtype_w))
-        )
-        config = _GEMM_QUANT_TYPE_CACHE[tuned_file].get(key, None)
-        if config is not None:
-            if AITER_LOG_TUNED_CONFIG:
-                msg = f"shape M:{M}, N:{N}, K:{K} q_dtype_w:{q_dtype_w}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned, in {tuned_file}!"
-                if "libtype" in config:
-                    msg += f" libtype is {config['libtype']}!"
-                if "kernelName" in config:
-                    msg += f" kernelName is {config['kernelName']} (kernelId {config.get('kernelId')})!"
-                logger.info(msg)
-            break
-    if config is None:
+            else (lambda _, pm: (cu_num, pm, N, K, str(q_dtype_w)))
+        ),
+        gfx,
+        cu_num,
+        M,
+        N,
+        K,
+        tuned_file,
+    )
+    if config is not None:
+        if AITER_LOG_TUNED_CONFIG:
+            msg = f"shape M:{M}, N:{N}, K:{K} q_dtype_w:{q_dtype_w}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned, in {tuned_file}!"
+            if "libtype" in config:
+                msg += f" libtype is {config['libtype']}!"
+            if "kernelName" in config:
+                msg += f" kernelName is {config['kernelName']} (kernelId {config.get('kernelId')})!"
+            logger.info(msg)
+    else:
         logger.info(
             f"shape is M:{M}, N:{N}, K:{K}, q_dtype_w:{q_dtype_w}, not found tuned config in {tuned_file}, will use default config!"
         )
@@ -1976,6 +1990,7 @@ def _gemm_a8w8_blockscale_bpreshuffle_native(
         AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE,
         gfx=gfx,
         cu_num=cu,
+        device=XQ.device.index,
     )
     # Triton path first: it allocates its own output, so skip the Y buffer the
     # ck/asm paths below need.

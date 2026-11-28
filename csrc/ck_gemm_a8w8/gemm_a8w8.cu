@@ -100,11 +100,11 @@ RowwiseKernel rowwise_dispatch(int M, int N, int K)
     return RowwiseKernelMap{GENERATE_LOOKUP_TABLE(ABDataType, DDataType, EDataType)};
   }();
 
-  const int cu_num           = get_device_cu_num();
+  const TunedCuNums cu_nums  = get_tuned_cu_nums();
   const std::string_view gfx = get_device_gfx();
 
   // First check if this shape(M,N,K) is available in the direct lookup.
-  auto it = lookup.find({gfx, cu_num, M, N, K});
+  auto it = find_tuned_row(lookup, cu_nums, gfx, M, N, K);
   // If we found an optimal kernel, use it.
   if (it != lookup.end())
   {
@@ -125,7 +125,7 @@ RowwiseKernel rowwise_dispatch(int M, int N, int K)
     padded_m = 20480;
   }
   // Second check if this shape(padded_m,N,K) is available in the direct lookup.
-  it = lookup.find({gfx, cu_num, padded_m, N, K});
+  it = find_tuned_row(lookup, cu_nums, gfx, padded_m, N, K);
   // If we found an optimal kernel, use it.
   if (it != lookup.end())
   {
