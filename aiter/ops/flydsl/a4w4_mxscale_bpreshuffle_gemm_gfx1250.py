@@ -17,6 +17,8 @@ import re
 import torch
 from torch import Tensor
 
+from .aot_launch import aot_factory
+
 GENERAL_NAME_PREFIX = "flydsl_a4w4_bpreshuffle_wmma"
 COMPUTE_NAME_PREFIX = "flydsl_a4w4_bpreshuffle_compute_wmma"
 _NAME_SUFFIX_RE = (
@@ -43,26 +45,40 @@ _EPILOGUE_MAX_PARTIAL_VECTORS = 128
 # buffer copies), so every base address and row pitch must be a multiple of this.
 ALIGN_BYTES = 16
 
-_launch_general = None
-_launch_compute = None
 _run_compiled = None
 _flyc = None
 _fx = None
 
 
+# AOT launcher factories. The kernel launchers take their Constexprs as launch
+# arguments, so a factory takes none and every launch passes them in
+# specialization_key. A factory imports its kernel module, so a launch served
+# from the AOT cache (``factory.lazy()``) never does.
+@aot_factory("gemm_a4w4_gfx1250")
+@functools.cache
+def _general_launcher():
+    from .kernels.gemm_a4w4_gfx1250 import launch_gemm_a4w4
+
+    return launch_gemm_a4w4
+
+
+@aot_factory("gemm_a4w4_256x256_gfx1250")
+@functools.cache
+def _compute_launcher():
+    from .kernels.gemm_a4w4_256x256_gfx1250 import launch_gemm_a4w4_256x256
+
+    return launch_gemm_a4w4_256x256
+
+
 def _lazy_import():
-    global _launch_general, _launch_compute, _run_compiled, _flyc, _fx
-    if _launch_general is not None:
+    global _run_compiled, _flyc, _fx
+    if _run_compiled is not None:
         return
     import flydsl.compiler as flyc_mod
     import flydsl.expr as fx_mod
 
-    from .kernels.gemm_a4w4_256x256_gfx1250 import launch_gemm_a4w4_256x256
-    from .kernels.gemm_a4w4_gfx1250 import launch_gemm_a4w4
     from .kernels.tensor_shim import _run_compiled as run_compiled
 
-    _launch_general = launch_gemm_a4w4
-    _launch_compute = launch_gemm_a4w4_256x256
     _run_compiled = run_compiled
     _flyc = flyc_mod
     _fx = fx_mod
@@ -268,7 +284,7 @@ def a4w4_kernel_launchable(kernel_name: str, M: int, N: int, K: int) -> bool:
 
 
 def _launch_specialization(cfg: dict, cluster_m: int, out_is_f16: int):
-    """(launcher, constexpr arguments) of a kernel config.
+    """(launcher factory, constexpr arguments) of a kernel config.
 
     ``cluster_m``, the one that fits M, is passed at launch, so M picks no JIT specialization.
     """
@@ -277,7 +293,7 @@ def _launch_specialization(cfg: dict, cluster_m: int, out_is_f16: int):
     split_k, cluster_n = cfg["split_k"], cfg["cluster_n"]
     common = (tile_m, tile_n, tile_k, m_warp, n_warp, out_is_f16, nb)
     if cfg["compute_bound"]:
-        return _launch_compute, (
+        return _compute_launcher, (
             *common,
             cluster_n,
             split_k,
@@ -286,7 +302,7 @@ def _launch_specialization(cfg: dict, cluster_m: int, out_is_f16: int):
         )
     # A launch of one workgroup is no cluster: it runs the plain kernel.
     use_cluster = cluster_m * cluster_n * split_k > 1
-    return _launch_general, (*common, use_cluster, cluster_n, split_k)
+    return _general_launcher, (*common, use_cluster, cluster_n, split_k)
 
 
 def preload_a4w4_kernel(
@@ -330,7 +346,12 @@ def preload_a4w4_kernel(
         null(),
         cluster_m,
     )
-    _preload_compiled(launch, *runtime_args, *specialization)
+    _preload_compiled(
+        launch.lazy(),
+        *runtime_args,
+        *specialization,
+        specialization_key=specialization,  # the key its launches look up
+    )
 
 
 def run_gemm_a4w4_mxscale_bpreshuffle_gfx1250(
@@ -441,7 +462,7 @@ def run_gemm_a4w4_mxscale_bpreshuffle_gfx1250(
     )
     launch, specialization = _launch_specialization(cfg, cluster_m, out_is_f16)
     _run_compiled(
-        launch,
+        launch.lazy(),
         *runtime_args,
         cluster_m,
         *specialization,

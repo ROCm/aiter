@@ -98,6 +98,23 @@ _MX_MOE = (
     "kernels/mfma_preshuffle_pipeline.py",
     "moe_common.py",
 )
+_GFX1250_GEMM = (
+    "kernels/act.py",
+    "kernels/gemm_common_gfx1250.py",
+    "kernels/gfx1250_cluster.py",
+)
+_GFX1250_A8W8_GEMM = (
+    *_GFX1250_GEMM,
+    "kernels/quant_utils.py",
+    "../../utility/mx_types.py",
+)
+_GFX1250_A4W4_GEMM = (
+    *_GFX1250_GEMM,
+    "kernels/splitk_fused_epilogue_gfx1250.py",
+    "kernels/tdm_ops_gfx1250.py",
+)
+# gemm_common_gfx1250.py reads it: whether kernels prefetch their own code.
+_GFX1250_GEMM_ENV = ("AITER_FLYDSL_INST_PREFETCH",)
 _GFX942_MOE_ENV = (
     "AITER_FLYDSL_MOE_BF16_RTA_SIMPLIFIED",
     "AITER_FLYDSL_MOE_BF16_RTE_SIMPLIFIED",
@@ -163,6 +180,45 @@ AOT_CACHES = {
     },
     "gemm_a16w16_band_gfx950": {},
     "gemm_a16w16_skinny_gfx950": {},
+    # gfx1250 GEMM
+    "gemm_a8w8_gfx1250": {
+        "sources": ("kernels/gemm_a8w8_gfx1250.py", *_GFX1250_A8W8_GEMM),
+        "env": _GFX1250_GEMM_ENV,
+    },
+    "gemm_a8w8_256x256_gfx1250": {
+        "sources": (
+            "kernels/gemm_a8w8_256x256_gfx1250.py",
+            *_GFX1250_A8W8_GEMM,
+            "kernels/splitk_fused_epilogue_gfx1250.py",
+            "kernels/tdm_ops_gfx1250.py",
+        ),
+        "env": _GFX1250_GEMM_ENV,
+    },
+    "gemm_a8w8_splitk_reduce_gfx1250": {
+        "sources": ("kernels/gemm_a8w8_splitk_reduce_gfx1250.py",),
+    },
+    "gemm_a4w4_gfx1250": {
+        "sources": ("kernels/gemm_a4w4_gfx1250.py", *_GFX1250_A4W4_GEMM),
+        "env": _GFX1250_GEMM_ENV,
+    },
+    "gemm_a4w4_256x256_gfx1250": {
+        "sources": ("kernels/gemm_a4w4_256x256_gfx1250.py", *_GFX1250_A4W4_GEMM),
+        "env": _GFX1250_GEMM_ENV,
+    },
+    "gemm_a16w16_gfx1250": {
+        "sources": (
+            "kernels/gemm_a16w16_kernel_gfx1250.py",
+            "kernels/communication_ops_utils.py",
+        ),
+    },
+    "gemm_a16w16_tdm_gfx1250": {
+        "sources": (
+            "kernels/gemm_a16w16_tdm_gfx1250.py",
+            "kernels/gemm_a16w16_gfx950_utils.py",
+            "kernels/gemm_a16w16_kernel_gfx1250.py",
+            "kernels/communication_ops_utils.py",
+        ),
+    },
     # 2-stage MoE
     "moe_gfx942_gemm": {
         "sources": _GFX942_MOE,
@@ -230,6 +286,36 @@ AOT_CACHES = {
             "kernels/dpp_utils.py",
             "kernels/layout_utils.py",
         ),
+    },
+    # gfx1250 grouped MoE
+    "grouped_gemm_a8w4_tdm_gfx1250": {
+        "sources": (
+            "kernels/act.py",
+            "kernels/gemm_common_gfx1250.py",
+            "kernels/mega_moe_gfx1250/tdm_gather_shim.py",
+            "kernels/mega_moe_gfx1250/types.py",
+            "kernels/quant_utils.py",
+            "../../utility/mx_types.py",
+        ),
+        "env": (
+            *_GFX1250_GEMM_ENV,
+            "AITER_FLYDSL_EP_DEFER_C_WAIT",
+            "AITER_FLYDSL_INTERLEAVED_LDS_LOAD",
+            "AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE",
+            "AITER_FLYDSL_PLANAR_LDS",
+        ),
+    },
+    "moe_gather_reduce": {},
+    "moe_fused_quant_preshuffle_route_ksplit": {
+        "sources": (
+            "kernels/act.py",
+            "kernels/gemm_common_gfx1250.py",
+            "kernels/moe_route_maps.py",
+            "kernels/quant_utils.py",
+            "kernels/tdm_ops_gfx1250.py",
+            "../../utility/mx_types.py",
+        ),
+        "env": _GFX1250_GEMM_ENV,
     },
     # Attention, GDN, conv3d
     "pa_decode_plan": {},

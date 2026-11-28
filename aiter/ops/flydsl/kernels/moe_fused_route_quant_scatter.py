@@ -58,6 +58,7 @@ Grid  : (ceil(numel / warps_per_block), 1, 1)   numel = token_num*topk
 Block : (BLOCK_THREADS, 1, 1)
 """
 
+import functools
 from types import SimpleNamespace
 
 import flydsl.compiler as flyc
@@ -67,6 +68,7 @@ from flydsl.expr import arith, const_expr, gpu, ptrtoint, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, T
 from flydsl.runtime.device import get_rocm_arch
 
+from aiter.ops.flydsl.aot_launch import aot_factory
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels import tdm_ops_gfx1250 as tdm_ops
 from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
@@ -1666,6 +1668,8 @@ def build_moe_fused_quant_preshuffle_module(
     return launch_fused
 
 
+@aot_factory("moe_fused_quant_preshuffle_route_ksplit")
+@functools.cache
 def build_moe_fused_quant_preshuffle_route_ksplit_module(
     feat_dim: int,
     wmma_rep: int,

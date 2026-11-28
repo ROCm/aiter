@@ -2241,7 +2241,8 @@ def _get_compiled_gather_reduce(
         build_moe_gather_reduce_module,
     )
 
-    return build_moe_gather_reduce_module(
+    # The handle of the AOT cache entry: a hit never builds the kernel.
+    return build_moe_gather_reduce_module.lazy(
         model_dim, topk, out_dtype, split_k, vec_dwords, w_dtype, addend_scale
     )
 

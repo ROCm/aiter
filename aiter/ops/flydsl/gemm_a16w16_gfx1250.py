@@ -9,6 +9,7 @@ import functools
 
 import torch
 
+from aiter.ops.flydsl.aot_launch import aot_factory
 from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
 _compile_gemm_a16w16 = None
@@ -75,6 +76,7 @@ _CFG_KEYS = (
 )
 
 
+@aot_factory("gemm_a16w16_gfx1250")
 @functools.lru_cache(maxsize=1024)
 def _cached_launcher(*cfg):
     return _compile_gemm_a16w16(**dict(zip(_CFG_KEYS, cfg)))
@@ -161,7 +163,7 @@ def gemm_a16w16(
     else:
         ws = y_buf
 
-    launch_fn = _cached_launcher(
+    launch_fn = _cached_launcher.lazy(
         N,
         K,
         tile_m,

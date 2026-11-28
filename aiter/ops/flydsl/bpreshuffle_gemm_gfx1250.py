@@ -11,10 +11,12 @@ import torch
 from torch import Tensor
 
 from .mxfp8_bpreshuffle_gemm_gfx1250 import BLOCK_K as SCALE_BLOCK_SIZE
+from .mxfp8_bpreshuffle_gemm_gfx1250 import (
+    gemm_a8w8_launcher,
+    splitk_reduce_launcher,
+)
 
 # Lazily bound flydsl symbols (kept out of import path when flydsl is absent).
-_launch_gemm_a8w8 = None
-_compile_splitk_reduce = None
 _run_compiled = None
 _ptr_arg = None
 _fx = None
@@ -26,20 +28,14 @@ _MAX_SPLIT_K = 8
 
 
 def _lazy_import():
-    global _launch_gemm_a8w8, _compile_splitk_reduce, _run_compiled, _ptr_arg, _fx
-    if _launch_gemm_a8w8 is not None:
+    global _run_compiled, _ptr_arg, _fx
+    if _run_compiled is not None:
         return
     import flydsl.expr as fx_mod
 
-    from .kernels.gemm_a8w8_gfx1250 import launch_gemm_a8w8
-    from .kernels.gemm_a8w8_splitk_reduce_gfx1250 import (
-        compile_gemm_a8w8_splitk_reduce,
-    )
     from .kernels.tensor_shim import _run_compiled as run_compiled
     from .kernels.tensor_shim import ptr_arg
 
-    _launch_gemm_a8w8 = launch_gemm_a8w8
-    _compile_splitk_reduce = compile_gemm_a8w8_splitk_reduce
     _run_compiled = run_compiled
     _ptr_arg = ptr_arg
     _fx = fx_mod
@@ -188,7 +184,7 @@ def run_preshuffle_gemm_a8_gfx1250(
     )
     stream = _fx.Stream(torch.cuda.current_stream(device=XQ.device))
     _run_compiled(
-        _launch_gemm_a8w8,
+        gemm_a8w8_launcher.lazy(),
         _ptr_arg(gemm_out),
         _ptr_arg(XQ),
         _ptr_arg(WQ),
@@ -210,9 +206,7 @@ def run_preshuffle_gemm_a8_gfx1250(
     if partials is not None:
         dense = ldc == N
         _run_compiled(
-            _compile_splitk_reduce(
-                split_k=split_k, out_dtype_str=out_dtype, partial_dtype_str="f32"
-            ),
+            splitk_reduce_launcher.lazy(split_k, out_dtype, "f32"),
             _ptr_arg(partials),
             _ptr_arg(Out),
             M * N if dense else N,
