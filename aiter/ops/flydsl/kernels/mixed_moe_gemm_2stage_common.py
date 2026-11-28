@@ -30,6 +30,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.act import (
     SituParams,
@@ -38,7 +39,10 @@ from aiter.ops.flydsl.kernels.act import (
     silu_mul_batch,
 )
 from aiter.ops.flydsl.kernels.kernels_common import default_f8_type
-from aiter.ops.flydsl.moe_common import GateMode
+from aiter.ops.flydsl.moe_common import (
+    GateMode,
+    flydsl_stage1_measured_prefill,
+)
 
 from .layout_utils import crd2idx, idx2crd
 from .mfma_epilogues import c_shuffle_epilog, default_epilog
@@ -107,6 +111,29 @@ def _idx_to_fly_ptr(idx_val, value, alignment):
     elem_type = getattr(value_type, "element_type", value_type)
     ptr_ty = fx.PointerType.get(elem_type, fx.AddressSpace.Global, alignment)
     return fx.inttoptr(ptr_ty, fx.Int64(idx_val))
+
+
+def flydsl_stage1_cshuffle_n(
+    tile_n: int,
+    gate_up_interleave: bool,
+    is_splitk: bool,
+    measured_family: bool = False,
+) -> int:
+    """CShuffle elements per row the stage-1 epilogue may hold in LDS.
+
+    The interleaved non-split-K epilogue folds gate and up in registers and
+    writes only the activated half of the tile (``c_shuffle_epilog`` is called
+    with ``gui_tile_n = tile_n // 2``), so it needs ``tile_m * (tile_n // 2)``
+    elements.  Every other epilogue writes the full ``tile_n``.  Take the half
+    budget only on the measured family's wide tile: every other launch keeps the
+    historical full-width budget, so its LDS use and compiled kernel are the
+    stock ones.  The half budget is what lets the measured 256-wide quantized
+    epilogue fit without the split-output path.
+    """
+    tile_n = int(tile_n)
+    if measured_family and gate_up_interleave and not is_splitk and tile_n > 128:
+        return tile_n // 2
+    return tile_n
 
 
 def compile_mixed_moe_gemm1_common(
@@ -287,8 +314,29 @@ def compile_mixed_moe_gemm1_common(
     cshuffle_elem_bytes = 4 if need_quant else (4 if out_is_f32 else 2)
     single_x_bytes = int(tile_m) * int(lds_stride) * int(a_elem_bytes)
     x_region_bytes = k_wave * single_x_bytes
+    _cshuffle_measured = flydsl_stage1_measured_prefill(
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=experts,
+        topk=topk,
+        act=act,
+        a_dtype=a_dtype,
+        b_dtype=b_dtype,
+        out_dtype=out_s,
+        k_batch=k_batch,
+        gate_up_interleave=gate_up_interleave,
+        tile_m=tile_m,
+        inter_dim_pad=inter_dim_pad,
+        model_dim_pad=model_dim_pad,
+        gpu_arch=str(get_gfx_runtime()),
+        has_bias=enable_bias,
+        has_sorted_weights=doweight_stage1,
+    )
+    _cshuffle_n = flydsl_stage1_cshuffle_n(
+        tile_n, gate_up_interleave, is_splitk, _cshuffle_measured
+    )
     lds_out_bytes = (
-        cshuffle_elem_bytes * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
+        cshuffle_elem_bytes * int(tile_m) * _cshuffle_n if _use_cshuffle_epilog else 0
     )
     lds_tid_bytes = int(tile_m) * 4
     single_x_bytes if a_elem_bytes == 1 else (single_x_bytes // 2)

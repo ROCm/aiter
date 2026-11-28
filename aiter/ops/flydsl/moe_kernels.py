@@ -9,12 +9,17 @@ import re
 
 import torch
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.kernels.tensor_shim import (
     _run_compiled as _dispatch_compiled,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import (
     current_stream_arg,
     ptr_arg,
+)
+from aiter.ops.flydsl.moe_common import (
+    FLYDSL_PREFILL_SHAPES,
+    flydsl_stage1_measured_prefill,
 )
 
 _KERNEL_PARAMS: dict[str, dict] = {}
@@ -24,26 +29,48 @@ _HIP_MAX_GRID_DIM_Y = 65535
 
 
 @functools.lru_cache(maxsize=256)
-def _warn_tile_override(axis: str, inter_dim: int, requested: int, resolved: int):
+def _warn_tile_override(
+    axis: str,
+    inter_dim: int,
+    requested: int,
+    resolved: int,
+    interleaved: bool = False,
+):
     """Emit a one-time (deduped) warning when a requested tile is force-changed.
 
-    Deduped by (axis, inter_dim, requested, resolved) so it fires once per shape
-    during tuning/serving instead of every launch.
+    Deduped by (axis, inter_dim, requested, resolved, interleaved) so it fires
+    once per shape during tuning/serving instead of every launch.  On the
+    interleaved gate/up path the stock resolver is only the first half of the
+    decision: ``pick_flydsl_stage1_prefill_tile_n`` may re-open the wide tile,
+    so the message must not claim the requested tile always runs ``resolved``.
     """
     from aiter import logger
 
+    detail = (
+        " (interleaved gate/up stage 1 walks 2*inter_dim on the N axis)"
+        if axis == "tile_n"
+        else ""
+    )
+    if axis == "tile_n" and interleaved:
+        note = (
+            "The interleaved prefill rule may re-open tile_n=256 on the "
+            "shapes it measured."
+        )
+    else:
+        note = (
+            f"Any tuned config naming {axis}={requested} here actually runs "
+            f"{resolved}."
+        )
     logger.warning(
-        "FlyDSL MoE: %s=%d does not divide inter_dim=%d (not 256-aligned); "
-        "forcing %s=%d. tile=%d is NOT usable/tunable for this shape -- any tuned "
-        "config naming tile=%d here actually runs %d.",
+        "FlyDSL MoE: the stock resolver does not accept %s=%d for inter_dim=%d%s; "
+        "forcing %s=%d. %s",
         axis,
         requested,
         inter_dim,
+        detail,
         axis,
         resolved,
-        requested,
-        requested,
-        resolved,
+        note,
     )
 
 
@@ -104,6 +131,203 @@ def resolve_flydsl_grid_y_persist_m(
         1, (num_m_blocks + _HIP_MAX_GRID_DIM_Y - 1) // _HIP_MAX_GRID_DIM_Y
     )
     return max(requested_persist_m, required_persist_m)
+
+
+def flydsl_xcd_remap_loses_blocks(
+    grid_x: int, grid_y: int, group_m: int, persist_m: int, reach: int
+) -> bool:
+    """Whether the stage-1 XCD remap drops a block a routing can fill.
+
+    The remap (``mixed_moe_gemm_2stage_common``: ``workgroup_id = (linear_id %
+    8) * (n // 8) + linear_id // 8`` for a grid of ``n = grid_x * grid_y``
+    workgroups) is a bijection only when ``n`` is a whole number of rounds over
+    the 8 XCDs; otherwise the workgroups whose id falls in the last ``n % 8``
+    ids never run (aiter#7567).  A skipped workgroup is harmless only past the
+    most sorted M blocks a routing can fill (``reach``).
+    """
+    total = int(grid_x) * int(grid_y)
+    whole = total - total % 8
+    for skipped in range(whole, total):
+        first = skipped // (int(group_m) * int(grid_x)) * int(group_m)
+        size = min(int(grid_y) - first, int(group_m))
+        m_block = first + (skipped % (int(group_m) * int(grid_x))) % size
+        if m_block * int(persist_m) < int(reach):
+            return True
+    return False
+
+
+def pick_flydsl_stage1_prefill_tile_n(
+    *,
+    token_num: int,
+    inter_dim: int,
+    tile_n: int,
+    gate_up_interleave: bool,
+    a_dtype: str,
+    b_dtype: str,
+    out_dtype: str,
+    k_batch: int,
+    model_dim: int,
+    tile_k: int,
+    tile_m: int,
+    has_bias: bool,
+    has_sorted_weights: bool,
+    model_dim_pad: int,
+    inter_dim_pad: int,
+    experts: int,
+    act: str,
+    topk: int,
+    xcd_swizzle: int,
+    gpu_arch: str,
+) -> int:
+    """Widen the stage-1 gate/up tile on the measured interleaved a8w4 prefill
+    launches.
+
+    With ``gate_mode="interleave"`` a workgroup covers ``tile_n // 2`` output
+    columns, so a 256-wide tile halves the workgroup count and the A-tile reads
+    of the 128-wide one.  It pays on single-GPU prefill launches of a few
+    thousand to ~8K routed tokens; at 16K+ tokens the gate/up grid of a wide N
+    axis is already long enough that the narrow tile plus XCD grouping wins.
+    Every other launch keeps the caller's tile (a shape this rule does not name
+    runs exactly the stock path), a caller's XCD swizzle is never re-gridded,
+    and the 256-wide tile is taken only where ``2 * inter_dim`` is 256-aligned.
+    """
+    tile_n = int(tile_n)
+    two_n = 2 * int(inter_dim)
+    if (
+        not flydsl_stage1_measured_prefill(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            act=act,
+            a_dtype=a_dtype,
+            b_dtype=b_dtype,
+            out_dtype=out_dtype,
+            k_batch=k_batch,
+            gate_up_interleave=gate_up_interleave,
+            tile_m=tile_m,
+            inter_dim_pad=inter_dim_pad,
+            model_dim_pad=model_dim_pad,
+            gpu_arch=gpu_arch,
+            has_bias=has_bias,
+            has_sorted_weights=has_sorted_weights,
+        )
+        or int(xcd_swizzle) != 0
+        or tile_n != 128
+        or two_n % 256 != 0
+        or int(model_dim) % int(tile_k) != 0
+    ):
+        return tile_n
+    # 4K-8K was measured on the 128-row sorted block; the 64-row block was
+    # not measured there, so keep its stock tile.
+    if 4096 <= int(token_num) <= 8192 and int(tile_m) == 128:
+        return 256
+    # The 16K+ branch was measured on the 64-row block for all four shapes
+    # and on the 128-row block only for K5120/N640 (the two captured/derived
+    # TP8 M16384 rows in the timing table); other 16K+ 128-row blocks are
+    # untimed and keep the stock tile.
+    if (
+        int(token_num) >= 16384
+        and two_n <= 1280
+        and (
+            int(tile_m) == 64
+            or (int(tile_m) == 128 and (int(model_dim), int(inter_dim)) == (5120, 640))
+        )
+    ):
+        return 256
+    return tile_n
+
+
+def pick_flydsl_stage1_prefill_xcd(
+    *,
+    token_num: int,
+    inter_dim: int,
+    inter_dim_pad: int,
+    model_dim: int,
+    tile_n: int,
+    tile_k: int,
+    grid_y: int,
+    persist_m: int,
+    tile_m: int,
+    experts: int,
+    topk: int,
+    gate_up_interleave: bool,
+    a_dtype: str,
+    b_dtype: str,
+    out_dtype: str,
+    k_batch: int,
+    xcd_swizzle: int,
+    act: str,
+    has_bias: bool,
+    has_sorted_weights: bool,
+    model_dim_pad: int,
+    gpu_arch: str,
+) -> int:
+    """Group an interleaved a8w4 prefill launch over the XCDs when it is safe.
+
+    Production leaves ``xcd_swizzle`` off on these launches.  At 16K+ routed
+    tokens grouping a few M blocks of one expert per XCD keeps its gate/up weight
+    tiles resident, which is 10-20 % faster on MI355X at the measured
+    DeepSeek-V4.1-Flash / -V4-Pro prefill shapes.  Below that it loses (the
+    groups do not amortize); a caller's non-zero swizzle is never overridden and
+    the rule is limited to the 64-row sorted block it was measured on (at
+    ``tile_m=128`` the grouping loses on the same shapes).
+
+    The stock remap derives its ``grid_x`` from ``inter_dim - inter_dim_pad``
+    while the launcher also adds ``tile2_pad = (tile_k // 2 -
+    (inter_dim - inter_dim_pad) % (tile_k // 2)) % (tile_k // 2)``.  When
+    ``tile2_pad != 0`` the two grids differ and the remap can skip the last N
+    tile (open aiter#8512 / #6598), so require it to be zero rather than rely on
+    ``inter_dim_pad == 0`` alone.  The remap also must not drop a block a
+    routing can fill (aiter#7567).
+    """
+    xcd_swizzle = int(xcd_swizzle)
+    if (
+        xcd_swizzle != 0
+        or not flydsl_stage1_measured_prefill(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            act=act,
+            a_dtype=a_dtype,
+            b_dtype=b_dtype,
+            out_dtype=out_dtype,
+            k_batch=k_batch,
+            gate_up_interleave=gate_up_interleave,
+            tile_m=tile_m,
+            inter_dim_pad=inter_dim_pad,
+            model_dim_pad=model_dim_pad,
+            gpu_arch=gpu_arch,
+            has_bias=has_bias,
+            has_sorted_weights=has_sorted_weights,
+        )
+        or int(token_num) < 16384
+        # The grouping was measured on the 64-row sorted block (the record
+        # launches at 16K); at tile_m 128 it loses, so keep the stock dispatch
+        # there rather than extrapolate.
+        or int(tile_m) != 64
+    ):
+        return xcd_swizzle
+    tile_k = int(tile_k)
+    if tile_k <= 0 or tile_k % 2:
+        return xcd_swizzle
+    half_k = tile_k // 2
+    if (int(inter_dim) - int(inter_dim_pad)) % half_k != 0:
+        # tile2_pad != 0: the launcher's grid_x is the remap's grid_x + 1 and
+        # the last N tile is never assigned.  Keep the stock dispatch until
+        # aiter#8512 / #6598 land.
+        return xcd_swizzle
+    group_m = 4
+    grid_x = (2 * int(inter_dim) - 2 * int(inter_dim_pad) + int(tile_n) - 1) // int(
+        tile_n
+    )
+    grid_y = (int(grid_y) + int(persist_m) - 1) // int(persist_m)
+    routes = int(token_num) * int(topk)
+    reach = (routes + min(int(experts), routes) * (int(tile_m) - 1)) // int(tile_m)
+    if flydsl_xcd_remap_loses_blocks(grid_x, grid_y, group_m, persist_m, reach):
+        return xcd_swizzle
+    return group_m
 
 
 def requires_flydsl_stage2_reduce(
@@ -167,16 +391,24 @@ def resolve_flydsl_stage2_tile_k(inter_dim: int, tile_k: int) -> int:
     return tile_k
 
 
-def resolve_flydsl_stage1_tile_n(inter_dim: int, tile_n: int) -> int:
+def resolve_flydsl_stage1_tile_n(
+    inter_dim: int, tile_n: int, *, interleaved: bool = False
+) -> int:
     """Return a ``tile_n`` that divides ``inter_dim``, preferring the caller value.
 
-    For non-256-aligned ``inter_dim`` (e.g. MiniMax TP4 ``inter=384``) the stage1
-    gate/up (N) axis cannot be tiled with ``tile_n=256`` (OOB reads -> wrong output
-    or memfault), so this forces the largest legal tile
-    (``pick_flydsl_stage1_tile_n`` -> 128). The downgrade is silent by default but
-    logs a one-time warning, because it means ``tile_n=256`` is NOT tunable for
-    such shapes: a tuned config that names a 256 kernel here actually runs 128.
-    Tuners should not offer 256 candidates for non-256 ``inter_dim``.
+    This is the historical resolver for the non-interleaved layouts, whose
+    stage1 gate/up (N) axis is ``inter_dim``: there a ``tile_n=256`` on a
+    non-256-aligned ``inter_dim`` (e.g. MiniMax TP4 ``inter=384``) over-reads
+    the axis (OOB -> wrong output or memfault), so it forces the largest legal
+    tile (``pick_flydsl_stage1_tile_n`` -> 128). The downgrade is silent by
+    default but logs a one-time warning, because it means ``tile_n=256`` is NOT
+    tunable for such shapes: a tuned config that names a 256 kernel here
+    actually runs 128. For the interleaved gate/up layout the N axis is
+    ``2 * inter_dim``; ``pick_flydsl_stage1_prefill_tile_n`` re-opens 256 on
+    the measured family where that axis is 256-aligned. ``interleaved`` is
+    passed by the producer so the warning does not claim the resolver's 128 is
+    the final launch on that path. Tuners should not offer 256 candidates for
+    non-256 ``inter_dim`` on the non-interleaved path.
     """
     inter_dim = int(inter_dim)
     tile_n = int(tile_n)
@@ -184,7 +416,9 @@ def resolve_flydsl_stage1_tile_n(inter_dim: int, tile_n: int) -> int:
         return tile_n
     auto = pick_flydsl_stage1_tile_n(inter_dim)
     if inter_dim % auto == 0:
-        _warn_tile_override("tile_n", inter_dim, tile_n, auto)
+        _warn_tile_override(
+            "tile_n", inter_dim, tile_n, auto, interleaved=bool(interleaved)
+        )
         return auto
     return tile_n
 
@@ -1783,12 +2017,52 @@ def _flydsl_moe_stage1_impl(
             **_a16w4_shared_tile(shared_tile, 1),
         )
         return inter_sorted
-    # The gate/up (N) axis tile must divide inter_dim; for non-256-aligned
-    # inter_dim, tile_n=256 over-reads/writes the N axis (OOB -> wrong output
-    # or memfault). Downgrade to a divisor (128). Applies to both a16w4
-    # (bf16 x mxfp4) and a8w4 (fp8 x mxfp4); a4w4 is unaffected.
+    # For the non-interleaved layouts the gate/up (N) axis is inter_dim; a
+    # non-256-aligned inter_dim cannot be tiled with tile_n=256 (OOB -> wrong
+    # output or memfault), so downgrade to a divisor (128). This stock resolver
+    # applies to both a16w4 (bf16 x mxfp4) and a8w4 (fp8 x mxfp4); a4w4 is
+    # unaffected. The interleaved gate/up rule below re-opens 256 on the
+    # measured family because there the N axis is 2 * inter_dim.
     if b_dtype == "fp4" and a_dtype in ("bf16", "fp8"):
-        tile_n = resolve_flydsl_stage1_tile_n(inter_dim, tile_n)
+        tile_n = resolve_flydsl_stage1_tile_n(
+            inter_dim, tile_n, interleaved=gate_up_interleave
+        )
+        # The interleaved a8w4 prefill rule widens the tile on the measured
+        # shapes only; the historical resolver above keeps every other launch
+        # (including tuned rows naming a 256 tile) on the stock path.  The
+        # token gate is a cheap call-site guard: no rule below can fire below
+        # 4K routed tokens, and decode calls must not pay the Python check.
+        if (
+            token_num >= 4096
+            and gate_up_interleave
+            and a_dtype == "fp8"
+            and b_dtype == "fp4"
+            and E in (384, 385)
+            and topk in (6, 7)
+            and (model_dim, inter_dim) in FLYDSL_PREFILL_SHAPES
+        ):
+            tile_n = pick_flydsl_stage1_prefill_tile_n(
+                token_num=token_num,
+                inter_dim=inter_dim,
+                tile_n=tile_n,
+                gate_up_interleave=gate_up_interleave,
+                a_dtype=a_dtype,
+                b_dtype=b_dtype,
+                out_dtype=out_dtype,
+                k_batch=k_batch,
+                model_dim=model_dim,
+                tile_k=tile_k,
+                tile_m=tile_m,
+                has_bias=bias is not None,
+                has_sorted_weights=sorted_weights is not None,
+                model_dim_pad=model_dim_pad,
+                inter_dim_pad=inter_dim_pad,
+                experts=E,
+                act=act,
+                topk=topk,
+                xcd_swizzle=xcd_swizzle,
+                gpu_arch=str(get_gfx_runtime()),
+            )
     _splitk_fp4 = _is_splitk and _need_fp4
     _gui_sk = gate_up_interleave and _is_splitk
     _gui_sk_fused = _gui_sk and _fuse_any_quant
@@ -1851,6 +2125,44 @@ def _flydsl_moe_stage1_impl(
     _grid_y = min(_dense_blks, _all_blks)
 
     _persist_m = resolve_flydsl_grid_y_persist_m(_grid_y, persist_m)
+
+    # Large interleaved a8w4 prefill: grouped dispatch over the XCDs keeps one
+    # expert's gate/up weight tiles resident while its M blocks stream past.
+    # Same call-site guard: the rule needs 16K+ tokens and a caller xcd of 0.
+    if (
+        token_num >= 16384
+        and gate_up_interleave
+        and a_dtype == "fp8"
+        and b_dtype == "fp4"
+        and E in (384, 385)
+        and topk in (6, 7)
+        and (model_dim, inter_dim) in FLYDSL_PREFILL_SHAPES
+        and xcd_swizzle == 0
+    ):
+        xcd_swizzle = pick_flydsl_stage1_prefill_xcd(
+            token_num=token_num,
+            inter_dim=inter_dim,
+            inter_dim_pad=inter_dim_pad,
+            model_dim=model_dim,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            grid_y=_grid_y,
+            persist_m=_persist_m,
+            tile_m=_sort_block_m,
+            experts=E,
+            topk=topk,
+            gate_up_interleave=gate_up_interleave,
+            a_dtype=a_dtype,
+            b_dtype=b_dtype,
+            out_dtype=out_dtype,
+            k_batch=k_batch,
+            xcd_swizzle=xcd_swizzle,
+            act=act,
+            has_bias=bias is not None,
+            has_sorted_weights=sorted_weights is not None,
+            model_dim_pad=model_dim_pad,
+            gpu_arch=str(get_gfx_runtime()),
+        )
 
     # Allocate sorted-scale buffer with padding for tiled layout
     scale_cols = inter_dim // 32
@@ -2931,7 +3243,6 @@ def flydsl_moe_topids_to_rows(
         )
     else:
         from aiter.jit.utils.build_targets import is_gfx1250_family
-        from aiter.jit.utils.chip_info import get_gfx_runtime
         from aiter.ops.flydsl.kernels.moe_route_maps import (
             MAX_TP_ROUTE_BUCKETS,
             tp_route_min_routes,

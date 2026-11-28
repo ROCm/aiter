@@ -557,7 +557,7 @@ def test_flydsl_stage2_fp8_ep_reduction():
     torch.testing.assert_close(out, torch.full_like(out, 3.0))
 
 
-@pytest.mark.parametrize("inter_dim", [256, 384, 640])
+@pytest.mark.parametrize("inter_dim", [256, 384, 640, 1152])
 @_SKIP_GFX950_FLYDSL
 def test_flydsl_e2e_a8w4_gui(inter_dim):
     from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
