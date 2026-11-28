@@ -338,11 +338,22 @@ def build_flash_attn_paged_decode_module_gfx11(
         last_key = seq_kv - 1
         k_base = buf_base_i64(K) + fx.Int64(kvh) * (K_SH * 2)
         v_base = buf_base_i64(V) + fx.Int64(kvh) * (V_SH * 2)
-        # The descales as scalar loads: K's multiplies the scores, V's the
-        # output; only when built for them.
+        # The descales as scalar loads: K's folds into the softmax scale (one
+        # scalar multiply, not one per score), V's multiplies the output; only
+        # when built for them.
         if const_expr(descale):
             k_desc = fx.Int32(table_scalar(K_DESC, 0, 1)).bitcast(fx.Float32)
             v_desc = fx.Int32(table_scalar(V_DESC, 0, 1)).bitcast(fx.Float32)
+        scale_l2 = (
+            fx.Float32(SCALE_LOG2) * k_desc
+            if const_expr(descale)
+            else fx.Float32(SCALE_LOG2)
+        )
+        nscale_l2 = (
+            fx.Float32(-SCALE_LOG2) * k_desc
+            if const_expr(descale)
+            else fx.Float32(-SCALE_LOG2)
+        )
         GPTR16 = fx.PointerType.get(
             elem.ir_type, address_space=fx.AddressSpace.Global, alignment=16
         )
@@ -549,8 +560,6 @@ def build_flash_attn_paged_decode_module_gfx11(
                 row = []
                 for si in range_constexpr(8):
                     x = fx.Float32(s_acc[kb][si])
-                    if const_expr(descale):
-                        x = x * k_desc
                     key = key0 + kb * 16 + 2 * si + hh
                     x = (key > q_lim).select(fx.Float32(NEG_BIG), x)
                     x = (key >= seq_kv).select(fx.Float32(NEG_BIG), x)
@@ -565,8 +574,8 @@ def build_flash_attn_paged_decode_module_gfx11(
                         m_loc = fx.maxnumf(m_loc, s_vals[kb][si])
             m_loc = fx.maxnumf(m_loc, m_loc.shuffle_xor(16, WAVE_SIZE))
             m_new = fx.maxnumf(m_old, m_loc)
-            alpha = _exp2((m_old - m_new) * SCALE_LOG2)
-            neg_mc = m_new * (-SCALE_LOG2)
+            alpha = _exp2((m_old - m_new) * scale_l2)
+            neg_mc = m_new * nscale_l2
             l_new = l_old * alpha
             o_acc = [
                 Vec.from_elements(
@@ -578,7 +587,7 @@ def build_flash_attn_paged_decode_module_gfx11(
             for kb in range_constexpr(NK):
                 own = []
                 for si in range_constexpr(8):
-                    p = _exp2(fx.fma(s_vals[kb][si], fx.Float32(SCALE_LOG2), neg_mc))
+                    p = _exp2(fx.fma(s_vals[kb][si], scale_l2, neg_mc))
                     l_new = l_new + p
                     own.append(p)
                 ownp = [
@@ -686,7 +695,7 @@ def build_flash_attn_paged_decode_module_gfx11(
                 num_records_bytes=rows64 * nseg64 * 4,
             )
             row_seg = ((bat * q_small + tok) * H + head) * num_segments + seg
-            m_log2 = fx.Float32(results[0]) * fx.Float32(SCALE_LOG2)
+            m_log2 = fx.Float32(results[0]) * scale_l2
             m_out = (l_fin > 0.0).select(m_log2, fx.Float32(NEG_INF))
             # A segment without keys for this row still writes its statistics,
             # (-inf, 0), so the merge needs no knowledge of the partition; its O

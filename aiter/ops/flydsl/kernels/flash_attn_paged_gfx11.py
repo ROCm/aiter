@@ -418,12 +418,23 @@ def build_flash_attn_paged_module_gfx11(
             kv_head = head // GROUP if GROUP > 1 else head  # GROUP is a Python int
             k_base = buf_base_i64(K) + fx.Int64(kv_head * K_SH) * 2
             v_base = buf_base_i64(V) + fx.Int64(kv_head * V_SH) * 2
-            # The descales as scalar loads: K's multiplies the scores, V's the
-            # output. Only when built for them: the extra live values tip the
-            # head_dim-128 tile from 221 VGPRs into spilling.
+            # The descales as scalar loads: K's folds into the softmax scale (a
+            # scalar multiply once, not one per score: that cost 6% on the
+            # 16-wave head_dim-128 tiles), V's multiplies the output. Only when
+            # built for them.
             if const_expr(descale):
                 k_desc = fx.Int32(table_scalar(K_DESC, 0, 1)).bitcast(fx.Float32)
                 v_desc = fx.Int32(table_scalar(V_DESC, 0, 1)).bitcast(fx.Float32)
+            scale_l2 = (
+                fx.Float32(SCALE_LOG2) * k_desc
+                if const_expr(descale)
+                else fx.Float32(SCALE_LOG2)
+            )
+            nscale_l2 = (
+                fx.Float32(-SCALE_LOG2) * k_desc
+                if const_expr(descale)
+                else fx.Float32(-SCALE_LOG2)
+            )
             # 16-byte aligned global pointer type for the gathered K / V loads.
             GPTR16 = fx.PointerType.get(
                 elem.ir_type, address_space=fx.AddressSpace.Global, alignment=16
@@ -760,8 +771,6 @@ def build_flash_attn_paged_module_gfx11(
                     row = []
                     for si in range_constexpr(8):
                         x = fx.Float32(acc[si])
-                        if const_expr(descale):
-                            x = x * k_desc
                         if const_expr(causal or mask_tail):
                             key = j32 * BLOCK_N + kb * 16 + 2 * si + hh
                         if const_expr(causal):
@@ -779,8 +788,8 @@ def build_flash_attn_paged_module_gfx11(
                             m_loc = fx.maxnumf(m_loc, s_vals[kb][si])
                 m_loc = fx.maxnumf(m_loc, m_loc.shuffle_xor(16, WAVE_SIZE))
                 m_new = fx.maxnumf(m_old, m_loc)
-                alpha = _exp2((m_old - m_new) * SCALE_LOG2)
-                neg_mc = m_new * (-SCALE_LOG2)
+                alpha = _exp2((m_old - m_new) * scale_l2)
+                neg_mc = m_new * nscale_l2
                 l_new = l_old * alpha
                 o_acc = [
                     Vec.from_elements(
@@ -794,9 +803,7 @@ def build_flash_attn_paged_module_gfx11(
                 for kb in range_constexpr(NK):
                     own = []
                     for si in range_constexpr(8):
-                        p = _exp2(
-                            fx.fma(s_vals[kb][si], fx.Float32(SCALE_LOG2), neg_mc)
-                        )
+                        p = _exp2(fx.fma(s_vals[kb][si], scale_l2, neg_mc))
                         l_new = l_new + p
                         own.append(p)
                     ownp = [
