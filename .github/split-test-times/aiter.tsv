@@ -63,6 +63,7 @@ op_tests/test_flydsl_topk_per_row_small_k.py	49
 op_tests/test_fmha_fwd_mxfp8_asm.py	4
 op_tests/test_fmha_fwd_with_sink_asm.py	4
 op_tests/test_fmha_fwd_with_sink_varlen_asm.py	5
+op_tests/test_fmha_gfx942_asm_splitkv.py	85
 op_tests/test_fused_kv_norm_rope_group_quant.py	7
 op_tests/test_fused_norm_rope_attn_rope_cast.py	176
 op_tests/test_fused_qk_norm.py	17
