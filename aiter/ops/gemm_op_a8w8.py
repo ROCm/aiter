@@ -1437,22 +1437,6 @@ def get_mxscale_bpreshuffle_config(m: int, n: int, k: int, w_scale_block: str):
             n,
             k,
         )
-    if row is not None and row.get("libtype") == "flydsl":
-        from .flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
-            is_compute_wmma_kernel_name,
-            parse_wmma_kernel_name,
-        )
-
-        kernel_name = str(row["kernelName"])
-        wmma_config = parse_wmma_kernel_name(kernel_name)
-        # A padded row must not send a decode M below a compute kernel's
-        # full M tile; kernel_fits_shape rejects that cluster-barrier case.
-        if (
-            wmma_config is not None
-            and is_compute_wmma_kernel_name(kernel_name)
-            and m < wmma_config["tile_m"]
-        ):
-            row = None
     if row is None:
         report_key = (gfx, n, k, w_scale_block)
         if report_key not in _MXSCALE_UNTUNED_REPORTED:
@@ -1719,11 +1703,16 @@ def _flydsl_mxfp8_fallback_kernel(
 ):
     """Best-effort gfx1250 mxfp8 kernel for a shape with no tuned row.
 
+    Takes the unfused, unsplit tile of up to 256 columns with the lowest
+    ``waves * sqrt(tile area)`` (a compute kernel counts 0.8x): few big tiles while the
+    CUs stay full. Ties go to the (2, 4), (4, 2), (1, 2) clusters, then the larger
+    tile_k, then more buffers.
     ``mx32``: A scale is row-major 1x32 and B scale is 32x4 shuffled;
     tile_n must be a multiple of 32.
     """
     from ..ops.flydsl.gemm_tune.flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common import (
         is_compute_kernel,
+        is_pow2_geometry,
         kernel_fits_shape,
         kernels_list,
     )
@@ -1734,26 +1723,31 @@ def _flydsl_mxfp8_fallback_kernel(
     fits = [
         ki
         for ki in kernels_list.values()
-        if kernel_fits_shape(ki, m, n, k)
+        if ki.split_k == 1
+        and not ki.fused_splitk
+        and ki.tile_n <= 256  # wider tiles measured slower
+        and is_pow2_geometry(ki)
+        # Underfilled compute tiles are tuned rows only: the pick here is unmeasured.
+        and not (is_compute_kernel(ki) and m < ki.tile_m)
+        and kernel_fits_shape(ki, m, n, k)
         and not (mx32 and (ki.a_preshuffle or ki.tile_n % 32))
     ]
-    if not fits:
-        return None
-    want_tm = min(256, max(16, 1 << (m - 1).bit_length()))
-    compute = [ki for ki in fits if is_compute_kernel(ki)]
-    if compute:
-        return min(
-            compute,
-            key=lambda x: (
-                abs(x.tile_m - want_tm),
-                -(x.cluster_m * x.cluster_n),
-                x.split_k,
-                x.persistent_n_tiles,
-                -x.tile_n,
-                -x.num_buffers,
-            ),
+    num_cu = get_cu_num() or 256
+    cluster_pref = ((2, 4), (4, 2), (1, 2))
+
+    def key(ki):
+        tiles = math.ceil(m / ki.tile_m) * math.ceil(n / ki.tile_n)
+        cost = math.ceil(tiles / num_cu) * math.sqrt(ki.tile_m * ki.tile_n)
+        cluster = (ki.cluster_m, ki.cluster_n)
+        pref = cluster_pref.index(cluster) if cluster in cluster_pref else 3
+        return (
+            cost * (0.8 if is_compute_kernel(ki) else 1),
+            pref,
+            -ki.tile_k,
+            -ki.num_buffers,
         )
-    return min(fits, key=lambda x: (abs(x.tile_m - want_tm), -x.tile_n, -x.tile_k))
+
+    return min(fits, key=key, default=None)
 
 
 def gemm_a8w8_blockscale_bpreshuffle_fake(
