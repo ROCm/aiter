@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import argparse
+import functools
 import sys
 
 import torch
@@ -11,8 +11,15 @@ from aiter.ops.triton.quant import (
     dequant_hadamard_quant_mxfp4,
     dynamic_mxfp4_quant,
 )
-from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm, shuffle_weight
-from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+    override_parser_action,
+)
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 
 def get_default_shapes() -> list[tuple[int, int]]:
@@ -26,60 +33,23 @@ def get_default_shapes() -> list[tuple[int, int]]:
     ]
 
 
-def _hadamard16(device: torch.device) -> torch.Tensor:
-    matrix = torch.ones((1, 1), dtype=torch.float32, device=device)
-    while matrix.shape[0] < 16:
-        matrix = torch.cat(
-            (
-                torch.cat((matrix, matrix), dim=1),
-                torch.cat((matrix, -matrix), dim=1),
-            ),
-            dim=0,
-        )
-    return matrix * 0.25
+def _generate_rot_inputs(M: int, K: int):
+    x = torch.randn((M, K), dtype=torch.bfloat16, device="cuda")
+    return dynamic_mxfp4_quant(x)
 
 
-def _decomposed_reference(
-    packed: torch.Tensor,
-    scales: torch.Tensor,
-    sign: torch.Tensor,
-    hadamard: torch.Tensor,
-):
-    values = mxfp4_to_f32(packed)
-    scale = e8m0_to_f32(scales).repeat_interleave(32, dim=1)
-    transposed = (values * scale).to(torch.bfloat16).t().contiguous()
-    K, M = transposed.shape
-    rotated = (
-        transposed.float().reshape(K, M // 16, 16) * sign.reshape(1, 1, 16)
-    ) @ hadamard
-    return dynamic_mxfp4_quant(rotated.reshape(K, M))
+def _generate_fixed_inputs():
+    return (torch.ones(16, dtype=torch.float32, device="cuda"),)
 
 
-def _decomposed_layout(
-    packed: torch.Tensor,
-    scales: torch.Tensor,
-    sign: torch.Tensor,
-    hadamard: torch.Tensor,
-):
-    output, output_scales = _decomposed_reference(packed, scales, sign, hadamard)
-    return (
-        shuffle_weight(output, arch="gfx950", layout=(16, 16)),
-        shuffle_scale_gemm(
-            output_scales, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
-        ),
-    )
+_ROT_KEYS = ["packed", "scales"]
+_FIXED_KEYS = ["sign"]
 
 
 def run_benchmark(args):
     shapes = [tuple(args.shape)] if args.shape else get_default_shapes()
     providers = args.provider.split(",")
-    known_providers = {
-        "fused",
-        "fused_layout",
-        "fused_sr",
-        "decomposed",
-        "decomposed_layout",
-    }
+    known_providers = {"fused", "fused_layout", "fused_sr"}
     unknown_providers = set(providers) - known_providers
     if unknown_providers:
         raise ValueError(f"unknown providers: {sorted(unknown_providers)}")
@@ -88,8 +58,6 @@ def run_benchmark(args):
         "fused": ("green", "-"),
         "fused_layout": ("green", "--"),
         "fused_sr": ("red", "-"),
-        "decomposed": ("blue", "-"),
-        "decomposed_layout": ("blue", "--"),
     }
     benchmark = triton.testing.Benchmark(
         x_names=["M", "K"],
@@ -103,22 +71,22 @@ def run_benchmark(args):
         args={"metric": args.metric},
     )
 
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
+
     @triton.testing.perf_report([benchmark])
     def bench(M, K, provider, metric):
         torch.manual_seed(17)
-        x = torch.randn((M, K), dtype=torch.bfloat16, device="cuda")
-        packed, scales = dynamic_mxfp4_quant(x)
-        sign = torch.ones(16, dtype=torch.float32, device=x.device)
-        hadamard = _hadamard16(x.device)
 
         if provider == "fused":
 
-            def fn():
+            def fn(packed, scales, sign):
                 return dequant_hadamard_quant_mxfp4(packed, scales, sign)
 
         elif provider == "fused_layout":
 
-            def fn():
+            def fn(packed, scales, sign):
                 return dequant_hadamard_quant_mxfp4(
                     packed,
                     scales,
@@ -129,7 +97,7 @@ def run_benchmark(args):
 
         elif provider == "fused_sr":
 
-            def fn():
+            def fn(packed, scales, sign):
                 return dequant_hadamard_quant_mxfp4(
                     packed,
                     scales,
@@ -138,27 +106,21 @@ def run_benchmark(args):
                     philox_seed=1234,
                 )
 
-        elif provider == "decomposed":
-
-            def fn():
-                return _decomposed_reference(packed, scales, sign, hadamard)
-
-        elif provider == "decomposed_layout":
-
-            def fn():
-                return _decomposed_layout(packed, scales, sign, hadamard)
-
         else:
             raise AssertionError(f"unvalidated provider: {provider}")
 
-        ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+        bencher.build_pool(
+            [functools.partial(_generate_rot_inputs, M, K)],
+            [_ROT_KEYS],
+            [_generate_fixed_inputs],
+            [_FIXED_KEYS],
+        )
+        ms = bencher.bench(fn)
         if metric == "time":
             return ms
         # Useful traffic: packed input, its scales, the sign vector, and both
         # outputs. Layout variants permute the same number of bytes.
-        input_bytes = (
-            packed.numel() + scales.numel() + sign.numel() * sign.element_size()
-        )
+        input_bytes = M * (K // 2) + M * (K // 32) + 16 * torch.float32.itemsize
         output_bytes = K * (M // 2) + K * (M // 32)
         return (input_bytes + output_bytes) / (ms * 1e-3) * 1e-9
 
@@ -166,10 +128,7 @@ def run_benchmark(args):
 
 
 def parse_args(args: list[str] | None = None):
-    parser = argparse.ArgumentParser(
-        prog="Benchmark fused MXFP4 dequant-transpose-H16-requant",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+    parser = get_parser(kernel_name="fused MXFP4 dequant-transpose-H16-requant")
     parser.add_argument(
         "--shape",
         type=int,
@@ -179,16 +138,11 @@ def parse_args(args: list[str] | None = None):
     )
     parser.add_argument(
         "--provider",
-        default="fused,fused_layout,fused_sr,decomposed,decomposed_layout",
-        help=(
-            "comma-separated providers: fused, fused_layout, fused_sr,"
-            " decomposed, decomposed_layout"
-        ),
+        default="fused,fused_layout,fused_sr",
+        help="comma-separated providers: fused, fused_layout, fused_sr",
     )
-    parser.add_argument(
-        "--metric",
-        choices=("time", "bandwidth"),
-        default="time",
+    override_parser_action(
+        parser, action="--metric", choices=["time", "bandwidth"], default="time"
     )
     parser.add_argument("-o", "--output", action="store_true")
     return parser.parse_args(args)
