@@ -1,0 +1,11 @@
+{
+  "bfloat16": {
+    "attn": {
+      "num_warps": 2,
+      "MAX_SEGMENTS": 16
+    },
+    "reduce": {
+      "num_warps": 8
+    }
+  }
+}
