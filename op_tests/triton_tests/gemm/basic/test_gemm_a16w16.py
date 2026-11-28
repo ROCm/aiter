@@ -154,6 +154,71 @@ def test_gemm_a16_w16_activation(
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-2)
 
 
+def _force_round_before_act(monkeypatch):
+    """Enable ROUND_BEFORE_ACT on any arch with the wrapper's own get_arch.
+
+    Do not patch arch_info.get_arch, because it also selects the config.
+    """
+    import aiter.ops.triton.gemm.basic.gemm_a16w16 as gemm_module
+
+    monkeypatch.setattr(gemm_module, "get_arch", lambda: "gfx1151")
+
+
+# The accumulator is -98304 or +98304, outside the fp16 range.
+# Keep NUM_KSPLIT == 1, or the kernel skips the fused epilogue.
+@pytest.mark.parametrize(
+    "dtype, x_value, expected",
+    [
+        # The first row needs the bound. The other rows must not get one.
+        (torch.float16, -6.0, 0.0),
+        (torch.float16, 6.0, float("inf")),
+        (torch.bfloat16, 6.0, 98304.0),
+    ],
+    ids=["fp16_below_min", "fp16_above_max", "bf16_no_bound"],
+)
+@pytest.mark.parametrize("activation", ["gelu", "gelu_tanh", "silu"])
+def test_gemm_a16_w16_activation_round_before_act_bound(
+    monkeypatch, activation, dtype, x_value, expected
+):
+    """The rounding step must give the result of an fp32 epilogue."""
+    _skip_if_triton_on_gfx1250("triton")
+    _force_round_before_act(monkeypatch)
+
+    M, N, K = 64, 64, 4096
+    x = torch.full((M, K), x_value, dtype=dtype, device="cuda")
+    w = torch.full((N, K), 4.0, dtype=dtype, device="cuda")
+
+    out = gemm_a16w16(x, w, dtype=dtype, activation=activation)
+
+    assert not torch.isnan(out).any(), (
+        f"{activation} made {torch.isnan(out).sum().item()} NaN values from an "
+        f"accumulator of {x_value * 4.0 * K:.0f}"
+    )
+    # rtol allows a different accumulation order but finds a wrong bound.
+    torch.testing.assert_close(
+        out, torch.full_like(out, expected), atol=1e-3, rtol=1e-6, equal_nan=False
+    )
+
+
+@pytest.mark.parametrize("activation", ["gelu", "gelu_tanh", "silu"])
+def test_gemm_a16_w16_activation_fp16_keeps_nan(monkeypatch, activation):
+    """ROUND_BEFORE_ACT must keep an input NaN. A finite value hides the bad input."""
+    _skip_if_triton_on_gfx1250("triton")
+    _force_round_before_act(monkeypatch)
+
+    M, N, K = 64, 64, 512
+    x = torch.full((M, K), 1.0, dtype=torch.float16, device="cuda")
+    w = torch.full((N, K), 1.0, dtype=torch.float16, device="cuda")
+    x[0, 0] = float("nan")
+
+    out = gemm_a16w16(x, w, dtype=torch.float16, activation=activation)
+
+    assert torch.isnan(out[0]).all(), (
+        f"{activation} dropped the NaN of row 0; the rounding step must "
+        f"propagate it"
+    )
+
+
 @pytest.mark.parametrize("M, N, K", get_shapes())
 @pytest.mark.parametrize("layout", ["TT", "NN", "NT"])
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
