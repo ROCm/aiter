@@ -16,7 +16,7 @@ __device__ int32_t get_local_splits(int32_t seqlen_kv,
     int32_t ex_splits =
         seqlen_kv /
         196; // magic num 196. Experiments shows 196 per splits can get better performance.
-    return opus::min(opus::min(ex_splits, num_splits_per_cu), num_splits);
+    return opus::max(opus::min(opus::min(ex_splits, num_splits_per_cu), num_splits), 1);
 #endif
 }
 
@@ -84,7 +84,7 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
     if(lane_idx == 0)
     {
         p_lds_shift[0]     = 0;
-        p_lds_kv_seqlen[0] = 0;
+        p_lds_kv_seqlen[0] = params.p_seqlens_kv_indptr[0];
         for(int32_t bid = 1; bid < params.num_batches; bid++)
         {
             p_lds_shift[bid] = p_lds_shift[bid - 1] + p_lds_split[bid - 1];
