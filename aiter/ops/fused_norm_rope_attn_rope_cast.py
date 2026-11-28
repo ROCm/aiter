@@ -226,8 +226,35 @@ def _fused_norm_rope_attn_rope_cast_fwd(
     norm_eps: float,
     num_splits: int = 1,
     workspace: torch.Tensor | None = None,
+    split_flags: torch.Tensor | None = None,
 ) -> None:
     """Write outputs for the two-source FP8 interface, optionally with split-KV."""
+
+
+# An H64 two-way split whose CTA pairs reduce in-kernel synchronizes each pair
+# through zeroed flag words (one 128-byte line per token) that the kernel leaves
+# zero. Launches that may run concurrently need separate flags, so the default
+# flags belong to a (device, stream): kernels on one stream run in order.
+_SPLIT_FLAG_WORDS = 32
+_SPLIT_FLAG_TOKENS = 4096
+_split_flags_by_stream: dict[tuple[int, int], torch.Tensor] = {}
+
+
+def _stream_split_flags(device: torch.device, tokens: int) -> torch.Tensor | None:
+    if tokens > _SPLIT_FLAG_TOKENS:
+        return None
+    key = (device.index, torch.cuda.current_stream(device).cuda_stream)
+    flags = _split_flags_by_stream.get(key)
+    if flags is None:
+        # Zeroing inside a graph would repeat on every replay. Until an eager
+        # call on this stream allocates them, use the separate reduction.
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        flags = torch.zeros(
+            _SPLIT_FLAG_TOKENS * _SPLIT_FLAG_WORDS, dtype=torch.int32, device=device
+        )
+        _split_flags_by_stream[key] = flags
+    return flags
 
 
 def fused_norm_rope_attn_rope_cast(
@@ -255,6 +282,7 @@ def fused_norm_rope_attn_rope_cast(
     norm_eps: float = 1e-6,
     num_splits: int = 0,
     workspace: torch.Tensor | None = None,
+    split_flags: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Fuse Q preparation, two-source FP8 attention and output RoPE/quantization.
 
@@ -314,6 +342,16 @@ def fused_norm_rope_attn_rope_cast(
     its shape must match the selected count for the current input capacities.
     No workspace is used with one split.
 
+    H64 decode with two splits can reduce inside the attention kernel. Its CTA
+    pairs synchronize through ``split_flags``, a zeroed contiguous int32 buffer
+    of at least ``32*T`` elements that every launch leaves zero, so graph
+    replay needs no reset. Launches that may run concurrently must not share
+    it. When omitted, each (device, stream) gets its own buffer on its first
+    eager call; a graph captured on a stream without one uses the separate
+    reduction. Graphs captured on one stream share its buffer: replay them in
+    order or pass distinct ``split_flags``. Results are bitwise identical
+    either way.
+
     All tensors must be on q.device. Output buffers must be contiguous and
     disjoint from inputs and each other. Warm up before graph capture.
     """
@@ -345,6 +383,9 @@ def fused_norm_rope_attn_rope_cast(
         )
     if type(num_splits) is not int or not 0 <= num_splits <= 32:
         raise ValueError("num_splits must be an integer in [0,32]")
+    pair_flags = split_flags
+    if pair_flags is None and h == 64 and t > 48:
+        pair_flags = _stream_split_flags(q.device, t)
     if num_splits == 0:
         num_splits = 1
         if t:
@@ -408,6 +449,8 @@ def fused_norm_rope_attn_rope_cast(
         )
     if num_splits == 1 and workspace is not None:
         raise ValueError("workspace requires num_splits > 1")
+    if num_splits == 2:
+        split_flags = pair_flags
     if out is None:
         out = torch.empty((t, h // 8, 4096), device=q.device, dtype=torch.float8_e4m3fn)
     if out_scale is None:
@@ -438,6 +481,7 @@ def fused_norm_rope_attn_rope_cast(
         float(norm_eps),
         num_splits,
         workspace,
+        split_flags,
     )
     return out, out_scale, lse
 

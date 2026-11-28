@@ -107,9 +107,12 @@ template <bool DirectQ        = false,
           int HeadTile        = 64,
           bool BoundedPrefill = false,
           bool PackedPrefill  = false,
-          bool WideKvOffsets  = false>
+          bool WideKvOffsets  = false,
+          bool PairFused      = false>
 struct FusedNormRopeAttnRopeCastConfig : FusedNormRopeAttnRopeCastTraits<>
 {
+    // Two-way split whose CTA pair reduces in-kernel (see split_token and pair_reduce).
+    static constexpr bool PAIR_FUSED      = PairFused;
     static constexpr bool DIRECT_Q        = DirectQ;
     static constexpr int NUM_SPLITS       = FixedSplits;
     static constexpr int NUM_HEADS        = Heads;
@@ -1482,13 +1485,14 @@ __device__ __forceinline__ V pack_output_lanes(V value)
     return value;
 }
 
-template <class T, class VO, bool OneGroup = false>
+template <class T, class VO, bool OneGroup = false, int Segments = 0xf, bool PreRope = false>
 __device__ __forceinline__ void fused_epilogue(const FusedNormRopeAttnRopeCastParams& a,
                                                const VO& v_o,
                                                int warp,
                                                int lane,
                                                int token,
-                                               int h_start)
+                                               int h_start,
+                                               const opus::vector_t<float, 4>* rope = nullptr)
 {
     using namespace opus;
     constexpr int VEC = VEC_O2<T>;
@@ -1517,6 +1521,12 @@ __device__ __forceinline__ void fused_epilogue(const FusedNormRopeAttnRopeCastPa
                     rope_sin[i.value] = bf32(sn[idx]);
                 });
             }
+            else if constexpr(PreRope)
+            {
+                // Loaded earlier by epilogue_rope.
+                rope_cos = rope[c.value % 2];
+                rope_sin = rope[2 + c.value % 2];
+            }
             else
             {
                 const int ri = (d - 448) / 2;
@@ -1535,6 +1545,8 @@ __device__ __forceinline__ void fused_epilogue(const FusedNormRopeAttnRopeCastPa
             }
         }
         static_for<OneGroup ? 1 : PV_GROUPS<T>>([&](auto r) {
+            if constexpr(!((Segments >> r.value) & 1))
+                return;
             const int head_off = OneGroup ? 0 : (warp + r.value) % PV_GROUPS<T> * 16 * 512;
             constexpr int base = (r.value * NC + c.value) * VEC;
             auto buf           = cast<bf16_t>(slice(v_o, number<base>{}, number<base + VEC>{}));
@@ -1591,6 +1603,8 @@ __device__ __forceinline__ void fused_epilogue(const FusedNormRopeAttnRopeCastPa
     {
         const int64_t head_base = int64_t(token) * a.H + h_start + lane;
         static_for<OneGroup ? 1 : PV_GROUPS<T>>([&](auto r) {
+            if constexpr(!((Segments >> r.value) & 1))
+                return;
             const int head_group = OneGroup ? 0 : (warp + r.value) % PV_GROUPS<T> * T::W_M;
             if constexpr(T::NUM_HEADS > 0 && T::NUM_HEADS < T::HEAD_TILE)
                 if(head_base + head_group >= int64_t(token + 1) * a.H)
@@ -1605,7 +1619,85 @@ __device__ __forceinline__ void fused_epilogue(const FusedNormRopeAttnRopeCastPa
     }
 }
 
+// The RoPE coefficients fused_epilogue loads for warp 3, register chunks 2 and 3
+// (cos, cos, sin, sin), for callers that can issue them early (unbounded layout only).
+template <class T>
+__device__ __forceinline__ void epilogue_rope(const FusedNormRopeAttnRopeCastParams& a,
+                                              int warp,
+                                              int lane,
+                                              int token,
+                                              opus::vector_t<float, 4>* rope)
+{
+    using namespace opus;
+    static_assert(!T::BOUNDED_PREFILL);
+    if(warp != 3)
+        return;
+    const int64_t pos = a.positions64 ? reinterpret_cast<const int64_t*>(a.positions_ptr)[token]
+                                      : reinterpret_cast<const int*>(a.positions_ptr)[token];
+    auto cs           = reinterpret_cast<const bf16_t*>(a.cos_ptr) + pos * 32;
+    auto sn           = reinterpret_cast<const bf16_t*>(a.sin_ptr) + pos * 32;
+    auto offsets      = layout_to_offsets<VEC_O2<T>>(make_layout_o_packed<T>(warp, lane, 512));
+    static_for<2>([&](auto k) {
+        const int ri = (offsets[2 + k.value] % 512 - 448) / 2;
+        if(((reinterpret_cast<uintptr_t>(cs) | reinterpret_cast<uintptr_t>(sn)) & 7) == 0)
+        {
+            rope[k.value]     = cast<float>(*reinterpret_cast<const vector_t<bf16_t, 4>*>(cs + ri));
+            rope[2 + k.value] = cast<float>(*reinterpret_cast<const vector_t<bf16_t, 4>*>(sn + ri));
+        }
+        else
+        {
+            static_for<4>([&](auto i) {
+                rope[k.value][i.value]     = bf32(cs[ri + i.value]);
+                rope[2 + k.value][i.value] = bf32(sn[ri + i.value]);
+            });
+        }
+    });
+}
+
 // ------------------------------------------------------------------------------------ driver
+
+// Fused two-way split. A one-dimensional grid places the two splits of a token in
+// CTAs b and b + 8: (b / 16) * 8 + b % 8 is the token and b / 8 % 2 the split.
+// Round-robin dispatch puts both on one XCD, so they share an L2. Each CTA reads
+// its XCC_ID and publishes it at entry; a CTA skips the agent-scope release only when
+// it has seen the same XCC_ID for its partner. Otherwise it writes back L2 and the
+// reader invalidates its own L2 before reading, so any dispatch or partition mode
+// stays correct. The flag word is zero between launches: the last CTA of a pair
+// to use it clears it.
+// The caller owns the flag words (args.split_flags, pair_flag_stride words per
+// token): one word per 128-byte line, so pairs poll their own line. Launches that
+// may run concurrently need disjoint flag buffers.
+constexpr int pair_flag_stride = 32;
+// Flag word: XCC codes in bits 0-4 / 8-12, then per-split arrived, ready, fenced and done
+// bits (shifted by the split), and ready_all for a CTA that stored its whole partial.
+constexpr uint32_t pair_xcc_valid = 0x10;
+constexpr uint32_t pair_arrived   = 1u << 16;
+constexpr uint32_t pair_ready     = 1u << 18;
+constexpr uint32_t pair_fenced    = 1u << 20;
+constexpr uint32_t pair_done      = 1u << 22;
+constexpr uint32_t pair_ready_all = 1u << 24;
+
+template <class T>
+__device__ __forceinline__ int split_token()
+{
+    if constexpr(T::PAIR_FUSED)
+        return int(blockIdx.x / 16 * 8 + blockIdx.x % 8);
+    else
+        return int(blockIdx.x);
+}
+template <class T>
+__device__ __forceinline__ unsigned split_index()
+{
+    if constexpr(T::PAIR_FUSED)
+        return blockIdx.x / 8 % 2;
+    else
+        return blockIdx.z;
+}
+__device__ __forceinline__ uint32_t pair_xcc_code()
+{
+    // HW_REG_XCC_ID bits [3:0].
+    return pair_xcc_valid | (__builtin_amdgcn_s_getreg((20) | (3 << 11)) & 0xf);
+}
 
 // A split partitions the concatenated prefix/extend tile lists. Derive ranges
 // from live device CSR on every launch, including graph replay. Each physical
@@ -1639,8 +1731,8 @@ __device__ __forceinline__ CsrRange csr_range(const FusedNormRopeAttnRopeCastPar
         const uint32_t pt     = (uint32_t(p.end - p.begin) + T::KV_TILE_SIZE - 1) / T::KV_TILE_SIZE;
         const uint32_t et     = (uint32_t(e.end - e.begin) + T::KV_TILE_SIZE - 1) / T::KV_TILE_SIZE;
         const uint32_t splits = T::NUM_SPLITS ? T::NUM_SPLITS : a.num_splits;
-        const uint32_t first  = (pt + et) * blockIdx.z / splits;
-        const uint32_t last   = (pt + et) * (blockIdx.z + 1) / splits;
+        const uint32_t first  = (pt + et) * split_index<T>() / splits;
+        const uint32_t last   = (pt + et) * (split_index<T>() + 1) / splits;
         const auto range      = extend ? e : p;
         const int64_t shift   = extend ? pt : 0;
         const int64_t size    = int64_t(range.end) - range.begin;
@@ -2013,6 +2105,223 @@ __device__ __forceinline__ void attention_segment(const FusedNormRopeAttnRopeCas
 
 } // namespace fused_norm_rope_attn_rope_cast_fwd
 
+// Reduce a fused two-way split (see split_token). Every thread holds four register
+// segments of accumulators (segment r belongs to head group (warp + r) % 4, as in
+// scale_o); split s finishes segments 2s and 2s + 1 of every thread. Each CTA stores the
+// partner's segments of its FP32 partial plus all statistics, in the split-reduction
+// layout, publishes them, then merges its own segments exactly as the split-2 decode
+// reduction does and runs the usual epilogue on them. A CTA whose partner had not
+// started when it arrived stores everything and leaves the whole reduction to the
+// partner, so no CTA waits for one that is not resident.
+template <class T, class VO>
+__device__ __forceinline__ void pair_reduce(const FusedNormRopeAttnRopeCastParams& kargs,
+                                            char* smem,
+                                            VO& v_o,
+                                            float m_row,
+                                            float l_row,
+                                            float true_max,
+                                            float* partial,
+                                            int token,
+                                            int head,
+                                            int warp_id,
+                                            int lane_id)
+{
+    using namespace opus;
+    using namespace fused_norm_rope_attn_rope_cast_fwd;
+    static_assert(T::NUM_SPLITS == 2 && T::NUM_HEADS == T::HEAD_TILE && T::HEAD_TILE == 64 &&
+                  PV_GROUPS<T> == T::NUM_WARPS && PV_GROUPS<T> == 4);
+    constexpr int SEG = O_ELEMS<T> / PV_GROUPS<T>; // accumulators per segment and thread
+    const int split = split_index<T>(), other = 1 - split;
+    uint32_t* flag   = kargs.split_flags + int64_t(token) * pair_flag_stride;
+    auto* word       = reinterpret_cast<uint32_t*>(smem + fac_base<T>);
+    uint32_t arrived = 0;
+    if(threadIdx.x == 0)
+        arrived = atomicOr(flag, pair_arrived << split);
+    // Store the partner's segments while the arrival is in flight.
+    auto store = [&](auto r) {
+        static_for<SEG / 4>([&](auto c) {
+            constexpr int i = r.value * (SEG / 4) + c.value;
+            *reinterpret_cast<vector_t<float, 4>*>(partial + i * 256 * 4 + threadIdx.x * 4) =
+                slice(v_o, number<i * 4>{}, number<i * 4 + 4>{});
+        });
+    };
+    if(split)
+    {
+        store(number<0>{});
+        store(number<1>{});
+    }
+    else
+    {
+        store(number<2>{});
+        store(number<3>{});
+    }
+    if(threadIdx.x == 0)
+        *word = arrived;
+    __builtin_amdgcn_s_barrier();
+    arrived = *word;
+    __builtin_amdgcn_s_barrier();
+    const uint32_t partner_xcc = (arrived >> (8 * other)) & 0x1f;
+    const bool second          = (arrived & (pair_arrived << other)) != 0;
+    // A partner that published its XCC_ID is resident and will arrive.
+    const bool store_all = !second && !(partner_xcc & pair_xcc_valid);
+    const bool same_l2   = partner_xcc == pair_xcc_code();
+    if(store_all)
+    {
+        if(split)
+        {
+            store(number<2>{});
+            store(number<3>{});
+        }
+        else
+        {
+            store(number<0>{});
+            store(number<1>{});
+        }
+    }
+    if(lane_id < T::W_M)
+        *reinterpret_cast<vector_t<float, 4>*>(partial + T::HEAD_TILE * 512 + head * 4) =
+            vector_t<float, 4>{m_row, l_row, true_max, 0.0f};
+    // Independent of the partner: load while its data is in flight.
+    const float sink = kargs.attn_sink_ptr
+                           ? static_cast<const float*>(kargs.attn_sink_ptr)[head] * 1.44269504089f
+                           : -__builtin_inff();
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    __builtin_amdgcn_s_barrier();
+    if(threadIdx.x == 0)
+    {
+        // Another XCD (or an unknown one) needs the agent-scope release of L2.
+        if(!same_l2)
+            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+        atomicOr(flag,
+                 store_all ? pair_ready_all
+                           : (pair_ready << split) | (same_l2 ? 0u : pair_fenced << split));
+    }
+    if(store_all)
+        return;
+    // Also independent of the partner.
+    vector_t<float, 4> rope[4];
+    epilogue_rope<T>(kargs, warp_id, lane_id, token, rope);
+    if(threadIdx.x == 0)
+    {
+        uint32_t w;
+        while(!((w = __hip_atomic_load(flag, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)) &
+                ((pair_ready << other) | pair_ready_all)))
+            __builtin_amdgcn_s_sleep(1);
+        *word = w;
+        // The last CTA to touch the flag clears it for the next launch.
+        if((w & pair_ready_all) || (atomicOr(flag, pair_done << split) & (pair_done << other)))
+            __hip_atomic_store(flag, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+    __builtin_amdgcn_s_barrier();
+    const uint32_t ready = *word;
+    const bool merge_all = (ready & pair_ready_all) != 0;
+    if(merge_all || (ready & (pair_fenced << other)))
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    else
+        asm volatile("buffer_inv sc0" ::: "memory");
+
+    // Merge exactly as the split-2 decode reduction: splits in order, sink once.
+    const float* src = kargs.partial_ptr + (int64_t(token) * 2 + other) * kargs.H * 516;
+    const auto stats =
+        *reinterpret_cast<const vector_t<float, 4>*>(src + T::HEAD_TILE * 512 + head * 4);
+    VO v_p;
+    auto load = [&](auto r) {
+        static_for<SEG / 4>([&](auto c) {
+            constexpr int i = r.value * (SEG / 4) + c.value;
+            const auto values =
+                *reinterpret_cast<const vector_t<float, 4>*>(src + i * 256 * 4 + threadIdx.x * 4);
+            static_for<4>([&](auto j) { v_p[i * 4 + j.value] = values[j.value]; });
+        });
+    };
+    if(merge_all)
+        static_for<PV_GROUPS<T>>(load);
+    else if(split)
+    {
+        load(number<2>{});
+        load(number<3>{});
+    }
+    else
+    {
+        load(number<0>{});
+        load(number<1>{});
+    }
+    const float m0 = split ? stats[0] : m_row, l0 = split ? stats[1] : l_row;
+    const float m1 = split ? m_row : stats[0], l1 = split ? l_row : stats[1];
+    const float x0 = split ? stats[2] : true_max, x1 = split ? true_max : stats[2];
+    constexpr float LN_2 = 0.69314718056f;
+    float maximum = -__FLT_MAX__, merged_max = -__builtin_inff();
+    if(l0 > 0.0f)
+        maximum = fmaxf(maximum, m0);
+    merged_max = fmaxf(merged_max, x0);
+    if(l1 > 0.0f)
+        maximum = fmaxf(maximum, m1);
+    merged_max            = fmaxf(merged_max, x1);
+    const float final_max = fmaxf(maximum, sink);
+    // The FMA placement and v_rcp_f32 below reproduce the reduction kernel's code.
+    float attention_sum = 0.0f;
+    const float f0      = l0 > 0.0f ? __builtin_amdgcn_exp2f(m0 - final_max) : 0.0f;
+    if(l0 > 0.0f)
+        attention_sum += l0 * __builtin_amdgcn_exp2f(m0 - maximum);
+    const float f1    = l1 > 0.0f ? __builtin_amdgcn_exp2f(m1 - final_max) : 0.0f;
+    float denominator = __builtin_fmaf(f1, l1, f0 * l0);
+    if(l1 > 0.0f)
+        attention_sum += l1 * __builtin_amdgcn_exp2f(m1 - maximum);
+    if(kargs.attn_sink_ptr)
+        denominator += __builtin_amdgcn_exp2f(sink - final_max);
+    const float reciprocal = denominator > 0.0f ? __builtin_amdgcn_rcpf(denominator) : 0.0f;
+    // Warp w computed the statistics of head group w; one split writes them.
+    if(lane_id < T::W_M && (merge_all || split == 0))
+    {
+        if(kargs.max_ptr)
+            kargs.max_ptr[int64_t(token) * kargs.H + head] = merged_max * LN_2;
+        if(kargs.lse_ptr)
+            static_cast<float*>(kargs.lse_ptr)[int64_t(token) * kargs.H + head] =
+                attention_sum > 0.0f ? (maximum + __builtin_amdgcn_logf(attention_sum)) * LN_2
+                                     : __builtin_inff();
+    }
+    // Broadcast the per-head factors of all head groups, as write_fac does.
+    auto* facs       = reinterpret_cast<float*>(smem + p_base<T>);
+    const int slot   = (lane_id % T::W_M) * PV_GROUPS<T> + warp_id;
+    facs[slot]       = f0;
+    facs[slot + 64]  = f1;
+    facs[slot + 128] = reciprocal;
+    __builtin_amdgcn_s_barrier();
+    const auto* row = facs + (lane_id % T::W_M) * PV_GROUPS<T>;
+    const auto g0   = *reinterpret_cast<const vector_t<float, 4>*>(row);
+    const auto g1   = *reinterpret_cast<const vector_t<float, 4>*>(row + 64);
+    const auto gr   = *reinterpret_cast<const vector_t<float, 4>*>(row + 128);
+    auto combine    = [&](auto r, auto s) {
+        const int group = (warp_id + r.value) % PV_GROUPS<T>;
+        const float h0 = g0[group], h1 = g1[group], hr = gr[group];
+        static_for<SEG>([&](auto e) {
+            constexpr int i = r.value * SEG + e.value;
+            const float a   = s.value ? v_p[i] : v_o[i];
+            const float b   = s.value ? v_o[i] : v_p[i];
+            v_o[i]          = __builtin_fmaf(b, h1, a * h0) * hr;
+        });
+    };
+    if(merge_all)
+    {
+        if(split)
+            static_for<PV_GROUPS<T>>([&](auto r) { combine(r, number<1>{}); });
+        else
+            static_for<PV_GROUPS<T>>([&](auto r) { combine(r, number<0>{}); });
+        fused_epilogue<T, VO, false, 0xf, true>(kargs, v_o, warp_id, lane_id, token, 0, rope);
+    }
+    else if(split)
+    {
+        combine(number<2>{}, number<1>{});
+        combine(number<3>{}, number<1>{});
+        fused_epilogue<T, VO, false, 0xc, true>(kargs, v_o, warp_id, lane_id, token, 0, rope);
+    }
+    else
+    {
+        combine(number<0>{}, number<0>{});
+        combine(number<1>{}, number<0>{});
+        fused_epilogue<T, VO, false, 0x3, true>(kargs, v_o, warp_id, lane_id, token, 0, rope);
+    }
+}
+
 // Shared device implementation for the source-compiled kernel specializations.
 template <class Traits, bool CHECKED, bool CONTINUOUS = false, bool Split = false>
 __device__ __forceinline__ void
@@ -2025,7 +2334,7 @@ fused_norm_rope_attn_rope_cast_fwd_impl(FusedNormRopeAttnRopeCastParams kargs, c
     using D_ACC  = typename T::D_ACC;
     using D_OUT  = typename T::D_OUT;
 
-    const int q_token_idx   = block_id_x();
+    const int q_token_idx   = T::PAIR_FUSED ? split_token<T>() : block_id_x();
     const int h_block_start = T::NUM_HEADS == T::HEAD_TILE ? 0 : block_id_y() * T::HEAD_TILE;
 
     int lane_id = thread_id_x() % T::WARP_SIZE;
@@ -2138,10 +2447,25 @@ fused_norm_rope_attn_rope_cast_fwd_impl(FusedNormRopeAttnRopeCastParams kargs, c
         constexpr int partial_heads = T::NUM_HEADS < T::HEAD_TILE ? T::NUM_HEADS : T::HEAD_TILE;
         // Store FP32 O as coalesced vectors: [register chunk][thread][4].
         // The last four floats per head hold m, l, true max and padding.
-        float* partial =
-            kargs.partial_ptr +
-            ((int64_t(q_token_idx) * kargs.num_splits + blockIdx.z) * kargs.H + h_block_start) *
-                516;
+        float* partial = kargs.partial_ptr +
+                         ((int64_t(q_token_idx) * kargs.num_splits + split_index<T>()) * kargs.H +
+                          h_block_start) *
+                             516;
+        if constexpr(T::PAIR_FUSED)
+        {
+            pair_reduce<T>(kargs,
+                           smem,
+                           v_o,
+                           m_row,
+                           l_row,
+                           true_max,
+                           partial,
+                           q_token_idx,
+                           head,
+                           warp_id,
+                           lane_id);
+            return;
+        }
         if constexpr(T::NUM_HEADS < T::HEAD_TILE)
         {
             static_assert(T::NUM_HEADS == 16 && T::HEAD_TILE == 32);
@@ -2209,8 +2533,9 @@ template <class T, bool Split = false>
 __device__ __forceinline__ bool indices_valid(const FusedNormRopeAttnRopeCastParams& a)
 {
     __shared__ int invalid_wave[4];
-    const int t = blockIdx.x, lane = threadIdx.x % 64, warp = threadIdx.x / 64;
-    bool valid = true;
+    const int t = fused_norm_rope_attn_rope_cast_fwd::split_token<T>(), lane = threadIdx.x % 64,
+              warp = threadIdx.x / 64;
+    bool valid     = true;
     // Validate the independent row spaces before either tile loop can use them.
     // Read four contiguous indices per lane when the CSR range is aligned.
     auto validate = [&](const int* ptr, const int* ids, int cap, int rows, bool extend) {
@@ -2253,16 +2578,37 @@ __device__ __forceinline__ bool indices_valid(const FusedNormRopeAttnRopeCastPar
 // Split-KV partial attention and output reduction.
 // gfx950 bodies only: retain launch stubs for host and other device passes.
 // The public entrypoints reject unsupported devices before launching.
-template <int Heads, bool DirectQ = false, int FixedSplits = 0, int HeadTile = 64>
+template <int Heads,
+          bool DirectQ    = false,
+          int FixedSplits = 0,
+          int HeadTile    = 64,
+          bool PairFused  = false>
 __global__ __launch_bounds__(256, 1) void fused_norm_rope_attn_rope_cast_decode_kernel(
     FusedNormRopeAttnRopeCastParams args)
 {
 #if defined(__gfx950__)
-    fused_norm_rope_attn_rope_cast_fwd::specialize_heads<Heads>(args);
+    using namespace fused_norm_rope_attn_rope_cast_fwd;
+    specialize_heads<Heads>(args);
     if constexpr(FixedSplits)
         args.num_splits = FixedSplits;
-    using T = FusedNormRopeAttnRopeCastConfig<DirectQ, FixedSplits, Heads, HeadTile>;
+    using T = FusedNormRopeAttnRopeCastConfig<DirectQ,
+                                              FixedSplits,
+                                              Heads,
+                                              HeadTile,
+                                              false,
+                                              false,
+                                              false,
+                                              PairFused>;
     __shared__ __align__(16) char smem[T::smem_bytes() + 2 * 68 * sizeof(int)];
+    if constexpr(PairFused)
+    {
+        // The grid is padded to whole groups of eight tokens.
+        if(split_token<T>() >= args.N)
+            return;
+        if(threadIdx.x == 0)
+            atomicOr(&args.split_flags[int64_t(split_token<T>()) * pair_flag_stride],
+                     pair_xcc_code() << (8 * split_index<T>()));
+    }
     if(indices_valid<T, true>(args))
         fused_norm_rope_attn_rope_cast_fwd_impl<T, false, true, true>(args, smem);
     else
@@ -2415,6 +2761,14 @@ hipError_t run_fused_norm_rope_attn_rope_cast_heads(const FusedNormRopeAttnRopeC
         const dim3 split_grid(args.N, Heads / 64, args.num_splits);
         if(args.num_splits == 2)
         {
+            if constexpr(Heads == 64)
+                if(args.split_flags && policy::prefer_h64_pair_split(args.N))
+                {
+                    // Each pair reduces in-kernel; no separate reduction launch.
+                    fused_norm_rope_attn_rope_cast_decode_kernel<Heads, true, 2, 64, true>
+                        <<<dim3((args.N + 7) / 8 * 16), 256, 0, stream>>>(args);
+                    return hipGetLastError();
+                }
             fused_norm_rope_attn_rope_cast_decode_kernel<Heads, true, 2>
                 <<<split_grid, 256, 0, stream>>>(args);
         }
