@@ -4755,12 +4755,20 @@ def compile_mixed_moe_gemm2_common(
                             syncscope="agent",
                         )
 
-                e_vec = 2 if accumulate else min(body_tile_n // 32, 8)
+                if const_expr(need_fp8_out):
+                    # store_pair writes one e8m0 byte per fragment, so a
+                    # fragment must be exactly one 8-column MXFP8 group.
+                    e_vec = 8
+                    cshuffle_nlane = min(32, body_tile_n // 8)
+                else:
+                    e_vec = 2 if accumulate else min(body_tile_n // 32, 8)
+                    cshuffle_nlane = 32
                 rocdl.s_setprio(3)
                 c_shuffle_epilog(
                     tile_m=tile_m,
                     tile_n=body_tile_n,
                     e_vec=e_vec,
+                    cshuffle_nlane=cshuffle_nlane,
                     m_repeat=m_repeat,
                     num_acc_n=body_num_acc_n,
                     tx=tx,

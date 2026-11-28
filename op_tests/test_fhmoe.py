@@ -1181,6 +1181,85 @@ def test_dsv4_production_reduce_matches_fp32(
     assert _rel_l2(fused, expected) <= _rel_l2(composed, expected) + 1e-2
 
 
+@pytest.mark.parametrize(
+    ("m", "expected_stage2"),
+    (
+        (4, "flydsl_moe2_afp8_wfp4_bf16_t32x128x128_reduce_persist"),
+        # tile_n=256 runs the shared expert as two 128-column halves.
+        (8, "flydsl_moe2_afp8_wfp4_bf16_t32x256x128_reduce_bnt2_persist"),
+    ),
+)
+def test_dsv4_fhmoe_fp8_route_out_matches_fp32(
+    monkeypatch: pytest.MonkeyPatch,
+    dsv4_weights: _Weights,
+    m: int,
+    expected_stage2: str,
+):
+    import importlib
+
+    fused_moe_module = importlib.import_module("aiter.fused_moe")
+    profile = _Profile(7168, 384, 384, 385, 6)
+    config_path = Path(__file__).resolve().parents[1] / "aiter/configs/tuned_fhmoe.csv"
+    metadata = fused_moe_module.get_2stage_cfgs(
+        fused_moe_module.get_padded_M(m),
+        profile.hidden,
+        profile.inter,
+        profile.experts,
+        profile.routed_topk + 1,
+        torch.bfloat16,
+        dtypes.fp8,
+        dtypes.fp4x2,
+        aiter.QuantType.per_1x32,
+        True,
+        aiter.ActivationType.Silu,
+        False,
+        0,
+        0,
+        True,
+        GateMode.INTERLEAVE,
+        config_file=str(config_path),
+    )
+    assert metadata.stage2.keywords["kernelName"] == expected_stage2
+
+    monkeypatch.setenv("AITER_BF16_FP8_MOE_BOUND", "0")
+    monkeypatch.setenv("AITER_FLYDSL_FORCE_REDUCE", "0")
+    hidden, routed_weight, routed_ids, all_weight, all_ids = _route_inputs(
+        profile, m, dsv4_weights.routed_w1.device, dsv4_weights.routed_expert_ids
+    )
+    kwargs = _common_kwargs(profile, dsv4_weights.routed_s1, dsv4_weights.routed_s2)
+    kwargs.update(
+        shared_w1=dsv4_weights.shared_w1,
+        shared_w2=dsv4_weights.shared_w2,
+        shared_w1_scale=dsv4_weights.shared_s1,
+        shared_w2_scale=dsv4_weights.shared_s2,
+        shared_expert_id=profile.shared_id,
+        clamp_shared=True,
+    )
+    args = (hidden, dsv4_weights.routed_w1, dsv4_weights.routed_w2, all_weight, all_ids)
+    monkeypatch.setenv("AITER_FLYDSL_STAGE2_FP8", "0")
+    bf16_rows = fused_moe(*args, **kwargs)
+    monkeypatch.setenv("AITER_FLYDSL_STAGE2_FP8", "1")
+    fp8_rows = fused_moe(*args, **kwargs)
+
+    expected, _, _ = _torch_heterogeneous_reference(
+        profile,
+        dsv4_weights,
+        {
+            "hidden": hidden,
+            "routed_weight": routed_weight,
+            "routed_ids": routed_ids,
+            "clamp_shared": True,
+            "swiglu_limit": _swiglu_limit(profile),
+        },
+    )
+    assert torch.isfinite(fp8_rows).all()
+    assert not torch.equal(fp8_rows, bf16_rows), "FP8 route rows were not used"
+    fp8_error = _rel_l2(fp8_rows, expected)
+    vs_bf16 = _rel_l2(fp8_rows, bf16_rows)
+    assert fp8_error <= 5e-2, f"FP8 route rows FP32 error: {fp8_error:.3e}"
+    assert vs_bf16 <= 5e-2, f"FP8 against BF16 route rows: {vs_bf16:.3e}"
+
+
 def test_mxfp8_shared_k_offsets_cover_multiple_tiles(
     monkeypatch: pytest.MonkeyPatch,
     mxfp8_weights: _Weights,
