@@ -50,9 +50,13 @@ _COMPUTE_PROFILES = (
     (128, 256, 128, 2, 2, 4),
     (128, 256, 128, 2, 2, 3),
 )
-_COMPUTE_CLUSTERS = ((2, 2), (4, 2), (2, 4), (4, 4), (1, 4))
+# (4,1)/(2,1): let 256x256 serve N that are multiples of 256 but not of
+# 512/1024 (e.g. gemm-request N=1792), instead of falling back to 128x128.
+_COMPUTE_CLUSTERS = ((2, 2), (4, 2), (2, 4), (4, 4), (1, 4), (4, 1), (2, 1))
 _COMPUTE_MIN_K_PER_SPLIT = 512
-_PERSISTENT_N_TILES = (2, 4, 8)
+# Higher / irregular ps lets gemm-request N approach ASM's fixed ~256-TG
+# occupancy (N=32768→ps32; N=25600→ps25; N=5120→ps5).
+_PERSISTENT_N_TILES = (2, 4, 5, 8, 10, 16, 20, 25, 32, 64)
 
 _CLUSTER_MIN_DIM = 8192
 _CLUSTER_MIN_TILES = 32
@@ -74,6 +78,10 @@ class WmmaKernelInstance:
     name_prefix: str = NAME_PREFIX
     a_preshuffle: bool = False
     persistent_n_tiles: int = 1
+    m_run_cap: int = 32
+    c_vmem_store: bool = False
+    xcd_swizzle: int = 0
+    rotate_n: bool = False
 
     def name_for(self, a_preshuffle: bool = False) -> str:
         return (
@@ -82,6 +90,10 @@ class WmmaKernelInstance:
             f"cm{self.cluster_m}_cn{self.cluster_n}"
             + ("_apre" if (a_preshuffle or self.a_preshuffle) else "")
             + (f"_ps{self.persistent_n_tiles}" if self.persistent_n_tiles > 1 else "")
+            + (f"_mr{self.m_run_cap}" if self.m_run_cap != 32 else "")
+            + (f"_xcd{self.xcd_swizzle}" if self.xcd_swizzle else "")
+            + ("_cv" if self.c_vmem_store else "")
+            + ("_rn" if self.rotate_n else "")
         )
 
     @property
