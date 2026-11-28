@@ -2,11 +2,23 @@
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_details/_matmul.py
 
 import itertools
+import os
+import weakref
 from functools import lru_cache
 
 import torch
 import triton
 
+from aiter.ops.triton._gluon_kernels.gfx942.moe.moe_op_gemm_a16w4 import (
+    _moe_gemm_a16w4_gfx942 as _moe_gemm_a16w4_gluon_gfx942,
+)
+from aiter.ops.triton._gluon_kernels.gfx942.moe.moe_op_gemm_a16w4 import (
+    STRIP16_COLS,
+    STRIP16_K,
+    STRIP16_REC_BYTES,
+    W_LAYOUT_STRIP16,
+    gfx942_a16w4_layouts,
+)
 from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4 import (
     _moe_gemm_a16w4_swizzle as _moe_gemm_a16w4_gluon_gfx950_swizzle,
 )
@@ -28,7 +40,7 @@ from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
 
 _LOGGER = AiterTritonLogger()
 
-_GLUON_SUPPORTED_ARCHS = ("gfx1250", "gfx1250-strict", "gfx950")
+_GLUON_SUPPORTED_ARCHS = ("gfx1250", "gfx1250-strict", "gfx950", "gfx942")
 
 
 @lru_cache(maxsize=1)
@@ -57,6 +69,21 @@ def can_overflow_int32(tensor: torch.Tensor):
 
 def should_upcast_indices(*args):
     return any(tensor is not None and can_overflow_int32(tensor) for tensor in args)
+
+
+def _gfx942_gluon_weight_layout_ok(w, w_scales):
+    """The gfx942 Gluon kernel addresses the packed fp4 tile as uint16 with 16-byte vector
+    loads along K and, for K-contiguous scales, 4-byte vectors of e8m0 scales: the base
+    pointers and the per-column / per-expert strides must keep those alignments. Contiguous
+    (E, N, K/2) weights viewed as (E, K/2, N) satisfy this whenever K % 128 == 0; padded or
+    offset views may not, and go to the Triton kernel instead."""
+    if w.data_ptr() % 16 or w.stride(-1) % 16 or w.stride(0) % 16:
+        return False
+    if w_scales.stride(-2) == 1 and (
+        w_scales.data_ptr() % 4 or w_scales.stride(-1) % 4 or w_scales.stride(0) % 4
+    ):
+        return False
+    return True
 
 
 def allocate_output(
@@ -297,6 +324,112 @@ def get_kernel_config_gluon_gfx950(m, n, k, routing_data):
     return ret
 
 
+def get_kernel_config_gluon_gfx942(m, n, k, routing_data):
+    """Configs for the gfx942 Gluon kernel (v_perm byte-LUT dequant, see
+    _gluon_kernels/gfx942/moe/moe_op_gemm_a16w4.py). The whole BLOCK_K x BLOCK_N bf16
+    B operand is dequantised into VGPRs, so BLOCK_K shrinks as BLOCK_M grows."""
+    block_m = routing_data.block_m
+    group_m = 4
+    num_xcds = get_num_xcds()
+    xcd_swizzle = num_xcds
+    # Launch-config sweep on MI300X (2026-10-22, DeepSeek-V4.1-Flash TP8 decode shapes, microbench vs exact
+    # oracle): the .cg (streaming) cache modifier on the weight loads costs 1.23x on the 3-tile down-proj
+    # (K=384, BLOCK_K=128) and is neutral elsewhere -> default loads for every block_m; the gate-up
+    # projection (K=5120, 20+ tiles) runs 1.32-1.44x faster with BLOCK_K=512 x 8 warps than with
+    # BLOCK_K=256 x 4 warps at block_m <= 32 (same 16 dwords per lane, half the iterations, 70 VGPRs).
+    w_cache_modifier = None
+    num_stages = 1
+    split_k = 1
+
+    # the kernel needs K % BLOCK_K == 0 (no K tail); K is always a multiple of 128 here (checked by
+    # the caller), but TP-sharded intermediate sizes padded to 128 (e.g. 384, 640) are not multiples of 256
+    block_k_decode = 256 if k % 256 == 0 else 128
+    # long-K projections (gate-up: K = hidden size) at decode block sizes: wider K tile, 8 warps
+    gateup_decode = k % 512 == 0 and k >= 2048
+
+    # Swept entries ship in configs/gfx942/gluon/moe/a16w4/DEFAULT.json, keyed like the
+    # Triton table (block_m is the dispatch key, fixed by routing, not a tunable); the
+    # heuristic below generalises them to unkeyed shapes.
+    waves_per_eu = 0
+    tuned = get_moe_dispatch("A16W4", "gfx942", "gluon").get(f"bm{block_m}_n{n}_k{k}")
+    if tuned is not None and k % tuned["block_k"] == 0:
+        block_n = tuned["block_n"]
+        block_k = tuned["block_k"]
+        num_warps = tuned["num_warps"]
+        waves_per_eu = tuned.get("waves_per_eu", 0)
+        w_cache_modifier = tuned.get("w_cache_modifier", None)
+    elif block_m <= 32:
+        block_n = 128
+        block_k = 512 if gateup_decode else block_k_decode
+        num_warps = 8 if gateup_decode else 4
+    elif block_m == 64:
+        block_n = 128
+        block_k = 128
+        num_warps = 8
+    else:
+        block_n = 256
+        block_k = 128
+        num_warps = 8
+
+    if block_m == 16:
+        grid_m = routing_data.n_blocks(m, block_m)
+        grid_n = triton.cdiv(n, block_n)
+        grid = grid_m * grid_n * split_k
+        while block_n > 16 * num_warps and grid < 256:
+            block_n = block_n // 2
+            grid_m = routing_data.n_blocks(m, block_m)
+            grid_n = triton.cdiv(n, block_n)
+            grid = grid_m * grid_n * split_k
+
+    return {
+        "block_m": block_m,
+        "block_n": block_n,
+        "block_k": block_k,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+        "group_m": group_m,
+        "xcd_swizzle": xcd_swizzle,
+        "w_cache_modifier": w_cache_modifier,
+        "split_k": split_k,
+        "waves_per_eu": waves_per_eu,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+    }
+
+
+@lru_cache(maxsize=64)
+def _gfx942_layouts_cached(block_m, block_n, block_k, num_warps):
+    return gfx942_a16w4_layouts(block_m, block_n, block_k, num_warps)
+
+
+# fp16 B operand with the e8m0 scale folded into the per-group lookup table (FP16_OPERAND in the gfx942 kernel):
+# 12 instead of 18.5 VALU ops per 8 weights, bit-identical weights when every e8m0 scale is in [114, 140]
+# (CPU AOT, MI300X: loop VALU -21 % at block_m 16, -13 % at 32; +2 % at 64/128, where the in-register bf16 -> fp16
+# activation convert outweighs the dequant saving, so block_m > 32 keeps the bf16 path)
+# (fp4 * 2^(e-127) a normal fp16) or 0 (all-zero padding groups). AITER_A16W4_GFX942_FP16=auto (default) checks
+# each scale tensor once (one reduction + sync, outside graph capture; the verdict lives as long as the scale
+# storage, so a freed and reallocated buffer is checked again; scales must not be modified in place afterwards),
+# 1 forces it, 0 disables it.
+_GFX942_FP16 = os.environ.get("AITER_A16W4_GFX942_FP16", "auto")
+_gfx942_fp16_scales_ok = {}
+
+
+def _gfx942_fp16_operand(w_scales):
+    if _GFX942_FP16 in ("0", "1"):
+        return _GFX942_FP16 == "1"
+    storage = w_scales.untyped_storage()
+    key = (w_scales.data_ptr(), tuple(w_scales.shape), tuple(w_scales.stride()))
+    hit = _gfx942_fp16_scales_ok.get(key)
+    if hit is not None and hit[0]() is storage:
+        return hit[1]
+    if torch.cuda.is_current_stream_capturing():
+        return False  # cannot sync here; the bf16 path is always exact
+    s = w_scales.view(torch.uint8)
+    ok = bool((((s >= 114) & (s <= 140)) | (s == 0)).all().item())
+    _gfx942_fp16_scales_ok[key] = (weakref.ref(storage), ok)
+    return ok
+
+
 def get_kernel_config_gluon_gfx1250(m, n, k, routing_data):
     block_m = routing_data.block_m
     group_m = 4
@@ -358,6 +491,7 @@ def moe_gemm_a16w4(
     backend: str | None = None,
     expert_map=None,
     gate_valid=None,
+    w_layout=None,
 ):
     """
     Computes MoE GEMM with 16-bit activations and MxFP4 weights
@@ -385,6 +519,15 @@ def moe_gemm_a16w4(
         limit(float):
         swiglu_add_residual(bool): Whether to add swiglu residual
         backend(Optional[str]): "triton", "gluon" or None(auto-detect).
+        w_layout(Optional[str]): None = column-major `w` as described above. "GFX942_STRIP16" (gfx942 gluon
+            only): `w` is the (E, N/16, K_packed/128, 1088) record tensor from
+            aiter.ops.triton.utils.shuffle.gfx942_strip16_pack (weights and scales of one 16-column x 128-K
+            block in 17 contiguous cache lines); `w_scales` must still be the original (E, K_packed/32, N)
+            tensor (shapes and the fp16-operand range check come from it, the kernel reads the scales from
+            the records). The reduction length is x.shape[-1], or unpadded_K when given (at every block_m),
+            and may be shorter than the packed K: activations past it are not read. unpadded_N works as
+            for column-major weights. Bit-identical output to the column-major layout on the same tile
+            config. There is no Triton fallback for this layout: unsupported shapes raise.
 
     Returns:
         torch.Tensor: Output with shape as x(num_tokens, K/hidden_dim/emb_dim)
@@ -426,19 +569,41 @@ def moe_gemm_a16w4(
         backend,
     )
 
-    assert w.stride(-2) == 1, "`w` must be column-major when it has data-type mxfp"
+    strip16 = w_layout == W_LAYOUT_STRIP16
+    assert w_layout is None or strip16, f"unknown w_layout {w_layout!r}"
+    if not strip16:
+        assert w.stride(-2) == 1, "`w` must be column-major when it has data-type mxfp"
     assert x_scales is None, "x_scales must be none"
     assert x_static_scale is None, "x_static_scale must be none"
     assert quant_static_scale is None, "quant_static_scale must be none"
 
     # determine shapes
     M = x.shape[-2] if gather_indx is None else gather_indx.shape[0]
-    K, N = x.shape[-1], w.shape[-1]
     block_m = routing_data.block_m
-    if unpadded_N and block_m == 16:
-        N = unpadded_N
-    if unpadded_K and block_m == 16:
-        K = unpadded_K
+    if strip16:
+        # The records fix the packed (padded) K and N. The reduction length K is separate from it: x.shape[-1],
+        # or unpadded_K when given (at every block_m: activations past it are never read), and may be shorter
+        # than the packed K, e.g. when the previous GEMM was cut to unpadded_N. The kernel masks the activation
+        # loads to K; tiles and record strides follow the packed K.
+        assert backend == "gluon" and get_arch() == "gfx942", "w_layout GFX942_STRIP16 needs the gfx942 gluon kernel"
+        assert swizzle_mx_scale is None and expert_map is None
+        assert w.is_contiguous() and w.ndim == 4 and w.shape[-1] == STRIP16_REC_BYTES, tuple(w.shape)
+        K_packed, N = w.shape[2] * STRIP16_K, w.shape[1] * STRIP16_COLS
+        assert tuple(w_scales.shape) == (w.shape[0], K_packed // 32, N), (tuple(w_scales.shape), tuple(w.shape))
+        K = x.shape[-1]
+        if unpadded_K:
+            assert unpadded_K <= K, (unpadded_K, K)
+            K = unpadded_K
+        assert K <= K_packed, f"w_layout GFX942_STRIP16: reduction length {K} > packed K {K_packed}"
+        if unpadded_N and block_m == 16:
+            assert unpadded_N % STRIP16_COLS == 0, unpadded_N
+            N = unpadded_N
+    else:
+        K, N = x.shape[-1], w.shape[-1]
+        if unpadded_N and block_m == 16:
+            N = unpadded_N
+        if unpadded_K and block_m == 16:
+            K = unpadded_K
 
     # compute optimization flags
     if backend == "gluon":
@@ -446,6 +611,32 @@ def moe_gemm_a16w4(
 
         if get_arch() in ("gfx1250", "gfx1250-strict"):
             config = get_kernel_config_gluon_gfx1250(M, N, K, routing_data)
+        elif get_arch() == "gfx942":
+            # Gluon kernel: linear (unswizzled) e8m0 scales, K-contiguous fp4 weights,
+            # K a multiple of the tile, vector-load-aligned strides; everything else
+            # goes to the Triton kernel.
+            config = None
+            if strip16:
+                # whole K tiles must stay inside the records: BLOCK_K * SPLIT_K divides the packed K. Take the
+                # config of the reduction length (that of column-major weights) when it fits, else the packed K's.
+                for k_cfg in dict.fromkeys((K, K_packed)):
+                    config = get_kernel_config_gluon_gfx942(M, N, k_cfg, routing_data)
+                    if config is not None and K_packed % (config["block_k"] * config["split_k"]) == 0:
+                        break
+                    config = None
+                assert config is not None, "w_layout GFX942_STRIP16: no gluon config for this shape"
+            elif (
+                swizzle_mx_scale is None
+                and K % 128 == 0
+                and w.stride(-2) == 1
+                and _gfx942_gluon_weight_layout_ok(w, w_scales)
+            ):
+                config = get_kernel_config_gluon_gfx942(M, N, K, routing_data)
+                if config is not None and K % (config["block_k"] * config["split_k"]) != 0:
+                    config = None
+            if config is None:
+                backend = "triton"
+                config = get_kernel_config_triton(M, N, K, routing_data)
         elif get_arch() == "gfx950":
             # Currently on gfx950, gluon kernels requires that swizzling is enabled
             # and K % 256 == 0. Otherwise, fallback to Triton
@@ -499,8 +690,8 @@ def moe_gemm_a16w4(
     )
     if expert_map is not None:
         assert (
-            backend == "triton"
-        ), "expert_map (EP) is only supported on the triton backend"
+            backend == "triton" or get_arch() == "gfx942"
+        ), "expert_map (EP) is only supported on the triton backend and the gfx942 gluon kernel"
         # Non-local experts' output rows are left unwritten (no zero-fill), so the
         # combine must skip their gates -- gate_valid is required to do that.
         assert (
@@ -529,7 +720,73 @@ def moe_gemm_a16w4(
     grid = grid_m * grid_n * config["split_k"]
 
     # launch kernel
-    if backend == "gluon":
+    if backend == "gluon" and get_arch() == "gfx942":
+        # scale check on every call (not only at block_m <= 32), so the large-M profile run fills the cache before
+        # graph capture; a first check inside capture would fall back to bf16 for the captured decode graphs
+        fp16_operand = _gfx942_fp16_operand(w_scales) and config["block_m"] <= 32
+        load_x, load_w, load_s, mfma_layout = _gfx942_layouts_cached(
+            config["block_m"], config["block_n"], config["block_k"], config["num_warps"]
+        )
+        # W_STRIP16: the kernel takes the strip stride (bytes) as stride_w_n; the record stride is fixed (1088 B)
+        w_stride_k, w_stride_n = (w.stride(2), w.stride(1)) if strip16 else (w.stride(1), w.stride(2))
+        _moe_gemm_a16w4_gluon_gfx942[(grid,)](
+            y,
+            y.stride(0),
+            y.stride(1),
+            y.stride(2),
+            x,
+            x.stride(0),
+            x.stride(1),
+            w,
+            w.stride(0),
+            w_stride_k,
+            w_stride_n,
+            w_scales,
+            w_scales.stride(0),
+            w_scales.stride(1),
+            w_scales.stride(2),
+            bias,
+            stride_bias,
+            gammas,
+            N,
+            K,
+            gather_indx,
+            expt_hist,
+            expt_token_offs_raw,
+            expt_hist_sum,
+            expt_block_pid_map,
+            expert_map,
+            grid_m,
+            grid_n,
+            apply_swiglu_matmul,
+            alpha,
+            limit,
+            reduction_n_matmul,
+            swiglu_add_residual,
+            routing_data.n_expts_act,
+            expert_map is not None,
+            config["block_m"],
+            config["block_n"],
+            config["block_k"],
+            config["group_m"],
+            XCD_SWIZZLE=config["xcd_swizzle"],
+            SPLIT_K=config["split_k"],
+            W_CACHE_MODIFIER=config["w_cache_modifier"],
+            SCALE_K_CONTIG=w_scales.stride(1) == 1,
+            LOAD_X=load_x,
+            LOAD_W=load_w,
+            LOAD_S=load_s,
+            MFMA_LAYOUT=mfma_layout,
+            UPCAST_INDICES=should_upcast_indices(x, w, y),
+            FP16_OPERAND=fp16_operand,
+            W_STRIP16=strip16,
+            # only a STRIP16 reduction shorter than the packed K can leave a partial tile (column-major checks above)
+            EVEN_K=K % (config["block_k"] * config["split_k"]) == 0,
+            num_warps=config["num_warps"],
+            num_stages=config["num_stages"],
+            waves_per_eu=config["waves_per_eu"],
+        )
+    elif backend == "gluon":
         if get_arch() in ("gfx1250", "gfx1250-strict"):
             _moe_gemm_a16w4_gluon[(grid,)](
                 y,

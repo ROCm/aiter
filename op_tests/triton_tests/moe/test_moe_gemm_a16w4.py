@@ -266,6 +266,214 @@ def test_op(
     assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)
 
 
+@pytest.mark.parametrize("m, n, k, n_expts_tot, n_expts_act", [(192, 1536, 5120, 384, 6), (24, 5120, 2304, 48, 6)])
+def test_gfx942_gluon_fp16_operand_matches_bf16(m, n, k, n_expts_tot, n_expts_act, monkeypatch):
+    """gfx942 FP16_OPERAND path (e8m0 scale folded into the fp16 byte lookup) against the bf16 path on the same
+    inputs: every fp4 code, scales across the whole exact window [114, 140], zero-padding columns (zero weights with
+    e8m0 0, as vLLM pads), and activations spanning the fp16 range."""
+    if arch_info.get_arch() != "gfx942":
+        pytest.skip("gfx942 Gluon a16w4 kernel only")
+    import aiter.ops.triton.moe.moe_op_gemm_a16w4 as moe_mod
+
+    device = "cuda"
+    torch.manual_seed(0)
+    m, rdata, gindx, sindx = init_routing_data(m, n_expts_tot, n_expts_act, True, False, device=device)
+    x = (torch.randn((m, k), device=device) * 2.0 ** torch.randint(-12, 8, (m, k), device=device)).to(torch.bfloat16)
+    w_packed = torch.randint(0, 256, (n_expts_tot, n, k // 2), dtype=torch.uint8, device=device)
+    w_scale = torch.randint(114, 141, (n_expts_tot, n, k // 32), dtype=torch.uint8, device=device)
+    w_packed[:, -32:] = 0
+    w_scale[:, -32:] = 0
+    w_tri, s_tri = w_packed.transpose(1, 2), w_scale.transpose(1, 2)
+    ys = {}
+    for mode in ("0", "1"):
+        monkeypatch.setattr(moe_mod, "_GFX942_FP16", mode)
+        ys[mode] = moe_gemm_a16w4(
+            x, w_tri, None, s_tri, None, None, None, rdata, gindx, None, None, None,
+            torch.bfloat16, False, backend="gluon",
+        )
+    # same exact products and f32 accumulation (the bf16 path is checked against the reference by test_op); the
+    # only operand difference is activations below 2^-17, which fp16 rounds: last-bit output differences at most
+    atol = 2.0**-20 * ys["0"].abs().max().item()
+    torch.testing.assert_close(ys["1"], ys["0"], rtol=2.0**-7, atol=atol)
+    assert (ys["1"] == ys["0"]).float().mean().item() > 0.99
+    assert (ys["1"][:, -32:] == 0).all()
+    # |x| > 65504 saturates in the fp16 convert instead of producing inf
+    x[: m // 2, ::7] = 1.0e5
+    y_big = moe_gemm_a16w4(
+        x, w_tri, None, s_tri, None, None, None, rdata, gindx, None, None, None, torch.bfloat16, False, backend="gluon"
+    )
+    assert torch.isfinite(y_big).all()
+
+
+def test_gfx942_gluon_fp16_operand_scale_check(monkeypatch):
+    """auto mode: the scale-range verdict is per scale storage and is redone for a new buffer at the same address."""
+    if arch_info.get_arch() != "gfx942":
+        pytest.skip("gfx942 Gluon a16w4 kernel only")
+    import aiter.ops.triton.moe.moe_op_gemm_a16w4 as moe_mod
+
+    monkeypatch.setattr(moe_mod, "_GFX942_FP16", "auto")
+    monkeypatch.setattr(moe_mod, "_gfx942_fp16_scales_ok", {})
+    for lo, hi, ok in ((114, 140, True), (113, 140, False), (114, 141, False), (120, 125, True)):
+        s = torch.randint(lo, hi + 1, (8, 64, 160), dtype=torch.uint8, device="cuda")
+        s[0, 0, 0], s[0, 0, 1], s[0, 1, 0] = lo, hi, 0
+        assert moe_mod._gfx942_fp16_operand(s.transpose(1, 2)) is ok, (lo, hi)
+        assert moe_mod._gfx942_fp16_operand(s.transpose(1, 2)) is ok, (lo, hi)  # cached
+        del s
+
+
+def test_gfx942_gluon_fp16_operand_graph_capture(monkeypatch):
+    """vLLM order: a large-M eager call (the profile run, block_m > 32) primes the scale check, then a decode-size
+    call is captured with no eager warmup at that size. The captured call must take the fp16 path from the cache
+    (no host sync under capture) and replay must match eager."""
+    if arch_info.get_arch() != "gfx942":
+        pytest.skip("gfx942 Gluon a16w4 kernel only")
+    import aiter.ops.triton.moe.moe_op_gemm_a16w4 as moe_mod
+
+    monkeypatch.setattr(moe_mod, "_GFX942_FP16", "auto")
+    real, seen = moe_mod._gfx942_fp16_operand, []
+
+    def spy(scales):
+        r = real(scales)
+        seen.append((torch.cuda.is_current_stream_capturing(), r))
+        return r
+
+    monkeypatch.setattr(moe_mod, "_gfx942_fp16_operand", spy)
+    device = "cuda"
+    torch.manual_seed(0)
+    n, k, n_expts_tot, n_expts_act = 1536, 5120, 384, 6
+    w_packed = torch.randint(0, 256, (n_expts_tot, n, k // 2), dtype=torch.uint8, device=device)
+    w_scale = torch.randint(118, 129, (n_expts_tot, n, k // 32), dtype=torch.uint8, device=device)
+    w_tri, s_tri = w_packed.transpose(1, 2), w_scale.transpose(1, 2)
+
+    def make_call(m):
+        m, rdata, gindx, _ = init_routing_data(m, n_expts_tot, n_expts_act, True, False, device=device)
+        x = (torch.randn((m, k), device=device) * 0.1).to(torch.bfloat16)
+        return lambda: moe_gemm_a16w4(
+            x, w_tri, None, s_tri, None, None, None, rdata, gindx, None, None, None, torch.bfloat16, False, backend="gluon"
+        )
+
+    decode = make_call(192)
+    y_eager = decode()  # compile outside capture
+    monkeypatch.setattr(moe_mod, "_gfx942_fp16_scales_ok", {})
+    make_call(8192)()  # profile-run size
+    seen.clear()
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        y_graph = decode()
+    g.replay()
+    torch.cuda.synchronize()
+    assert seen == [(True, True)], seen
+    assert torch.equal(y_graph, y_eager)
+
+
+@pytest.mark.parametrize("m", [24, 256, 4096])
+@pytest.mark.parametrize("n, k", [(1536, 5120), (5120, 768), (5120, 384)])
+@pytest.mark.parametrize("fp16_mode", ["0", "auto"])
+def test_gfx942_gluon_strip16_matches_column_major(m, n, k, fp16_mode, monkeypatch):
+    """w_layout="GFX942_STRIP16": pack/unpack round trip, and the record layout gives a bit-identical output to the
+    column-major layout (same registers, K grouping and MFMA order) at decode and prefill block sizes, on the bf16
+    and the fp16 operand paths."""
+    if arch_info.get_arch() != "gfx942":
+        pytest.skip("gfx942 Gluon a16w4 kernel only")
+    import aiter.ops.triton.moe.moe_op_gemm_a16w4 as moe_mod
+    from aiter.ops.triton._gluon_kernels.gfx942.moe.moe_op_gemm_a16w4 import (
+        W_LAYOUT_STRIP16,
+    )
+    from aiter.ops.triton.utils.shuffle import (
+        gfx942_strip16_pack,
+        gfx942_strip16_unpack,
+    )
+
+    monkeypatch.setattr(moe_mod, "_GFX942_FP16", fp16_mode)
+    device = "cuda"
+    torch.manual_seed(0)
+    n_expts_tot, n_expts_act = 64, 6
+    m, rdata, gindx, sindx = init_routing_data(m, n_expts_tot, n_expts_act, True, False, device=device)
+    x = (torch.randn((m, k), device=device) * 0.5).to(torch.bfloat16)
+    w_packed = torch.randint(0, 256, (n_expts_tot, n, k // 2), dtype=torch.uint8, device=device)
+    w_scale = torch.randint(114, 141, (n_expts_tot, n, k // 32), dtype=torch.uint8, device=device)
+    w_tri, s_tri = w_packed.transpose(1, 2), w_scale.transpose(1, 2)
+
+    rec = gfx942_strip16_pack(w_tri, s_tri)
+    w_back, s_back = gfx942_strip16_unpack(rec)
+    assert torch.equal(w_back, w_tri) and torch.equal(s_back, s_tri)
+
+    y_col = moe_gemm_a16w4(
+        x, w_tri, None, s_tri, None, None, None, rdata, gindx, None, None, None, torch.bfloat16, False, backend="gluon"
+    )
+    y_rec = moe_gemm_a16w4(
+        x, rec, None, s_tri, None, None, None, rdata, gindx, None, None, None, torch.bfloat16, False,
+        backend="gluon", w_layout=W_LAYOUT_STRIP16,
+    )
+    assert torch.equal(y_rec, y_col)
+
+
+@pytest.mark.parametrize("m", [24, 256, 4096])
+@pytest.mark.parametrize("case", ["gateup_unpadded_n", "x_short_576", "x_padding_inf_unpadded_k"])
+@pytest.mark.parametrize("fp16_mode", ["0", "auto"])
+def test_gfx942_gluon_strip16_padded_k(m, case, fp16_mode, monkeypatch):
+    """STRIP16 records packed at a padded K, reduced over a shorter K (the packed K and the reduction length are
+    separate):
+      gateup_unpadded_n         gate-up (N 768, unpadded_N 512, swiglu) feeds a down projection packed at K 384;
+                                at block_m 16 its output is 256 wide, else 384 (unpadded_N applies at block_m 16)
+      x_short_576               x is 576 wide, the records 640 (a partial last K tile, masked activation loads)
+      x_padding_inf_unpadded_k  x has the padded width 384 with Inf / NaN past unpadded_K = 256
+    The STRIP16 output must equal the column-major GEMM on zero-padded activations bit for bit (same tile config;
+    the padding weights are random, they only ever meet zero activations) and must not read the padding."""
+    if arch_info.get_arch() != "gfx942":
+        pytest.skip("gfx942 Gluon a16w4 kernel only")
+    import aiter.ops.triton.moe.moe_op_gemm_a16w4 as moe_mod
+    from aiter.ops.triton._gluon_kernels.gfx942.moe.moe_op_gemm_a16w4 import (
+        W_LAYOUT_STRIP16,
+    )
+    from aiter.ops.triton.utils.shuffle import gfx942_strip16_pack
+
+    monkeypatch.setattr(moe_mod, "_GFX942_FP16", fp16_mode)
+    device = "cuda"
+    torch.manual_seed(0)
+    n_expts_tot, n_expts_act, hidden = 64, 6, 1024
+    m, rdata, gindx, _ = init_routing_data(m, n_expts_tot, n_expts_act, True, False, device=device)
+
+    def weights(n, k):  # column-major (E, K/2, N) fp4 + (E, K/32, N) e8m0, random over the whole (padded) K
+        w = torch.randint(0, 256, (n_expts_tot, n, k // 2), dtype=torch.uint8, device=device).transpose(1, 2)
+        s = torch.randint(114, 141, (n_expts_tot, n, k // 32), dtype=torch.uint8, device=device).transpose(1, 2)
+        return w, s
+
+    def gemm(x, w, s, strip16, gather=None, **kw):
+        return moe_gemm_a16w4(
+            x, gfx942_strip16_pack(w, s) if strip16 else w, None, s, None, None, None, rdata, gather, None, None,
+            None, torch.bfloat16, backend="gluon", **({"w_layout": W_LAYOUT_STRIP16} if strip16 else {}), **kw,
+        )
+
+    unpadded_k = None
+    if case == "gateup_unpadded_n":
+        k_pad = 384
+        w_gu, s_gu = weights(768, hidden)
+        x0 = (torch.randn((m, hidden), device=device) * 0.5).to(torch.bfloat16)
+        x = gemm(x0, w_gu, s_gu, True, gindx, apply_swiglu=True, unpadded_N=512)
+        x_col = gemm(x0, w_gu, s_gu, False, gindx, apply_swiglu=True, unpadded_N=512)
+        assert torch.equal(x, x_col)
+        assert x.shape[-1] == (256 if rdata.block_m == 16 else 384), (rdata.block_m, tuple(x.shape))
+    elif case == "x_short_576":
+        k_pad = 640
+        x = (torch.randn((m * n_expts_act, 576), device=device) * 0.5).to(torch.bfloat16)
+    else:
+        k_pad, unpadded_k = 384, 256
+        x = (torch.randn((m * n_expts_act, k_pad), device=device) * 0.5).to(torch.bfloat16)
+        x[:, unpadded_k:] = float("inf")
+        x[::3, unpadded_k + 1] = float("nan")
+    k = unpadded_k or x.shape[-1]
+
+    w_dn, s_dn = weights(hidden, k_pad)
+    x_ref = torch.zeros((x.shape[0], k_pad), dtype=x.dtype, device=device)
+    x_ref[:, :k] = x[:, :k]
+    y_ref = gemm(x_ref, w_dn, s_dn, False)
+    y_rec = gemm(x, w_dn, s_dn, True, unpadded_K=unpadded_k)
+    assert torch.isfinite(y_rec).all()
+    assert torch.equal(y_rec, y_ref)
+
+
 def _ep_setup(
     m, n, k, n_expts_tot, n_expts_act, ep_size, ep_rank, do_gather, do_scatter
 ):
@@ -323,6 +531,7 @@ def _ep_setup(
     "do_gather, do_scatter", [(True, False), (False, True), (True, True)]
 )
 @pytest.mark.parametrize("apply_swiglu", [False, True])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_op_expert_parallel(
     m,
     n,
@@ -334,11 +543,15 @@ def test_op_expert_parallel(
     do_gather,
     do_scatter,
     apply_swiglu,
+    backend,
 ):
     """Rank-local weights + global routing reproduce the local experts' output;
     non-local gates contribute exactly 0 to the top-k combine."""
-    if not arch_info.is_fp4_avail():
+    if not (arch_info.is_fp4_avail() or arch_info.get_arch() == _TUNED_ARCH):
         pytest.skip("MXFP4 not supported on this architecture")
+    # expert_map on the gluon path is gfx942-only (other arches assert in the wrapper)
+    if backend == "gluon" and arch_info.get_arch() != "gfx942":
+        pytest.skip("gluon expert_map is only supported on gfx942")
 
     x, w_tri, w_scale_tri, bias, rdata, gindx, sindx, lo, hi, expert_map, gate_valid = (
         _ep_setup(
@@ -372,7 +585,7 @@ def test_op_expert_parallel(
         None,
         torch.bfloat16,
         apply_swiglu,
-        backend="triton",
+        backend=backend,
         expert_map=expert_map,
         gate_valid=gate_valid,
     )
