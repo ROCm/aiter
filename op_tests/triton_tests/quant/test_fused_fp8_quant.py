@@ -1,3 +1,8 @@
+import os
+import subprocess
+import sys
+import textwrap
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -18,6 +23,38 @@ from aiter.test_common import (
 from op_tests.triton_tests.utils.types import with_default_dtype
 
 rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
+
+
+def test_fused_fp8_quant_imports_in_triton_only_mode():
+    # Load this file directly so the unrelated fused_mxfp4_quant import in
+    # quant/__init__.py does not hide this module's aiter.dtypes regression.
+    module_path = os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "..",
+            "..",
+            "aiter",
+            "ops",
+            "triton",
+            "quant",
+            "fused_fp8_quant.py",
+        )
+    )
+    script = textwrap.dedent(f"""
+        import importlib.util
+
+        from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+
+        path = {module_path!r}
+        spec = importlib.util.spec_from_file_location("_fused_fp8_quant_test", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        assert module.fp8_dtype == get_fp8_e4m3_dtype()
+        """)
+    env = os.environ.copy()
+    env["AITER_TRITON_ONLY"] = "1"
+    subprocess.run([sys.executable, "-c", script], check=True, env=env)
 
 
 def rmsnorm(input, weight, eps=1e-6):

@@ -1,3 +1,8 @@
+import os
+import subprocess
+import sys
+import textwrap
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -16,6 +21,18 @@ from op_tests.triton_tests.quant.test_fused_fp8_quant import (
 )
 from op_tests.triton_tests.quant.test_quant_mxfp4 import torch_dynamic_mxfp4_quant
 from op_tests.triton_tests.utils.activation_ref import silu_exp2_ref
+
+
+def test_activation_imports_in_triton_only_mode():
+    script = textwrap.dedent("""
+        from aiter.ops.triton.fusions import activation
+        from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+
+        assert activation.fp8_dtype == get_fp8_e4m3_dtype()
+        """)
+    env = os.environ.copy()
+    env["AITER_TRITON_ONLY"] = "1"
+    subprocess.run([sys.executable, "-c", script], check=True, env=env)
 
 
 def pad_tensor_2d(tensor, mult_m=256, mult_n=8):
