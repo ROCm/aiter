@@ -30,7 +30,8 @@ private:
         const char* env = std::getenv("OPUS_GEN_CO_DIR");
         const std::string root = env && *env ? env : OPUS_GEN_CO_DIR;
         AITER_CHECK(!root.empty(), "gfx950 CO directory is empty");
-        const auto path = root + "/gfx950/a8w8_blockscale_bpreshuffle/" + image_name;
+        // image_name is relative to gfx950/: "<image_dir>/<name>.co".
+        const auto path = root + "/gfx950/" + image_name;
         std::ifstream file(path, std::ios::binary | std::ios::ate);
         AITER_CHECK(file.is_open(), "gfx950 cannot open CO: ", path);
         const std::streamsize size = file.tellg();
@@ -49,10 +50,11 @@ inline AiterAsmKernelFast& co_kernel(const std::string& symbol, const std::strin
     return cache.get_or_create(cache_key, [&]() { return CoModule(symbol, image_name); }).kernel;
 }
 } // namespace opus_gfx950_co
-template<class Kargs>
+// KARGS_BYTES: the kernarg size the .co images were built with.
+template<int KARGS_BYTES = 96, class Kargs>
 inline void opus_co_launch_gfx950(AiterAsmKernelFast& kernel, dim3 grid, dim3 block,
                                   Kargs& args, hipStream_t stream, unsigned dynamic_lds = 0) {
-    static_assert(sizeof(args) == 96);
+    static_assert(sizeof(args) == KARGS_BYTES);
     size_t arg_size = sizeof(args);
     kernel.launch_kernel({&args, &arg_size,
                           int(grid.x), int(grid.y), int(grid.z),

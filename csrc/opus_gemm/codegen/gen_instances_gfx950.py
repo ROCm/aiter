@@ -4,7 +4,7 @@
 
 import os
 
-from opus_gemm_common import OpusGemmInstance
+from opus_gemm_common import OpusGemmInstance, mxfp8_direction
 
 from codegen.common import (
     WARP_SIZE,
@@ -17,6 +17,9 @@ from codegen.common import (
 # ---------------- gfx950 arch-override maps ----------------
 
 PIPELINE_HEADER_MAP = {
+    "a8w8_blockscale_mxfp8": "gfx950/opus_gemm_pipeline_a8w8_blockscale_mxfp8_4wave_gfx950.cuh",
+    "a8w8_mxfp8_co": "gfx950/opus_gemm_pipeline_a8w8_mxfp8_gfx950.cuh",
+    "a8w8_mxfp8_bpreshuffle_co": "gfx950/opus_gemm_pipeline_a8w8_mxfp8_gfx950.cuh",
     "a8w8_blockscale_mxscale_gemm_bpreshuffle": "gfx950/opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
     "a8w8_mxscale_bmm_bpreshuffle_compact": "gfx950/opus_bmm_pipeline_mxscale_compact_gfx950.cuh",
     "a8w8_scale": "gfx950/opus_bmm_pipeline_a8w8_mxscale_gfx950.cuh",
@@ -56,6 +59,9 @@ PIPELINE_HEADER_MAP_4G_SAFE = {
 }
 
 TRAITS_HEADER_MAP = {
+    "a8w8_blockscale_mxfp8": "gfx950/opus_gemm_traits_a8w8_blockscale_mxfp8_4wave_gfx950.cuh",
+    "a8w8_mxfp8_co": "gfx950/opus_gemm_traits_a8w8_mxfp8_gfx950.cuh",
+    "a8w8_mxfp8_bpreshuffle_co": "gfx950/opus_gemm_traits_a8w8_mxfp8_gfx950.cuh",
     "a8w8_blockscale_mxscale_gemm_bpreshuffle": "gfx950/opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh",
     "a8w8_mxscale_bmm_bpreshuffle_compact": "gfx950/opus_bmm_traits_mxscale_compact_gfx950.cuh",
     "a8w8_scale": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
@@ -86,6 +92,9 @@ TRAITS_HEADER_MAP = {
 }
 
 KERNEL_FUNC_MAP = {
+    "a8w8_blockscale_mxfp8": "opus_gemm_mxfp8_4wave",
+    "a8w8_mxfp8_co": "gemm_a8w8_mxfp8_body",
+    "a8w8_mxfp8_bpreshuffle_co": "gemm_a8w8_mxfp8_body",
     "a8w8_blockscale_mxscale_gemm_bpreshuffle": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_kernel",
     "a8w8_mxscale_bmm_bpreshuffle_compact": "opus_bmm_mxscale_compact_kernel",
     "a8w8_scale": "gemm_a8w8_scale_kernel",
@@ -123,6 +132,9 @@ KERNEL_FUNC_MAP_4G_SAFE = {
 }
 
 TRAITS_NAME_MAP = {
+    "a8w8_blockscale_mxfp8": "opus_gemm_mxfp8_4wave_tile_traits",
+    "a8w8_mxfp8_co": "opus_mxfp8_traits",
+    "a8w8_mxfp8_bpreshuffle_co": "opus_mxfp8_traits",
     "a8w8_blockscale_mxscale_gemm_bpreshuffle": "opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_traits_gfx950",
     "a8w8_mxscale_bmm_bpreshuffle_compact": "opus_bmm_mxscale_compact_traits_gfx950",
     "a8w8_scale": "opus_gemm_a8w8_scale_traits_gfx950",
@@ -153,6 +165,9 @@ TRAITS_NAME_MAP = {
 }
 
 KARGS_NAME_MAP = {
+    "a8w8_blockscale_mxfp8": "opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950",
+    "a8w8_mxfp8_co": "opus_gemm_mxfp8_kargs_gfx950",
+    "a8w8_mxfp8_bpreshuffle_co": "opus_gemm_mxfp8_kargs_gfx950",
     "a8w8_blockscale_mxscale_gemm_bpreshuffle": "opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950",
     "a8w8_mxscale_bmm_bpreshuffle_compact": "opus_bmm_compact_kargs_gfx950",
     "a8w8_scale": "opus_gemm_scale_kargs_gfx950",
@@ -3191,27 +3206,57 @@ def gen_bmm_mxscale_fused_instance(
     )
 
 
-_BPRESHUFFLE_ARGUMENTS = r"""
+def _bpreshuffle_arguments(direction="NT"):
+    """Host checks / kargs of a bpreshuffle kernel for an "NT", "NN", "TT" or "TN" layout.
+
+    The first letter is A, the second B (BLAS op): A T = stored [K,M] (M-contiguous),
+    B T = stored [N,K] (K-contiguous), B N = stored [K,N] (N-contiguous)."""
+    if direction == "NT":
+        matrix_check = 'XQ.is_contiguous() && WQ.is_contiguous() && Y.is_contiguous(), "matrix layout differs"'
+        sfa_stride_check = "x_scale.stride(1) == m"
+        sfb_check = ' && w_scale.is_contiguous(), "scale layout differs"'
+        stride_a, stride_b, stride_sfb = "k", "k", "k / 128"
+    else:
+        a_strides = ("1", "m") if direction[0] == "T" else ("k", "1")
+        b_strides = ("k", "1") if direction[1] == "T" else ("1", "n")
+        sfb_strides = ("k / 128", "1") if direction[1] == "T" else ("1", "n / 128")
+        stride_a = "m" if direction[0] == "T" else "k"
+        stride_b = "k" if direction[1] == "T" else "n"
+        stride_sfb = "k / 128" if direction[1] == "T" else "n / 128"
+        matrix_check = (
+            'Y.is_contiguous(), "matrix shape/output layout differs");\n'
+            f"    AITER_CHECK(XQ.stride(-2) == {a_strides[0]} && XQ.stride(-1) == {a_strides[1]} &&\n"
+            f"                WQ.stride(-2) == {b_strides[0]} && WQ.stride(-1) == {b_strides[1]},\n"
+            f'                "{direction} CO expects XQ strides ({a_strides[0]}, {a_strides[1]}) and WQ strides ({b_strides[0]}, {b_strides[1]}); got (",\n'
+            '                XQ.stride(-2), ", ", XQ.stride(-1), ") and (", WQ.stride(-2), ", ", WQ.stride(-1), ")"'
+        )
+        sfa_stride_check = "(k == 128 || x_scale.stride(1) == m)"
+        sfb_check = (
+            " &&\n"
+            f"                (n == 128 || w_scale.stride(0) == {sfb_strides[0]}) && (k == 128 || w_scale.stride(1) == {sfb_strides[1]}),\n"
+            f'                "{direction} CO expects E8M0 scales: x_scale [M,K/128] with column-major bytes (contiguous, as per_group_quant_hip(transpose_scale=True) emits, or a strides (1,M) view), w_scale [N/128,K/128] strides ({sfb_strides[0]}, {sfb_strides[1]})"'
+        )
+    return f"""
     AITER_CHECK((XQ.dim() == 2 || XQ.dim() == 3) && WQ.dim() == XQ.dim() && Y.dim() == XQ.dim() &&
                 (XQ.dim() == 2 || (XQ.size(0) == 1 && WQ.size(0) == 1 && Y.size(0) == 1)), "requires GEMM batch=1");
     const int64_t m = XQ.size(-2), n = WQ.size(-2), k = XQ.size(-1);
     AITER_CHECK(m > 0 && n > 0 && k > 0 && m <= INT32_MAX && n <= INT32_MAX && k <= INT32_MAX &&
                 WQ.size(-1) == k && Y.size(-2) == m && Y.size(-1) == n &&
-                XQ.is_contiguous() && WQ.is_contiguous() && Y.is_contiguous(), "matrix layout differs");
-    const auto e8m0 = [](const aiter_tensor_t& tensor) {
+                {matrix_check});
+    const auto e8m0 = [](const aiter_tensor_t& tensor) {{
         return tensor.dtype() == AITER_DTYPE_fp8_e8m0 || tensor.dtype() == AITER_DTYPE_u8;
-    };
+    }};
     AITER_CHECK(e8m0(x_scale) && e8m0(w_scale) && x_scale.dim() == 2 && w_scale.dim() == 2 &&
                 x_scale.size(0) == m && x_scale.size(1) == k / 128 &&
-                (x_scale.is_contiguous() || (x_scale.stride(0) == 1 && x_scale.stride(1) == m)) &&
-                w_scale.size(0) == n / 128 && w_scale.size(1) == k / 128 && w_scale.is_contiguous(), "scale layout differs");
-    opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950 args{};
+                (x_scale.is_contiguous() || (x_scale.stride(0) == 1 && {sfa_stride_check})) &&
+                w_scale.size(0) == n / 128 && w_scale.size(1) == k / 128{sfb_check});
+    opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950 args{{}};
     args.ptr_a = XQ.data_ptr(); args.ptr_b = WQ.data_ptr(); args.ptr_c = Y.data_ptr();
     args.m = m; args.n = n; args.k = k; args.batch = 1;
-    args.stride_a = k; args.stride_b = k; args.stride_c = n;
+    args.stride_a = {stride_a}; args.stride_b = {stride_b}; args.stride_c = n;
     args.stride_a_batch = m * k; args.stride_b_batch = n * k; args.stride_c_batch = int(uint64_t(m) * n);
     args.ptr_sfa = x_scale.data_ptr(); args.ptr_sfb = w_scale.data_ptr();
-    args.stride_sfa = m; args.stride_sfb = k / 128;
+    args.stride_sfa = m; args.stride_sfb = {stride_sfb};
     args.stride_sfa_batch = m * (k / 128); args.stride_sfb_batch = (n / 128) * (k / 128);
 """
 
@@ -3293,10 +3338,11 @@ def gen_mxscale_bpreshuffle_instance(
             + " && ".join(conditions)
             + ', "CO tensor extent exceeds pipeline limits");'
         )
-        kernel_select = f'static AiterAsmKernelFast& kernel = opus_gfx950_co::co_kernel("{symbol}", "{entry["image"]}");'
+        image = f'{entry["image_dir"]}/{entry["image"]}'
+        kernel_select = f'static AiterAsmKernelFast& kernel = opus_gfx950_co::co_kernel("{symbol}", "{image}");'
         if entry.get("short_symbol"):
-            kernel_select = f"""static AiterAsmKernelFast& normal = opus_gfx950_co::co_kernel("{symbol}", "{entry['image']}");
-    static AiterAsmKernelFast& short_k = opus_gfx950_co::co_kernel("{entry['short_symbol']}", "{entry['image']}");
+            kernel_select = f"""static AiterAsmKernelFast& normal = opus_gfx950_co::co_kernel("{symbol}", "{image}");
+    static AiterAsmKernelFast& short_k = opus_gfx950_co::co_kernel("{entry['short_symbol']}", "{image}");
     AiterAsmKernelFast& kernel = k <= {entry['short_max_k']} ? short_k : normal;"""
         body = f"""{grid_setup}
     {kernel_select}
@@ -3444,7 +3490,7 @@ struct {alias} : {entry["traits"]} {{}};
         host_header=host_header,
         name=k.name,
         workspace_extra=workspace_extra,
-        arguments=_BPRESHUFFLE_ARGUMENTS,
+        arguments=_bpreshuffle_arguments(mxfp8_direction(k.bpreshuffle_co) or "NT"),
         body=body,
     )
     write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), source)
@@ -3469,12 +3515,233 @@ struct {alias} : {entry["traits"]} {{}};
         )
 
 
+# ---------- a8w8_mxfp8 / a8w8_mxfp8_bpreshuffle (MXFP8 x MXFP8, 1x32 e8m0) ----------
+# XQ / WQ are the logical [batch, M, K] / [batch, N, K] views of the stored
+# operands; the launcher picks the layout from their strides (as the gfx950
+# a16w16 4-wave launchers do) and runs that layout's image (index A_T * 2 + B_T),
+# loaded by opus_co_launch_gfx950.cuh from gen_co/gfx950/<family>/ (112-byte kargs):
+#   XQ K-contiguous (K, 1) = A [M, K]; M-contiguous (1, M) = A stored [K, M] (T).
+#   WQ K-contiguous (K, 1) = B [N, K]; N-contiguous (1, N) = B stored [K, N].
+# a8w8_mxfp8: plain operands, images <name>_<nt|nn|tt|tn>.co.
+# a8w8_mxfp8_bpreshuffle: NT only, WQ = shuffle_weight(w, layout=(16, 16)) of
+# B [N, K], image <name>.co.
+# x_scale / w_scale e8m0 row-major [batch * rows, K/32] (or [batch, rows, K/32])
+# and Y [batch, M, N] bf16 in every layout. opus_gemm_a8w8_mxfp8(_bpreshuffle)_launch
+# (opus_gemm.cu) checks the shapes.
+
+
+def gen_a8w8_mxfp8_co_instance(
+    cg, k, traits_header, kargs_name, instance_impl_preamble, **_unused
+):
+    """Host launcher of one pre-compiled a8w8_mxfp8(_bpreshuffle) kid.
+
+    The device code is the kid's layout images (build_co.py --arch gfx950),
+    loaded at runtime by opus_co_launch_gfx950.cuh; no device TU.
+    Variant "" persistent (grid = min(tiles, CUs)), "np" / "nob" one tile per
+    block ("nob": no M/N boundary handling), "sk" split-K: splitK = S segments
+    of K, resolved by the caller (aiter/ops/opus/gemm_op_a8w8.py); S > 1 needs a
+    caller-owned fp32 workspace [S][batch][padded_M][padded_N] (padded to whole
+    tiles) for the partials, which splitk_reduce_kernel sums into Y.
+    """
+    from opus_gemm_common import (
+        A8W8_MXFP8_CO_MODE,
+        A8W8_MXFP8_KARGS_BYTES,
+        A8W8_MXFP8_LAYOUTS,
+        a8w8_mxfp8_co_dir,
+        a8w8_mxfp8_co_images,
+    )
+
+    variant = k.co_variant
+    mode = A8W8_MXFP8_CO_MODE[variant]
+    # A K that is a multiple of 32 but not of 2 B_K runs on the boundary kids ("np", persistent): the kernel rounds
+    # its K tiles up to a pair and the caller zeroes the scales of the 1x32 groups past K (see below). "nob" has no
+    # buffer ranges and split-K splits whole tile pairs, so those need K % (2 B_K) == 0.
+    ragged_ok = variant in ("np", "")
+    co_dir = a8w8_mxfp8_co_dir(k)
+    symbols = dict(a8w8_mxfp8_co_images(k))
+    images = ", ".join(
+        f'"{symbols[layout]}"' if layout in symbols else "nullptr"
+        for layout in A8W8_MXFP8_LAYOUTS
+    )
+    if variant == "nob":
+        align_code = f"""AITER_CHECK(M % {k.B_M} == 0 && N % {k.B_N} == 0,
+                "{k.name} needs M % {k.B_M} == 0 and N % {k.B_N} == 0 (M=", M, " N=", N, ")");"""
+    else:
+        align_code = (
+            f"""AITER_CHECK(N % 16 == 0, "{k.name} needs N % 16 == 0 (N=", N, ")");"""
+        )
+    if ragged_ok:
+        # The kernel runs ceil(K / {2 * k.B_K}) * 2 K tiles of 4 scale groups each. The groups past K / 32 multiply
+        # whatever follows the operands' K bytes (the next row, or zero past the buffer range), so their scales must
+        # be 0x00 (2^-127 each: the products underflow to 0): scales of a ragged K have every group of those tiles.
+        k_base_check = f"""AITER_CHECK(K % 32 == 0, "{k.name} needs K % 32 == 0 (K=", K, ")");
+    const int k_groups = K % {2 * k.B_K} == 0 ? K / 32 : (K + {2 * k.B_K - 1}) / {2 * k.B_K} * {2 * k.B_K // 32};
+    AITER_CHECK(x_scale.size(-1) >= k_groups && w_scale.size(-1) >= k_groups,
+                "{k.name}: K=", K, " is not a multiple of {2 * k.B_K}: x_scale / w_scale need ", k_groups,
+                " columns, those from K / 32 = ", K / 32, " on 0x00 (got ", x_scale.size(-1), " / ",
+                w_scale.size(-1), ")");"""
+    else:
+        k_base_check = (
+            f"AITER_CHECK(K % {2 * k.B_K} == 0, "
+            f'"{k.name} needs K % {2 * k.B_K} == 0 (K=", K, ")");'
+        )
+    if mode == 2:
+        mode_code = f"""const int S = splitK < 1 ? 1 : splitK;
+    AITER_CHECK(K % (S * {2 * k.B_K}) == 0, "{k.name}: K=", K, " is not a multiple of splitK * {2 * k.B_K} (splitK=", S, ")");
+    kargs.split_k = S;
+    const dim3 grid(tiles * S);
+    const int padded_m = (M + {k.B_M} - 1) / {k.B_M} * {k.B_M}, padded_n = (N + {k.B_N} - 1) / {k.B_N} * {k.B_N};
+    if (S > 1) {{
+        AITER_CHECK(workspace.has_value(), "{k.name}: splitK > 1 requires a workspace");
+        // splitk_reduce_kernel reads the partials through one 32-bit buffer range.
+        AITER_CHECK((size_t)S * batch * padded_m * padded_n * 4 <= UINT32_MAX,
+                    "{k.name}: split-K workspace of splitK=", S, " exceeds 4 GiB");
+        kargs.ptr_ws = opus_validate_workspace(workspace.value(), XQ, AITER_DTYPE_fp32,
+                                               (size_t)S * batch * padded_m * padded_n, 256, "{k.name}");
+    }}"""
+        reduce_code = """if (S > 1) {
+        // fp32 partials [S][batch][padded_M][padded_N] -> Y.
+        splitk_reduce_kernel<16, 64, __bf16, false, __bf16, true>
+            <<<dim3((N + 1023) / 1024, batch * M), dim3(64), 0, stream>>>(
+                kargs.ptr_ws, reinterpret_cast<__bf16*>(Y.data_ptr()), S, M, N, batch,
+                padded_m, padded_n, nullptr, 0);
+    }"""
+    else:
+        reduce_code = ""
+        mode_code = f"""AITER_CHECK(splitK <= 1, "{k.name} does not split K (splitK=", splitK, ")");"""
+        # persistent: at most one block per CU, walking the batch-major tile list
+        if mode == 0:
+            mode_code += """
+    const int cus = (int)get_num_cu_func();
+    kargs.grid_blocks = tiles < cus ? tiles : cus;
+    const dim3 grid(kargs.grid_blocks);"""
+        else:  # one tile per block: (tiles per batch, 1, batch)
+            mode_code += """
+    const dim3 grid(tiles / batch, 1, batch);"""
+    INSTANCE_IMPL = f"""{instance_impl_preamble()}
+#include "{traits_header}"
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+#include "opus_gemm_common.cuh"
+#include "gfx950/opus_co_launch_gfx950.cuh"
+template <typename D_C>
+void
+{k.name}(
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    aiter_tensor_t &x_scale,
+    aiter_tensor_t &w_scale,
+    std::optional<aiter_tensor_t> workspace,
+    int splitK)
+{{
+    static_assert(std::is_same<D_C, bf16_t>::value, "{k.kernel_tag} writes bf16");
+    const int batch = XQ.size(0);
+    const int M = XQ.size(1);
+    const int K = XQ.size(2);
+    const int N = WQ.size(1);
+    {k_base_check}
+    {align_code}
+    // 32-bit buffer ranges: one C tile (the kernel bases C per tile in 64 bits) stays under 2 GiB.
+    // C is bounded on a whole {k.B_M}-row tile whatever M is: the epilogue stores every tile row at
+    // r * N + c (+ 2^30 elements for a masked column) and the buffer range drops the rows past M, so
+    // that offset must not wrap back into the range.
+    AITER_CHECK(2 * ((int64_t)({k.B_M} - 1) * N + {k.B_N}) <= INT32_MAX &&
+                    (batch == 1 || (int64_t)M * N <= INT32_MAX),
+                "{k.name}: M=", M, " N=", N, " batch=", batch, " exceeds the 32-bit buffer ranges of C");
+    // Layout from strides: operand [rows, K] is dense K-contiguous (stored [rows, K]) or dense
+    // rows-contiguous (stored [K, rows]); batch strides rows * K (checked only for batch > 1).
+    auto transposed = [&](const aiter_tensor_t& t, int64_t rows, const char* what) {{
+        const bool batch_ok = batch == 1 || t.stride(0) == rows * K;
+        if (t.stride(2) == 1 && t.stride(1) == K && batch_ok) return false;
+        AITER_CHECK(t.stride(1) == 1 && t.stride(2) == rows && batch_ok, "{k.name}: ", what,
+                    " must be dense K-contiguous (strides (", K, ", 1)) or dense ", rows,
+                    "-row-contiguous (strides (1, ", rows, ")); got strides (", t.stride(0), ", ",
+                    t.stride(1), ", ", t.stride(2), ")");
+        return true;
+    }};
+    const bool a_t = transposed(XQ, M, "XQ");
+    const bool b_t = transposed(WQ, N, "WQ");
+    // Images by layout index A_T * 2 + B_T (nt, nn, tt, tn; nullptr: not built for this family).
+    static const char* const kImages[4] = {{{images}}};
+    const int layout = (a_t ? 2 : 0) + (b_t ? 1 : 0);
+    AITER_CHECK(kImages[layout] != nullptr, "{k.name}: takes K-contiguous XQ / WQ only (NT)");
+    // A / B stored [K, M] / [K, N]: 16-byte rows of M / N.
+    AITER_CHECK(!a_t || M % 16 == 0, "{k.name}: A stored [K, M] needs M % 16 == 0 (M=", M, ")");
+    AITER_CHECK(!b_t || N % 16 == 0, "{k.name}: B stored [K, N] needs N % 16 == 0 (N=", N, ")");
+    // A / B are based in 64 bits per tile (row-major [rows, K], the shuffled B too: per tile of rows; stored
+    // [K, rows]: per K tile), so an operand may exceed 4 GiB and only one tile of it -- {k.B_M} / {k.B_N} rows of K, or
+    // {k.B_K} k rows of M / N -- and its e8m0 scales (based per row in 32 bits) are bounded. batch > 1: the
+    // 32-bit batch strides keep the whole operand under 2 GiB.
+    auto operand_fits = [&](bool t, int64_t rows, int64_t tile_rows) {{
+        if (batch > 1) return rows * K * batch <= INT32_MAX;
+        return (t ? ({k.B_K} + 1) * rows : tile_rows * K) <= INT32_MAX && rows * (K / 32) <= INT32_MAX;
+    }};
+    AITER_CHECK(operand_fits(a_t, M, {k.B_M}), "{k.name}: A M=", M, " K=", K, " batch=", batch,
+                " exceeds the 32-bit buffer ranges");
+    AITER_CHECK(operand_fits(b_t, N, {k.B_N}), "{k.name}: B N=", N, " K=", K, " batch=", batch,
+                " exceeds the 32-bit buffer ranges");
+    static AiterAsmKernelFast* kKernels[4] = {{}};   // loaded on first use (the module cache is thread-safe)
+    if (!kKernels[layout])
+        kKernels[layout] = &opus_gfx950_co::co_kernel(kImages[layout], "{co_dir}/" + std::string(kImages[layout]) + ".co");
+
+    {kargs_name} kargs{{}};
+    kargs.ptr_a = XQ.data_ptr();
+    kargs.ptr_b = WQ.data_ptr();
+    kargs.ptr_c = Y.data_ptr();
+    kargs.ptr_sfa = x_scale.data_ptr();
+    kargs.ptr_sfb = w_scale.data_ptr();
+    kargs.m = M;
+    kargs.n = N;
+    kargs.k = K;
+    kargs.batch = batch;
+    kargs.stride_a = a_t ? M : K;  // row stride of the stored A (bytes)
+    kargs.stride_b = b_t ? N : K;  // row stride of the stored B (bpreshuffle: of B [N, K] before the shuffle)
+    kargs.stride_c = N;
+    // batch == 1: the batch strides are unused (batch_id is 0), and M * K / N * K / M * N may exceed int.
+    kargs.stride_a_batch = batch == 1 ? 0 : M * K;
+    kargs.stride_b_batch = batch == 1 ? 0 : N * K;
+    kargs.stride_c_batch = batch == 1 ? 0 : M * N;
+    // Row-major e8m0 scales; the row stride is the scale's own width (K / 32, or more for a ragged K, see above).
+    kargs.stride_sfa = (int)x_scale.size(-1);
+    kargs.stride_sfb = (int)w_scale.size(-1);
+    kargs.stride_sfa_batch = batch == 1 ? 0 : M * (int)x_scale.size(-1);
+    kargs.stride_sfb_batch = batch == 1 ? 0 : N * (int)w_scale.size(-1);
+    const int tiles = ((M + {k.B_M} - 1) / {k.B_M}) * ((N + {k.B_N} - 1) / {k.B_N}) * batch;
+    kargs.grid_blocks = tiles;
+    kargs.split_k = 1;
+    auto stream = aiter::getCurrentHIPStream();
+    {mode_code}
+    opus_co_launch_gfx950<{A8W8_MXFP8_KARGS_BYTES}>(*kKernels[layout], grid, dim3({k.BLOCK_SIZE}), kargs, stream);
+    {reduce_code}
+}}
+#endif // launcher only on regular host pass
+"""
+    write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
+    for CDtype in k.output_dtypes:
+        cg._host_instantiations.append(
+            {
+                "kid_name": k.name,
+                "dtype": CDtype,
+                "host_decl": (
+                    f"template void\n{k.name}<{CDtype}>(\n    aiter_tensor_t &XQ,\n"
+                    "    aiter_tensor_t &WQ,\n    aiter_tensor_t &Y,\n"
+                    "    aiter_tensor_t &x_scale,\n    aiter_tensor_t &w_scale,\n"
+                    "    std::optional<aiter_tensor_t> workspace,\n    int splitK);\n"
+                ),
+                # splitK > 1 launches the shared reduce kernel (splitk_reduce TU).
+                **({"splitk_reduce_arch": "gfx950"} if mode == 2 else {}),
+            }
+        )
+
+
 # ---------- Self-register at import time ----------
 register_emit(
     "gfx950",
     "a8w8_blockscale_mxscale_gemm_bpreshuffle",
     gen_mxscale_bpreshuffle_instance,
 )
+# Plain-B MXFP8 NT / NN / TT / TN COs: the same CO launcher, its own family and table.
+register_emit("gfx950", "a8w8_blockscale_mxfp8", gen_mxscale_bpreshuffle_instance)
 register_emit("gfx950", "a16w16_persistent", gen_persistent_instance)
 register_emit("gfx950", "a8w8_scale", gen_scale_instance)
 register_emit("gfx950", "a8w8_mxscale", gen_scale_instance)
@@ -3483,6 +3750,8 @@ register_emit("gfx950", "a8w8", gen_noscale_instance_gfx950)
 register_emit("gfx950", "a16w16_mono_tile", gen_mono_tile_instance)
 register_emit("gfx950", "a16w16_flatmm", gen_flatmm_instance)
 register_emit("gfx950", "a16w16_flatmm_splitk", gen_flatmm_splitk_instance)
+register_emit("gfx950", "a8w8_mxfp8_co", gen_a8w8_mxfp8_co_instance)
+register_emit("gfx950", "a8w8_mxfp8_bpreshuffle_co", gen_a8w8_mxfp8_co_instance)
 
 
 def _register_bmm_emit(kernel_tag, fn, launcher_tile_mult):

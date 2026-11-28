@@ -1,0 +1,395 @@
+{
+  "_comment": [
+    "Pre-compiled gfx950 a8w8_mxfp8 (MXFP8 x MXFP8, 1x32 e8m0 scales, plain row-major A / B) kids, read by",
+    "opus_gemm_common.py (kid registry) and gen_co/build_co.py --arch gfx950 --family a8w8_mxfp8 (builds the .co",
+    "into gen_co/gfx950/a8w8_mxfp8/, with its build_info.json).",
+    "",
+    "gfx950 entries (tag a8w8_mxfp8_co: 2x2 waves, B_K 128):",
+    "  kid            local to the a8w8_mxfp8/gfx950/CU namespace: 100 256x256 \"nob\"; 101-106 \"np\" 256x256, 256x128,",
+    "                 128x256, 128x128, 192x256, 256x192; 107-111 persistent, 112-116 \"sk\" 256x128 .. 256x192",
+    "                 (a8w8_mxfp8_bpreshuffle kid = this kid - 100: the same tile / variant).",
+    "  variant        \"\" persistent, \"np\" one tile per block, \"sk\" split-K (fp32 partials summed by",
+    "                 splitk_reduce_kernel) -- any M, N % 16; \"nob\" one tile per block without M/N boundary",
+    "                 handling (M % B_M, N % B_N).",
+    "  A kid has one image per layout, picked by the launcher from the tensor strides:",
+    "  opus_gemm_gfx950_a8w8_mxfp8_co_{B_M}x{B_N}x{B_K}[_{variant}]_<nt|nn|tt|tn>.co (nt = A [M,K], B [N,K];",
+    "  nn = B stored [K,N]; tt = A stored [K,M]; tn = both).",
+    "  block_size, tile, wave_layout [T_M, T_N], launch_bounds and device_flags as in co_kernels.json."
+  ],
+  "gfx950": [
+    {
+      "kid": 100,
+      "tag": "a8w8_mxfp8_co",
+      "block_size": 256,
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": "nob"
+    },
+    {
+      "kid": 101,
+      "tag": "a8w8_mxfp8_co",
+      "block_size": 256,
+      "tile": [
+        256,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": "np"
+    },
+    {
+      "kid": 102,
+      "tag": "a8w8_mxfp8_co",
+      "block_size": 256,
+      "tile": [
+        256,
+        128,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": "np"
+    },
+    {
+      "kid": 103,
+      "tag": "a8w8_mxfp8_co",
+      "block_size": 256,
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": "np"
+    },
+    {
+      "kid": 104,
+      "tag": "a8w8_mxfp8_co",
+      "block_size": 256,
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": "np"
+    },
+    {
+      "kid": 105,
+      "tag": "a8w8_mxfp8_co",
+      "block_size": 256,
+      "tile": [
+        192,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": "np"
+    },
+    {
+      "kid": 106,
+      "tag": "a8w8_mxfp8_co",
+      "block_size": 256,
+      "tile": [
+        256,
+        192,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": "np"
+    },
+    {
+      "kid": 107,
+      "tag": "a8w8_mxfp8_co",
+      "block_size": 256,
+      "tile": [
+        256,
+        128,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": ""
+    },
+    {
+      "kid": 108,
+      "tag": "a8w8_mxfp8_co",
+      "block_size": 256,
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": ""
+    },
+    {
+      "kid": 109,
+      "tag": "a8w8_mxfp8_co",
+      "block_size": 256,
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": ""
+    },
+    {
+      "kid": 110,
+      "tag": "a8w8_mxfp8_co",
+      "block_size": 256,
+      "tile": [
+        192,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": ""
+    },
+    {
+      "kid": 111,
+      "tag": "a8w8_mxfp8_co",
+      "block_size": 256,
+      "tile": [
+        256,
+        192,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": ""
+    },
+    {
+      "kid": 112,
+      "tag": "a8w8_mxfp8_co",
+      "block_size": 256,
+      "tile": [
+        256,
+        128,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": "sk"
+    },
+    {
+      "kid": 113,
+      "tag": "a8w8_mxfp8_co",
+      "block_size": 256,
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": "sk"
+    },
+    {
+      "kid": 114,
+      "tag": "a8w8_mxfp8_co",
+      "block_size": 256,
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": "sk"
+    },
+    {
+      "kid": 115,
+      "tag": "a8w8_mxfp8_co",
+      "block_size": 256,
+      "tile": [
+        192,
+        256,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": "sk"
+    },
+    {
+      "kid": 116,
+      "tag": "a8w8_mxfp8_co",
+      "block_size": 256,
+      "tile": [
+        256,
+        192,
+        128
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": "sk"
+    }
+  ]
+}

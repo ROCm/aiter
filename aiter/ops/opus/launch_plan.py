@@ -463,7 +463,15 @@ def _get_cached_a16w16_launch_plan(
 _A8W8_FAMILY = "a8w8"
 _A8W8_BLOCKSCALE_FAMILY = "a8w8_blockscale"
 _A8W8_BPRESHUFFLE_FAMILY = "a8w8_blockscale_bpreshuffle"
+_A8W8_MXFP8_FAMILY = "a8w8_blockscale_mxfp8"
 _A8W8_MXSCALE_BMM_FAMILY = "a8w8_mxscale_bmm"
+# MXFP8 x MXFP8 with 1x32 e8m0 scales: plain NT / NN / TT / TN and NT bpreshuffle.
+_A8W8_MXFP8_1X32_FAMILY = "a8w8_mxfp8"
+_A8W8_MXFP8_1X32_BPRESHUFFLE_FAMILY = "a8w8_mxfp8_bpreshuffle"
+_A8W8_MXFP8_1X32_FAMILIES = (
+    _A8W8_MXFP8_1X32_FAMILY,
+    _A8W8_MXFP8_1X32_BPRESHUFFLE_FAMILY,
+)
 
 # Derived, not restated. This used to be a second hand-kept copy of the tag list
 # in OPUS_KERNEL_TAGS_BY_ARCH_FAMILY, and the two drifted the moment the
@@ -503,13 +511,23 @@ _A8W8_FAMILY_BY_TAG = {
     "a8w8_scale": _A8W8_BLOCKSCALE_FAMILY,
     "a8w8_blockscale_bpreshuffle_singlebuf": _A8W8_BPRESHUFFLE_FAMILY,
     "a8w8_blockscale_mxscale_gemm_bpreshuffle": _A8W8_BPRESHUFFLE_FAMILY,
+    "a8w8_blockscale_mxfp8": _A8W8_MXFP8_FAMILY,
     **{tag: _A8W8_MXSCALE_BMM_FAMILY for tag in _A8W8_MXSCALE_BMM_TAGS},
+    **{
+        tag: family
+        for arch_families in OPUS_KERNEL_TAGS_BY_ARCH_FAMILY.values()
+        for family in _A8W8_MXFP8_1X32_FAMILIES
+        for tag in arch_families.get(family, ())
+    },
 }
 _A8W8_FAMILY_LAYOUT = {
     _A8W8_FAMILY: "plain",
     _A8W8_BLOCKSCALE_FAMILY: "plain",
     _A8W8_BPRESHUFFLE_FAMILY: "bpreshuffle",
+    _A8W8_MXFP8_FAMILY: "plain",
     _A8W8_MXSCALE_BMM_FAMILY: "mxscale_bmm",
+    _A8W8_MXFP8_1X32_FAMILY: "plain",
+    _A8W8_MXFP8_1X32_BPRESHUFFLE_FAMILY: "bpreshuffle",
 }
 _FP8_DTYPES = frozenset(
     dtype
@@ -561,11 +579,12 @@ def _validate_a8w8_public_contract(
     if input_dtype not in _FP8_DTYPES:
         raise ValueError(f"OPUS kid {kid} requires FP8 XQ/WQ; got {input_dtype}")
     if (
-        kernel_tag == "a8w8_blockscale_mxscale_gemm_bpreshuffle"
+        kernel_tag
+        in ("a8w8_blockscale_mxscale_gemm_bpreshuffle", "a8w8_blockscale_mxfp8")
         and input_dtype != torch.float8_e4m3fn
     ):
         raise ValueError(
-            f"OPUS gfx950 MXFP8 bpreshuffle requires float8_e4m3fn XQ/WQ; "
+            f"OPUS gfx950 MXFP8 {family} requires float8_e4m3fn XQ/WQ; "
             f"got {input_dtype}"
         )
 
@@ -576,7 +595,14 @@ def _validate_a8w8_public_contract(
             )
     else:
         expected_output_dtype = (
-            torch.bfloat16 if family == _A8W8_BPRESHUFFLE_FAMILY else torch.float32
+            torch.bfloat16
+            if family
+            in (
+                _A8W8_BPRESHUFFLE_FAMILY,
+                _A8W8_MXFP8_FAMILY,
+                *_A8W8_MXFP8_1X32_FAMILIES,
+            )
+            else torch.float32
         )
         if output_dtype != expected_output_dtype:
             raise ValueError(
@@ -600,6 +626,12 @@ def _validate_a8w8_public_contract(
             raise ValueError("OPUS a8w8_mxscale_bmm requires x_scale and w_scale")
         if split_k == 0 and has_workspace:
             raise ValueError("OPUS a8w8_mxscale_bmm split_k=0 does not use workspace")
+        return family
+    if family in _A8W8_MXFP8_1X32_FAMILIES:
+        # Split-K kids take split_k (0 = auto) and an optional fp32 workspace; the
+        # launch plan rejects them for the other kids.
+        if not has_x_scale:
+            raise ValueError(f"OPUS {family} requires x_scale and w_scale")
         return family
 
     if has_workspace and not (

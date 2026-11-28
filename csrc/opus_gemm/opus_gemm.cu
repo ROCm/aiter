@@ -507,4 +507,130 @@ void opus_gemm_a8w8_blockscale_bpreshuffle_launch(
   }
 }
 
+void opus_gemm_a8w8_blockscale_mxfp8_launch(
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &x_scale,
+    aiter_tensor_t &w_scale,
+    aiter_tensor_t &Y,
+    int kid)
+{
+  aiter_detail::g_aiter_can_throw = true;
+  constexpr const char* entry = "opus_gemm_a8w8_blockscale_mxfp8_launch";
+  opus_check_a8_family_tensors(entry, XQ, WQ, Y);
+  opus_check_a8_scale_devices(entry, XQ, x_scale, w_scale);
+  AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16,
+              entry, ": expected bf16 Y, got ", AiterDtype_to_str(Y.dtype()));
+  const auto &info = opus_get_arch_info();
+#ifdef OPUS_BUILD_HAS_GFX950
+  if (info.arch == OpusGfxArch::Gfx950)
+  {
+    opus_a8w8_blockscale_mxfp8_kid_dispatch_gfx950(kid)(XQ, WQ, x_scale, w_scale, Y);
+    return;
+  }
+#endif
+  AITER_CHECK(false,
+              entry, ": no registered kernel for current device ", info.dev,
+              " with gcnArchName='", info.name, "' (gfx950 only)");
+}
+
+// MXFP8 x MXFP8 (gfx950), 1x32 e8m0 scales.
+// Shapes: XQ [batch, M, K], WQ [batch, N, K] fp8 (logical views of the stored
+// operands), Y [batch, M, N] bf16; scales e8m0 row-major, 2D [batch * rows, K/32]
+// or 3D [batch, rows, K/32]. a8w8_mxfp8: plain NT / NN / TT / TN from the strides;
+// a8w8_mxfp8_bpreshuffle: NT, WQ = shuffle_weight(w, (16, 16)) of B [N, K].
+// The kid launchers check the strides of their layout and the tile alignment.
+static void opus_gemm_a8w8_mxfp8_run(
+    const char* entry,
+    bool bpreshuffle,
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    aiter_tensor_t &x_scale,
+    aiter_tensor_t &w_scale,
+    std::optional<aiter_tensor_t> workspace,
+    int kid,
+    int split_k)
+{
+  aiter_detail::g_aiter_can_throw = true;
+  opus_check_a8_family_tensors(entry, XQ, WQ, Y);
+  opus_check_a8_scale_devices(entry, XQ, x_scale, w_scale);
+  AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16,
+              entry, ": expected bf16 Y, got ", AiterDtype_to_str(Y.dtype()));
+  AITER_CHECK(XQ.dim() == 3 && WQ.dim() == 3 && Y.dim() == 3,
+              entry, ": XQ/WQ/Y must be 3D [batch, M, K], [batch, N, K], [batch, M, N]");
+  AITER_CHECK(Y.is_contiguous() && x_scale.is_contiguous() && w_scale.is_contiguous(),
+              entry, ": Y and the scales must be contiguous");
+  const int64_t batch = XQ.size(0), M = XQ.size(1), K = XQ.size(2), N = WQ.size(1);
+  AITER_CHECK(batch >= 1 && M >= 1 && WQ.size(0) == batch && WQ.size(2) == K,
+              entry, ": WQ must be [batch, N, K] matching XQ");
+  AITER_CHECK(Y.size(0) == batch && Y.size(1) == M && Y.size(2) == N,
+              entry, ": Y must be [batch, M, N]");
+  // Scales have K/32 columns, or more: a K that is not a multiple of 256 carries the zeroed groups of its last K
+  // tiles (the kid launcher checks how many, and which K it runs).
+  AITER_CHECK(K % 32 == 0 && K > 0,
+              entry, ": K must be a positive multiple of 32 (got K=", K, ")");
+  const int64_t groups_k = K / 32;
+  auto check_scale = [&](const aiter_tensor_t& s, int64_t rows, const char* name) {
+    AITER_CHECK(s.element_size() == 1, entry, ": ", name, " must be e8m0 (1 byte)");
+    AITER_CHECK((s.dim() == 2 && s.size(0) == batch * rows) ||
+                    (s.dim() == 3 && s.size(0) == batch && s.size(1) == rows),
+                entry, ": ", name, " must be [batch * ", rows, ", K/32] or [batch, ",
+                rows, ", K/32]");
+    AITER_CHECK(s.size(-1) >= groups_k, entry, ": ", name, " must have at least K/32 = ", groups_k,
+                " columns (got ", s.size(-1), ")");
+  };
+  check_scale(x_scale, M, "x_scale");
+  check_scale(w_scale, N, "w_scale");
+  if (workspace.has_value())
+  {
+    AITER_CHECK(workspace->is_gpu() && workspace->device_id == XQ.device_id,
+                entry, ": workspace device ", workspace->device_id,
+                " must match input device ", XQ.device_id);
+  }
+
+  const auto &info = opus_get_arch_info();
+  if (info.arch == OpusGfxArch::Gfx950)
+  {
+#ifdef OPUS_BUILD_HAS_GFX950
+    (bpreshuffle ? opus_a8w8_mxfp8_bpreshuffle_kid_dispatch_gfx950 : opus_a8w8_mxfp8_kid_dispatch_gfx950)(kid)(
+        XQ, WQ, Y, x_scale, w_scale, workspace, split_k);
+    return;
+#else
+    AITER_CHECK(false, entry, ": module was not built with gfx950 support for current device ",
+                info.dev);
+#endif
+  }
+  AITER_CHECK(false, entry, ": no registered kernel on device ", info.dev,
+              " with gcnArchName='", info.name, "'");
+}
+
+void opus_gemm_a8w8_mxfp8_launch(
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    aiter_tensor_t &x_scale,
+    aiter_tensor_t &w_scale,
+    std::optional<aiter_tensor_t> workspace,
+    int kid,
+    int split_k)
+{
+  opus_gemm_a8w8_mxfp8_run("opus_gemm_a8w8_mxfp8_launch", false,
+                           XQ, WQ, Y, x_scale, w_scale, workspace, kid, split_k);
+}
+
+void opus_gemm_a8w8_mxfp8_bpreshuffle_launch(
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    aiter_tensor_t &x_scale,
+    aiter_tensor_t &w_scale,
+    std::optional<aiter_tensor_t> workspace,
+    int kid,
+    int split_k)
+{
+  opus_gemm_a8w8_mxfp8_run("opus_gemm_a8w8_mxfp8_bpreshuffle_launch", true,
+                           XQ, WQ, Y, x_scale, w_scale, workspace, kid, split_k);
+}
+
 #endif // !__HIP_DEVICE_COMPILE__

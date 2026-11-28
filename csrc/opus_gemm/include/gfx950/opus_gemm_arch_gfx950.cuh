@@ -194,6 +194,23 @@ opus_a8w8_blockscale_bpreshuffle_kid_dispatch_gfx950<fp32_t>(int id)
     return entry->func;
 }
 
+// MXFP8 1x128 blockscale with plain (not shuffled) A and B: NT / NN / TT / TN COs.
+inline OpusA8W8BlockscaleBpreshuffleKernel
+opus_a8w8_blockscale_mxfp8_kid_dispatch_gfx950(int id)
+{
+    using Entry = opus_gfx950_detail::OpusA8W8KidEntry<
+        OpusA8W8BlockscaleBpreshuffleKernel>;
+    static constexpr std::array<
+        Entry, GENERATE_A8W8_BLOCKSCALE_MXFP8_KID_DISPATCH_GFX950_SIZE>
+        kKids = {{GENERATE_A8W8_BLOCKSCALE_MXFP8_KID_DISPATCH_GFX950}};
+    AITER_CHECK(!kKids.empty(),
+                "no registered kernel for OPUS a8w8_blockscale_mxfp8 on gfx950");
+    const auto* entry = opus_gfx950_detail::find_kid(kKids, id);
+    AITER_CHECK(entry != nullptr,
+                "unknown kid ", id, " for OPUS a8w8_blockscale_mxfp8 on gfx950");
+    return entry->func;
+}
+
 inline bool opus_a8w8_blockscale_bpreshuffle_has_workspace_kernel_gfx950(int id)
 {
     return opus_gfx950_detail::bpreshuffle_workspace_entry(id) != nullptr;
@@ -209,6 +226,33 @@ opus_a8w8_blockscale_bpreshuffle_workspace_kid_dispatch_gfx950(int id)
     AITER_CHECK(entry != nullptr,
                 "unknown workspace kid ", id, " for OPUS "
                 "a8w8_blockscale_bpreshuffle on gfx950 with bf16 Y");
+    return entry->func;
+}
+
+// XQ, WQ, Y, x_scale, w_scale, workspace, splitK.
+using OpusA8W8Mxfp8Kernel = void (*)(
+    aiter_tensor_t&, aiter_tensor_t&, aiter_tensor_t&,
+    aiter_tensor_t&, aiter_tensor_t&, std::optional<aiter_tensor_t>, int);
+
+inline OpusA8W8Mxfp8Kernel opus_a8w8_mxfp8_kid_dispatch_gfx950(int id)
+{
+    using Entry = opus_gfx950_detail::OpusA8W8KidEntry<OpusA8W8Mxfp8Kernel>;
+    static constexpr std::array<Entry, GENERATE_A8W8_MXFP8_KID_DISPATCH_GFX950_SIZE>
+        kKids = {{GENERATE_A8W8_MXFP8_KID_DISPATCH_GFX950}};
+    AITER_CHECK(!kKids.empty(), "no registered kernel for OPUS a8w8_mxfp8 on gfx950");
+    const auto* entry = opus_gfx950_detail::find_kid(kKids, id);
+    AITER_CHECK(entry != nullptr, "unknown kid ", id, " for OPUS a8w8_mxfp8 on gfx950");
+    return entry->func;
+}
+
+inline OpusA8W8Mxfp8Kernel opus_a8w8_mxfp8_bpreshuffle_kid_dispatch_gfx950(int id)
+{
+    using Entry = opus_gfx950_detail::OpusA8W8KidEntry<OpusA8W8Mxfp8Kernel>;
+    static constexpr std::array<Entry, GENERATE_A8W8_MXFP8_BPRESHUFFLE_KID_DISPATCH_GFX950_SIZE>
+        kKids = {{GENERATE_A8W8_MXFP8_BPRESHUFFLE_KID_DISPATCH_GFX950}};
+    AITER_CHECK(!kKids.empty(), "no registered kernel for OPUS a8w8_mxfp8_bpreshuffle on gfx950");
+    const auto* entry = opus_gfx950_detail::find_kid(kKids, id);
+    AITER_CHECK(entry != nullptr, "unknown kid ", id, " for OPUS a8w8_mxfp8_bpreshuffle on gfx950");
     return entry->func;
 }
 

@@ -9,8 +9,9 @@ and so is the batched GEMM at B = 1 (bmm, on the same scales). Its candidates
 are the tuned bmm kernels of the shape's N and K at M/2..2M in this table and
 in gemm_a8w8_blockscale_bpreshuffle's e8m0 table (any block), else that
 table's bmm kernels of any N and K at those M, plus the heuristic pick and
-their split-K neighbours. The fastest lands in the same
-table the gfx1250 rows live in, keyed by gfx and w_scale_block (1x32: a shape
+their split-K neighbours, and every OPUS a8w8_mxfp8_bpreshuffle kid that runs the shape
+(split-K kids at S = 2 / 4 / 8; libtype "opus", kernelId its local kid). The
+fastest lands in the same table the gfx1250 rows live in, keyed by gfx and w_scale_block (1x32: a shape
 list without the column is one); a bmm row's kernelId is "bmm", which
 gemm_a8w8_mxfp8_bpreshuffle runs as the batched GEMM:
 
@@ -561,6 +562,36 @@ def run_gemm_opus(x, weight_shuffle, x_scale, w_scale, out, kid):
     )
 
 
+def opus_mxfp8_candidates(m, n, k, gfx, cu_num):
+    """(local kid, instance name, split_k) of the OPUS a8w8_mxfp8_bpreshuffle (1x32) kids that
+    run (m, n, k); the split-K ("sk") kids once per feasible S in 2 / 4 / 8."""
+    from aiter.ops.opus.gemm_op_a8w8 import a8w8_mxfp8_kid_runs
+    from csrc.opus_gemm.opus_gemm_common import get_registry
+
+    return [
+        (kid, inst.name, split)
+        for kid, inst in get_registry("a8w8_mxfp8_bpreshuffle", gfx, cu_num).items()
+        for split in ((2, 4, 8) if inst.co_variant == "sk" else (1,))
+        if a8w8_mxfp8_kid_runs(inst, m, n, k, split)
+    ]
+
+
+def run_gemm_opus_mxfp8(x, weight_shuffle, x_scale, w_scale, out, kid, split_k):
+    from aiter.ops.opus import opus_gemm
+
+    return opus_gemm(
+        x,
+        weight_shuffle,
+        out,
+        kid=kid,
+        family="a8w8_mxfp8_bpreshuffle",
+        layout="bpreshuffle",
+        x_scale=x_scale,
+        w_scale=w_scale,
+        split_k=split_k,
+    )
+
+
 # The batched GEMM at B = 1 in --mxscale_table mode: its ids follow mxfp8's
 # (kernelId records the backend in that table).
 KERNEL_ID_BASE_BMM = 3_000_000
@@ -981,8 +1012,14 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             runs.extend(
                 (kid, 1, instance.name, run_gemm_opus) for kid, instance in opus
             )
+            if self._bmm_1x32 and args.libtype != "flydsl":
+                # The 1x32 OPUS a8w8_mxfp8_bpreshuffle kids; a run's kernelId is its local kid.
+                runs.extend(
+                    (kid, split, name, run_gemm_opus_mxfp8)
+                    for kid, name, split in opus_mxfp8_candidates(M, N, K, gfx, cu_num)
+                )
             for kernel_id, split_k, name, run in runs:
-                is_opus = run is run_gemm_opus
+                is_opus = run in (run_gemm_opus, run_gemm_opus_mxfp8)
                 info = (
                     info_keys,
                     kernel_id,
@@ -996,7 +1033,13 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                         generate_data,
                         (M, N, K, seed, block),
                         run,
-                        (gemm_keys, kernel_id) if is_opus else (gemm_keys, name),
+                        (
+                            (gemm_keys, kernel_id, split_k)
+                            if run is run_gemm_opus_mxfp8
+                            else (
+                                (gemm_keys, kernel_id) if is_opus else (gemm_keys, name)
+                            )
+                        ),
                         dict(run_kwargs),
                         run_torch,
                         ref_args,
@@ -1020,7 +1063,8 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         if not tasks:
             return []
         ensure_opus_kids_compiled(
-            {task[0][1] for task in tasks if task[0][-1] == "opus"},
+            # blockscale kids only (the a8w8_mxfp8_bpreshuffle ones are pre-compiled .co)
+            {task[0][1] for task in tasks if task[3] is run_gemm_opus},
             cu_num=self.get_cu_num(),
         )
         counts = Counter(task[0][0] for task in tasks)

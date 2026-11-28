@@ -2963,6 +2963,33 @@ _BMM_MFMA_NAME_PREFIX = "flydsl_bmm_mxfp8_mfma"
 _MXFP8_TUNED_KEYS = ["gfx", "cu_num", "M", "N", "K", "w_scale_block"]
 
 
+@functools.lru_cache(maxsize=1024)
+def _opus_mxfp8_kid(M: int, N: int, K: int, kernel_name: str, split_k: int = 0):
+    """Local kid serving a libtype "opus" row that names the OPUS
+    a8w8_mxfp8_bpreshuffle instance ``kernel_name``, or None when none runs
+    (M, N, K) with ``split_k``. A "nob" kid runs whole tiles only, so a ragged
+    M under a padded-M row runs the "np" kid of the same tile."""
+    from csrc.opus_gemm.opus_gemm_common import get_registry
+
+    from .opus.gemm_op_a8w8 import a8w8_mxfp8_kid_runs
+
+    kids = get_registry("a8w8_mxfp8_bpreshuffle", get_gfx(), get_cu_num())
+    named = next((inst for inst in kids.values() if inst.name == kernel_name), None)
+    if named is None:
+        raise ValueError(f"Invalid tuned OPUS kernel {kernel_name}")
+    tile = (named.B_M, named.B_N, named.B_K)
+    variants = ("nob", "np") if named.co_variant == "nob" else (named.co_variant,)
+    for variant in variants:
+        for kid, inst in kids.items():
+            if (
+                inst.co_variant == variant
+                and (inst.B_M, inst.B_N, inst.B_K) == tile
+                and a8w8_mxfp8_kid_runs(inst, M, N, K, split_k)
+            ):
+                return kid
+    return None
+
+
 @functools.lru_cache(maxsize=1)
 def _load_mxfp8_bpreshuffle_tuned(tuned_file: str) -> dict:
     """{(gfx, cu_num, M, N, K, w_scale_block): row} of the mxfp8 tuned CSV."""
@@ -2982,9 +3009,10 @@ def _get_mxfp8_bpreshuffle_config(
 
     A FlyDSL tuned row wins (exact M, else a padded M, the walk
     get_CKGEMM_config makes); an untuned shape uses the FlyDSL heuristic.
-    gfx950 rows are FlyDSL mxpsh / 8-wave kernels, or (kernelId "bmm") the
-    batched GEMM at B = 1; an untuned gfx950 shape runs the mxpsh heuristic
-    tile.
+    gfx950 rows are FlyDSL mxpsh / 8-wave kernels, (kernelId "bmm") the
+    batched GEMM at B = 1, or (libtype "opus") an OPUS a8w8_mxfp8_bpreshuffle kid
+    (see _opus_mxfp8_kid); an untuned gfx950 shape, or an opus row no kid can
+    run, runs the mxpsh heuristic tile.
     """
     tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE_FILE
     gfx, cu_num = get_gfx(), get_cu_num()
@@ -3009,6 +3037,15 @@ def _get_mxfp8_bpreshuffle_config(
     if gfx == "gfx950":
         if config is not None and config["libtype"] == "flydsl":
             return "flydsl", str(config["kernelName"]), int(config["splitK"])
+        if (
+            config is not None
+            and config["libtype"] == "opus"
+            and _opus_mxfp8_kid(
+                M, N, K, str(config["kernelName"]), int(config["splitK"])
+            )
+            is not None
+        ):
+            return "opus", str(config["kernelName"]), int(config["splitK"])
         from .flydsl.mxscale_preshuffle_kernels import pick_mxfp8_kernel_name_gfx950
 
         name = pick_mxfp8_kernel_name_gfx950(M, N, K)
@@ -3062,8 +3099,10 @@ def gemm_a8w8_mxfp8_bpreshuffle(
 
     * gfx950: x_scale [M, K/32] and w_scale [N, K/32] e8m0, row-major and
       unshuffled. The w_scale block is read off its shape and served by
-      flydsl.gemm_a8w8_mxfp8 (as the batched mxscale GEMM does), or by the
-      batched GEMM at B = 1 where a tuned row (kernelId "bmm") picked it. The 32x32 and
+      flydsl.gemm_a8w8_mxfp8 (as the batched mxscale GEMM does), by the
+      batched GEMM at B = 1 where a tuned row (kernelId "bmm") picked it, or
+      by an OPUS a8w8_mxfp8_bpreshuffle kid where a tuned row (libtype "opus") picked it
+      (1x32 w_scale, bf16 output). The 32x32 and
       128x128 blocks go through gemm_a8w8_blockscale_bpreshuffle, whose tuned
       rows pick bmm or these kernels.
     * gfx1250: w_scale [N, K/32] is always 32x4 shuffled. x_scale is
@@ -3084,8 +3123,37 @@ def gemm_a8w8_mxfp8_bpreshuffle(
     w_scale_block = _MXFP8_W_SCALE_BLOCK
     if gfx == "gfx950" and w_scale.dim() == 2:
         w_scale_block = mxscale_w_scale_block(tuple(w_scale.shape), N, K)
-    _, kernel_name, _ = _get_mxfp8_bpreshuffle_config(M, N, K, w_scale_block)
+    libtype, kernel_name, split_k = _get_mxfp8_bpreshuffle_config(
+        M, N, K, w_scale_block
+    )
     if gfx == "gfx950":
+        if libtype == "opus":
+            if (
+                Y.dtype == dtypes.bf16
+                and tuple(x_scale.shape) == (M, K // 32)
+                and tuple(w_scale.shape) == (N, K // 32)
+            ):
+                from .opus import opus_gemm
+
+                # The OPUS kids take dense operands: a strided out is written
+                # through a dense one, as the 8-wave rows these replace did.
+                dense = Y if Y.is_contiguous() else Y.new_empty(M, N)
+                opus_gemm(
+                    XQ.contiguous(),
+                    WQ.contiguous(),
+                    dense,
+                    kid=_opus_mxfp8_kid(M, N, K, kernel_name, split_k=split_k),
+                    family="a8w8_mxfp8_bpreshuffle",
+                    layout="bpreshuffle",
+                    x_scale=x_scale,
+                    w_scale=w_scale,
+                    split_k=split_k,
+                )
+                if dense is not Y:
+                    Y.copy_(dense)
+                return Y
+            # The OPUS kids write bf16 only; let the mxpsh heuristic pick.
+            kernel_name = None
         is_bmm = kernel_name is not None and kernel_name.startswith(
             f"{_BMM_MFMA_NAME_PREFIX}_"
         )

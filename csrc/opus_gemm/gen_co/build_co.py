@@ -31,9 +31,18 @@ identical without any sidecar::
     .co filename == extern "C" symbol inside the .co == host launcher symbol
 
 gfx950 uses short image/launcher names while retaining each verified ELF symbol.
-Its manifest is
-``gen_co/co_kernels_gfx950_a8w8_blockscale_bpreshuffle.json``. Its images and
-build metadata live in ``gen_co/gfx950/a8w8_blockscale_bpreshuffle/``.
+Its preshuffled-B manifest is
+``gen_co/co_kernels_gfx950_a8w8_blockscale_bpreshuffle.json``; its images and
+build metadata live in ``gen_co/gfx950/a8w8_blockscale_bpreshuffle/``. The
+plain-B MXFP8 NT / NN / TT / TN kernels (the a8w8_blockscale_mxfp8 family, its
+own kid space; select it with --family) are declared in
+``gen_co/co_kernels_gfx950_a8w8_blockscale.json`` and live in
+``gen_co/gfx950/a8w8_blockscale/``. Without --out-dir, a build goes to the
+family's directory.
+``--family a8w8_mxfp8`` / ``a8w8_mxfp8_bpreshuffle`` build an MXFP8 1x32 family
+instead (``co_kernels_gfx950_<family>.json``: a8w8_mxfp8 one image per layout,
+a8w8_mxfp8_bpreshuffle the NT one, into ``gen_co/gfx950/<family>/``) with the pin toolchain's
+``clang++ --cuda-device-only`` (``-cuid`` pinned, so rebuilds are byte-reproducible).
 The gfx1250 manifest is ``gen_co/co_kernels_gfx1250.json``.
 
 The compiler is NOT pinned to a version
@@ -89,8 +98,15 @@ from codegen.gen_instances_gfx1250 import (
 # whose .co is not on disk (so nothing downstream can register an unlaunchable
 # kid), and this script exists to create exactly those files.
 from opus_gemm_common import (
+    A8W8_MXFP8_KARGS_BYTES,
+    a8w8_mxfp8_bpreshuffle_co_kernels_declared,
+    a8w8_mxfp8_co_images,
+    a8w8_mxfp8_co_kernels_declared,
+    a8w8_mxfp8_co_traits_args,
     gfx950_co_kernels_declared,
+    gfx950_mxfp8_co_kernels_declared,
     gfx1250_4wave_co_kernels_declared,
+    mxfp8_direction,
 )
 
 from aiter_worker_limits import (
@@ -353,18 +369,46 @@ def _check_gfx950_pin(
             path,
         ]
     ).stdout
-    reads = {int(x) for x in re.findall(r"ds_read_b128\s+a\[(\d+):", asm)}
-    bm, bn, bk = entry["tile"]
-    wm, wn = entry["wave_layout"]
-    a_regs = bm // (wm * 16) * (bk // 128) * 8
-    if entry["pipeline"] == "pingpong_lds":
-        a_regs = min(bm // (wm * 16), 3) * 8
-    b_regs = bn // (wn * 16) * 8
-    for bit, first, size in ((1, 0, a_regs), (2, 64, b_regs)):
-        if mask & bit and not set(range(first, first + size, 4)).issubset(reads):
-            raise ValueError(
-                f"pin mask {mask}: LDS reads did not reach AGPR range {first}:{first + size}"
-            )
+    if mxfp8_direction(entry):
+        # NT / NN / TT / TN pin A / B anywhere in the AGPRs, loaded by plain or TR8 reads:
+        # every MFMA A / B operand must be an AGPR range that an LDS read filled.
+        reads = {
+            reg
+            for first, last in re.findall(r"\bds_read\w*\s+a\[(\d+):(\d+)\]", asm)
+            for reg in range(int(first), int(last) + 1)
+        }
+        mmas = [
+            re.split(r",\s*", line.split("//", 1)[0].strip().split(None, 1)[1])
+            for line in asm.splitlines()
+            if "v_mfma_scale_" in line
+        ]
+        if not mmas:
+            raise ValueError("pin A/B: no MFMA instructions")
+        for bit, index, operand in ((1, 1, "A"), (2, 2, "B")):
+            if not mask & bit:
+                continue
+            for op in mmas:
+                match = re.fullmatch(r"a\[(\d+):(\d+)\]", op[index])
+                if match is None:
+                    raise ValueError(f"pin {operand}: MFMA operand is not in AGPRs")
+                first, last = map(int, match.groups())
+                if not set(range(first, last + 1)).issubset(reads):
+                    raise ValueError(
+                        f"pin {operand}: MFMA AGPRs were not loaded from LDS"
+                    )
+    else:
+        reads = {int(x) for x in re.findall(r"ds_read_b128\s+a\[(\d+):", asm)}
+        bm, bn, bk = entry["tile"]
+        wm, wn = entry["wave_layout"]
+        a_regs = bm // (wm * 16) * (bk // 128) * 8
+        if entry["pipeline"] == "pingpong_lds":
+            a_regs = min(bm // (wm * 16), 3) * 8
+        b_regs = bn // (wn * 16) * 8
+        for bit, first, size in ((1, 0, a_regs), (2, 64, b_regs)):
+            if mask & bit and not set(range(first, first + size, 4)).issubset(reads):
+                raise ValueError(
+                    f"pin mask {mask}: LDS reads did not reach AGPR range {first}:{first + size}"
+                )
     if mask & 4:
         mmas = [
             line.split("//", 1)[0].strip().split(None, 1)[1].split(", ")
@@ -828,9 +872,119 @@ def build_one(k, args, llvm_bin, workdir):
     return info
 
 
-def _default_co_output_dir(arch, offload_arch):
+# gfx950 CO families: their declared manifests (separate kid spaces) and image dirs.
+_GFX950_CO_FAMILIES = {
+    "a8w8_blockscale_bpreshuffle": gfx950_co_kernels_declared,
+    "a8w8_blockscale_mxfp8": gfx950_mxfp8_co_kernels_declared,
+}
+# --family -> declared kids of the MXFP8 1x32 families.
+_A8W8_MXFP8_FAMILIES = {
+    "a8w8_mxfp8": a8w8_mxfp8_co_kernels_declared,
+    "a8w8_mxfp8_bpreshuffle": a8w8_mxfp8_bpreshuffle_co_kernels_declared,
+}
+# Device-only clang++ flags of every a8w8_mxfp8 image (recorded in build_info.json).
+_A8W8_MXFP8_FLAGS = ["--cuda-device-only", "-D__HIPCC_RTC__", "-O3", "-std=c++17"]
+
+_A8W8_MXFP8_STUB_TEMPLATE = """// generated by build_co.py -- do not edit
+#include <opus/hip_minimal.hpp>
+#include "{pipeline_header}"
+extern "C" __global__ __launch_bounds__({lb_threads}, {lb_waves}) void {symbol}({kargs_name} kargs) {{
+    {body_func}<{traits_name}<{traits_args}>>(kargs);
+}}
+"""
+
+
+def build_one_a8w8_mxfp8(item, args, llvm_bin, workdir):
+    """Build one a8w8_mxfp8 image (kid, layout): device-only clang++ on the pin toolchain."""
+    from codegen import gen_instances_gfx950 as gfx950
+
+    kid, k, layout, symbol = item
+    traits_args = a8w8_mxfp8_co_traits_args(k, layout)
+    stub_path = os.path.join(workdir, f"{symbol}.cc")
+    with open(stub_path, "w") as f:
+        f.write(
+            _A8W8_MXFP8_STUB_TEMPLATE.format(
+                pipeline_header=gfx950.PIPELINE_HEADER_MAP[k.kernel_tag],
+                lb_threads=k.BLOCK_SIZE,
+                lb_waves=k.co_min_waves_per_eu,
+                symbol=symbol,
+                kargs_name=gfx950.KARGS_NAME_MAP[k.kernel_tag],
+                body_func=gfx950.KERNEL_FUNC_MAP[k.kernel_tag],
+                traits_name=gfx950.TRAITS_NAME_MAP[k.kernel_tag],
+                traits_args=traits_args,
+            )
+        )
+    out_path = os.path.join(args.out_dir, f"{symbol}.co")
+    device_flags = list(k.co_device_flags) + list(args.device_flag)
+    include = os.path.join(_OPUS_GEMM_DIR, "include")
+    cmd = [
+        _tool(llvm_bin, "clang++"),
+        "-x",
+        "hip",
+        stub_path,
+        "--offload-arch=gfx950",
+        *_A8W8_MXFP8_FLAGS,
+        # Reproducible: the default CUID derives from the (temporary) path.
+        f"-cuid={symbol}",
+        f"-I{include}",
+        f"-I{os.path.join(include, 'gfx950')}",
+        f"-I{os.path.join(_CSRC_DIR, 'include')}",
+        *device_flags,
+        "-o",
+        out_path,
+    ]
+    print(f"[build_co] compiling {symbol}")
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stdout + proc.stderr)
+        raise SystemExit(f"build_co: clang++ failed for {symbol}")
+    unbundled = _unbundle_if_needed(out_path, llvm_bin, "gfx950")
+    readelf = _tool(llvm_bin, "llvm-readelf")
+    md = _kernel_metadata(readelf, out_path, symbol)
+    target_md = _elf_target_metadata(out_path, "gfx950")
+    target_md.update(_device_link_metadata(readelf, out_path))
+    if md["kernarg_segment_size"] != A8W8_MXFP8_KARGS_BYTES:
+        raise SystemExit(
+            f"build_co: {symbol} kernarg mismatch: .co says "
+            f"{md['kernarg_segment_size']}, host ABI requires {A8W8_MXFP8_KARGS_BYTES}"
+        )
+    if md["vgpr_spill_count"]:
+        msg = f"{symbol} spills {md['vgpr_spill_count']} VGPRs"
+        if args.fail_on_spill:
+            raise SystemExit(f"build_co: {msg} and --fail-on-spill is set")
+        print(f"[build_co]   WARNING: {msg}", file=sys.stderr)
+    with open(out_path, "rb") as f:
+        co_sha256 = hashlib.sha256(f.read()).hexdigest()
+    if not args.no_asm:
+        asm_dir = os.path.join(args.out_dir, "asm")
+        os.makedirs(asm_dir, exist_ok=True)
+        objdump = _tool(llvm_bin, "llvm-objdump")
+        with open(os.path.join(asm_dir, f"{symbol}.dis"), "w") as f:
+            f.write(_run([objdump, "-d", "--mcpu=gfx950", out_path]).stdout)
+    print(
+        f"[build_co]   {symbol}: VGPR={md['vgpr_count']} SGPR={md['sgpr_count']} "
+        f"LDS={md['group_segment_fixed_size']} kernarg={md['kernarg_segment_size']} "
+        f"{'(unbundled)' if unbundled else '(bare ELF)'}"
+    )
+    return {
+        "symbol": symbol,
+        "status": "ready",
+        "co_sha256": co_sha256,
+        "kid": kid,
+        "layout": layout,
+        "tile": [k.B_M, k.B_N, k.B_K],
+        "variant": k.co_variant,
+        "launch_bounds": [k.BLOCK_SIZE, k.co_min_waves_per_eu],
+        "device_flags": device_flags,
+        "traits_args": traits_args,
+        **target_md,
+        **md,
+    }
+
+
+def _default_co_output_dir(arch, offload_arch, image_dir=None):
     if arch == "gfx950":
-        return os.path.join(_HERE, arch, "a8w8_blockscale_bpreshuffle")
+        return os.path.join(_HERE, arch, image_dir)
     if offload_arch == "gfx1250-strict":
         return os.path.join(_HERE, arch + "-strict")
     return os.path.join(_HERE, "named_reg", arch)
@@ -903,6 +1057,13 @@ def main():
         help=JOBS_CLI_HELP,
     )
     p.add_argument(
+        "--family",
+        choices=sorted({*_GFX950_CO_FAMILIES, *_A8W8_MXFP8_FAMILIES}),
+        default="a8w8_blockscale_bpreshuffle",
+        help="gfx950 CO family (manifest) the --kids refer to; each has its own kid "
+        "space and image directory (a8w8_mxfp8 / a8w8_mxfp8_bpreshuffle: pin toolchain)",
+    )
+    p.add_argument(
         "--kids",
         nargs="+",
         default=None,
@@ -918,18 +1079,18 @@ def main():
         "gfx1250-strict",
     ):
         p.error("--offload-arch does not match --arch")
-    if not args.out_dir:
-        args.out_dir = _default_co_output_dir(args.arch, args.offload_arch)
-    os.makedirs(args.out_dir, exist_ok=True)
-
     llvm_bin = os.path.abspath(args.llvm_bin) if args.llvm_bin else ""
     print(f"[build_co] clang from: {llvm_bin or '(PATH / hipcc default)'}")
 
-    table = (
-        gfx950_co_kernels_declared
-        if args.arch == "gfx950"
-        else gfx1250_4wave_co_kernels_declared
-    )
+    mxfp8 = args.arch == "gfx950" and args.family in _A8W8_MXFP8_FAMILIES
+    if mxfp8:
+        table = _A8W8_MXFP8_FAMILIES[args.family]
+    else:
+        table = (
+            _GFX950_CO_FAMILIES[args.family]
+            if args.arch == "gfx950"
+            else gfx1250_4wave_co_kernels_declared
+        )
     selected = set(table)
     if args.kids:
         try:
@@ -947,9 +1108,29 @@ def main():
         if kid in selected
         and (args.arch == "gfx950" or entry.kernel_tag in _PIPELINE_HEADERS)
     ]
+    if mxfp8:
+        # One build item per image: (kid, instance, layout, symbol).
+        instances = [
+            (kid, k, layout, symbol)
+            for kid, k in table.items()
+            if kid in selected
+            for layout, symbol in a8w8_mxfp8_co_images(k)
+        ]
     if not instances:
         raise SystemExit(f"build_co: no pre-compiled entries for {args.arch}")
-    build = build_one_gfx950 if args.arch == "gfx950" else build_one
+    if not args.out_dir:
+        # gfx950: each CO family has its own image directory (and build_info.json);
+        # an MXFP8 1x32 family's is gfx950/<family>/.
+        if mxfp8:
+            image_dir = args.family
+        else:
+            image_dir = instances[0]["image_dir"] if args.arch == "gfx950" else None
+        args.out_dir = _default_co_output_dir(args.arch, args.offload_arch, image_dir)
+    os.makedirs(args.out_dir, exist_ok=True)
+    if mxfp8:
+        build = build_one_a8w8_mxfp8
+    else:
+        build = build_one_gfx950 if args.arch == "gfx950" else build_one
     jobs = get_worker_count_for(len(instances), args.jobs)
 
     workdir = tempfile.mkdtemp(
@@ -970,7 +1151,7 @@ def main():
                 built = list(
                     pool.map(lambda k: build(k, args, llvm_bin, workdir), instances)
                 )
-            built.sort(key=lambda b: b["kid"])
+            built.sort(key=lambda b: (b["kid"], b.get("layout", "")))
     finally:
         if args.keep_temps:
             print(f"[build_co] stub TUs kept in {workdir}")
@@ -1005,6 +1186,10 @@ def main():
         "common_flags": common_flags,
         "kernels": built,
     }
+    if mxfp8:
+        # clang++ device-only, not hipcc (build_one_a8w8_mxfp8).
+        del info["hipcc"]
+        info["common_flags"] = [*_A8W8_MXFP8_FLAGS, "-cuid=<symbol>"]
     info_path = os.path.join(args.out_dir, "build_info.json")
     with open(info_path, "w") as f:
         json.dump(info, f, indent=2, sort_keys=True)
