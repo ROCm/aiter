@@ -4,6 +4,7 @@
 from aiter import logger
 
 from ..jit.core import compile_ops
+from ..jit.utils.chip_info import get_tuned_cu_nums, log_tuned_cu_fallback
 
 
 @compile_ops("module_gemm_common", fc_name="getPaddedM", ffi_type="ctypes")
@@ -20,6 +21,37 @@ def find_padded_m_row(tuned: dict, key, m: int, n: int, k: int):
         row = tuned.get(key(padded_m))
         if row is not None:
             return row, padded_m
+    return None, padded_m
+
+
+def find_tuned_row(
+    tuned: dict,
+    key,
+    gfx: str,
+    cu_num: int,
+    m: int,
+    n: int,
+    k: int,
+    source: str,
+    device: int | None = None,
+):
+    """(row, M it was tuned at) of a table keyed by gfx and CU count.
+
+    Walks M as find_padded_m_row does. At each M, tries the CU counts of
+    get_tuned_cu_nums(cu_num, device) in turn. key maps a CU count and an M
+    to the table key. source names the table in the log line of a fallback.
+    Row is None when no M and no CU count hits.
+    """
+    cu_nums = get_tuned_cu_nums(cu_num, device)
+    padded_m = m
+    for gl in (None, 0, 1):
+        padded_m = m if gl is None else get_padded_m(m, n, k, gl)
+        for tuned_cu in cu_nums:
+            row = tuned.get(key(tuned_cu, padded_m))
+            if row is not None:
+                if tuned_cu != cu_num:
+                    log_tuned_cu_fallback(source, gfx, cu_num, tuned_cu)
+                return row, padded_m
     return None, padded_m
 
 
