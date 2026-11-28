@@ -78,8 +78,12 @@ need no AOT change.
   two-stage jobs and with the whole budget: the replays run only their host
   code, and not every toolchain builds every arch (ROCm 7.2 cannot build the
   cluster launch gfx1250 builds turn on).
-- A worker replays up to 12 jobs of one row in turn, so the kernels they share
-  compile once. `AITER_FLYDSL_AOT_TIMEOUT` applies to the worker's whole batch.
+- A worker replays up to 32 jobs in turn, rows of one model (rows that differ
+  only in their token count and the kernels tuned for it), so the kernels
+  they share compile once. A worker also traces a kernel once: it launches an
+  AOT cache entry it did not build a single time, to see that the entry is
+  the kernel the request traces to, and answers its later requests from the
+  entry (`docs/flydsl_aot_cache.md`, 4.4). `AITER_FLYDSL_AOT_TIMEOUT` applies to the worker's whole batch.
 - `--check` compiles nothing and fails on any kernel the replay would need but
   the cache lacks; it is the CPU-side counterpart of the step-2 test below.
 
@@ -438,6 +442,18 @@ python op_tests/test_moe_2stage.py
   its `convert_to_jit_arguments` / `get_ir_types`, to trace each distinct
   launch once (`replay._trace_identity`). Update `requested_kernels` for that
   release.
+- **The build got slow after a FlyDSL upgrade**: a worker answers the
+  repeated requests of an AOT cache entry from the entry, untraced, once a
+  launch of it derived the key the entry recorded. It reads that key from
+  FlyDSL's private `JitFunction._last_compiled`
+  (`aot_cache._last_compile`); a FlyDSL without it leaves every request
+  traced, as before. The kernels are the same.
+- **`built from other IR` in the log, or a `_StaleEntryError` that says so**:
+  an entry of the AOT cache recorded another kernel than a launch of its
+  request traces to, so its key does not decide its kernel
+  (`docs/flydsl_aot_cache.md`, 4.2 and 4.4). To check every request of a
+  build, replay it again over the built caches with
+  `AITER_FLYDSL_AOT_CACHE=verify`.
 - **Worker OOM / killed (exitcode -9)**: abnormal exits are auto-retried
   (`AITER_FLYDSL_AOT_MAX_RETRIES`) and the default worker count is already
   bounded by the shared CPU and memory policy. If it still happens,

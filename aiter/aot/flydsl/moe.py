@@ -123,9 +123,12 @@ _ROW_FIELDS = (
 )
 # gate_mode is overwritten by each job's variant.
 _ROW_KEY = ("csv_path", *(f for f in _ROW_FIELDS if f != "gate_mode"))
-# Jobs of one row share most of their kernels, so one worker replays them in
+# What tells the rows of one model apart: its tuned token counts and the
+# kernels tuned for each.
+_ROW_VARIES = ("token", "kernelName1", "kernelName2")
+# Jobs of one model share most of their kernels, so one worker replays them in
 # turn; capped so no single worker trails the rest of the build.
-_JOBS_PER_WORKER = 12
+_JOBS_PER_WORKER = 32
 _FP8 = ("float8_e4m3fn", "float8_e4m3fnuz")
 _FP4 = "float4_e2m1fn_x2"
 
@@ -638,18 +641,38 @@ def _replay_batch(jobs: list[dict], kernel_name: str) -> dict:
 
 
 def _batches(jobs: list[dict]) -> list[list[dict]]:
-    """Each row's jobs in runs of at most ``_JOBS_PER_WORKER``, largest first.
-    A run keeps both token counts of a variant together. Equal-sized runs are
-    shuffled (stably) so that neighbouring rows of one model, which share
+    """The jobs in runs of at most ``_JOBS_PER_WORKER``, largest first. A run
+    takes rows of one model (rows that differ only in their token count and
+    the kernels tuned for it), neighbours by kernel name: they share kernels,
+    and a worker traces a kernel once however many of its jobs request it
+    (``FlyDSLAotCache._prebuild``). A row's jobs stay together as far as they
+    fit, so that a run keeps both token counts of a variant. Equal-sized runs
+    are shuffled (stably) so that neighbouring runs of one model, which share
     kernels and would wait on each other's compiles, do not start together."""
     rows: dict[tuple, list[dict]] = {}
     for job in jobs:
         rows.setdefault(tuple(job[f] for f in _ROW_KEY), []).append(job)
-    batches = [
-        (row, row_jobs[start : start + _JOBS_PER_WORKER])
-        for row, row_jobs in rows.items()
-        for start in range(0, len(row_jobs), _JOBS_PER_WORKER)
-    ]
+
+    def model(row: tuple) -> tuple:
+        return tuple(v for f, v in zip(_ROW_KEY, row) if f not in _ROW_VARIES)
+
+    def order(row: tuple) -> tuple:
+        fields = dict(zip(_ROW_KEY, row))
+        return (*model(row), *(fields[f] for f in _ROW_VARIES[::-1]))
+
+    batches: list[tuple[tuple, list[dict]]] = []
+    for row in sorted(rows, key=order):
+        row_jobs = rows[row]
+        for start in range(0, len(row_jobs), _JOBS_PER_WORKER):
+            run = row_jobs[start : start + _JOBS_PER_WORKER]
+            if (
+                batches
+                and model(batches[-1][0]) == model(row)
+                and len(batches[-1][1]) + len(run) <= _JOBS_PER_WORKER
+            ):
+                batches[-1][1].extend(run)
+            else:
+                batches.append((row, list(run)))
     batches.sort(key=lambda b: (-len(b[1]), zlib.crc32(repr(b[0]).encode())))
     return [batch for _, batch in batches]
 

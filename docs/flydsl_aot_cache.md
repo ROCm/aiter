@@ -376,12 +376,58 @@ bisection then stops early and skips kernels. On the mxfp8 CSV below this
 lost 7 of 49 kernels. The export runs first. When the
 export just built the entry, its own compile already showed the replay the
 request and filled FlyDSL's cache (the same artifact), so the JIT launch is
-skipped. Otherwise it runs and also fills FlyDSL's own cache for mode `0`
-and the fallback, like before this cache.
+skipped. Otherwise it would run and also fill FlyDSL's own cache for mode
+`0` and the fallback, like before this cache.
+
+That launch traces the kernel, because FlyDSL derives its key from the
+trace, only to find it compiled, and a prebuild requests each kernel many
+times: the full `gfx942;gfx950` build makes about 90,000 requests for 17,000
+entries, and tracing was 60% of its CPU time. So a process makes the launch
+once for an entry it did not build, and answers the entry's later requests
+without it:
+
+- the launch derives FlyDSL's key of the kernel the request traces to, and
+  the entry's sidecar records the key of the kernel it was built from
+  (`"ir"`). Where the two are the same (`_check_launch`), the entry is that
+  kernel and FlyDSL's own cache holds it, and the process has confirmed the
+  entry. An entry the process built itself is confirmed by its build;
+- a later request of a confirmed entry makes no launch. The cache hands the
+  recorded key to whoever collects requests
+  (`aot_cache.entry_requests(report)`, which `requested_kernels()` enters),
+  so the bisection sees the same requests. Collect a replay's requests
+  through `requested_kernels()`: watching FlyDSL's launches alone misses
+  these, which is the loss described above.
+
+Where the two keys differ, the entry's key does not decide its kernel: an
+error says so once, and every request of the entry is launched as before.
+So is every request of an entry without a recorded key, with a FlyDSL that
+keeps no last compile to read (`JitFunction._last_compiled`, private to it),
+inside another launcher's trace, which FlyDSL inlines, while FlyDSL dumps
+what it compiles, and under the `COMPILE_ONLY` of a preload (below). A
+replay that only identifies kernels confirms nothing, since its launches end
+at their key. Under `AITER_FLYDSL_AOT_CACHE=verify` a prebuild leaves no
+launch out and raises on a difference.
+
+This adds no key: a request is answered from an entry by the key a serving
+process loads it by, after a launch showed that the entry is what the request
+traces to. Since each process launches each entry it uses once, `--check`
+still looks every kernel up in FlyDSL's cache.
 
 Cost, gfx950 mxfp8 and a4w4 CSVs above, run one after the other on fresh
 directories: 155 s at HEAD, 164 s with the cache (62 GPU binaries, the same
-set). A replay whose entries all exist still traces every request.
+set), measured before any launch was left out.
+
+The full `gfx942;gfx950` build (`run_aot`'s stages, 96 workers, fresh
+directories, MI308X host): FlyDSL traces 90,500 launches before and 23,500
+after, for the same 16,103 kernels in its cache and the same entries in this
+one. The MoE stage, whose workers also take the rows of one model together
+(`aot/flydsl/moe.py`), goes from 677 s and 737 CPU-min to 180 s and 200
+CPU-min. All stages took 35.2 min before; after, 19.3 min on a host that
+other builds were loading at the time (MegaMoE, which is LLVM time for 7170
+kernels, one set per rank, and gains little, took 614 s there against 486 s
+before). No process of that build found an entry built from other IR than
+its request traces to. `--check` of the MoE tables on the built caches
+passes, and fails with one of FlyDSL's artifacts emptied.
 
 A preload (`tensor_shim._preload_compiled`) also turns `COMPILE_ONLY` on for
 the process, to warm one launcher up in a serving or tuning process. That is
@@ -403,8 +449,9 @@ Parallel replays share both caches safely. FlyDSL's own disk cache takes a
 per-artifact file lock, so one process runs LLVM and the others load its
 result; the export takes `flock <digest>.lock`. Measured on the mxfp8 CSV,
 two replays at once on one directory (40 workers): 58 LLVM compiles and 58
-exports for 58 kernels, none twice. Each process still traces the kernels it
-requests, which the replay needs. With `FLYDSL_RUNTIME_ENABLE_CACHE=0` or an
+exports for 58 kernels, none twice. A process traces a kernel once, to build
+its entry or to confirm it, and again where the launch above is still made.
+With `FLYDSL_RUNTIME_ENABLE_CACHE=0` or an
 IR dump, FlyDSL skips its cache and lock, and processes compile the same
 kernel in parallel; exports stay single. `flock` assumes a local file system.
 
