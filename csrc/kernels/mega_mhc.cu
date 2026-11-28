@@ -1179,7 +1179,18 @@ __device__ __forceinline__ void post192_tiles(const bf16* residual,
 
 #endif
 }
-template <int H, int VARIANT, bool MXFP8, class C, bool HAS_POST, bool IDENTITY_PRE>
+// GATES_ONLY: the tile half of the small-M launch (mega_mhc_small_m_kernel). The
+// workgroups still post-mix their columns for the projection and reduce the split
+// partials, and the last split to arrive runs the gates and Sinkhorn, but none
+// stores residual_out, collapses or normalizes (the row workgroups own those), and
+// a split that is not the last retires as soon as its partials are published.
+template <int H,
+          int VARIANT,
+          bool MXFP8,
+          class C,
+          bool HAS_POST,
+          bool IDENTITY_PRE,
+          bool GATES_ONLY = false>
 __device__ __forceinline__ void distributed_tiles(const bf16* residual,
                                                   const bf16* sublayer,
                                                   const float* post_mix,
@@ -1233,6 +1244,9 @@ __device__ __forceinline__ void distributed_tiles(const bf16* residual,
                               C::groups == 2 && !C::decode_rows && C::prefetch == 4 &&
                               C::split == 16;
     static_assert(!FAST_FIN || THREADS == 512);
+    static_assert(!GATES_ONLY || (HAS_POST && !IDENTITY_PRE && C::segment && STREAMS == 1 &&
+                                  split_k > 1 && !C::fixed_tokens && !C::decode_rows &&
+                                  !FAST_FIN));
     const int wave = wid % WAVES, wg = GROUPS == 1 ? 0 : wid / WAVES;
     const int lane                = tid % 64;
     constexpr bool ELEMENT_LAYOUT = C::segment || HAS_POST || !IDENTITY_PRE;
@@ -1450,12 +1464,14 @@ __device__ __forceinline__ void distributed_tiles(const bf16* residual,
                             r[st][c][e] = opus::fp32_to_bf16(v);
                         }
                     }
-                    store_vector_nbytes<bf16, bf16, 8, 16, (C::segment ? 2 : 0)>(
-                        g_out,
-                        r[st][c],
-                        tile_valid(k, c) ? tile_row(c) * 4 * hidden +
-                                               (wave * STREAMS + st) * hidden + k + tile_col(c)
-                                         : DEAD);
+                    if constexpr(!GATES_ONLY)
+                        store_vector_nbytes<bf16, bf16, 8, 16, (C::segment ? 2 : 0)>(
+                            g_out,
+                            r[st][c],
+                            tile_valid(k, c) ? tile_row(c) * 4 * hidden +
+                                                   (wave * STREAMS + st) * hidden + k +
+                                                   tile_col(c)
+                                             : DEAD);
                 }
             }
 #pragma unroll
@@ -1479,7 +1495,7 @@ __device__ __forceinline__ void distributed_tiles(const bf16* residual,
         for(int c = 0; c < NC; ++c)
         {
             constexpr bool LOCAL_IDENTITY = !C::segment && !HAS_POST && IDENTITY_PRE;
-            if(wave == (LOCAL_IDENTITY ? 0 : c % WAVES))
+            if(!GATES_ONLY && wave == (LOCAL_IDENTITY ? 0 : c % WAVES))
             {
                 bf16x8 new_regs[4], collapsed;
                 if constexpr(LOCAL_IDENTITY)
@@ -1700,6 +1716,9 @@ __device__ __forceinline__ void distributed_tiles(const bf16* residual,
         __syncthreads();
         if((last & 255u) != static_cast<unsigned>(split_k - 1))
         {
+            // GATES_ONLY: the partials are published; nothing else is this split's job.
+            if constexpr(GATES_ONLY)
+                return;
             if(tid == 0)
             {
                 unsigned value = 0;
@@ -1946,9 +1965,10 @@ __device__ __forceinline__ void distributed_tiles(const bf16* residual,
 
     if constexpr(FAST_FIN)
         __syncthreads(); // handed_mask was written by wave 4 without a barrier.
-    else
+    else if constexpr(!GATES_ONLY)
         normalize_own_columns();
-    if(handed_mask != 0)
+    // GATES_ONLY: no split stages columns or hands them off.
+    if(!GATES_ONLY && handed_mask != 0)
     {
         __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
         const int full_part = hidden / split_k;
@@ -3070,6 +3090,253 @@ __global__ __launch_bounds__((launch_threads<H, VARIANT, HAS_POST, POST_STREAMS>
     }
 #endif
 }
+// Small-M launch: H = 5120 calls with post-mix and pre-mix of 9..128 tokens (the
+// small16 / small128 / small variants). In the standard launch every split of a
+// token block stores its residual_out columns, collapses them and then needs the
+// block's rstd before it normalizes them. Here the first 8 * split workgroups are
+// that launch's tiles in their GATES_ONLY form (projection, split reduction, gates,
+// Sinkhorn), and each later workgroup owns ONE token row over all H columns:
+// post-mix, residual_out, collapse, the row's square sum, rstd, normalization and
+// quantization, with one workgroup barrier and no cross-workgroup wait.
+//
+// Arithmetic = the standard small/post path's, element for element:
+//  * post-mix: distributed_tiles' packed multiply / FMA chain;
+//  * collapse: four scalar FMAs from zero in stream order (collapse_fma<true>),
+//    one BF16 rounding;
+//  * the collapse square sum keeps the standard association. A unit = the 128
+//    columns of one wave group of one split. Eight adjacent lanes own a unit:
+//    lane j holds columns {8 j .. 8 j + 7} and {64 + 8 j ..} of it as ONE dot2
+//    chain (the standard wave's two k steps), the eight lanes fold with the same
+//    DPP tree, a split adds its two units in order from zero, the splits fold in
+//    four interleaved chains from zero, then (c0 + c1) + (c2 + c3): what the
+//    finisher and every self-rstd split compute from the partials (the zeros the
+//    standard path adds for the waves that hold no collapse rows do not change a
+//    non-negative sum);
+//  * rstd, normalization and MXFP8: the standard expressions; four adjacent lanes
+//    own a group of 32 columns.
+// Every output is bit for bit the standard launch's (op_tests/test_mega_mhc.py).
+// Ported from the plugin_poc Mega-MHC small-M kernel
+// (https://github.com/coderfeli/plugin_poc/pull/129).
+template <int H, bool MXFP8>
+__device__ __forceinline__ void small_m_rows(const bf16* residual,
+                                             const bf16* sublayer,
+                                             const float* post_mix,
+                                             const float* comb_mix,
+                                             const float* pre_mix,
+                                             int token,
+                                             bf16* residual_out,
+                                             bf16* layer_input,
+                                             uint8_t* quant_out,
+                                             uint8_t* quant_scale,
+                                             const bf16* norm_weight,
+                                             float norm_eps)
+{
+#if defined(__gfx950__)
+    using C              = KernelTuning<H, 5, true>;
+    constexpr int SPLITS = C::split, UNIT = H / (SPLITS * C::groups);
+    constexpr int UNITS = H / UNIT, ROW_WAVES = UNITS * 8 / 64;
+    static_assert(C::segment && C::chunks == 2 && C::groups == 2 && UNIT == 128 &&
+                  SPLITS % 4 == 0 && UNITS % 8 == 0 && ROW_WAVES <= 8);
+    __shared__ float unit_sq[UNITS];
+    const int tid          = threadIdx.x;
+    const int wid          = __builtin_amdgcn_readfirstlane(tid / 64);
+    const int unit         = tid / 8, k_lane = (tid % 8) * 8;
+    const int64_t row_base = static_cast<int64_t>(token) * H;
+    auto g_res =
+        opus::make_gmem<bf16>(const_cast<bf16*>(residual) + row_base * 4, 4 * H * sizeof(bf16));
+    auto g_out = opus::make_gmem<bf16>(residual_out + row_base * 4, 4 * H * sizeof(bf16));
+    auto g_sub = opus::make_gmem<bf16>(const_cast<bf16*>(sublayer) + row_base, H * sizeof(bf16));
+    auto g_norm   = opus::make_gmem<bf16>(layer_input + row_base, H * sizeof(bf16));
+    auto g_weight = opus::make_gmem<bf16>(const_cast<bf16*>(norm_weight), H * sizeof(bf16));
+    MegaMHCQuantOutput<MXFP8> quant(quant_out, quant_scale, row_base, H);
+    bf16x8 collapsed[2] = {}, w[2] = {};
+    if(wid < ROW_WAVES)
+    {
+        float post[4], pre[4], comb[4][4]; // comb[st][h] = comb_mix[token][h][st]
+#pragma unroll
+        for(int st = 0; st < 4; ++st)
+        {
+            post[st] = post_mix[token * 4 + st];
+            pre[st]  = pre_mix[token * 4 + st];
+#pragma unroll
+            for(int h = 0; h < 4; ++h)
+                comb[st][h] = comb_mix[token * 16 + h * 4 + st];
+        }
+        bf16x8 old_regs[2][4], x[2];
+#pragma unroll
+        for(int n = 0; n < 2; ++n)
+        {
+            const int col = unit * UNIT + n * 64 + k_lane;
+#pragma unroll
+            for(int h = 0; h < 4; ++h)
+                old_regs[n][h] = load_vector_nbytes<bf16, 8, 16>(g_res, h * H + col);
+            x[n] = load_vector_nbytes<bf16, 8, 16>(g_sub, col);
+            // Needed after the barrier only; requested with the row.
+            w[n] = load_vector_nbytes<bf16, 8, 16>(g_weight, col);
+        }
+        __builtin_amdgcn_sched_barrier(0);
+        float sq_x = 0;
+#pragma unroll
+        for(int n = 0; n < 2; ++n)
+        {
+            const int col = unit * UNIT + n * 64 + k_lane;
+            bf16x8 r[4];
+#pragma unroll
+            for(int st = 0; st < 4; ++st)
+            {
+#pragma unroll
+                for(int e = 0; e < 8; e += 2)
+                {
+                    f32x2 v = mul_float_pair(bf16_pair_to_float(x[n], e), post[st]);
+#pragma unroll
+                    for(int h = 0; h < 4; ++h)
+                        v = fma_float_pair(bf16_pair_to_float(old_regs[n][h], e), comb[st][h], v);
+                    r[st][e]     = opus::fp32_to_bf16(v[0]);
+                    r[st][e + 1] = opus::fp32_to_bf16(v[1]);
+                }
+                store_vector_nbytes<bf16, bf16, 8, 16, 2>(g_out, r[st], st * H + col);
+            }
+#pragma unroll
+            for(int e = 0; e < 8; ++e)
+            {
+                float v = 0;
+#pragma unroll
+                for(int h = 0; h < 4; ++h)
+                    v = collapse_fma<true>(static_cast<float>(r[h][e]), pre[h], v);
+                collapsed[n][e] = opus::fp32_to_bf16(v);
+            }
+            sq_x = bf16_sqsum<5>(collapsed[n], sq_x);
+        }
+        sq_x = sum_element_lanes<8>(sq_x);
+        if(tid % 8 == 0)
+            unit_sq[unit] = sq_x;
+    }
+    __syncthreads();
+    if(wid < ROW_WAVES)
+    {
+        // Scalar adds: packed FP32 adds would pair the sums and read the high
+        // dword (the gfx950 lanes 48..63 MFMA hazard, see collapse_fma).
+        auto add = [](float a, float b) {
+            float r = a + b;
+            asm("" : "+v"(r));
+            return r;
+        };
+        float group_sum[4];
+#pragma unroll
+        for(int g = 0; g < 4; ++g)
+        {
+            float v = 0.0f;
+#pragma unroll
+            for(int s = g; s < SPLITS; s += 4)
+            {
+                // A split's partial: zero plus its two units, in wave-group order.
+                float p = add(0.0f, unit_sq[2 * s]);
+                p       = add(p, unit_sq[2 * s + 1]);
+                v       = add(v, p);
+            }
+            group_sum[g] = v;
+        }
+        const float sq   = add(add(group_sum[0], group_sum[1]), add(group_sum[2], group_sum[3]));
+        const float rstd = rsqrtf(sq * (1.0f / H) + norm_eps);
+#pragma unroll
+        for(int n = 0; n < 2; ++n)
+        {
+            const int col = unit * UNIT + n * 64 + k_lane;
+            bf16x8 out;
+#pragma unroll
+            for(int e = 0; e < 8; ++e)
+                out[e] = opus::fp32_to_bf16(static_cast<float>(collapsed[n][e]) * rstd *
+                                            static_cast<float>(w[n][e]));
+            store_vector_nbytes<bf16, bf16, 8, 16, RT>(g_norm, out, col);
+            quant.store(out, col);
+        }
+    }
+#endif
+}
+
+// Grid: 8 * split tile workgroups (the standard block index -> token block / split
+// map), then one row workgroup per token.
+template <int H, bool MXFP8>
+__global__ __launch_bounds__(512, 1) void mega_mhc_small_m_kernel(const bf16* residual,
+                                                                  const bf16* sublayer,
+                                                                  const float* post_mix,
+                                                                  const float* comb_mix,
+                                                                  const float* pre_mix,
+                                                                  const bf16* fn_packed,
+                                                                  int tokens,
+                                                                  int split_arg,
+                                                                  bf16* residual_out,
+                                                                  float* post_out,
+                                                                  float* comb_out,
+                                                                  bf16* layer_input,
+                                                                  uint8_t* quant_out,
+                                                                  uint8_t* quant_scale,
+                                                                  float* next_pre,
+                                                                  const float* hc_scale,
+                                                                  const float* hc_base,
+                                                                  const bf16* norm_weight,
+                                                                  float* partials,
+                                                                  unsigned int* counters,
+                                                                  int hidden_arg,
+                                                                  float rms_eps,
+                                                                  float pre_eps,
+                                                                  float sinkhorn_eps,
+                                                                  float post_mult,
+                                                                  float norm_eps,
+                                                                  int sinkhorn_repeat_arg)
+{
+#if defined(__gfx950__)
+    using Tiles               = KernelTuning<H, 5, true>;
+    constexpr int TILE_BLOCKS = 8 * Tiles::split;
+    static_assert(Tiles::threads == 512);
+    if(blockIdx.x < TILE_BLOCKS)
+        distributed_tiles<H, 5, MXFP8, Tiles, true, false, true>(residual,
+                                                                 sublayer,
+                                                                 post_mix,
+                                                                 comb_mix,
+                                                                 pre_mix,
+                                                                 fn_packed,
+                                                                 tokens,
+                                                                 split_arg,
+                                                                 residual_out,
+                                                                 post_out,
+                                                                 comb_out,
+                                                                 layer_input,
+                                                                 quant_out,
+                                                                 quant_scale,
+                                                                 next_pre,
+                                                                 hc_scale,
+                                                                 hc_base,
+                                                                 norm_weight,
+                                                                 partials,
+                                                                 counters,
+                                                                 hidden_arg,
+                                                                 rms_eps,
+                                                                 pre_eps,
+                                                                 sinkhorn_eps,
+                                                                 post_mult,
+                                                                 norm_eps,
+                                                                 sinkhorn_repeat_arg);
+    else
+    {
+        const int token = blockIdx.x - TILE_BLOCKS;
+        if(token < tokens)
+            small_m_rows<H, MXFP8>(residual,
+                                   sublayer,
+                                   post_mix,
+                                   comb_mix,
+                                   pre_mix,
+                                   token,
+                                   residual_out,
+                                   layer_input,
+                                   quant_out,
+                                   quant_scale,
+                                   norm_weight,
+                                   norm_eps);
+    }
+#endif
+}
+
 void check_tensor(const aiter_tensor_t& t,
                   const aiter_tensor_t& ref,
                   AiterDtype dtype,
@@ -3112,7 +3379,8 @@ void launch_mega_mhc(aiter_tensor_t& residual_out,
                      int sinkhorn_repeat,
                      int split_k,
                      bool has_post,
-                     bool identity_pre)
+                     bool identity_pre,
+                     bool small_m = false)
 {
     using StreamTuning = mega_mhc_stream::Tuning<H, VARIANT>;
     AITER_CHECK(residual.is_gpu() && residual.dim() == 3 && residual.size(1) == 4,
@@ -3200,6 +3468,49 @@ void launch_mega_mhc(aiter_tensor_t& residual_out,
     if(t == 0)
         return;
     const hipStream_t stream = getCurrentHIPStream();
+    if(small_m)
+    {
+        // The small-M launch (variant small_m, see mega_mhc_small_m_kernel): the
+        // small variants' workspace, H = 5120 post + pre calls of 9..128 tokens.
+        if constexpr(H == 5120 && VARIANT == 5)
+        {
+            AITER_CHECK(has_post && !identity_pre && t > 8 && t <= 128,
+                        "small-M Mega-MHC requires post-mix, pre-mix and 9..128 tokens");
+            constexpr int tile_split = KernelTuning<H, VARIANT, true>::split;
+            mega_mhc_small_m_kernel<H, MXFP8><<<dim3(8 * tile_split + t), 512, 0, stream>>>(
+                static_cast<const bf16*>(residual.data_ptr()),
+                static_cast<const bf16*>(sublayer_out.data_ptr()),
+                static_cast<const float*>(post_mix.data_ptr()),
+                static_cast<const float*>(comb_mix.data_ptr()),
+                static_cast<const float*>(pre_mix.data_ptr()),
+                static_cast<const bf16*>(fn_packed.data_ptr()),
+                t,
+                tile_split,
+                static_cast<bf16*>(residual_out.data_ptr()),
+                static_cast<float*>(post_out.data_ptr()),
+                static_cast<float*>(comb_out.data_ptr()),
+                static_cast<bf16*>(layer_input.data_ptr()),
+                static_cast<uint8_t*>(quant_out.data_ptr()),
+                static_cast<uint8_t*>(quant_scale.data_ptr()),
+                static_cast<float*>(next_pre.data_ptr()),
+                static_cast<const float*>(hc_scale.data_ptr()),
+                static_cast<const float*>(hc_base.data_ptr()),
+                static_cast<const bf16*>(norm_weight.data_ptr()),
+                static_cast<float*>(partials.data_ptr()),
+                static_cast<unsigned int*>(counters.data_ptr()),
+                h,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult,
+                norm_eps,
+                sinkhorn_repeat);
+            HIP_CALL(hipGetLastError());
+            return;
+        }
+        else
+            AITER_CHECK(false, "small-M Mega-MHC requires H=5120");
+    }
 // Automatic post tuning uses a prefix of the workspace split capacity.
 #define KERNEL_SPLIT(POST) \
     (KernelTuning<H, VARIANT, POST>::distributed ? KernelTuning<H, VARIANT, POST>::split : split_k)
@@ -3378,7 +3689,7 @@ void mega_mhc_bf16(aiter_tensor_t& residual_out,
         }
     }
     AITER_CHECK(!res_preshuffle, "Mega-MHC res_preshuffle requires gfx1250");
-    auto launch = [&]<int H, int VARIANT, bool MXFP8>() {
+    auto launch = [&]<int H, int VARIANT, bool MXFP8, bool SMALL_M = false>() {
         launch_mega_mhc<H, VARIANT, MXFP8>(residual_out,
                                            post_out,
                                            comb_out,
@@ -3405,7 +3716,8 @@ void mega_mhc_bf16(aiter_tensor_t& residual_out,
                                            sinkhorn_repeat,
                                            split_k,
                                            has_post,
-                                           identity_pre);
+                                           identity_pre,
+                                           SMALL_M);
     };
     auto select_variant = [&]<int H, bool MXFP8>() {
         if constexpr(mega_mhc_stream::tuned_hidden<H>)
@@ -3438,6 +3750,13 @@ void mega_mhc_bf16(aiter_tensor_t& residual_out,
                     launch.template operator()<H, 24, MXFP8>();
                 else
                     AITER_CHECK(false, "mid768 requires H=5120");
+                return;
+            case 26:
+                // small_m: the small variants' tiling and workspace (ID 5).
+                if constexpr(H == 5120)
+                    launch.template operator()<H, 5, MXFP8, true>();
+                else
+                    AITER_CHECK(false, "small_m requires H=5120");
                 return;
             }
 #undef VARIANT_CASE

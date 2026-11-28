@@ -24,8 +24,12 @@ import pandas as pd
 import torch
 
 import aiter
-from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.topk import biased_grouped_topk, biased_grouped_topk_hip
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
+from aiter.ops.topk import (
+    biased_grouped_topk,
+    biased_grouped_topk_hip,
+    topk_gating_fwd,
+)
 from aiter.test_common import (
     benchmark,
     checkAllclose,
@@ -1024,6 +1028,101 @@ def bench_topk_gating_unaligned(num_experts, num_tokens, topk, score_func, dtype
     return {"gfx": get_gfx(), "unaligned bad": bad}
 
 
+# ---------------------------------------------------------------------------
+# FlyDSL sqrtsoftplus router (gfx950, E=384 top-6 / E=128 top-3) vs HIP
+# ---------------------------------------------------------------------------
+
+_FLYDSL_SQRTSOFTPLUS_SHAPES = ((384, 6), (128, 3))
+_FLYDSL_SQRTSOFTPLUS_TOKENS = (1, 2, 5, 8, 16, 18, 24, 30, 42, 64, 96, 128, 256, 4096)
+
+
+def _sqrtsoftplus_logits(kind, num_experts, num_tokens):
+    g = torch.Generator(device="cuda").manual_seed(num_experts * 7919 + num_tokens)
+    x = torch.randn(num_tokens, num_experts, device="cuda", generator=g) * 3
+    if kind == "ties":
+        # many exactly-equal scores in every row, at and across the top-k cutoff
+        x = (x * 0.5).round()
+    elif kind == "special":
+        tok = torch.arange(num_tokens, device="cuda")
+        x[tok, (tok * 7 + 3) % num_experts] = float("nan")
+        x[tok, (tok * 11 + 2) % num_experts] = float("inf")
+        x[tok, (tok * 5 + 1) % num_experts] = float("-inf")
+        # rows with fewer than top-k experts above -inf
+        x[::5] = float("nan")
+        x[1::7] = -1e30
+        x[1::7, :2] = 1.0
+    return x.to(torch.bfloat16)
+
+
+def bench_topk_gating_flydsl_sqrtsoftplus(num_experts, topk, num_tokens, kind):
+    """aiter.topk_gating (the FlyDSL kernel on these shapes) against the HIP
+    topk_gating_kernel_opt it replaces: ids, weights and pad rows must be equal
+    bit for bit, with and without num_valid_rows, scale and renorm swept."""
+    from aiter.ops.flydsl.sqrtsoftplus_topk import sqrtsoftplus_topk_supported
+
+    logits = _sqrtsoftplus_logits(kind, num_experts, num_tokens)
+    g = torch.Generator(device="cuda").manual_seed(num_tokens)
+    bias = torch.randn(num_experts, device="cuda", generator=g) * 0.1
+
+    def outputs():
+        return (
+            torch.full((num_tokens, topk), float("nan"), device="cuda"),
+            torch.full((num_tokens, topk), 7, dtype=torch.int32, device="cuda"),
+        )
+
+    bad = 0
+    taken = True
+    for scale, renorm, valid in (
+        (1.0, True, None),
+        (1.5, True, num_tokens // 2),
+        (2.5, False, None),
+        (1.5, True, num_tokens),
+    ):
+        nvr = (
+            None
+            if valid is None
+            else torch.tensor([valid], dtype=torch.int32, device="cuda")
+        )
+        w_fly, i_fly = outputs()
+        w_hip, i_hip = outputs()
+        taken &= sqrtsoftplus_topk_supported(
+            w_fly, i_fly, logits, bias, renorm, scale, "sqrtsoftplus", 0, nvr
+        )
+        aiter.topk_gating(
+            w_fly,
+            i_fly,
+            logits,
+            bias,
+            need_renorm=renorm,
+            routed_scaling_factor=scale,
+            score_func="sqrtsoftplus",
+            num_valid_rows=nvr,
+        )
+        topk_gating_fwd(
+            w_hip, i_hip, logits, bias, renorm, scale, "sqrtsoftplus", 0, nvr
+        )
+        bad += not torch.equal(i_fly, i_hip)
+        bad += not torch.equal(w_fly.view(torch.int32), w_hip.view(torch.int32))
+
+    w, i = outputs()
+    _, us_fly = run_perftest(
+        aiter.topk_gating, w, i, logits, bias, True, 1.5, "sqrtsoftplus"
+    )
+    _, us_hip = run_perftest(
+        topk_gating_fwd, w, i, logits, bias, True, 1.5, "sqrtsoftplus", 0, None
+    )
+    return {
+        "E": num_experts,
+        "k": topk,
+        "T": num_tokens,
+        "input": kind,
+        "flydsl taken": taken,
+        "flydsl us": us_fly,
+        "hip us": us_hip,
+        "bad": bad,
+    }
+
+
 def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning("topk_gating unsupported on %s; skipping", get_gfx())
@@ -1076,10 +1175,11 @@ def main():
             "shared",
             "pad-rows",
             "unaligned",
+            "flydsl-sqrtsoftplus",
         ],
         help="Comma-separated list of sections to run: "
         "sigmoid,biased-sigmoid,softplus,softmax,nan,ties,eplb,shared,pad-rows,"
-        "unaligned (default: all except biased-sigmoid). "
+        "unaligned,flydsl-sqrtsoftplus (default: all except biased-sigmoid). "
         "Sigmoid, softplus and softmax are named after score functions; nan, ties, "
         "eplb, pad-rows and unaligned "
         "each sweep all score functions. --score-func is a deprecated alias.",
@@ -1357,6 +1457,32 @@ def main():
             print(f"\nERROR: {len(errors)} unaligned config(s) failed!")
             print(errors.to_string(index=False))
             failed_sections.append("unaligned")
+
+    # -- FlyDSL sqrtsoftplus router vs HIP, bit for bit (gfx950 only) --------
+    # Fixed shapes: the two router geometries the FlyDSL kernel serves.
+    if "flydsl-sqrtsoftplus" in sections:
+        if get_gfx_runtime() != "gfx950":
+            print("SKIP: flydsl-sqrtsoftplus needs gfx950")
+        else:
+            df = pd.DataFrame(
+                [
+                    bench_topk_gating_flydsl_sqrtsoftplus(E, k, T, kind)
+                    for (E, k), T, kind in itertools.product(
+                        _FLYDSL_SQRTSOFTPLUS_SHAPES,
+                        _FLYDSL_SQRTSOFTPLUS_TOKENS,
+                        ("random", "ties", "special"),
+                    )
+                ]
+            )
+            aiter.logger.info(
+                "topk_gating FlyDSL sqrtsoftplus vs HIP (markdown):\n%s",
+                df.to_markdown(index=False),
+            )
+            errors = df[(df["bad"] > 0) | (~df["flydsl taken"])]
+            if len(errors) > 0:
+                print(f"\nERROR: {len(errors)} flydsl-sqrtsoftplus config(s) failed!")
+                print(errors.to_string(index=False))
+                failed_sections.append("flydsl-sqrtsoftplus")
 
     if failed_sections:
         print(

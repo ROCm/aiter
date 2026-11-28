@@ -171,6 +171,48 @@ def _use_flydsl_herd(
     )
 
 
+# The FlyDSL sqrtsoftplus router (flydsl/sqrtsoftplus_topk.py) takes the DeepSeek-V4 /
+# V4.1 shapes on gfx950: 384 experts top-6 and 128 experts top-3, bit for bit the HIP
+# topk_gating_kernel_opt. Verified and faster up to this many rows; larger stay on HIP.
+_FLYDSL_SQRTSOFTPLUS_MAX_M = 16384
+
+
+def _use_flydsl_sqrtsoftplus_topk(
+    topk_weights: torch.Tensor,
+    topk_indices: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    need_renorm: bool,
+    routed_scaling_factor: float,
+    score_func: str,
+    num_shared_experts: int,
+    num_valid_rows: torch.Tensor | None,
+) -> bool:
+    if (
+        score_func != "sqrtsoftplus"
+        or num_shared_experts != 0
+        or gating_output.dim() != 2
+        or gating_output.shape[1] not in (384, 128)
+        or gating_output.shape[0] > _FLYDSL_SQRTSOFTPLUS_MAX_M
+    ):
+        return False
+    try:
+        from .flydsl.sqrtsoftplus_topk import sqrtsoftplus_topk_supported
+    except ImportError:  # no FlyDSL in this environment
+        return False
+    return sqrtsoftplus_topk_supported(
+        topk_weights,
+        topk_indices,
+        gating_output,
+        correction_bias,
+        need_renorm,
+        routed_scaling_factor,
+        score_func,
+        num_shared_experts,
+        num_valid_rows,
+    )
+
+
 def _valid_bias_dtypes(gating_dtype: torch.dtype) -> tuple[torch.dtype, ...]:
     """Bias dtypes instantiated for this gating dtype; see _AITER_TOPK_GATING_SLICE.
 
@@ -257,6 +299,29 @@ def topk_gating(
             need_renorm,
             routed_scaling_factor,
             score_func,
+            num_valid_rows,
+        )
+        return
+    if _use_flydsl_sqrtsoftplus_topk(
+        topk_weights,
+        topk_indices,
+        gating_output,
+        correction_bias,
+        need_renorm,
+        routed_scaling_factor,
+        score_func,
+        num_shared_experts,
+        num_valid_rows,
+    ):
+        from .flydsl.sqrtsoftplus_topk import sqrtsoftplus_topk
+
+        sqrtsoftplus_topk(
+            topk_weights,
+            topk_indices,
+            gating_output,
+            correction_bias,
+            need_renorm,
+            routed_scaling_factor,
             num_valid_rows,
         )
         return

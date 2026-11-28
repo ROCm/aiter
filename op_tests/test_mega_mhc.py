@@ -15,8 +15,10 @@ from functools import cache
 import pandas as pd
 import torch
 
+import aiter.ops.mega_mhc as mega_mhc_module
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.mega_mhc import (
+    _STREAM_VARIANTS,
     _counter_state_ok,
     mega_mhc,
     mega_mhc_shuffle_fn,
@@ -52,6 +54,8 @@ DECODE_TOKEN_COUNTS = (
 PREFILL_TOKEN_COUNTS = (4096, 4097, 4160, 4224, 6000, 8192, 8200, 8320, 9000, 16384)
 TOKEN_COUNTS = DECODE_TOKEN_COUNTS + PREFILL_TOKEN_COUNTS
 HIDDEN_SIZES = (5120, 7168)
+# H=5120 post + pre calls of 9..128 tokens take the small_m launch on gfx950.
+SMALL_M_TOKEN_COUNTS = (9, 12, 16, 18, 24, 30, 36, 42, 48, 64, 72, 96, 127, 128)
 
 
 def ref_mhc_fused_post_pre_delayed_rmsnorm(
@@ -210,6 +214,50 @@ def backend_function(name):
 
         return mhc_fused_post_pre_delayed_rmsnorm
     raise ValueError(f"unknown backend: {name}")
+
+
+def check_small_m_bitwise(t, out_dtype, seed=0):
+    """small_m against the standard small-variant launch on the same inputs and
+    workspace: residual_out, post, comb, the layer input (and MXFP8 codes and
+    scales) and next_pre must be equal bit for bit. Returns the mismatching outputs."""
+    args, kw, _ = case(t, 5120, "post", seed)
+    calls = []
+    real = mega_mhc_module._native_launcher
+
+    def capture(hidden):
+        launch = real(hidden)
+
+        def run(*launch_args):
+            calls.append(launch_args)
+            return launch(*launch_args)
+
+        return run
+
+    mega_mhc_module._native_launcher = capture
+    try:
+        mega_mhc(*args, **kw, out_dtype=out_dtype)
+    finally:
+        mega_mhc_module._native_launcher = real
+    (launch_args,) = calls
+    variant = _STREAM_VARIANTS[launch_args[27]]
+    if variant != "small_m":
+        return [f"took {variant}"]
+    standard = list(launch_args)
+    # outputs: residual_out, post, comb, norm, q, scale, next_pre
+    for i in (0, 1, 2, 3, 4, 5, 6):
+        standard[i] = torch.empty_like(launch_args[i])
+    standard[27] = _STREAM_VARIANTS.index(mega_mhc_module._select_stream_variant(t)[0])
+    real(5120)(*standard)
+    torch.cuda.synchronize()
+    names = ("residual_out", "post", "comb", "norm", "q", "scale", "next_pre")
+    compared = (0, 1, 2, 3, 6) + ((4, 5) if out_dtype == "mxfp8" else ())
+    return [
+        names[i]
+        for i in compared
+        if not torch.equal(
+            launch_args[i].view(torch.uint8), standard[i].view(torch.uint8)
+        )
+    ]
 
 
 def benchmark_bytes(m, hidden_size, mode, out_dtype="bf16"):
@@ -507,6 +555,20 @@ def main():
             "TB/s is effective tensor bandwidth; excludes scratch and repeated loads.",
             flush=True,
         )
+    small_m_failures = []
+    if arch == "gfx950" and 5120 in args.hidden and "post" in args.mode:
+        for dtype, m in itertools.product(selected, SMALL_M_TOKEN_COUNTS):
+            bad = check_small_m_bitwise(m, dtype, args.seed)
+            if bad:
+                small_m_failures.append((m, dtype, bad))
+        print(
+            f"small_m vs standard launch, bit for bit: "
+            f"{len(SMALL_M_TOKEN_COUNTS) * len(selected) - len(small_m_failures)}/"
+            f"{len(SMALL_M_TOKEN_COUNTS) * len(selected)} PASS",
+            flush=True,
+        )
+        for failure in small_m_failures:
+            print(f"  FAIL small_m m={failure[0]} {failure[1]}: {failure[2]}")
     rows = []
     for dtype, h, mode, m in itertools.product(
         selected,
@@ -549,6 +611,8 @@ def main():
         f"{skipped} backend comparisons skipped.",
         flush=True,
     )
+    if small_m_failures:
+        raise SystemExit("small_m differs from the standard launch")
 
 
 if __name__ == "__main__":

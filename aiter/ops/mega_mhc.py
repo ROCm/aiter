@@ -60,7 +60,13 @@ _STREAM_VARIANTS = (
     "gfx1250_split3",
     "mid768",  # gfx950, H=5120, T=513..768: five column splits.
     "post192",  # gfx950, H=5120, T=129..256: register-local post-mix, ten waves.
+    # gfx950, H=5120, post + pre calls of the small variants (T=9..128): one
+    # workgroup a token row writes residual_out and the layer input, the split
+    # tiles only reduce the gates. Chosen per call; same workspace and outputs.
+    "small_m",
 )
+
+_SMALL_M_VARIANTS = frozenset(("small16", "small128", "small"))
 
 _DISTRIBUTED_VARIANTS = frozenset(
     (
@@ -642,6 +648,14 @@ def mega_mhc(
             # tagged scratch and one workgroup per CU.
             variant, split_k = "gfx1250_split2", 2
             partials = partials[: split_k * t * 32]
+        if (
+            variant in _SMALL_M_VARIANTS
+            and has_post
+            and pre_mix is not None
+            and h == 5120
+            and arch == "gfx950"
+        ):
+            variant = "small_m"
         launch = _native_launcher(h if h in _STREAM_HIDDEN_SIZES else 0)
         launch(
             residual_out,
