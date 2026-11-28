@@ -409,6 +409,7 @@ def gemm_a16w16_opus(
     a missing or invalid tuned row uses the migrated architecture heuristic.
     """
     XQ, WQ, Y, is_gemm = _prepare_shape_driven_a16w16(A, B, bias, dtype, out)
+    from .compiled_kids import tuned_kid_is_compiled
     from .policy import (
         lookup_a16w16_opus_config,
         resolve_a16w16_heuristic_candidate,
@@ -447,6 +448,9 @@ def gemm_a16w16_opus(
                     f"splitK={config.get('splitK')!r}; "
                     "using OPUS heuristic fallback"
                 )
+            elif not tuned_kid_is_compiled("a16w16", plan.resolved_kid, XQ.device):
+                # Valid kid, but absent from the loaded module (warned once).
+                plan = None
         if plan is None:
             plan = resolve_a16w16_heuristic_candidate(batch=batch, **lookup_args)
             if plan is None:

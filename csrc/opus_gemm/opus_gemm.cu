@@ -16,10 +16,20 @@
 #include "gfx1250/opus_gemm_arch_gfx1250.cuh"      // generated gfx1250 exact-kid dispatch
 #endif
 #include "opus_gemm_common.cuh"
+#include "opus_compiled_kids.h"                    // OPUS_COMPILED_KIDS
 #include "opus_gemm_manifest.h"                    // a8w8 launcher symbols
 #include "opus_gemm_utils.cuh"                     // bf16_t / fp32_t
 
 #include <optional>
+#include <string>
+
+// The kids this binary can launch, as ';'-joined "family/gfx/cu_num/kid".
+// Generated from the dispatch-table routes, per device namespace: gfx1250 and
+// gfx1250-strict list only the kids that have device code for that device.
+std::string opus_compiled_kids()
+{
+  return OPUS_COMPILED_KIDS;
+}
 
 #ifndef OPUS_A8W8_DISPATCH_KERNEL_TYPES_DEFINED
 #define OPUS_A8W8_DISPATCH_KERNEL_TYPES_DEFINED

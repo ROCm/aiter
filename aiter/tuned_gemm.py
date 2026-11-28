@@ -121,11 +121,15 @@ def get_GEMM_A16W16_tuned_config(
     bpreshuffle: bool = False,
     gfx: str | None = None,
     cu_num: int | None = None,
+    device: torch.device | None = None,
 ):
     """Return the tuned config for this GEMM, or None if no usable row exists.
 
     Rows naming a FlyDSL kernel missing from the catalog, or an OPUS candidate
-    that no longer resolves, are skipped as if absent.
+    that no longer resolves, are skipped as if absent. An OPUS row whose kid the
+    loaded module did not compile is skipped too. That check looks at ``device``,
+    the device the GEMM runs on (None: the current one), because the launcher
+    keys its tables by that device's arch and CU count.
     """
     cfg = get_GEMM_A16W16_config_()
     cu_num = get_cu_num() if cu_num is None else cu_num
@@ -241,6 +245,16 @@ def get_GEMM_A16W16_tuned_config(
                             )
                     except (ValueError, KeyError, TypeError):
                         pass
+                if resolved is not None:
+                    from aiter.ops.opus.compiled_kids import tuned_kid_is_compiled
+
+                    # A valid kid can still be absent from the (subset-built)
+                    # module; the launcher would raise, so skip the row.
+                    if not tuned_kid_is_compiled(
+                        "a16w16", resolved.resolved_kid, device
+                    ):
+                        config = None
+                        continue
                 if resolved is None:
                     # Discard the whole stale (kid, split-K) pair before
                     # trying another padded row or the default fallback.
@@ -289,12 +303,15 @@ def get_GEMM_A16W16_config(
     bpreshuffle: bool = False,
     gfx: str | None = None,
     cu_num: int | None = None,
+    device: torch.device | None = None,
 ):
+    # ``device`` is part of the cache key: two devices with the same (gfx,
+    # cu_num) arguments can still differ in the OPUS compiled-kid check.
     cu_num = get_cu_num() if cu_num is None else cu_num
     if gfx is None:
         gfx = get_gfx_runtime()
     config = get_GEMM_A16W16_tuned_config(
-        M, N, K, bias, dtype, otype, scaleAB, bpreshuffle, gfx, cu_num
+        M, N, K, bias, dtype, otype, scaleAB, bpreshuffle, gfx, cu_num, device
     )
     if config is None:
         default_config = {}
@@ -523,6 +540,7 @@ def _gemm_a16w16(
             bpreshuffle=bpreshuffle,
             gfx=gfx,
             cu_num=cu_num,
+            device=inp_view.device,
         )
         if config["libtype"] == "opus" and not (
             _opus_reads_layout(inp_view, k) and _opus_reads_layout(B, k)

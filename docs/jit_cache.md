@@ -26,6 +26,15 @@ or protect against external edits that bypass the generation markers.
 
 ## Opus compiled-kid metadata
 
+The generated `opus_compiled_kids.h` embeds a per-device launchability manifest
+of `family/gfx/cu_num/kid` keys in `module_deepgemm_opus`; `opus_compiled_kids()`
+returns it. It is not the sidecar below: the sidecar is the set of selected
+routes, and the manifest adds the `gfx1250-strict` namespace and drops gfx1250
+kids that have no device code in the build. Tuned-row
+dispatch uses it to skip a row whose kid this binary lacks (see
+`aiter/ops/opus/README.md`). It lives in the binary, so it needs no sidecar or
+receipt and cannot drift from the installed `.so`.
+
 The tuner reads `{bd_dir}/compiled_kids_opus.json`. Normal runtime dispatch
 reads CSV/C++ lookup tables, not this sidecar. A rebuild copies the canonical
 sidecar into staging; codegen unions it with CSV kids, heuristic defaults and

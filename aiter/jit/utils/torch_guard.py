@@ -107,6 +107,8 @@ NONE_WRAPPED_OP = [
     "qr_open_handles",
     "qr_get_handle",
     "qr_uses_pull_q4",
+    # No tensor arguments: returns the compiled-kid manifest as a string
+    "opus_compiled_kids",
     # These take pybind aiter_tensor_t, not torch.Tensor -- incompatible with torch.compile
     "all_reduce",
     "reduce_scatter",

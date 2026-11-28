@@ -106,6 +106,18 @@ def _build_targets_standalone(explicit_targets=()):
                 for cu in arches.get(_registry_arch(gfx), {})
             }
         )
+    targets = {(_registry_arch(gfx), cu) for gfx, cu in _native_build_targets()}
+    for gfx, _cu in tuple(targets):
+        targets.update(
+            (gfx, cu)
+            for arches in KERNEL_REGISTRY.values()
+            for cu in arches.get(_registry_arch(gfx), {})
+        )
+    return sorted(targets)
+
+
+def _native_build_targets():
+    """The unfolded (gfx, cu) targets of the detected GPU, as chip_info reports."""
     import importlib.util
 
     utils_dir = add_aiter_utils_to_sys_path()
@@ -116,14 +128,42 @@ def _build_targets_standalone(explicit_targets=()):
     )
     mod = importlib.util.module_from_spec(mod_spec)
     mod_spec.loader.exec_module(mod)
-    targets = {(_registry_arch(gfx), cu) for gfx, cu in mod.get_build_targets()}
-    for gfx, _cu in tuple(targets):
-        targets.update(
-            (gfx, cu)
-            for arches in KERNEL_REGISTRY.values()
-            for cu in arches.get(_registry_arch(gfx), {})
-        )
-    return sorted(targets)
+    return mod.get_build_targets()
+
+
+def _offload_archs():
+    """The arches hipcc compiles device code for, as GPU_ARCHS names them.
+
+    This is the compiler's offload list, not the registry ``--targets`` (those
+    pair every selected arch with every registry CU count and say nothing about
+    which device passes exist). ``native`` is resolved as chip_info does.
+    """
+    raw = [
+        gfx
+        for gfx in os.getenv("GPU_ARCHS", "native").split(";")
+        if gfx.strip() and gfx.strip().lower() != "native"
+    ]
+    if not raw:
+        raw = [gfx for gfx, _cu in _native_build_targets()]
+    return {gfx.split(":", 1)[0].strip().lower() for gfx in raw}
+
+
+def _gfx1250_device_pass_built():
+    """Whether a device pass that defines ``__gfx1250__`` is compiled.
+
+    gfx1250-strict shares the gfx1250 kernel family (``_registry_arch``), but
+    its device pass defines only ``__gfx1250_strict__``. The non-CO gfx1250
+    device TUs sit behind ``__gfx1250__`` (``_own_arch_device_pass_guard``), so
+    only a plain ``gfx1250`` offload target gives them device code, and a strict
+    device never runs them. CO kids carry their device code in prebuilt ``.co``
+    files and do not depend on the offload list. When the arch cannot be
+    detected (no GPU, GPU_ARCHS unset) the build itself cannot target a GPU, and
+    the previous behaviour (assume the pass exists) stands.
+    """
+    try:
+        return "gfx1250" in _offload_archs()
+    except Exception:  # noqa: BLE001 -- no GPU visible
+        return True
 
 
 # Merge the codegen maps registered by each architecture.
@@ -556,9 +596,13 @@ def _record_one_instantiation(
 
 
 class opus_gemm_codegen:
-    def __init__(self, working_path, istune=False, *, num_xcd):
+    def __init__(
+        self, working_path, istune=False, *, num_xcd, gfx1250_device_pass=True
+    ):
         self.working_path = working_path
         self.num_xcd = num_xcd
+        # False when no plain gfx1250 offload target exists, see _gfx1250_device_pass_built.
+        self.gfx1250_device_pass = gfx1250_device_pass
         self.impl_path = os.path.join(working_path, "impl")
         self.instances_path = os.path.join(working_path, "instances")
         self.istune = istune
@@ -956,6 +1000,45 @@ class opus_gemm_codegen:
                 },
             )
 
+    def gen_compiled_kids_header(self, kernels_dict):
+        """Embed the compiled (family, gfx, cu, kid) set in the module.
+
+        Python reads it through ``opus_compiled_kids()`` to learn which tuned
+        kids this binary can launch, instead of discovering an uncompiled kid
+        from a C++ exception. It is written from the same dict that feeds every
+        dispatch table, so the two cannot drift apart.
+
+        The gfx1250 kids are listed per namespace, because a strict device is
+        a different binary target than a regular one: ``gfx1250`` for a regular
+        device and ``gfx1250-strict`` for a strict (MI450 A0) one. A non-CO
+        kid has device code only when the build has a ``__gfx1250__`` device
+        pass, and only for a regular device; the strict namespace therefore
+        lists the CO kids alone. A kid that is not listed has a launcher but no
+        device code for that namespace, so Python must not pick it.
+        """
+        with_device_tu = {row["kid_name"] for row in self._device_instantiations}
+        keys = set()
+        for key, instance in kernels_dict.items():
+            if not isinstance(key, KernelKey):
+                continue
+            if key.gfx != "gfx1250":
+                keys.add(key.encode())
+                continue
+            device_code = instance.name in with_device_tu
+            if self.gfx1250_device_pass or not device_code:
+                keys.add(key.encode())
+            if not device_code:
+                keys.add(f"{key.family}/gfx1250-strict/{key.cu_num}/{key.kid}")
+        keys = sorted(keys)
+        write_if_changed(
+            os.path.join(self.working_path, "opus_compiled_kids.h"),
+            "#pragma once\n"
+            "// SPDX-License-Identifier: MIT\n"
+            "// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.\n"
+            "// Auto-generated. Do not edit. See gen_instances.py:gen_compiled_kids_header.\n"
+            f'#define OPUS_COMPILED_KIDS "{";".join(keys)}"\n',
+        )
+
     def gen_manifest_head(self, kernels_dict):
         # Forward declarations for every launcher symbol the dispatcher references.
         MANIFEST_HEAD = """#pragma once
@@ -1323,6 +1406,7 @@ void
             self._emit_splitk_reduce_tu()
 
         self.gen_manifest_head(by_symbol)
+        self.gen_compiled_kids_header(kernels_dict)
         self.gen_a16w16_kid_dispatch(kernels_dict)
         self.gen_a8w8_kid_dispatch(kernels_dict)
         self.gen_bmm_mxscale_kid_dispatch(kernels_dict)
@@ -1574,6 +1658,7 @@ if __name__ == "__main__":
         args.working_path,
         args.tune,
         num_xcd=_gfx950_num_xcd(targets, targets_from_cli=bool(args.targets)),
+        gfx1250_device_pass=_gfx1250_device_pass_built(),
     )
     codegen.gen_instances({key: available[key] for key in sorted(selected)})
     Path(sidecar_path).parent.mkdir(parents=True, exist_ok=True)

@@ -428,6 +428,35 @@ build candidates before spawning workers. They pass requests through
 the generated sidecar and a receipt binding its contents to that binary.
 Runtime exact dispatch does not read this sidecar.
 
+The sidecar is the set of *selected routes*: every kid the generator emitted,
+whether or not it can run on a given device. The binary also embeds a separate
+per-device *launchability manifest*, so a prebuilt module carries its own.
+`opus_compiled_kids()` returns it as `family/gfx/cu_num/kid` keys, and
+`aiter/ops/opus/compiled_kids.py` wraps it. The two agree for every arch except
+gfx1250, where the manifest has two namespaces (below). Callers that take a kid from a
+*tuned row* (`get_GEMM_A16W16_tuned_config`, `gemm_a16w16_opus` and the
+`a8w8_blockscale_bpreshuffle` tuned rows) skip a row whose kid is not in the set
+and use the next candidate or the default backend, with one warning that names
+the kid and how to rebuild. A kid passed explicitly is not filtered. A module
+built before the manifest cannot be checked, so those callers keep their old
+behavior for it. The `a16w16` family and the gfx950 `a8w8_blockscale_bpreshuffle`
+family are the subset-built ones; the other families are always compiled in full.
+
+The check keys the manifest by the *physical* device, as the C++ dispatcher
+does (`gcnArchName` and `multiProcessorCount`, through `_device_arch_and_cu`),
+not by the row's `cu_num`. A `CU_NUM` override changes the tuned-row lookup but
+not the table the launcher searches, so a kid compiled only for the overridden
+CU count is skipped.
+
+The gfx1250 kids are listed under two namespaces: `gfx1250` for a regular device
+and `gfx1250-strict` for a strict (MI450 A0) one, which torch reports as plain
+`gfx1250` (Python tells them apart with `get_gfx_runtime()`). The non-CO gfx1250
+device TUs sit behind `__gfx1250__`, so they have device code only when the
+compiler's offload list (`GPU_ARCHS`, not the registry `--targets`) holds a plain
+`gfx1250`, and only a regular device can run them. The `gfx1250` namespace lists
+every selected kid in that case and only the CO kids (prebuilt `.co` images)
+otherwise. The `gfx1250-strict` namespace always lists the CO kids alone.
+
 A tuner skips rebuilding only when the sidecar and its receipt match the
 required kids and installed binary. Missing or stale metadata triggers a
 rebuild. An explicit `AITER_REBUILD` request runs once in the parent even on
