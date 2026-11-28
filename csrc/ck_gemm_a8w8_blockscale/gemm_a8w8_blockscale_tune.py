@@ -40,6 +40,21 @@ from gemm_a8w8_blockscale_instance import candidate_kernels_dict
 
 from csrc.opus_gemm.opus_gemm_common import get_registry
 
+# flydsl (optional): without an install the candidate list stays empty and only the
+# FlyDSL candidates are skipped.
+try:
+    from aiter.ops.flydsl.gemm_kernels import flydsl_gemm_a8w8_blockscale_bpreshuffle
+    from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_common import (
+        candidate_kernel_ids as flydsl_candidate_kernel_ids,
+    )
+    from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_common import (
+        kernels_list as candidate_kernels_flydsl_dict,
+    )
+except ImportError:
+    print("[FlyDSL] not available, flydsl blockscale tuning disabled")
+    candidate_kernels_flydsl_dict = {}
+
+
 block_shape = (128, 128)
 
 
@@ -181,6 +196,34 @@ def run_gemm_a8w8_blockscale_flydsl(
     )
 
 
+def run_gemm_a8w8_blockscale_bpreshuffle_flydsl(
+    x, weight_shuffle, x_scale_t, w_scale, out, kernel_id
+):
+    """
+    Run a tuned gfx942 FlyDSL blockscale kernel.
+
+    Only the B-preshuffle variant exists, so this is never reached with
+    preshuffleB=False. x_scale_t is the K-major scale buffer the CK and asm preshuffle
+    paths also take.
+    """
+
+    ki = candidate_kernels_flydsl_dict[kernel_id]
+    return flydsl_gemm_a8w8_blockscale_bpreshuffle(
+        x,
+        weight_shuffle,
+        x_scale_t,
+        w_scale,
+        out,
+        ki.tile_m,
+        ki.tile_n,
+        ki.tile_k,
+        num_waves=ki.num_waves,
+        use_async_copy=ki.use_async_copy,
+        use_cshuffle_epilog=ki.use_cshuffle_epilog,
+        split_k=ki.split_k,
+    )
+
+
 def generate_data(m, n, k, seed, device="cuda"):
     """
     Generate random data for testing the gemm a8w8 blockscale kernel.
@@ -259,7 +302,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             default="all",
             choices=["ck", "cktile", "asm", "opus", "flydsl", "all", "both"],
             required=False,
-            help="CK gemm a8w8 blockscale type to tune: ck, cktile, asm, opus, flydsl, both or all (covers all supported backends across standard/preshuffleB modes)",
+            help="CK gemm a8w8 blockscale type to tune: ck, cktile, asm, opus, flydsl, both or all (covers all supported backends across standard/preshuffleB modes). On gfx942 flydsl requires --preshuffle.",
         )
 
         self.parser.add_argument(
@@ -274,6 +317,13 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             type=int,
             default=list(range(1, BLOCK_PER_CU_MAX + 1)),
             help="List of BlockPerCu values to tune (CKTile only)",
+        )
+
+        self.parser.add_argument(
+            "--flydsl_full_space",
+            action="store_true",
+            help="Time every gfx942 FlyDSL kernel the shape can run, instead of only "
+            "those the M-regime pruning rules keep. Use it to audit the rules.",
         )
 
     def calculate(self, results, bpes=(1, 1, 2)):
@@ -300,6 +350,12 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             # kernel_list = candidate_kernels_bpreshuffle_cktile_dict if preshuffleB else candidate_kernels_cktile_dict
             kernel_list = candidate_kernels_cktile_dict
         elif libType == "flydsl":
+            # The gfx942 and gfx950 FlyDSL families share this libtype and their
+            # kernel ids overlap, so the arch picks the list.
+            if self.get_gfx() == "gfx942":
+                if kernelId not in candidate_kernels_flydsl_dict:
+                    return None
+                return candidate_kernels_flydsl_dict[kernelId].name
             from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
                 kernels_list,
             )
@@ -527,8 +583,73 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         return tasks_opus
 
     def get_gemm_a8w8_blockscale_flydsl_tune_task(
-        self, info_keys, seed, preshuffleB, run_kwargs
+        self, info_keys, seed, preshuffleB, run_kwargs, full_space=False
     ):
+        # One FlyDSL family per arch: B-preshuffle on gfx942, 8-wave on gfx950.
+        if info_keys[0] == "gfx942":
+            return self._flydsl_bpreshuffle_tune_tasks(
+                info_keys, seed, preshuffleB, run_kwargs, full_space
+            )
+        return self._flydsl_8wave_tune_tasks(info_keys, seed, preshuffleB, run_kwargs)
+
+    def _flydsl_bpreshuffle_tune_tasks(
+        self,
+        info_keys,
+        seed,
+        preshuffleB,
+        run_kwargs,
+        full_space,
+    ):
+        _, cu_num, M, N, K = info_keys
+
+        if not preshuffleB:
+            print(
+                "[FlyDSL] blockscale tuning needs --preshuffle "
+                "(FlyDSL has no plain-B block-scale kernel), skipping"
+            )
+            return []
+        if not candidate_kernels_flydsl_dict:
+            print("[FlyDSL] not available, skipping flydsl blockscale tuning")
+            return []
+
+        gemm_keys = ["x", "weight_shuffle", "x_scale_t", "w_scale", "out"]
+        ref_keys = ["x", "weight", "x_scale", "w_scale"]
+        tasks_flydsl = []
+        # Split kernels are included whatever --splitK says: that flag selects the CK
+        # and asm split variants, while FlyDSL's split is a separate kernel offered
+        # where it can pay. The splitK column stays 0; kernelName carries the split.
+        for i in flydsl_candidate_kernel_ids(M, N, K, cu_num, full_space=full_space):
+            ki = candidate_kernels_flydsl_dict[i]
+            info = (info_keys, i, 0, ki.name, "flydsl", preshuffleB)
+            tasks_flydsl.append(
+                (
+                    info,
+                    generate_data,
+                    (M, N, K, seed),
+                    run_gemm_a8w8_blockscale_bpreshuffle_flydsl,
+                    (
+                        gemm_keys,
+                        i,
+                    ),
+                    dict(run_kwargs),
+                    run_torch,
+                    (
+                        ref_keys,
+                        None,
+                        dtypes.bf16,
+                    ),
+                    {},
+                    None,
+                    1e-2,
+                    0.01,
+                    None,
+                    None,
+                    ("out",),
+                )
+            )
+        return tasks_flydsl
+
+    def _flydsl_8wave_tune_tasks(self, info_keys, seed, preshuffleB, run_kwargs):
         gfx, _, M, N, K = info_keys
         if gfx != "gfx950":
             return []
@@ -793,6 +914,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                         seed,
                         isPreshuffleB,
                         run_kwargs,
+                        full_space=args.flydsl_full_space,
                     )
                 )
             shape_kernel_nums = len(task) - prev_task_count
