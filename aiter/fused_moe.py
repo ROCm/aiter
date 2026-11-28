@@ -6253,6 +6253,7 @@ def fused_moe_2stages(
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
+    gfx = get_gfx_runtime()
     token_num, _ = hidden_states.shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
     dtype = moe_out.dtype
@@ -6345,6 +6346,13 @@ def fused_moe_2stages(
                 or gate_mode == GateMode.INTERLEAVE
             )
             or (q_dtype_a in [dtypes.fp4x2] and metadata.ksplit > 1 and is_shuffled)
+            # gfx942 (CDNA3) has no FP4 activation kernel. Whenever the activation
+            # dtype resolved to bf16 (resolve_activation_dtype forces this on
+            # gfx942), take the a16w4 bypass for ANY activation/gate_mode so we
+            # never fall through to fused_dynamic_mxfp4_quant_moe_sort below,
+            # which aborts on gfx942 ("not support output type: fp4x2").
+            # See ROCm/aiter#8379 review.
+            or (gfx == "gfx942" and q_dtype_a in [dtypes.bf16, dtypes.fp16])
         )
     ):
         a1 = hidden_states.to(dtype)
@@ -6616,6 +6624,10 @@ def fused_moe_2stages(
             and activation
             in (ActivationType.Swiglu, ActivationType.Situv2, ActivationType.Relu2)
             or (metadata.ksplit > 1 and is_shuffled)
+            # gfx942: no FP4 activation kernel -> keep the stage1 output in bf16
+            # (a16w4) for ANY activation, mirroring the stage1 input bypass, so
+            # the fp4 inter-stage quant below is never reached. ROCm/aiter#8379.
+            or (gfx == "gfx942" and q_dtype_a in [dtypes.bf16, dtypes.fp16])
         )
     ):
         a2_scale = None
