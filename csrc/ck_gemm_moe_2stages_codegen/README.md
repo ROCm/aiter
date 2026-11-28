@@ -63,6 +63,52 @@ Staged screening can miss a faster pair. Use `full` to check the selected
 kernel, and keep activation limits and stage2 settings consistent across
 tuning, AOT and production; see [MXFP4 settings](../../aiter/aot/flydsl/README.md#mxfp4-activation-and-stage2-settings).
 
+#### `--grouped-gemm` (gfx1250)
+
+Tunes the FlyDSL grouped-GEMM MoE (`aiter/configs/*tuned_grouped_fmoe*.csv`).
+The default `--grouped-search descent` searches every knob both GEMM kernels
+read from the row (tiles, wave grid, buffers, clusters, persistent workers,
+waves per TDM tensor, split-K, `rolled_drain`, `next_stage_prefetch`, ...):
+
+- start points: the row the runtime uses for the bucket today, the runtime
+  default, rows tuned for neighbouring buckets, and a tile_m sized to the rows
+  per expert;
+- coordinate descent, one knob group of one GEMM per batch, configs the
+  kernels would reject (tile fit, wave grid, cluster and LDS limits) skipped;
+  a move is taken when it saves `--grouped-min-gain` percent (default 1) of the
+  per-round time ratio; then moves that each gained less are combined; when
+  another start point beats the row in use, the descent also runs from the row
+  in use and the better end wins;
+- timing: profiler device time of whole `fused_moe` calls (reported as gemm1,
+  gemm2 and the rest), candidates interleaved over `--grouped-rounds` rounds
+  (default 5) and ranked by the median per-round ratio, so clock and power
+  drift cancel; a move must also win at least 75% of the rounds;
+- a final confirmation against the start point with twice the rounds; the
+  start point is kept unless the result beats it there too;
+- every candidate runs with the untuned row's activation (SiTUv2 included) and
+  activation dtype, and is checked against the start point's output and the
+  launch arguments the row asks for;
+- a worker process per `--mp` GPU, so a candidate that aborts the HSA queue
+  only costs a worker restart; `--grouped-budget` seconds (default 1800) bound
+  the search per shape. `-o2` writes every measured candidate.
+
+`--grouped-routing balanced|uniform|zipf:<s>` sets the token routing (default
+balanced) and `--grouped-tokens` the token counts, as fractions in (0.5, 1] of
+the row's bucket (default 1.0). Lists sum the time over every token count and
+routing: a bucket serves every M up to its token count, and balanced routing at
+exactly the bucket can favour tiles that lose below it or on skewed traffic
+(e.g. `--grouped-tokens 0.75,1.0 --grouped-routing balanced,zipf:0.6`).
+Rows with `ep_fused=1` or `topk=-1` need the multi-GPU EP bench and
+are skipped. A shape that another table merged at runtime already holds (for
+example a `model_configs/` file when `-o` is the shipped table) is not written;
+pass that table as `-o` to replace its row in place. `--grouped-search tile_m`
+keeps the old sweep of tile_m 16..128 at tile_n/tile_k 256.
+
+```bash
+python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py --grouped-gemm \
+  -i <untuned.csv> -o <tuned.csv> --mp 4 --grouped-budget 1200
+```
+
 #### `--last`
 - **Type**: Flag (boolean)
 - **Default**: `False`
