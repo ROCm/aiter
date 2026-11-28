@@ -1,0 +1,61 @@
+{
+  "$schema": "./loop.schema.json",
+  "_comment": "Copy to loop.json and fill in. Nothing here may contain a private key, a real hostname or a token; loop.json itself is gitignored.",
+
+  "workspace": {
+    "tmpRoot": "<absolute path to a scratch dir outside the repo>",
+    "_layout": "tmpRoot/pr-review/<pr>/<round>/{work,reports} — every intermediate lives here and the whole tree is deletable after a round"
+  },
+
+  "local": {
+    "ssh": "ssh",
+    "scp": "scp",
+    "identityFile": "<path to the ssh key, or null to use the agent's default>",
+    "python": "python3",
+    "toolsRoot": "<absolute path to .agent_loop/tools>",
+    "_note": "On Windows use the native OpenSSH binaries (C:\\Windows\\System32\\OpenSSH\\ssh.exe); the ones shipped with Git may not start under a confined harness."
+  },
+
+  "skill": {
+    "projectRoot": "<absolute path to the aiter checkout the gates read>",
+    "reviewPrRoot": "<projectRoot>/.claude/skills/review-pr",
+    "validateSkillRoot": "<projectRoot>/.claude/skills/validate-kernel-pr"
+  },
+
+  "providers": {
+    "_note": "Never hardcode these in the workflow scripts. The refuter MUST be a different model family from the worker: a same-model refuter killed 18% of findings, a cross-model one killed 40%.",
+    "worker":    { "provider": "<local-model>",    "model": "<local-model-id>" },
+    "refuter":   { "provider": "<frontier-model>", "model": "<frontier-model-id>" },
+    "formatter": { "provider": "<local-model>",    "model": "<local-model-id>" },
+    "remote":    { "provider": "<local-model>",    "model": "<local-model-id>" }
+  },
+
+  "hosts": [
+    {
+      "name": "gfx950-box",
+      "sshHost": "<fqdn>",
+      "user": "<user>",
+      "uidGid": "<uid>:<gid>",
+      "container": "<container name>",
+      "image": "<image the container was made from>",
+      "hostRoot": "/home/<user>/pr-review",
+      "containerMount": "/work",
+      "scratch": "/work/_tmp/{runId}",
+      "gpuGate": "/opt/rocm/bin/rocm-smi --showpids",
+      "_rules": "All PR testing runs inside the container. Scratch never goes to the host /tmp. The GPU gate must report no KFD processes before any run."
+    }
+  ],
+
+  "policy": {
+    "maxGateRounds": 3,
+    "refuteGranularity": "per-finding",
+    "severityBar": "in-tree-trigger-required",
+    "_severityBar": "A 🔴 requires a triggering point verifiable in this tree. A protocol documented outside the tree (a README telling downstream integrations to call something) caps the finding at ⚠️. Fixing this bar is what makes rounds comparable.",
+    "resume": true,
+    "budget": {
+      "maxAgents": 120,
+      "maxInputTokens": 4000000,
+      "_measured": "One full round on a 21.7k-line diff: ~45 agents, ~1.5M input / ~1.1M output tokens. Refutation is ~15k input per finding."
+    }
+  }
+}
