@@ -1,0 +1,2 @@
+gfx,cu_num,M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle,libtype,solidx,splitK,us,kernelName,err_ratio,tflops,bw
+gfx950,256,992,50016,6144,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,49,1,647.2992,flydsl_hgemm_abf16_wbf16_bf16_t256x256x64x2_ks1_w2x4x1_bias0_ktail0_gm4_pht_gfx950,0.0,941.88,1121.61
