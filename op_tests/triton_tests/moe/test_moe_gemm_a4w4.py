@@ -157,6 +157,11 @@ class Case:
             Case(256, 1024, 1024, 8, 4, preshuffle_weights=True),
             Case(16, 1536, 7168, 256, 8, hbm_swizzling=True, preshuffle_weights=True),
             Case(16, 7168, 768, 256, 8, hbm_swizzling=True, preshuffle_weights=True),
+            # DeepSeek-V4-Pro TP4 decode (384 experts, top-6): GEMM1 and GEMM2
+            # shapes on the block_m=16 decode kernel, ragged and full batches.
+            Case(37, 1536, 7168, 384, 6, hbm_swizzling=True, preshuffle_weights=True),
+            Case(37, 7168, 768, 384, 6, hbm_swizzling=True, preshuffle_weights=True),
+            Case(512, 7168, 768, 384, 6, hbm_swizzling=True, preshuffle_weights=True),
         ]
     ],
 )
