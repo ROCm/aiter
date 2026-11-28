@@ -64,9 +64,62 @@ class TestA16W16TunedConfigLookup(unittest.TestCase):
         self.assertEqual(config["libtype"], "torch")
 
 
+class TestBorrowedFlydslTdmRow(unittest.TestCase):
+    def _lookup(self, policy, gfx, m=128, row_arch="gfx1250", libtype="flydsl"):
+        row = {"libtype": libtype, "solidx": -1, "splitK": 1, "kernelName": "fixture"}
+        key = (row_arch, 256, 128, 163840, 7168, False, BF16, BF16, False, False)
+        catalog = mock.Mock()
+        catalog.TDM_POLICIES = ("tdm", "tdmi", "tdma", "tdmia")
+        catalog.get_flydsl_hgemm_kernel_params.return_value = {"policy": policy}
+        with (
+            mock.patch.object(tuned, "get_GEMM_A16W16_config_", lambda: {key: row}),
+            mock.patch.object(tuned, "_get_flydsl_gemm_kernels", lambda: catalog),
+            mock.patch.object(
+                tuned,
+                "get_padded_m",
+                lambda value, _n, _k, gl: (
+                    (value + 15) // 16 * 16
+                    if gl == 0
+                    else 1 << (value - 1).bit_length()
+                ),
+            ),
+        ):
+            actual = tuned.get_GEMM_A16W16_tuned_config(
+                m, 163840, 7168, False, BF16, BF16, False, False, gfx, 256
+            )
+        return actual, row
+
+    def test_borrowed_tdm_keeps_strict_fallback(self):
+        for policy in ("tdm", "tdmi", "tdma", "tdmia"):
+            for m in (65, 112, 113, 127, 128):
+                with self.subTest(policy=policy, m=m):
+                    actual, _ = self._lookup(policy, "gfx1250-strict", m)
+                    self.assertIsNone(actual)
+
+    def test_exact_gfx1250_keeps_tdm_selection(self):
+        for policy in ("tdm", "tdmi", "tdma", "tdmia"):
+            for m in (65, 112, 113, 127, 128):
+                with self.subTest(policy=policy, m=m):
+                    actual, row = self._lookup(policy, "gfx1250", m)
+                    self.assertEqual(actual, row)
+
+    def test_other_borrowed_rows_and_exact_strict_rows_are_preserved(self):
+        for policy, libtype, row_arch in (
+            ("ft", "flydsl", "gfx1250"),
+            ("ht", "flydsl", "gfx1250"),
+            (None, "triton", "gfx1250"),
+            (None, "triton", "gfx1250-strict"),
+        ):
+            with self.subTest(policy=policy, libtype=libtype, row_arch=row_arch):
+                actual, row = self._lookup(
+                    policy, "gfx1250-strict", row_arch=row_arch, libtype=libtype
+                )
+                self.assertEqual(actual, row)
+
+
 class TestGfx1250StrictOpusRow(unittest.TestCase):
-    """A gfx1250-strict device reuses gfx1250 rows, but OPUS dispatch keeps
-    the strict id, so a row is only usable if that dispatch accepts it."""
+    """The selector conservatively skips borrowed OPUS rows on strict devices,
+    independently of the lower-level dispatch's architecture support."""
 
     CU = 96
     SHAPE = (4, 2112, 7168)
@@ -107,26 +160,10 @@ class TestGfx1250StrictOpusRow(unittest.TestCase):
             (tuned_config["libtype"], tuned_config["solidx"]), ("opus", self.KID)
         )
 
-    def test_strict_id_skips_a_row_its_dispatch_rejects(self):
-        from aiter.ops.opus import dispatch
-        from csrc.opus_gemm.opus_gemm_common import KernelKey
-
-        with self.assertRaises(ValueError):
-            dispatch._resolve_contract(
-                KernelKey("a16w16", "gfx1250-strict", self.CU, self.KID),
-                torch.bfloat16,
-                torch.bfloat16,
-                torch.bfloat16,
-                "plain",
-                False,
-                False,
-                False,
-                False,
-                self.SPLIT_K,
-            )
+    def test_strict_id_skips_borrowed_opus_row(self):
         tuned_config, config = self._lookup("gfx1250-strict")
         self.assertIsNone(tuned_config)
-        self.assertEqual(config["libtype"], "triton")
+        self.assertEqual(config, {"libtype": "triton", "solidx": 0})
 
 
 class TestGfx1250StrictTdmRow(unittest.TestCase):
@@ -744,13 +781,14 @@ class TestLegacyFlydslHgemmConfigs(unittest.TestCase):
         from contextlib import nullcontext
         from types import SimpleNamespace
 
+        import aiter.ops.flydsl.gemm_a16w16_tdm as tdm
         import aiter.ops.flydsl.gemm_kernels as kernels
 
         seen = set()
         seen_tdm = False
         a = torch.empty((2, 8), dtype=torch.bfloat16)
-        b = torch.empty((8, 8), dtype=a.dtype)
-        out = torch.empty((2, 8), dtype=a.dtype)
+        b = torch.empty((16, 8), dtype=a.dtype)
+        out = torch.empty((2, 16), dtype=a.dtype)
         stream = SimpleNamespace(device=a.device)
         fields = (
             "block_m",
@@ -794,26 +832,73 @@ class TestLegacyFlydslHgemmConfigs(unittest.TestCase):
                 seen_tdm = True
                 continue
             seen.add(name)
+            is_tdm = params["policy"] in kernels.TDM_POLICIES
             for gfx in ("gfx1250", "gfx1250-strict"):
                 with (
                     self.subTest(gfx=gfx, kernel=name),
                     mock.patch.object(kernels, "get_gfx_runtime", return_value=gfx),
-                    mock.patch.object(torch.cuda, "stream", return_value=nullcontext()),
+                    mock.patch.object(
+                        torch.cuda, "stream", return_value=nullcontext()
+                    ) as context,
                     mock.patch.object(
                         kernels, "gemm_a16w16_gfx1250", return_value=out
                     ) as launch,
+                    mock.patch.object(
+                        tdm, "gemm_a16w16_tdm", return_value=out
+                    ) as tdm_launch,
                     mock.patch.object(kernels, "gemm_a16w16_band") as band,
                 ):
+                    kwargs = {field: params[field] for field in fields}
+                    if is_tdm and gfx == "gfx1250-strict":
+                        with self.assertRaisesRegex(
+                            RuntimeError, "TDM HGEMM policies require gfx1250"
+                        ):
+                            kernels.flydsl_hgemm(a, b, out=out, stream=stream, **kwargs)
+                        launch.assert_not_called()
+                        tdm_launch.assert_not_called()
+                        band.assert_not_called()
+                        context.assert_not_called()
+                        continue
                     result = kernels.flydsl_hgemm(
-                        a,
-                        b,
-                        out=out,
-                        stream=stream,
-                        **{field: params[field] for field in fields},
+                        a, b, out=out, stream=stream, **kwargs
                     )
                     self.assertIs(result, out)
                     band.assert_not_called()
+                    context.assert_called_once_with(stream)
+                    if is_tdm:
+                        launch.assert_not_called()
+                        tdm_launch.assert_called_once()
+                        args = tdm_launch.call_args.args
+                        self.assertEqual(len(args), 4)
+                        self.assertIs(args[0], a)
+                        self.assertEqual(args[1].shape, b.t().shape)
+                        self.assertEqual(args[1].stride(), b.t().stride())
+                        self.assertEqual(args[1].data_ptr(), b.data_ptr())
+                        self.assertIs(args[2], out)
+                        self.assertIsNone(args[3])
+                        interleave, atomic = kernels.TDM_POLICIES[params["policy"]]
+                        expected = {
+                            field: params[field]
+                            for field in fields
+                            if field not in ("k_waves", "policy")
+                        }
+                        expected.update(
+                            layout="nt",
+                            interleave=interleave,
+                            split_k_atomic=atomic,
+                            stream=stream,
+                        )
+                        self.assertEqual(tdm_launch.call_args.kwargs, expected)
+                        continue
+                    self.assertIn(params["policy"], ("ft", "ht", "hti"))
+                    tdm_launch.assert_not_called()
+                    launch.assert_called_once()
+                    self.assertIs(launch.call_args.args[0], a)
+                    self.assertIs(launch.call_args.args[1], b)
                     args = launch.call_args.kwargs
+                    self.assertIs(args["y"], out)
+                    self.assertEqual(args["dtype"], a.dtype)
+                    self.assertIsNone(args["bias"])
                     for old, new in (
                         ("tile_m", "block_m"),
                         ("tile_n", "block_n"),
