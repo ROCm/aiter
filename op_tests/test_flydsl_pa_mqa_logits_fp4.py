@@ -626,14 +626,13 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
 
 
 def test_pa_mqa_logits_fp4_page8(
-    batch, max_ctx, next_n=1, heads=32, head_dim=DEFAULT_HEAD_DIM, num_iters=20
+    batch, max_ctx, next_n=1, heads=32, head_dim=DEFAULT_HEAD_DIM, num_iters=20, page=8
 ):
-    """kv_block_size=8: the row-group kernel (pa_mqa_logits_fp4_rowgroup) in
-    its 8-row-page cache layout, pages in a random order, a sequence's next_n
+    """The row-group kernel (pa_mqa_logits_fp4_rowgroup) in its 8- or
+    64-row-page cache layout, pages in a random order, a sequence's next_n
     rows as its ragged rows (row n seeing context - next_n + n + 1 keys)."""
 
     setup_seed(SEED)
-    page = 8
     ctx_list = _make_varctx(batch, max_ctx, page)
     context_lens = torch.tensor(ctx_list, dtype=torch.int32, device=dev)
     max_blocks = -(-max_ctx // page)
@@ -678,7 +677,7 @@ def test_pa_mqa_logits_fp4_page8(
     lag = torch.arange(next_n - 1, -1, -1, dtype=torch.int32, device=dev)
     row_ends = (context_lens[:, None] - lag).reshape(-1)
 
-    def launch(out=out, out_offsets=None):
+    def launch(out=out, out_offsets=None, kv_cache=kv_cache, kv_scale=kv_scale):
         flydsl_pa_mqa_logits_fp4(
             q_packed,
             pack_q_scales(q_e8m0),
@@ -706,7 +705,7 @@ def test_pa_mqa_logits_fp4_page8(
     tail_ok = bool(torch.isneginf(out[~mask]).all())
     _, us = run_perftest(launch, num_iters=num_iters, num_warmup=3)
     print(
-        f"page8 batch={batch} ctx<= {max_ctx} next_n={next_n} heads={heads} "
+        f"page{page} batch={batch} ctx<= {max_ctx} next_n={next_n} heads={heads} "
         f"head_dim={head_dim}: cos={cos:.6f} max_abs_err={max_err:.2e} "
         f"past_ctx_neginf={tail_ok} {us:.1f} us"
     )
@@ -714,6 +713,7 @@ def test_pa_mqa_logits_fp4_page8(
     assert max_err < 1e-3 * want.abs().max().item(), max_err
     assert tail_ok, "columns past a row's context were written"
     _check_page8_packed(launch, out, row_ends)
+    _check_page8_strided(launch, out, kv_cache, kv_scale)
 
 
 def _check_page8_packed(launch, plane, row_ends):
@@ -733,6 +733,27 @@ def _check_page8_packed(launch, plane, row_ends):
         assert torch.equal(span, plane[row, :length]), f"packed row {row} differs"
         written[start : start + length] = True
     assert bool((flat[~written] == sentinel).all()), "packed rows wrote past their span"
+
+
+def _strided_pages(t, pad):
+    """``t``'s pages, each followed by ``pad`` unused bytes: a page stride
+    past the page's size, as when an index cache shares its pages."""
+    big = torch.full((t.shape[0], t[0].numel() + pad), 0xFF, dtype=t.dtype, device=dev)
+    big[:, : t[0].numel()] = t.reshape(t.shape[0], -1)
+    return big.as_strided(t.shape, (big.stride(0), *t.stride()[1:]))
+
+
+def _check_page8_strided(launch, plane, kv_cache, kv_scale):
+    """The same launch on caches whose pages are strided apart: bit for bit
+    the dense caches' result."""
+    out = torch.full_like(plane, float("-inf"))
+    launch(
+        out=out,
+        kv_cache=_strided_pages(kv_cache, 4096),
+        kv_scale=_strided_pages(kv_scale, 1024),
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(out, plane), "strided pages differ from dense pages"
 
 
 def _print_perf_summary():
@@ -856,11 +877,12 @@ def main():
         ]
 
     if args.kv_block_size == 8:
-        for b, c, nn, h in configs:
-            test_pa_mqa_logits_fp4_page8(
-                b, c, next_n=nn, heads=h, head_dim=args.head_dim,
-                num_iters=args.num_iters,
-            )  # fmt: skip
+        for page in (8, 64):
+            for b, c, nn, h in configs:
+                test_pa_mqa_logits_fp4_page8(
+                    b, c, next_n=nn, heads=h, head_dim=args.head_dim,
+                    num_iters=args.num_iters, page=page,
+                )  # fmt: skip
         print("  PASS")
         return
 

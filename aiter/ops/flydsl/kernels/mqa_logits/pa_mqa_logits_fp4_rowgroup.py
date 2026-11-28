@@ -320,6 +320,8 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
     wave_min_steps: int = 2,
     pages_per_block: int = 1,
     packed_out: bool = False,
+    kv_page_stride: int | None = None,
+    kvs_page_stride: int | None = None,
 ):
     """The MQA as a GEMM: M a sequence's query rows (query_start_loc's, any
     count, 0 included) times the heads, cut into tiles of ``tile_m`` (whole
@@ -360,6 +362,8 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
     # bytes from tile nt to nt + 1 within a K chunk's rows
     tile_stride = 16 * page_size if lane_major else 16 * MFMA_N
     kv_page, kvs_page = page_bytes(page_size, head_dim)
+    kv_page = kv_page if kv_page_stride is None else kv_page_stride
+    kvs_page = kvs_page if kvs_page_stride is None else kvs_page_stride
     kv_tile_bytes = 64 * page_size  # one k_tile of a page
     # dwords of a lane's q_scale row: m_tiles bytes padded to a multiple of 4
     qs_dw = (m_tiles + 3) // 4
@@ -1309,6 +1313,8 @@ def compile_pa_mqa_logits_fp4_rowgroup(
     wave_min_steps: int,
     pages_per_block: int,
     packed_out: bool = False,
+    kv_page_stride: int | None = None,
+    kvs_page_stride: int | None = None,
 ):
     kfn, row_groups = build_pa_mqa_logits_fp4_rowgroup_module(
         page_size=page_size,
@@ -1327,6 +1333,8 @@ def compile_pa_mqa_logits_fp4_rowgroup(
         wave_min_steps=wave_min_steps,
         pages_per_block=pages_per_block,
         packed_out=packed_out,
+        kv_page_stride=kv_page_stride,
+        kvs_page_stride=kvs_page_stride,
     )
     block_threads = num_warps * WARP_SIZE
 
@@ -1658,8 +1666,8 @@ def flydsl_pa_mqa_logits_fp4_rowgroup(
         kv_scale[0].numel(),
     ), "the plan's heads and page size must be the operands'"
     for t in (kv_cache, kv_scale):
-        # the kernel addresses page i at i * page bytes
-        assert t[0].is_contiguous() and t.stride(0) == t[0].numel(), t.stride()
+        # the kernel specializes on each operand physical page stride
+        assert t[0].is_contiguous() and t.stride(0) >= t[0].numel(), t.stride()
     # callers may hand over buffers sized for a larger batch: rows past
     # the last sequence's are not read
     assert block_tables.dtype == torch.int32 and block_tables.stride(1) == 1
@@ -1686,6 +1694,8 @@ def flydsl_pa_mqa_logits_fp4_rowgroup(
         wave_min_steps=plan.wave_min_steps,
         pages_per_block=plan.pages_per_block,
         packed_out=out_offsets is not None,
+        kv_page_stride=kv_cache.stride(0),
+        kvs_page_stride=kv_scale.stride(0),
     )
     if out_offsets is not None:
         assert out is not None and out.dim() == 1 and out.is_contiguous()
