@@ -931,7 +931,7 @@ def compile_flydsl_moe_stage2(
             # The kernel derives its gfx942 fallbacks (K=16 MFMA split, bf16 pack,
             # fp4 byte-LUT decode, atomic epilogue) from this arch string.
             rocm_arch=str(get_rocm_arch()),
-            epilog=("reduce" if b_dtype == "int4" and mode == "reduce" else "atomic"),
+            epilog="reduce" if mode == "reduce" and b_dtype != "bf16" else "atomic",
             topk=topk,
         )
     if b_dtype in ("fp4", "fp8"):
