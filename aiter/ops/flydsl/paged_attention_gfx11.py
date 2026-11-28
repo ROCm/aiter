@@ -218,8 +218,9 @@ def _prefill_tile(arch, max_q, max_k, H, D, batch, total_q):
         if D % 32 == 0 and max_k < 4 * max_q:
             # Long prefills: the head dim over two waves, single LDS buffer
             # (no spills; with the LDS operand loads pipelined this beats the
-            # one-wave tile: prefill 2048 658 us vs 707). Chunks over a much
-            # longer context keep the one-wave double-buffered tile (3% better).
+            # one-wave tile: prefill 2048 658 us vs 707). Chunks over a 4x
+            # longer context keep the one-wave double-buffered tile (3-4%
+            # better in both test environments).
             return 8, 32, 8, 2, False, False, None, pad, None
     elif max_k >= 4096:
         return 16, 64, 8, 1, True, False, None, pad, None
