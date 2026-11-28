@@ -265,8 +265,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const char*  kernelName,
     int          bpreshuffle,
     aiter_tensor_t* zero_bias_buf,
+    int          out_zeroed,
     hipStream_t  stream),
-    (A, B, out, A_scale, B_scale, bias, splitK, kernelName, bpreshuffle, zero_bias_buf, stream))
+    (A, B, out, A_scale, B_scale, bias, splitK, kernelName, bpreshuffle, zero_bias_buf, out_zeroed, stream))
 {
     validate_inputs(A, B, out, A_scale, B_scale);
     int Mdim = A->size(0);
@@ -333,19 +334,19 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                    (Kdim / k_per_split_aligned) == (selectedsplitK - 1),
                    __func__, " Kdim alignment check failed for splitK!");
 
-        // Step 3: Zero output buffer for atomic accumulation across splits.
         if (selectedsplitK > 1) {
-            // Split-K faults on output rows that are not 4-byte aligned.
+            // Split-K requires aligned output even when the producer clears it.
             AITER_CHECK(reinterpret_cast<uintptr_t>(out->ptr) % 4 == 0 && stride_c % 4 == 0,
                         __func__, " split-K needs 4-byte aligned output rows, got ptr offset ",
                         reinterpret_cast<uintptr_t>(out->ptr) % 4, " and row stride ",
                         stride_c, " bytes");
-            size_t row_bytes = static_cast<size_t>(Ndim) * out->element_size();
-            if (static_cast<size_t>(stride_c) == row_bytes) {
-                HIP_CALL(hipMemsetAsync(out->ptr, 0, out->numel() * out->element_size(), stream));
-            } else {
-                // The kernel writes rows stride_c bytes apart, so clear only the M x N view.
-                HIP_CALL(hipMemset2DAsync(out->ptr, stride_c, 0, row_bytes, Mdim, stream));
+            if (!out_zeroed) {
+                size_t row_bytes = static_cast<size_t>(Ndim) * out->element_size();
+                if (static_cast<size_t>(stride_c) == row_bytes) {
+                    HIP_CALL(hipMemsetAsync(out->ptr, 0, out->numel() * out->element_size(), stream));
+                } else {
+                    HIP_CALL(hipMemset2DAsync(out->ptr, stride_c, 0, row_bytes, Mdim, stream));
+                }
             }
         }
     }
