@@ -1,0 +1,22 @@
+{
+    "M_LEQ_1024": {
+        "BLOCK_H": 8,
+        "BLOCK_W": 32,
+        "num_warps": 2
+    },
+    "M_LEQ_4096": {
+        "BLOCK_H": 16,
+        "BLOCK_W": 32,
+        "num_warps": 1
+    },
+    "M_LEQ_16384": {
+        "BLOCK_H": 1,
+        "BLOCK_W": 128,
+        "num_warps": 1
+    },
+    "any": {
+        "BLOCK_H": 1,
+        "BLOCK_W": 256,
+        "num_warps": 2
+    }
+}
