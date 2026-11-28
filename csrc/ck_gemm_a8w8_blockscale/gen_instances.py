@@ -63,6 +63,28 @@ class gemm_a8w8_blockscale_codegen:
         """
         Generate kernel instance code for ck gemm a8w8 blockscale
         """
+        instance_params = f"""                    {k.BLOCK_SIZE},
+                    {k.ScaleBlockM}, {k.ScaleBlockN}, {k.ScaleBlockK},
+                    {k.MPerBLOCK}, {k.NPerBLOCK}, {k.KPerBLOCK},
+                    {k.AK1}, {k.BK1},
+                    {k.MPerXDL}, {k.NPerXDL},
+                    {k.WAVE_MAP_M}, {k.WAVE_MAP_N},
+                    S<{(", ").join(str(x) for x in k.ABLOCK_TRANSFER)}>,
+                    S<{(", ").join(str(x) for x in k.BBLOCK_TRANSFER)}>,
+                    {k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE},
+                    {k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE},
+                    S<{(", ").join(str(x) for x in k.CBLOCK_TRANSFER)}>,
+                    S<{(", ").join(str(x) for x in k.CBLOCK_SPV)}>,
+                    ck::BlockGemmPipelineScheduler::{k.PIPELINE_Sched},
+                    ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
+                    spec"""
+        # Mirrors minimum_occupancy in DeviceGemmMultiD_ABScale_Xdl_CShuffle_V3.
+        min_occupancy = (
+            1
+            if k.PIPELINE_Sched == "Intrawave"
+            and k.MPerBLOCK * k.NPerBLOCK // k.BLOCK_SIZE > 64
+            else 2
+        )
 
         LEGACY_INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
@@ -94,23 +116,16 @@ torch::Tensor
     auto run_kernel = [&]<CKGemmSpec spec> [[clang::always_inline]] (std::integral_constant<CKGemmSpec, spec>) {{
         using LegacyGemmInstance = DeviceLegacyGemmHelperF8BlockScale<
                     DDataType, EDataType,
-                    {k.BLOCK_SIZE},
-                    {k.ScaleBlockM}, {k.ScaleBlockN}, {k.ScaleBlockK},
-                    {k.MPerBLOCK}, {k.NPerBLOCK}, {k.KPerBLOCK},
-                    {k.AK1}, {k.BK1},
-                    {k.MPerXDL}, {k.NPerXDL},
-                    {k.WAVE_MAP_M}, {k.WAVE_MAP_N},
-                    S<{(", ").join(str(x) for x in k.ABLOCK_TRANSFER)}>,
-                    S<{(", ").join(str(x) for x in k.BBLOCK_TRANSFER)}>,
-                    {k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE},
-                    {k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE},
-                    S<{(", ").join(str(x) for x in k.CBLOCK_TRANSFER)}>,
-                    S<{(", ").join(str(x) for x in k.CBLOCK_SPV)}>,
-                    ck::BlockGemmPipelineScheduler::{k.PIPELINE_Sched},
-                    ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
-                    spec>;
+{instance_params}>;
+        // The same kernel with FP32 output, for the deterministic split-K partials.
+        using PartialsGemmInstance = DeviceLegacyGemmHelperF8BlockScale<
+                    DDataType, FP32,
+{instance_params}>;
 
-        return gemm_a8w8_blockscale_impl<DDataType, EDataType, LegacyGemmInstance>(XQ, WQ, x_scale, w_scale, Y, KBatch);
+        return gemm_a8w8_blockscale_impl<DDataType, EDataType, LegacyGemmInstance,
+                    PartialsGemmInstance,
+                    ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
+                    {min_occupancy}, {k.KPerBLOCK}, {k.MPerBLOCK}, {k.NPerBLOCK}>(XQ, WQ, x_scale, w_scale, Y, KBatch);
     }};
 
     if(gemm_spec == GemmSpecialization::Default)
