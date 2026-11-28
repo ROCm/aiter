@@ -1,0 +1,8 @@
+{
+  "contract_version": 1,
+  "gfx950": {
+    "fp8_H96_C10": "087a25b6559f483f4f9cce4c5011a551212592bafba3d3e3a83c7df59b84c5a7",
+    "fp8_H12_C64": "e0a80c8a3ea79b64df9f907f7275df151757c8b7b2cfc305ba96161cf08f5ff4",
+    "bf16_H96_C10": "9f6b45a20009f6887a416f2d4ba0c40fac62d8836c403bc6be97c45c7189278f"
+  }
+}
