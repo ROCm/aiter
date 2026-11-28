@@ -769,6 +769,26 @@ struct CodecFP8 : public CodecBase
     }
 };
 
+// The two-shot kernels send rank segments in a per-wave rotated order: consecutive waves start at
+// consecutive ranks, so the stores of a GPU spread over all of its links rather than queueing on
+// one rank's link at a time.
+template <int kWorldSize>
+__quickreduce_device_inline__ uint32_t two_shot_first_rank(int block, int thread)
+{
+    constexpr uint32_t kWavesPerBlock = kBlockSize / kWavefront;
+    uint32_t const wave               = __builtin_amdgcn_readfirstlane(thread / kWavefront);
+    return (static_cast<uint32_t>(block) * kWavesPerBlock + wave) % kWorldSize;
+}
+
+// Input atom held in tA[slot]. Loading in the send order keeps the tA indices of the sends static.
+template <class Codec>
+__quickreduce_device_inline__ uint32_t two_shot_atom(uint32_t first_rank, int slot)
+{
+    static_assert(Codec::kRankAtoms * Codec::kWorldSize == kAtoms);
+    uint32_t const r = (first_rank + slot / Codec::kRankAtoms) % Codec::kWorldSize;
+    return r * Codec::kRankAtoms + slot % Codec::kRankAtoms;
+}
+
 // Twoshot All Reduce
 template <typename T, class Codec, bool cast_bf2half>
 struct AllReduceTwoshot
@@ -792,22 +812,26 @@ struct AllReduceTwoshot
         uint8_t* rank_buffer = buffer_list[rank];
         Codec codec(thread, rank);
         int block_id = blockIdx.x;
+        // buffer_ptr[i] is rank (first_rank + i) % kWorldSize; both phases send in this order.
+        uint32_t const first_rank = two_shot_first_rank<kWorldSize>(block, thread);
         uint8_t* buffer_ptr[kWorldSize];
         for(int i = 0; i < kWorldSize; ++i)
         {
-            buffer_ptr[i] = buffer_list[i];
+            buffer_ptr[i] = buffer_list[(first_rank + i) % kWorldSize];
         }
         // --------------------------------------------------------
-        // Read input into registers
+        // Read input into registers in the same order, so tA[r * kRankAtoms] holds the atoms
+        // sent to buffer_ptr[r].
         int32x4_t tA[kAtoms];
 
         BufferResource src_buffer(const_cast<T*>(input), N * sizeof(T));
-        uint32_t src_offset = block * kTileSize + thread * sizeof(int32x4_t);
+        uint32_t const src_offset = block * kTileSize + thread * sizeof(int32x4_t);
 
         for(int i = 0; i < kAtoms; i++)
         {
-            tA[i] = buffer_load_dwordx4(src_buffer.descriptor, src_offset, 0, 0);
-            src_offset += kAtomStride * sizeof(int32x4_t);
+            uint32_t const offset =
+                src_offset + two_shot_atom<Codec>(first_rank, i) * kAtomStride * sizeof(int32x4_t);
+            tA[i] = buffer_load_dwordx4(src_buffer.descriptor, offset, 0, 0);
             if constexpr(cast_bf2half)
             {
                 const nv_bfloat162* bf_buf = reinterpret_cast<const nv_bfloat162*>(&tA[i]);
@@ -1004,20 +1028,25 @@ struct AllReduceTwoshotRMSNorm
         uint8_t* rank_buffer = buffer_list[rank];
         Codec codec(thread, rank);
         int block_id = blockIdx.x;
+        // buffer_ptr[i] is rank (first_rank + i) % kWorldSize; both phases send in this order.
+        uint32_t const first_rank = two_shot_first_rank<kWorldSize>(block, thread);
         uint8_t* buffer_ptr[kWorldSize];
         for(int i = 0; i < kWorldSize; ++i)
         {
-            buffer_ptr[i] = buffer_list[i];
+            buffer_ptr[i] = buffer_list[(first_rank + i) % kWorldSize];
         }
 
+        // Read input into registers in the same order, so tA[r * kRankAtoms] holds the atoms
+        // sent to buffer_ptr[r].
         int32x4_t tA[kAtoms];
         BufferResource src_buffer(const_cast<T*>(input), N * sizeof(T));
-        uint32_t src_offset = block * kTileSize + thread * sizeof(int32x4_t);
+        uint32_t const src_offset = block * kTileSize + thread * sizeof(int32x4_t);
 
         for(int i = 0; i < kAtoms; i++)
         {
-            tA[i] = buffer_load_dwordx4(src_buffer.descriptor, src_offset, 0, 0);
-            src_offset += kAtomStride * sizeof(int32x4_t);
+            uint32_t const offset =
+                src_offset + two_shot_atom<Codec>(first_rank, i) * kAtomStride * sizeof(int32x4_t);
+            tA[i] = buffer_load_dwordx4(src_buffer.descriptor, offset, 0, 0);
             if constexpr(cast_bf2half)
             {
                 const nv_bfloat162* bf_buf = reinterpret_cast<const nv_bfloat162*>(&tA[i]);
