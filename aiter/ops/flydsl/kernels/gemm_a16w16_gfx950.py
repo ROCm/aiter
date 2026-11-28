@@ -1280,6 +1280,9 @@ def gemm_a16w16_hti_gfx950_kernel(
         b0 = load_b_fragment(0, 0)
         a0 = load_a_fragment(0, 0)
         async_load_a_to_lds(1, k_tile + 1, 1)
+        # The second group runs one barrier ahead: for it, this barrier releases the
+        # first group to refill B half 0 of stage 0 below. Retire the b0 reads.
+        rocdl.s_waitcnt(lgkmcnt=0)
         rocdl.s_barrier()
         consume(c00, a0, b0, True)
         rocdl.s_barrier()
@@ -1297,6 +1300,9 @@ def gemm_a16w16_hti_gfx950_kernel(
         async_load_b_to_lds(1, next_k_tile, 0)
         wait_vmcnt_and_barrier(2 * half_ldg_b_iters + half_ldg_a_iters)
         consume(c11, a1, b1, True)
+        # Likewise for stage 1: for the second group, the barrier after this one
+        # releases the first group to refill B half 0 of stage 1. Retire the b0 reads.
+        rocdl.s_waitcnt(lgkmcnt=0)
         rocdl.s_barrier()
         # 1
         a0 = load_a_fragment(0, 1)
@@ -1355,6 +1361,10 @@ def gemm_a16w16_hti_gfx950_kernel(
     consume(c01, a0, b1, True)
     rocdl.s_barrier()
     a1 = load_a_fragment(1, 1)
+    # C half tiles stored to LDS after this barrier can overlap A half 1 of stage 1
+    # for some tiles; for the second group, this barrier also releases the first
+    # group's C(0, 1) stores. Retire the a1 reads.
+    rocdl.s_waitcnt(lgkmcnt=0)
     rocdl.s_barrier()
     rocdl.sched_barrier(0)
     store_half_tile_to_lds(0, 0, c00)
@@ -1377,12 +1387,20 @@ def gemm_a16w16_hti_gfx950_kernel(
         store_half_tile_to_global(1, 0)
         store_half_tile_to_global(1, 1)
     else:
+        # Realign the groups as the split-K path does. One barrier apart, the first
+        # group would read C half tiles before the second group has written them.
+        if wid // n_waves == 0:
+            rocdl.s_barrier()
+        # The C shuffle reads what other waves wrote to LDS: retire this wave's LDS
+        # writes before each such barrier, as the split-K path's gpu.barrier() does.
+        rocdl.s_waitcnt(lgkmcnt=0)
         wait_vmcnt_and_barrier(0)
         store_half_tile_to_global(0, 0)
         store_half_tile_to_global(0, 1)
         wait_vmcnt_and_barrier(0)
         store_half_tile_to_lds(1, 0, c10)
         store_half_tile_to_lds(1, 1, c11)
+        rocdl.s_waitcnt(lgkmcnt=0)
         wait_vmcnt_and_barrier(0)
         store_half_tile_to_global(1, 0)
         store_half_tile_to_global(1, 1)
