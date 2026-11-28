@@ -401,6 +401,45 @@ parser.add_argument(
     help="Request and verify log-sum-exp output.",
 )
 
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("nheads, nheads_k, d", [(8, 1, 128), (24, 12, 256)])
+def test_flash_attn_varlen_fp8_pertensor_out(nheads, nheads_k, d, causal):
+    """With `out`, the result lands in the caller's buffer (here the first rows
+    of a larger one) and equals the result without it, bit for bit."""
+    torch.random.manual_seed(0)
+    seqlens_q, seqlens_k = [77, 300], [200, 300]
+    cu_seqlens_q = torch.tensor([0, 77, 377], dtype=torch.int32, device="cuda")
+    cu_seqlens_k = torch.tensor([0, 200, 500], dtype=torch.int32, device="cuda")
+    q = torch.randn(377, nheads, d, device="cuda").to(dtypes.fp8)
+    k = torch.randn(500, nheads_k, d, device="cuda").to(dtypes.fp8)
+    v = torch.randn(500, nheads_k, d, device="cuda").to(dtypes.fp8)
+    descale = torch.ones(1, device="cuda")
+
+    def run(**kwargs):
+        return aiter.flash_attn_varlen_fp8_pertensor_func(
+            q,
+            k,
+            v,
+            descale,
+            descale,
+            descale,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max(seqlens_q),
+            max(seqlens_k),
+            causal=causal,
+            **kwargs,
+        )
+
+    ref = run()
+    buf = torch.full((382, nheads, d), float("nan"), dtype=ref.dtype, device="cuda")
+    got = run(out=buf[:377])
+    assert got.data_ptr() == buf.data_ptr()
+    assert torch.equal(buf[:377], ref)
+    assert torch.isnan(buf[377:]).all()
+
+
 if __name__ == "__main__":
     args = parser.parse_args()
 
