@@ -218,9 +218,12 @@ def fused_recurrent_kda(
         state_ref is not None and state_ref.dtype == torch.bfloat16 and T > 1
     )
     bucket_T = max(avg_T, 2) if bf16_resident else avg_T
+    user_config = config or {}
     config = get_kda_config(
         bucket_T, N, HV, K, V, overrides=config, fused=use_conv or use_rms_gate
     )
+    if cache_state_updates and "use_tdm_store" not in user_config:
+        config["use_tdm_store"] = False
     BV = config["BV"]
     SK = config["SK"]
     num_warps = config["num_warps"]
@@ -319,25 +322,31 @@ def fused_recurrent_kda(
 
     def _rows(t):
         if t is None:
-            return 1, 1
+            return row, 1
         st = t.stride()
-        assert st[0] % row == 0, "state slot stride must be a whole number of rows"
         assert st[1:] == (
             state_shape[1] * state_shape[2],
             state_shape[2],
             1,
         ), "state slabs must be dense in [HV, ., .]"
-        sr = st[0] // row
-        return sr, t.shape[0] * sr
+        # gfx950 addresses slots in rows; gfx1250 takes any element stride.
+        assert st[0] % row == 0 or _ARCH != "gfx950", "slot stride must be whole rows"
+        return st[0], (t.shape[0] * st[0] + row - 1) // row
 
     state_dst = final_state
     if state_dst is None and _ARCH == "gfx950":
         n_dst = B * T if is_paged else N
         state_dst = q.new_empty(n_dst, *state_shape, dtype=state_dtype)
-    slot_rows_in, rows_in = _rows(initial_state)
-    slot_rows_out, rows_out = (
-        (slot_rows_in, rows_in) if state_dst is initial_state else _rows(state_dst)
+    slot_in, rows_in = _rows(initial_state)
+    slot_out, rows_out = (
+        (slot_in, rows_in) if state_dst is initial_state else _rows(state_dst)
     )
+
+    def _tdm_ok(t):
+        return t is None or (t.data_ptr() % 16 == 0 and t.stride(0) % 4 == 0)
+
+    if not (_tdm_ok(initial_state) and _tdm_ok(state_dst)):
+        use_tdm_load = use_tdm_store = False
     if cache_state_updates:
         assert is_paged, "cache_state_updates requires ssm_state_indices"
         assert inplace_final_state, "cache_state_updates requires inplace_final_state"
@@ -351,6 +360,9 @@ def fused_recurrent_kda(
             f"warps={num_warps} paged={is_paged} gate={use_gate_in_kernel}"
         )
 
+    num_slots = 1
+    if is_paged and ssm_state_indices.ndim > 1 and not use_conv:
+        num_slots = ssm_state_indices.shape[-1]
     grid = (triton.cdiv(V, BV) * N * HV,)
     fused_recurrent_kda_packed_decode_kernel[grid](
         q_ptr=q,
@@ -381,10 +393,6 @@ def fused_recurrent_kda(
         stride_beta_token=beta.stride(1),
         stride_o_token=out.stride(1),
         stride_og_token=out_gate.stride(1) if use_rms_gate else 0,
-        stride_state_slot_rows=slot_rows_in,
-        stride_state_out_slot_rows=slot_rows_out,
-        state_rows=rows_in,
-        state_out_rows=rows_out,
         stride_cs_slot=conv_state.stride(0) if use_conv else 0,
         stride_cs_dim=conv_state.stride(1) if use_conv else 0,
         stride_cs_pos=conv_state.stride(2) if use_conv else 0,
@@ -420,7 +428,23 @@ def fused_recurrent_kda(
         W=W,
         USE_CONV=use_conv,
         USE_RMS_GATE=use_rms_gate,
-        **({"RESIDENT_STATE": bool(resident_state)} if _ARCH == "gfx950" else {}),
+        **(
+            {
+                "RESIDENT_STATE": bool(resident_state),
+                "stride_state_slot_rows": slot_in // row,
+                "stride_state_out_slot_rows": slot_out // row,
+                "state_rows": rows_in,
+                "state_out_rows": rows_out,
+            }
+            if _ARCH == "gfx950"
+            else {
+                "stride_state_slot": slot_in,
+                "stride_state_out_slot": slot_out,
+                "ROW_ALIGNED_SLOTS": state_v_first and slot_in % row == 0,
+                "NUM_SLOTS": num_slots,
+                "NUM_SLOTS_P2": triton.next_power_of_2(num_slots),
+            }
+        ),
         num_warps=num_warps,
         enable_fp_fusion=True,
         **(
@@ -432,9 +456,12 @@ def fused_recurrent_kda(
     return out, final_state
 
 
-# Routed on its public entry, ahead of fused_recurrent_kda: a provider with a
-# kernel for the packed one-token decode serves it here. When none does, the
-# native body calls fused_recurrent_kda, which a provider is asked about again.
+fused_recurrent_kda.supports_unaligned_state_stride = _ARCH in (
+    "gfx1250",
+    "gfx1250-strict",
+)
+
+
 @_route(op="fused_recurrent_kda_packed_decode")
 def fused_recurrent_kda_packed_decode(
     mixed_qkv: torch.Tensor,

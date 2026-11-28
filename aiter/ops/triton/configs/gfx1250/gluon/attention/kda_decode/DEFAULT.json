@@ -9,23 +9,54 @@
     "tdm_store_bufs": 1,
     "sched_strategy": "max-ilp"
   },
-  "t_gt1_seq_heads_geq_3072": {
+  "fused_t1": {
+    "BV": 128,
+    "SK": 8,
+    "num_warps": 4,
+    "num_buffers": 2,
+    "use_tdm_load": true,
+    "sched_strategy": "max-ilp"
+  },
+  "fused_seq_heads_lt_768": {
     "BV": 128,
     "SK": 16,
     "num_warps": 4,
-    "num_buffers": 2
+    "num_buffers": 2,
+    "use_tdm_load": true,
+    "use_tdm_store": true,
+    "tdm_store_bufs": 2,
+    "sched_strategy": "max-ilp"
+  },
+  "t_gt1_seq_heads_geq_3072": {
+    "BV": 64,
+    "SK": 16,
+    "num_warps": 4,
+    "num_buffers": 2,
+    "use_tdm_load": true,
+    "use_tdm_store": true
   },
   "t_gt1_seq_heads_geq_384": {
+    "BV": 64,
+    "SK": 16,
+    "num_warps": 4,
+    "num_buffers": 2,
+    "use_tdm_load": true,
+    "use_tdm_store": true
+  },
+  "t_gt1_seq_heads_lt_384": {
     "BV": 32,
     "SK": 16,
-    "num_warps": 1,
-    "num_buffers": 2
+    "num_warps": 2,
+    "num_buffers": 2,
+    "use_tdm_load": true,
+    "use_tdm_store": true
   },
   "t1_seq_heads_256_to_512": {
-    "BV": 16,
-    "SK": 32,
+    "BV": 32,
+    "SK": 16,
     "num_warps": 2,
-    "num_buffers": 2
+    "num_buffers": 2,
+    "use_tdm_load": true
   },
   "t_gt1_default": {
     "BV": 32,
@@ -38,5 +69,12 @@
     "SK": 32,
     "num_warps": 4,
     "num_buffers": 2
+  },
+  "t1_seq_heads_gt_512": {
+    "BV": 16,
+    "SK": 16,
+    "num_warps": 1,
+    "num_buffers": 2,
+    "use_tdm_load": true
   }
 }
