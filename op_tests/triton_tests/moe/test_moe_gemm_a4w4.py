@@ -150,6 +150,7 @@ class Case:
             Case(4096, 3072, 3072, 128, 4),
             Case(8192, 7168, 4096, 256, 8),
             # gfx1250 gluon preshuffled weights
+            Case(2048, 6144, 3072, 96, 6, hbm_swizzling=True, preshuffle_weights=True),
             Case(16, 4096, 7168, 256, 8, hbm_swizzling=True, preshuffle_weights=True),
             Case(16, 512, 7168, 256, 8, hbm_swizzling=True, preshuffle_weights=True),
             Case(16, 1024, 1024, 128, 4, preshuffle_weights=True),
