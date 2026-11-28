@@ -217,7 +217,8 @@ AOT_CACHES = {
     "gemm_a8w8_blockscale": {
         "sources": [
             "gemm_tune/flydsl_gemm_a8w8_blockscale_common.py",
-            "kernels/gemm_a8w8_blockscale_8wave.py",
+            "kernels/gemm_a8w8_blockscale_8wave_gfx942.py",
+            "kernels/gemm_a8w8_blockscale_8wave_gfx950.py",
         ],
     },
     "moe_gfx942_gemm": {
@@ -503,7 +504,7 @@ _run_compiled(
 device is one of its arguments and so in `key`
 (memory only; the `.o` is shared). Validated compile-only on gfx942 under
 `dry_run("gfx950", 256)` for the tuned kernel
-`flydsl_blockscale_8w_256x256x128_F8_F8_B16_ps0`, M=8192 N=768 K=7168, bf16
+`flydsl_blockscale_8w_gfx950_256x256x128_F8_F8_B16_ps0`, M=8192 N=768 K=7168, bf16
 and fp16 output:
 
 - the first process builds two `.o` (metadata `arch: gfx950`), a second

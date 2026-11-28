@@ -257,6 +257,15 @@ def gemm_a8w8_bpreshuffle_flydsl(
     return Out
 
 
+# Name prefixes of the FP32-scale FlyDSL blockscale kernels
+# (flydsl/gemm_tune/flydsl_gemm_a8w8_blockscale_common.py): the gfx950 8-wave
+# kernel (IDs 0/1) and the gfx942 8-wave kernel (IDs 2/3).
+_FLYDSL_BLOCKSCALE_PREFIXES = (
+    "flydsl_blockscale_8w_gfx950_",
+    "flydsl_blockscale_8w_gfx942_",
+)
+
+
 def gemm_a8w8_blockscale_flydsl(
     XQ: Tensor,
     WQ: Tensor,
@@ -267,24 +276,37 @@ def gemm_a8w8_blockscale_flydsl(
     isBpreshuffled: bool = False,
 ) -> Tensor:
     # A tuned FlyDSL row must execute FlyDSL, never silently select another backend.
-    gfx = get_gfx()
-    assert gfx == "gfx950", f"FlyDSL blockscale only supports gfx950, got {gfx}"
-    assert Out.dtype in (
-        dtypes.bf16,
-        dtypes.fp16,
-    ), f"FlyDSL blockscale only supports BF16/FP16 output, got {Out.dtype}"
-    assert x_scale.dtype == dtypes.fp32 and w_scale.dtype == dtypes.fp32, (
-        "FlyDSL blockscale requires FP32 scales, "
-        f"got x_scale={x_scale.dtype}, w_scale={w_scale.dtype}"
-    )
+    kernel_name = str(config.get("kernelName", ""))
     try:
         from .flydsl.gemm_a8w8_blockscale import (
             is_supported,
             run_gemm_a8w8_blockscale,
         )
+        from .flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
+            kernels_by_name,
+        )
 
-        assert is_supported(XQ, WQ, Out, isBpreshuffled), (
-            "Unsupported shape, dtype or device for FlyDSL blockscale: "
+        ki = kernels_by_name.get(kernel_name)
+        if ki is None:
+            raise ValueError(f"Unknown FlyDSL blockscale kernel: {kernel_name!r}")
+        if ki.preshuffle_b != isBpreshuffled:
+            raise ValueError("FlyDSL blockscale kernelName does not match the B layout")
+        # The named kernel's arch must be the device's: IDs 0/1 are the gfx950
+        # kernel, IDs 2/3 the gfx942 one.
+        gfx = get_gfx()
+        assert (
+            gfx == ki.gfx
+        ), f"FlyDSL blockscale kernel {kernel_name} runs on {ki.gfx}, got {gfx}"
+        assert Out.dtype in (
+            dtypes.bf16,
+            dtypes.fp16,
+        ), f"FlyDSL blockscale only supports BF16/FP16 output, got {Out.dtype}"
+        assert x_scale.dtype == dtypes.fp32 and w_scale.dtype == dtypes.fp32, (
+            "FlyDSL blockscale requires FP32 scales, "
+            f"got x_scale={x_scale.dtype}, w_scale={w_scale.dtype}"
+        )
+        assert is_supported(XQ, WQ, Out, isBpreshuffled, kernel_name), (
+            f"Unsupported shape, dtype or device for FlyDSL blockscale {kernel_name}: "
             f"XQ={tuple(XQ.shape)}/{XQ.dtype}/{XQ.device}, "
             f"WQ={tuple(WQ.shape)}/{WQ.dtype}/{WQ.device}, "
             f"Out={tuple(Out.shape)}/{Out.dtype}/{Out.device}, "
@@ -296,7 +318,7 @@ def gemm_a8w8_blockscale_flydsl(
             x_scale,
             w_scale,
             Out,
-            str(config.get("kernelName", "")),
+            kernel_name,
             isBpreshuffled,
         )
     except ImportError as exc:
@@ -2049,7 +2071,7 @@ def _gemm_a8w8_blockscale_bpreshuffle_native(
                 w_scale=w_scale,
                 family="a8w8_blockscale_bpreshuffle",
             )
-        elif libtype == "flydsl" and kernelName.startswith("flydsl_blockscale_8w_"):
+        elif libtype == "flydsl" and kernelName.startswith(_FLYDSL_BLOCKSCALE_PREFIXES):
             return gemm_a8w8_blockscale_flydsl(
                 XQ, WQ, x_scale, w_scale, Y, config, isBpreshuffled=True
             )

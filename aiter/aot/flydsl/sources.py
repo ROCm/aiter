@@ -118,7 +118,8 @@ AOT_CACHES = {
     "gemm_a8w8_blockscale": {
         "sources": (
             "gemm_tune/flydsl_gemm_a8w8_blockscale_common.py",
-            "kernels/gemm_a8w8_blockscale_8wave.py",
+            "kernels/gemm_a8w8_blockscale_8wave_gfx942.py",
+            "kernels/gemm_a8w8_blockscale_8wave_gfx950.py",
         ),
     },
     "gemm_a8w8_mxfp8_8wave": {

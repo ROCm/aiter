@@ -222,14 +222,15 @@ def test_gemm(
             ret["triton err"] = err_triton
             ret["triton/ck"] = avg_d / avg_b
 
-        # FlyDSL blockscale runs on gfx950 with FP32 scales, on shapes its tile fits.
-        if get_gfx() == "gfx950":
+        # FlyDSL blockscale runs with FP32 scales, on shapes its tile fits: IDs 0/1
+        # on gfx950, IDs 2/3 on gfx942.
+        if get_gfx() in ("gfx942", "gfx950"):
             from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
                 kernel_fits_shape,
                 kernelInstance,
             )
 
-            flydsl_kernel = kernelInstance(ck_preshuffle)
+            flydsl_kernel = kernelInstance(ck_preshuffle, get_gfx())
             if kernel_fits_shape(flydsl_kernel, m, n, k, get_gfx()):
                 f, avg_f = run_flydsl(
                     x,

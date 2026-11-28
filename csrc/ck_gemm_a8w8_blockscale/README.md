@@ -28,10 +28,25 @@ If you have built gemm_a8w8 kernels before tuning new GEMM shapes, please add `A
 
 ## More Options
 
-### FlyDSL blockscale (gfx950)
+### FlyDSL blockscale (gfx950, gfx942)
 
 Use `--libtype flydsl` for FlyDSL only, or `--libtype all` to compare it with
-the other backends. Inputs are FP8 E4M3FN with FP32 scales; output is BF16.
+the other backends. Inputs are FP8 (E4M3FN on gfx950, E4M3FNUZ on gfx942) with
+FP32 scales; output is BF16. Each candidate runs only on its own arch
+(`kernel_fits_shape` in
+[flydsl_gemm_a8w8_blockscale_common.py](../../aiter/ops/flydsl/gemm_tune/flydsl_gemm_a8w8_blockscale_common.py)
+has the exact limits):
+
+| kernelId | kernelName | gfx | B | Shapes | Output |
+|---|---|---|---|---|---|
+| 0 | `flydsl_blockscale_8w_gfx950_256x256x128_F8_F8_B16_ps0` | gfx950 | plain | K % 256 == 0, N % 8 == 0 | BF16, FP16 |
+| 1 | `flydsl_blockscale_8w_gfx950_256x256x128_F8_F8_B16_ps1` | gfx950 | preshuffled | K % 256 == 0, N % 16 == 0 | BF16, FP16 |
+| 2 | `flydsl_blockscale_8w_gfx942_256x256x128_F8_F8_B16_ps0` | gfx942 | plain | K % 128 == 0, N % 16 == 0, any M | BF16, FP16 |
+| 3 | `flydsl_blockscale_8w_gfx942_256x256x128_F8_F8_B16_ps1` | gfx942 | preshuffled | K % 128 == 0, N % 16 == 0, any M | BF16, FP16 |
+
+IDs 2/3 are the gfx942 2x4-LDS pf1 kernel: a 256x256 tile on eight waves
+with A and B staged through 64 KiB of LDS. Like IDs 0/1, it rounds BF16 and
+FP16 output to nearest even, and its `B16` names serve FP16 calls too.
 
 - Plain B: row-major `x_scale[M, K/128]`; the adapter transposes it to
   `[K/128, M]` inside the timed call.
