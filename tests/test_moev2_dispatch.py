@@ -145,6 +145,7 @@ def test_problem_round_trips_through_the_legacy_key():
         {"config_file": "/tmp/t.csv", "_disable_inline_sort": True},
         {"q_dtype_a2": dtypes.fp8, "input_dtype": dtypes.bf16, "swiglu_limit": 7.0},
         {"has_global_scale": True},
+        {"block_size_M": 32},
     ):
         p = _problem(**kwargs)
         args, kw = p.legacy_key()

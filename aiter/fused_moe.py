@@ -1648,6 +1648,7 @@ def _fused_moe_impl(
             _has_input_activation_scales=a1_scale is not None,
             has_num_local_tokens=num_local_tokens is not None,
             has_global_scale=w1_global_scale is not None or w2_global_scale is not None,
+            block_size_M=block_size_M,
         )
         return (
             metadata if _metadata_transform is None else _metadata_transform(metadata)
@@ -4585,6 +4586,7 @@ def get_2stage_cfgs(
     _exclude_mxmoe=False,
     _has_input_activation_scales=False,
     has_global_scale=False,
+    block_size_M=None,
 ):
     gate_mode = GateMode(gate_mode)
     if q_dtype_w == dtypes.fp4x2 and has_global_scale:
@@ -4924,6 +4926,40 @@ def get_2stage_cfgs(
                 f"[fused_moe] discarding FlyDSL tuned config for unsupported "
                 f"activation {activation}; using default heuristics"
             )
+        elif kn1.startswith("flydsl_moe1_abf16_") and (
+            has_stage1_bias
+            or has_stage2_bias
+            or gate_mode == GateMode.INTERLEAVE
+            or gate_up_interleave is True
+        ):
+            # The a16w4 FlyDSL stage 1 launches with w_layout="standard" and no
+            # bias argument for every activation (moe_kernels.py), and neither
+            # property is part of the row key, so the check covers every caller
+            # -- including non-Swiglu matches through the activation-disabled
+            # fallback. CK-Tile handles both, so these calls keep the route
+            # they had without a row.
+            cfg = None
+            logger.warning(
+                "[fused_moe] discarding a16w4 FlyDSL tuned config for a call with "
+                "per-expert bias or interleaved gate/up weights; using default "
+                "heuristics"
+            )
+        elif (
+            kn1.startswith("flydsl_moe1_abf16_wfp4_")
+            and block_size_M is not None
+            and int(block_size_M) != int(cfg["block_m"])
+        ):
+            # moe_sorting runs with the caller's block_size_M, which is not part of
+            # the row key. Stage 1 takes its tile from the kernel name and checks
+            # nothing; stage 2 then raises "sorting layout mismatch". CK-Tile gets
+            # block_m at call time, so these calls keep the route they had without
+            # a row. The a16w4 prefix leaves a16w16 rows to their ValueError guard.
+            logger.warning(
+                f"[fused_moe] discarding a16w4 FlyDSL tuned config: block_size_M="
+                f"{block_size_M} differs from the row's block_m={cfg['block_m']}; "
+                "using default heuristics"
+            )
+            cfg = None
         elif _disable_inline_sort and _is_inline_sort_cfg(kn1, kn2):
             cfg = None
             logger.warning("[fused_moe] discarding tuned inline-sort config")
@@ -6299,6 +6335,7 @@ def fused_moe_2stages(
         config_file=_metadata_config_file,
         input_dtype=hidden_states.dtype,
         _has_input_activation_scales=a1_scale is not None,
+        block_size_M=block_size_M,
     )
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)
