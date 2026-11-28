@@ -757,6 +757,15 @@ _paged_attention_kernel(const int* block_table_seq,
                 const int vlocal_token_idx =
                     rowid * VTOKENS_PER_LANE + vfetch_depth * CONTIGUOUS_KV_ELEMS_16B_LOAD;
 
+#if defined(__gfx950__)
+                if constexpr(sizeof(cache_t) == 2)
+                {
+                    Vlocal[vtoken_depth][vhe_depth][vfetch_depth] =
+                        lds_read_transposed_b16x8<n_thread_per_block * 16>(
+                            vlds_ptr, vlocal_token_idx, warpid * 16, lane16id);
+                    continue;
+                }
+#endif
                 // read data points individually and save them into array
                 cache_t elems[CONTIGUOUS_KV_ELEMS_16B_LOAD];
                 for(int d2 = 0; d2 < CONTIGUOUS_KV_ELEMS_16B_LOAD; ++d2)
@@ -2091,6 +2100,15 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
                 const int vlocal_token_idx =
                     rowid * VTOKENS_PER_LANE + vfetch_depth * CONTIGUOUS_KV_ELEMS_16B_LOAD;
 
+#if defined(__gfx950__)
+                if constexpr(sizeof(cache_t) == 2)
+                {
+                    Vlocal[vtoken_depth][vhe_depth][vfetch_depth] =
+                        lds_read_transposed_b16x8<n_thread_per_block * 16>(
+                            vlds_ptr, vlocal_token_idx, warpid * 16, lane16id);
+                    continue;
+                }
+#endif
                 // read data points individually and save them into array
                 cache_t elems[CONTIGUOUS_KV_ELEMS_16B_LOAD];
                 for(int d2 = 0; d2 < CONTIGUOUS_KV_ELEMS_16B_LOAD; ++d2)
