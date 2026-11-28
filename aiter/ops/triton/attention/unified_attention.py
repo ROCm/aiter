@@ -399,6 +399,46 @@ def _gfx12_prefill_fill(params: _UAParams, prgms: int, block_q: int):
     )
 
 
+def _head_split(params: _UAParams):
+    """(128, 64) for a 192-wide QK head, else (0, 0).
+
+    The Triton kernels then run Q.K as two dots, over 128 and 64 columns, instead
+    of one dot over the head padded to 256. Enabled only where it has been measured:
+    gfx950, BF16/FP16 query and KV cache, no sliding window, unshuffled KV cache.
+    """
+    if (
+        DEVICE_ARCH != "gfx950"
+        or params.head_size != 192
+        or params.sliding_window > 0
+        or params.shuffled_kv_cache
+        or params.q_dtype not in (torch.bfloat16, torch.float16)
+        or params.kv_cache_dtype not in (torch.bfloat16, torch.float16)
+    ):
+        return 0, 0
+    return 128, 64
+
+
+_VERIFY_3D_MAX_Q = 16
+
+
+def _keep_3d_for_verify(params: _UAParams):
+    """Short multi-token queries (spec-decode verify) under the head-192 split keep
+    the 3D kernel at any batch size.
+
+    The 2D grid gives every query block its own walk over the whole context, and its
+    attn_2d entry packs one query per block at 16 query heads per KV head, so a verify
+    of 8 tokens reads the context 8 times; the 3D attn_3d entry packs 4 per block.
+    Past the 4-programs-per-CU switch (about 114 sequences of 8 tokens) the 2D kernel
+    measured 2.0-3.2x slower than 3D on MI355X, at 8K to 128K context.
+    """
+    return (
+        not params.all_decode
+        and params.max_seqlen_q <= _VERIFY_3D_MAX_Q
+        and params.max_seqlen_k > 512
+        and _head_split(params) != (0, 0)
+    )
+
+
 def use_2d_kernel(params: _UAParams, backend: str = "triton"):
     # if IS_DEVICE_ARCH_GFX12, use 3D for decode, and for short (spec-decode verify)
     # queries while their rows are too few to fill the 2D grid; 2D otherwise, unless
@@ -454,6 +494,9 @@ def use_2d_kernel(params: _UAParams, backend: str = "triton"):
 
     if params.head_size >= 512 and not get_arch().is_rdna and not params.all_decode:
         return True
+
+    if _keep_3d_for_verify(params):
+        return False
 
     gate = params.target_num_prgms
     if DEVICE_ARCH == "gfx1100":
@@ -1031,6 +1074,7 @@ def _unified_attention_2d_triton(params: _UAParams):
         ), "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
 
     config = get_unified_attention_config("attn_2d", params, backend="triton")
+    head_lo, head_hi = _head_split(params)
     config["BLOCK_M"] = max(
         config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)
     )
@@ -1095,6 +1139,8 @@ def _unified_attention_2d_triton(params: _UAParams):
         ALL_DECODE=params.all_decode,
         SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
         K_WIDTH=params.k_width,
+        HEAD_SIZE_LO=head_lo,
+        HEAD_SIZE_HI=head_hi,
         **config,
         enable_fp_fusion=True,
     )
@@ -1110,6 +1156,7 @@ def _unified_attention_3d_triton(
 ):
     _reject_nvfp4_kv_on_triton(params)
     config = get_unified_attention_config("attn_3d", params, backend="triton")
+    head_lo, head_hi = _head_split(params)
     config["BLOCK_M"] = max(
         config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)
     )
@@ -1150,6 +1197,8 @@ def _unified_attention_3d_triton(
         block_table_stride=params.block_table.stride(0),
         query_stride_0=params.q.stride(0),
         query_stride_1=params.q.stride(1),
+        segm_output_stride_0=segm_output.stride(0),
+        segm_output_stride_1=segm_output.stride(1),
         qq_bias_stride_0=params.qq_bias.stride(0) if params.use_qq_bias else 0,
         BLOCK_SIZE=params.block_size,
         HEAD_SIZE=params.head_size,
@@ -1178,6 +1227,8 @@ def _unified_attention_3d_triton(
         IS_KV_FP8=(params.kv_cache_dtype == e4m3_dtype),
         NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         TILE_SIZE=TILE_SIZE,
+        HEAD_SIZE_LO=head_lo,
+        HEAD_SIZE_HI=head_hi,
         **config,
         enable_fp_fusion=True,
     )
