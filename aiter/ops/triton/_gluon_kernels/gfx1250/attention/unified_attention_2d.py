@@ -2486,6 +2486,370 @@ def attention_loop_tensor_subtile_split(
     return M, L, acc
 
 
+
+# LOOP_VARIANT 3 (attention_loop_fp8_folded)
+_P_FP8_SCALE = gl.constexpr(256.0)  # fp8 P is fed to the PV WMMA as P * 256
+_P_FP8_LOG2 = gl.constexpr(8.0)  # log2(_P_FP8_SCALE)
+
+
+@gluon.jit
+def _row_max_shift(M, qk, QK_scale, P_SHIFT: gl.constexpr):
+    """LOOP_VARIANT 2's row-max update, returning the score offset with the fp8 P scale folded in.
+
+    Returns (M, alpha, m_ij_scaled): alpha = exp2((M_old - M_new) * QK_scale) as in variant 2, and
+    m_ij_scaled = M_new * QK_scale - P_SHIFT, so exp2(s * QK_scale - m_ij_scaled) = 2^P_SHIFT * p.
+    """
+    m = reduce_max_prop_nan(qk, -1)
+    m_ij = elementwise_max_prop_nan(M, m)
+    m_ij_scaled = m_ij * QK_scale
+    alpha = gl.exp2(M * QK_scale - m_ij_scaled)
+    return m_ij, alpha, m_ij_scaled - P_SHIFT
+
+
+@gluon.jit
+def attention_loop_fp8_folded(
+    pgm,
+    kv_loader,
+    q,
+    M,
+    L,
+    acc0,
+    acc1,
+):
+    """LOOP_VARIANT 3: LOOP_VARIANT 2 with fp8 P computed pre-scaled by 256 (_P_FP8_SCALE).
+
+    P = exp2(s - M) lies in (0, 1]; cast to e4m3, every p < 2^-9 flushes to zero and p < 2^-6 keeps fewer
+    mantissa bits, which loses the long tail of a long-context softmax.  The scale is folded into the
+    exponent, exp2(x + 8) = 256 * exp2(x) (exact, a power of 2), so it costs no per-score multiply: the
+    per-row offset carries it.  The running sum L is scaled by the same 256 (the sink term at entry, then
+    the row sums of the scaled P), so acc / L and the split-KV partials are unchanged.  P * 256 <= 256 <
+    448 (e4m3 max).  bf16 P: identical to variant 2.
+    On draft-base1111 (where variant 2 multiplied P by 256 before the cast) this was 10-17% faster per call
+    for gpt-oss-120B 70k prefill (fp8, BLOCK_M 256), with identical error.
+
+    Pipeline (unchanged from LOOP_VARIANT 2):
+    Per iter (one WMMA + one softmax slice per stage):
+        stage 1: QK-0 + SM1-A
+        stage 2: QK-1 + SM1-B
+        stage 3: PV-0 + SM0-A
+        stage 4: PV-1 + SM0-B
+    """
+    cfg: gl.constexpr = pgm.cfg
+    MERGE_LOOP_TDM_WAITS: gl.constexpr = cfg.NUM_BUFFERS == 3
+    MERGE_EPI_TDM_WAITS: gl.constexpr = cfg.NUM_BUFFERS == 3
+
+    QK_scale = pgm.QK_scale
+    FOLD: gl.constexpr = q.dtype.is_fp8()  # an NVFP4 K never gets here (static_assert: variants 0-2)
+    if FOLD:
+        P_SHIFT: gl.constexpr = _P_FP8_LOG2
+        L = L * _P_FP8_SCALE  # the sink term, in the units of the scaled P
+    else:
+        P_SHIFT: gl.constexpr = 0.0
+
+    # Buffer rotation: tile m lives in slot m%N (K and V use disjoint LDS regions).
+    #   buf_tile_cur   -> tile j     ( j   %N)
+    #   buf_tile_next  -> tile j+1   ((j+1)%N)
+    #   buf_tile_next2 -> tile j+2   ((j+2)%N); aliases buf_tile_cur when N=2
+    physical_block_idx = kv_loader.load_block_ids(pgm.tile_start)
+    next_physical_block_idx = kv_loader.load_block_ids(pgm.tile_start + 1)
+    next2_physical_block_idx = kv_loader.load_block_ids(pgm.tile_start + 2)
+    next3_physical_block_idx = kv_loader.load_block_ids(pgm.tile_start + 3)
+
+    buf_tile_cur: gl.int32 = 0
+    buf_tile_next: gl.int32 = 1
+    if cfg.NUM_BUFFERS == 3:
+        buf_tile_next2: gl.int32 = 2
+    else:
+        buf_tile_next2: gl.int32 = 0  # aliases buf_tile_cur
+
+    # ---- Prologue ----
+    kv_loader.load_k_to_shared(physical_block_idx, buffer_id=buf_tile_cur)
+    kv_loader.load_k_to_shared(next_physical_block_idx, buffer_id=buf_tile_next)
+    kv_loader.load_v_to_shared(physical_block_idx, buffer_id=buf_tile_cur)
+
+    k = kv_loader.load_k_from_shared(
+        later="KV", wait_count=2, buffer_id=buf_tile_cur, target_dtype=q.dtype
+    )
+    # NVFP4 K: its scales come with K (the wait covered both TDM ops) and travel with it
+    k_scales = kv_loader.load_k_scales_from_shared(buffer_id=buf_tile_cur)
+    kv_loader.load_k_to_shared(next2_physical_block_idx, buffer_id=buf_tile_next2)
+    kv_loader.load_v_to_shared(next_physical_block_idx, buffer_id=buf_tile_next)
+
+    k0_s, k1_s = pgm.split_subtile(k)
+    if cfg.KV_NVFP4:
+        ks0, ks1 = pgm.split_k_scales(k_scales)
+        qk0 = pgm.compute_qk_subtile(k0_s, ks0)
+        qk1 = pgm.compute_qk_subtile(k1_s, ks1)
+    else:
+        qk0 = pgm.compute_qk_subtile(k0_s)
+        qk1 = pgm.compute_qk_subtile(k1_s)
+    if cfg.CAUSAL and pgm.tile_start >= pgm.safe_tile_end:
+        qk0 = pgm.apply_mask_qk_subtile(qk0, pgm.tile_start, 0)
+        qk1 = pgm.apply_mask_qk_subtile(qk1, pgm.tile_start, 1)
+
+    # FP8: qk_layout (K from HEAD_SIZE) and pv_layout (K from TILE_SIZE) can carry
+    # different WMMA instr_shape K dims. Relabel QK to pv_layout (trivial no-op)
+    qk0 = gl.convert_layout(qk0, cfg.pv_layout, assert_trivial=True)
+    qk1 = gl.convert_layout(qk1, cfg.pv_layout, assert_trivial=True)
+    qk = pgm.concat_subtile(qk0, qk1)
+    M, alpha, m_ij_scaled = _row_max_shift(M, qk, QK_scale, P_SHIFT)
+
+    k = kv_loader.load_k_from_shared(
+        later="VKV", wait_count=3, buffer_id=buf_tile_next, target_dtype=q.dtype
+    )
+    if cfg.KV_NVFP4:
+        k_scales = kv_loader.load_k_scales_from_shared(buffer_id=buf_tile_next)
+
+    qk0_shifted = qk0 * QK_scale - m_ij_scaled[:, None]
+    qk1_shifted = qk1 * QK_scale - m_ij_scaled[:, None]
+    p0 = gl.exp2(qk0_shifted)
+
+    # ---- Steady-state loop ----
+    # Loop carry from prev iter / prologue: p0, qk1_shifted, alpha, M, k (full K of tile j+1).
+    # At iter j entry 3 TDMs outstanding: V_j, K_{j+2}, V_{j+1}.
+    # Merged: one async_wait(1) drains V_j + K_{j+2}; V_{j+1} stays pending into next iter.
+    tile_end = gl.maximum(3, pgm.tile_end)
+    for j in range(pgm.tile_start, tile_end - 3):
+        next4_physical_block_idx = kv_loader.load_block_ids(j + 4)
+
+        if MERGE_LOOP_TDM_WAITS:
+            gl.amd.gfx1250.tdm.async_wait(1)
+        k0_s, k1_s = pgm.split_subtile(k)
+        if cfg.KV_NVFP4:
+            ks0, ks1 = pgm.split_k_scales(k_scales)
+
+        # --- S1: QK sub 0 + SM1-A ---
+        if cfg.KV_NVFP4:
+            qk0 = pgm.compute_qk_subtile(k0_s, ks0)
+        else:
+            qk0 = pgm.compute_qk_subtile(k0_s)
+        if MERGE_LOOP_TDM_WAITS and cfg.NUM_BUFFERS == 3:
+            kv_loader.load_k_to_shared(
+                next3_physical_block_idx,
+                buffer_id=buf_tile_cur if cfg.NUM_BUFFERS == 3 else buf_tile_next,
+            )
+            kv_loader.load_v_to_shared(
+                next2_physical_block_idx, buffer_id=buf_tile_next2
+            )
+        v = kv_loader.load_v_from_shared(
+            later="KV",
+            wait_count=2,
+            buffer_id=buf_tile_cur,
+            target_dtype=q.dtype,
+            skip_wait=MERGE_LOOP_TDM_WAITS,
+        )
+        p1 = gl.exp2(qk1_shifted)
+        acc0 = acc0 * alpha[:, None]
+        acc1 = acc1 * alpha[:, None]
+
+        v0_s, v1_s = pgm.split_subtile(v)
+        if not MERGE_LOOP_TDM_WAITS or cfg.NUM_BUFFERS == 2:
+            # N=2: K store must land after K ds_load so the prior ds_read has drained
+            kv_loader.load_k_to_shared(
+                next3_physical_block_idx,
+                buffer_id=buf_tile_cur if cfg.NUM_BUFFERS == 3 else buf_tile_next,
+            )
+
+        # --- S2: QK sub 1 + SM1-B ---
+        if cfg.KV_NVFP4:
+            qk1 = pgm.compute_qk_subtile(k1_s, ks1)
+        else:
+            qk1 = pgm.compute_qk_subtile(k1_s)
+        p = pgm.concat_subtile(p0, p1)
+        l_ij = gl.sum(p, 1)
+        L = L * alpha + l_ij
+        p = p.to(q.dtype)
+        k = kv_loader.load_k_from_shared(
+            later="VK",
+            wait_count=2,
+            buffer_id=buf_tile_next2,
+            target_dtype=q.dtype,
+            skip_wait=MERGE_LOOP_TDM_WAITS,
+        )
+        if cfg.KV_NVFP4:
+            k_scales = kv_loader.load_k_scales_from_shared(buffer_id=buf_tile_next2)
+
+        # --- S3: PV sub 0 + SM0-A ---
+        acc0 = pgm.compute_pv(p, v0_s, acc0)
+        qk0 = gl.convert_layout(qk0, cfg.pv_layout, assert_trivial=True)
+        qk1 = gl.convert_layout(qk1, cfg.pv_layout, assert_trivial=True)
+        qk = pgm.concat_subtile(qk0, qk1)
+        M, alpha, m_ij_scaled = _row_max_shift(M, qk, QK_scale, P_SHIFT)
+        if not MERGE_LOOP_TDM_WAITS or cfg.NUM_BUFFERS == 2:
+            kv_loader.load_v_to_shared(
+                next2_physical_block_idx, buffer_id=buf_tile_next2
+            )
+
+        # --- S4: PV sub 1 + SM0-B ---
+        acc1 = pgm.compute_pv(p, v1_s, acc1)
+        qk0_shifted = qk0 * QK_scale - m_ij_scaled[:, None]
+        qk1_shifted = qk1 * QK_scale - m_ij_scaled[:, None]
+        p0 = gl.exp2(qk0_shifted)
+
+        next2_physical_block_idx, next3_physical_block_idx = (
+            next3_physical_block_idx,
+            next4_physical_block_idx,
+        )
+        if cfg.NUM_BUFFERS == 3:
+            buf_tile_cur, buf_tile_next, buf_tile_next2 = (
+                buf_tile_next,
+                buf_tile_next2,
+                buf_tile_cur,
+            )
+        else:
+            buf_tile_cur, buf_tile_next, buf_tile_next2 = (
+                buf_tile_next,
+                buf_tile_cur,
+                buf_tile_next,
+            )
+
+    # ---- Epilogue (3 remaining tiles: L=tile_end-3, L+1, L+2) ----
+    if MERGE_EPI_TDM_WAITS:
+        gl.amd.gfx1250.tdm.async_wait(1)
+    epilogue_t_2 = tile_end - 2
+    epilogue_t_3 = tile_end - 1
+    if cfg.NUM_BUFFERS == 3 and MERGE_EPI_TDM_WAITS:
+        kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_tile_next2)
+
+    k0_s, k1_s = pgm.split_subtile(k)
+    if cfg.KV_NVFP4:
+        ks0, ks1 = pgm.split_k_scales(k_scales)
+
+    # --- S1: QK sub 0 for L+1 + SM1-A for L ---
+    if cfg.KV_NVFP4:
+        qk0 = pgm.compute_qk_subtile(k0_s, ks0)
+    else:
+        qk0 = pgm.compute_qk_subtile(k0_s)
+    p1 = gl.exp2(qk1_shifted)
+    acc0 = acc0 * alpha[:, None]
+    acc1 = acc1 * alpha[:, None]
+
+    if cfg.CAUSAL and epilogue_t_2 >= pgm.safe_tile_end:
+        qk0 = pgm.apply_mask_qk_subtile(qk0, epilogue_t_2, 0)
+    v_wait: gl.constexpr = 2
+    v = kv_loader.load_v_from_shared(
+        later="KV",
+        wait_count=v_wait,
+        buffer_id=buf_tile_cur,
+        target_dtype=q.dtype,
+        skip_wait=MERGE_EPI_TDM_WAITS,
+    )
+
+    # --- S2: QK sub 1 for L+1 + SM1-B for L ---
+    if cfg.KV_NVFP4:
+        qk1 = pgm.compute_qk_subtile(k1_s, ks1)
+    else:
+        qk1 = pgm.compute_qk_subtile(k1_s)
+    if cfg.CAUSAL and epilogue_t_2 >= pgm.safe_tile_end:
+        qk1 = pgm.apply_mask_qk_subtile(qk1, epilogue_t_2, 1)
+    p = pgm.concat_subtile(p0, p1)
+    l_ij = gl.sum(p, 1)
+    L = L * alpha + l_ij
+    p = p.to(q.dtype)
+
+    if cfg.NUM_BUFFERS == 2 or not MERGE_EPI_TDM_WAITS:
+        kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_tile_next2)
+    v0_s, v1_s = pgm.split_subtile(v)
+    k = kv_loader.load_k_from_shared(
+        later="VV",
+        wait_count=2,
+        buffer_id=buf_tile_next2,
+        target_dtype=q.dtype,
+        skip_wait=MERGE_EPI_TDM_WAITS,
+    )
+    if cfg.KV_NVFP4:
+        k_scales = kv_loader.load_k_scales_from_shared(buffer_id=buf_tile_next2)
+
+    # --- S3: PV sub 0 for L + SM0 for L+1 ---
+    acc0 = pgm.compute_pv(p, v0_s, acc0)
+    qk0 = gl.convert_layout(qk0, cfg.pv_layout, assert_trivial=True)
+    qk1 = gl.convert_layout(qk1, cfg.pv_layout, assert_trivial=True)
+    qk = pgm.concat_subtile(qk0, qk1)
+    M, alpha, m_ij_scaled = _row_max_shift(M, qk, QK_scale, P_SHIFT)
+
+    # --- S4: PV sub 1 for L + SM0-B for L+1 ---
+    acc1 = pgm.compute_pv(p, v1_s, acc1)
+    qk0_shifted = qk0 * QK_scale - m_ij_scaled[:, None]
+    qk1_shifted = qk1 * QK_scale - m_ij_scaled[:, None]
+    p0_next = gl.exp2(qk0_shifted)
+
+    if MERGE_EPI_TDM_WAITS:
+        gl.amd.gfx1250.tdm.async_wait(0)
+
+    v = kv_loader.load_v_from_shared(
+        later="V",
+        wait_count=1,
+        buffer_id=buf_tile_next,
+        target_dtype=q.dtype,
+        skip_wait=MERGE_EPI_TDM_WAITS,
+    )
+
+    k0_s, k1_s = pgm.split_subtile(k)
+    if cfg.KV_NVFP4:
+        ks0, ks1 = pgm.split_k_scales(k_scales)
+
+    # --- S1: QK sub 0 for L+2 + SM1-A for L+1 ---
+    if cfg.KV_NVFP4:
+        qk0 = pgm.compute_qk_subtile(k0_s, ks0)
+    else:
+        qk0 = pgm.compute_qk_subtile(k0_s)
+    acc0 = acc0 * alpha[:, None]
+    acc1 = acc1 * alpha[:, None]
+    p1_next = gl.exp2(qk1_shifted)
+    p = pgm.concat_subtile(p0_next, p1_next)
+
+    qk0 = pgm.apply_mask_qk_subtile(qk0, epilogue_t_3, 0)
+
+    # --- S2: QK sub 1 for L+2 + SM1-B for L+1 ---
+    if cfg.KV_NVFP4:
+        qk1 = pgm.compute_qk_subtile(k1_s, ks1)
+    else:
+        qk1 = pgm.compute_qk_subtile(k1_s)
+    l_ij = gl.sum(p, 1)
+    L = L * alpha + l_ij
+    p = p.to(q.dtype)
+    qk1 = pgm.apply_mask_qk_subtile(qk1, epilogue_t_3, 1)
+
+    v0_s, v1_s = pgm.split_subtile(v)
+
+    # --- S3: PV sub 0 for L+1 + SM0 for L+2 ---
+    acc0 = pgm.compute_pv(p, v0_s, acc0)
+    qk0 = gl.convert_layout(qk0, cfg.pv_layout, assert_trivial=True)
+    qk1 = gl.convert_layout(qk1, cfg.pv_layout, assert_trivial=True)
+    qk = pgm.concat_subtile(qk0, qk1)
+    M, alpha, m_ij_scaled = _row_max_shift(M, qk, QK_scale, P_SHIFT)
+
+    v = kv_loader.load_v_from_shared(
+        later="",
+        wait_count=0,
+        buffer_id=buf_tile_next2,
+        target_dtype=q.dtype,
+        skip_wait=MERGE_EPI_TDM_WAITS,
+    )
+    # --- S4: PV sub 1 for L+1 + SM0-B for L+2 ---
+    acc1 = pgm.compute_pv(p, v1_s, acc1)
+    qk0_shifted = qk0 * QK_scale - m_ij_scaled[:, None]
+    qk1_shifted = qk1 * QK_scale - m_ij_scaled[:, None]
+    p0_next = gl.exp2(qk0_shifted)
+    p1_next = gl.exp2(qk1_shifted)
+    p = pgm.concat_subtile(p0_next, p1_next)
+
+    # ---- Final SM1 + PV for L+2 ----
+    acc0 = acc0 * alpha[:, None]
+    l_ij = gl.sum(p, 1)
+    L = L * alpha + l_ij
+    p = p.to(q.dtype)
+
+    v0_s, v1_s = pgm.split_subtile(v)
+    acc0 = pgm.compute_pv(p, v0_s, acc0)
+    acc1 = acc1 * alpha[:, None]
+
+    acc1 = pgm.compute_pv(p, v1_s, acc1)
+    acc = pgm.concat_subtile(acc0, acc1)
+
+    return M, L, acc
+
+
 @gluon.jit
 def load_q(
     cfg,
@@ -2955,10 +3319,10 @@ def _unified_attention_gluon_kernel_2d(
         acc = gl.zeros([BLOCK_M, HEAD_SIZE], dtype=gl.float32, layout=cfg.pv_layout)
         M, L, acc = attention_loop_reordered(pgm, kv_loader, q, M, L, acc)
 
-    else:
+    elif LOOP_VARIANT == 2:
         gl.static_assert(
             (NUM_BUFFERS == 2) | (NUM_BUFFERS == 3),
-            "For loop variant 3, NUM_BUFFERS should be 2 or 3",
+            "For loop variant 2, NUM_BUFFERS should be 2 or 3",
         )
         # Variants 1/2 only mask the last 2 tiles; anything needing more must
         # route to variant 0. Only matters for the causal prefill path.
@@ -2974,6 +3338,34 @@ def _unified_attention_gluon_kernel_2d(
             [BLOCK_M, HEAD_SIZE // 2], dtype=gl.float32, layout=cfg.pv_layout
         )
         M, L, acc = attention_loop_tensor_subtile_split(
+            pgm,
+            kv_loader,
+            q,
+            M,
+            L,
+            acc0,
+            acc1,
+        )
+
+    else:
+        gl.static_assert(LOOP_VARIANT == 3, "LOOP_VARIANT must be 0, 1, 2 or 3")
+        gl.static_assert(
+            (NUM_BUFFERS == 2) | (NUM_BUFFERS == 3),
+            "For loop variant 3, NUM_BUFFERS should be 2 or 3",
+        )
+        # Same masking limits as variant 2 (variant 3 is variant 2 with a pre-scaled fp8 P).
+        if cfg.CAUSAL and not cfg.ALL_DECODE:
+            gl.static_assert(
+                cfg.NUM_MASKED_TILES <= 2,
+                "loop variant 3 handles <=2 masked tiles; use loop variant 0",
+            )
+        acc0 = gl.zeros(
+            [BLOCK_M, HEAD_SIZE // 2], dtype=gl.float32, layout=cfg.pv_layout
+        )
+        acc1 = gl.zeros(
+            [BLOCK_M, HEAD_SIZE // 2], dtype=gl.float32, layout=cfg.pv_layout
+        )
+        M, L, acc = attention_loop_fp8_folded(
             pgm,
             kv_loader,
             q,
