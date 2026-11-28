@@ -5,7 +5,8 @@
 
 Inputs follow the DSA indexer prefill call: Q ``[seq_len, 32, 128]`` FP8,
 contiguous KV ``[seq_len_kv, 128]`` FP8 with per-key FP32 scales, and causal
-windows for one sequence whose last ``seq_len`` tokens are the queries.
+windows for one sequence whose last ``seq_len`` tokens are the queries. When
+``seq_len > seq_len_kv`` the KV is pooled and each window grows in pooled units.
 """
 
 from __future__ import annotations
@@ -42,13 +43,20 @@ def build_inputs(seq_len, seq_len_kv, heads=HEADS, head_dim=HEAD_DIM, seed=0):
     kv_fp8 = (kv.float() / scale[:, None]).to(dtypes.fp8)
     q_fp8 = q.to(dtypes.fp8)
     rows = torch.arange(seq_len, dtype=torch.int32)
+    if seq_len > seq_len_kv:
+        # Pooled KV (one key per seq_len // seq_len_kv tokens, as in GLM-5.3-Flash):
+        # vLLM's indexer grows each query's bound in pooled units, so row i sees
+        # (i + 1) * seq_len_kv // seq_len keys and the last row sees all of them.
+        cu_ends = (rows + 1) * seq_len_kv // seq_len
+    else:
+        cu_ends = rows + (seq_len_kv - seq_len + 1)
     return {
         "Q": q_fp8,
         "KV": kv_fp8,
         "kv_scales": scale.contiguous(),
         "weights": torch.randn((seq_len, heads), dtype=torch.float32),
         "cu_starts": torch.zeros((seq_len,), dtype=torch.int32),
-        "cu_ends": rows + (seq_len_kv - seq_len + 1),
+        "cu_ends": cu_ends,
         "q_ref": q_fp8.float(),
         "kv_ref": kv_fp8.float() * scale[:, None],
     }
