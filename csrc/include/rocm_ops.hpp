@@ -2804,6 +2804,35 @@ namespace py = pybind11;
           py::arg("use_sigmoid") = false,                  \
           "Fused Gated RMSNorm + FP8 Per-Token Quantization");
 
+#define M3_TP1_NORM_PYBIND                                                              \
+    m.def("m3_tp1_norm_mx",                                                             \
+          &aiter::m3_tp1_norm_mx,                                                       \
+          "MiniMax-M3.1 TP1 Gemma add+RMSNorm with MXFP8 / MXFP4 epilogues (gfx950)",   \
+          py::arg("x"),                                                                 \
+          py::arg("flags"),                                                             \
+          py::arg("s_add"),                                                             \
+          py::arg("res"),                                                               \
+          py::arg("w"),                                                                 \
+          py::arg("res_out"),                                                           \
+          py::arg("out_bf16"),                                                          \
+          py::arg("q8"),                                                                \
+          py::arg("s8"),                                                                \
+          py::arg("q4"),                                                                \
+          py::arg("s4"),                                                                \
+          py::arg("eps"),                                                               \
+          py::arg("m"),                                                                 \
+          py::arg("n"),                                                                 \
+          py::arg("s8_w4"));
+
+#define M3_TP1_MX8_QUANT_PYBIND                                                         \
+    m.def("m3_tp1_mx8_quant",                                                           \
+          &aiter::m3_tp1_mx8_quant,                                                     \
+          "MiniMax-M3.1 TP1 MXFP8 activation quant (gfx950)",                           \
+          py::arg("x"),                                                                 \
+          py::arg("q"),                                                                 \
+          py::arg("s"),                                                                 \
+          py::arg("w4"));
+
 #define MHC_PYBIND                                \
     AITER_SET_STREAM_PYBIND;                      \
     m.def("mhc_pre_gemm_sqrsum",                  \

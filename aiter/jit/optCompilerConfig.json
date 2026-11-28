@@ -1036,6 +1036,37 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
+    "module_m3_tp1_norm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/m3_tp1_norm_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/m3_tp1/norm_mx.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-ffast-math'",
+            "f'-DOPUS_FP32_to_BF16_DEFAULT={os.environ.get(\"OPUS_FP32_to_BF16_DEFAULT\", 5)}'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/include/opus'"
+        ],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
+    "module_m3_tp1_mx8_quant": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/m3_tp1_mx8_quant_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/m3_tp1/mx8_quant.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
     "module_gated_rmsnorm_quant": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/gated_rmsnorm_quant_kernels.cu'",
