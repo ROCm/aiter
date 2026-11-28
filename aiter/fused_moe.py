@@ -170,6 +170,12 @@ def swiglu_limit_tag(swiglu_limit):
 
 
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
+# Opt-in gfx950 ASM stage 2 for one MXFP4 a4w4 shape (aiter/ops/asm/moe_stage2_mxfp4_t1.py).
+_MXFP4_MOE_STAGE2_T1 = os.environ.get("AITER_MXFP4_MOE_STAGE2_T1", "0") == "1"
+if _MXFP4_MOE_STAGE2_T1:
+    from aiter.ops.asm.moe_stage2_mxfp4_t1 import check_installed
+
+    check_installed()
 # (num_experts, topk) pairs the HIP kernel is instantiated for; must stay in
 # sync with AITER_MXFP4_SORT_QUANT_ROUTES in moe_sorting_opus_kernels.cu.
 _FUSED_DECODE_SORT_QUANT_ROUTES = {(512, 10), (513, 11)}
@@ -3506,6 +3512,28 @@ def _mxfp4_a4w4_stage2_fw(
     # kernelName2's format selects the gemm2 family: a flydsl_moe2_layout name
     # means path B (v2 gemm2 behind the mxmoe front-end), else native mxmoe.
     cfg = parse_g2_kname_any(kernelName2)
+    if _MXFP4_MOE_STAGE2_T1:
+        from aiter.ops.asm.moe_stage2_mxfp4_t1 import moe_stage2_mxfp4_t1
+
+        if moe_stage2_mxfp4_t1(
+            inter_states,
+            w2,
+            sorted_token_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_out,
+            topk,
+            w2_scale=w2_scale,
+            a2_scale=a2_scale,
+            block_m=block_m,
+            sorted_weights=sorted_weights,
+            topk_weights=topk_weights,
+            bias2=bias2,
+            reverse_sorted=reverse_sorted,
+            use_valid_token_count=use_valid_token_count,
+            atomic=cfg["atomic"],
+        ):
+            return moe_out
     # Read inter_real BEFORE any w2.view() drops the attr. The flydsl port reads
     # D_INTER directly (D_INTER_REAL handles the unpadded shard); no K-pad needed.
     inter_real = getattr(w2, "inter_real", None)
