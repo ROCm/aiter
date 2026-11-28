@@ -6,6 +6,14 @@ SHARD_TOTAL=${SHARD_TOTAL:-5}
 SHARD_IDX=${SHARD_IDX:-0}
 export CLANG_TOOLCHAIN_PROGRAM_TIMEOUT="${CLANG_TOOLCHAIN_PROGRAM_TIMEOUT:-300}"
 
+# FlyDSL AOT cache: re-trace every entry a test loads from disk and compare it
+# byte for byte with the cached object, so an input missing from a cache key
+# fails here rather than loading a stale kernel in production. A failure to
+# load an entry also fails. A launch with no prebuilt entry takes the JIT path
+# (logged as an error): only a prebuild builds entries, so a test shape the
+# wheel's prebuild did not cover is not checked here.
+export AITER_FLYDSL_AOT_CACHE="${AITER_FLYDSL_AOT_CACHE:-verify}"
+
 # Avoid per-invocation hipcc native arch probing (can timeout under heavy JIT
 # parallelism) by resolving the current GPU arch once for this job.
 if [[ -z "${GPU_ARCHS:-}" ]]; then
@@ -55,6 +63,7 @@ skip_tests=(
     "op_tests/multigpu_tests/triton_test/test_reduce_scatter_all_gather.py"
     "op_tests/multigpu_tests/triton_test/test_fused_rs_rmsnorm_quant_ag.py"
     "op_tests/multigpu_tests/flydsl_allreduce_bench.py"
+    "op_tests/multigpu_tests/bench_fused_ar_rms_gemma.py"
 )
 
 # When AITER_TEST is set, files are already the exact list for this shard (from artifact).
@@ -125,6 +134,11 @@ for file in "${sharded_files[@]}"; do
         op_tests/test_mla_v4_nm.py)
             # The test cases are pytest functions; the script entry point is an
             # opt-in perf sweep that exits 0 without running anything by default.
+            test_cmd=(timeout 60m python3 -m pytest -q "$file")
+            ;;
+        op_tests/test_mla_nvfp4.py|op_tests/test_mla_nvfp4_decode_prep.py)
+            # The test cases are pytest functions; test_mla_nvfp4.py has no script
+            # entry point and the decode prep's is a benchmark. Both skip off gfx1250.
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
             ;;
         op_tests/multigpu_tests/bench_mega_moe.py)
