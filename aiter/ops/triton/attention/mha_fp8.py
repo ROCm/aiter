@@ -1,3 +1,4 @@
+import functools
 import math
 
 import torch
@@ -9,9 +10,14 @@ from aiter.ops.triton._gluon_kernels.gfx950.attention.mha_fp8 import (
     _mha_varlen_fp8_combine,
     _mha_varlen_fwd_fp8,
 )
-from aiter.ops.triton._gluon_kernels.gfx1250.attention.mha_fp8 import _mha_fwd_subtiled
+from aiter.ops.triton._gluon_kernels.gfx1250.attention.mha_fp8 import (
+    _mha_fwd_subtiled,
+    _mha_varlen_fwd_kernel,
+)
+from aiter.ops.triton.attention.utils import lse_merge
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
+from aiter.ops.triton.utils.device_info import get_num_sms
 
 
 def get_mha_fwd_config(seqlen_q, seqlen_k, causal) -> dict:
@@ -56,6 +62,48 @@ def get_wmma_layouts(BLOCK_M, head_dim_pow2, num_warps):
         instr_shape=[16, 16, wmma_kwidth],
     )
     return WMMA_LAYOUT_QK, WMMA_LAYOUT_O
+
+
+def get_mha_varlen_config(causal, seqlen_k, total_q, num_heads) -> dict:
+    cfg_dir = resolve_config_dir("attention", "MHA", backend="gluon")
+    configs = load_config_json(f"{cfg_dir}/DEFAULT.json")["varlen"]
+    if causal:
+        cfg = configs["causal"]
+        programs = -(-total_q // cfg["BLOCK_M"]) * num_heads
+        num_sms = get_num_sms()
+        if programs < num_sms or (
+            programs < 2 * num_sms and seqlen_k <= configs["causal_small_max_seqlen_k"]
+        ):
+            cfg = configs["causal_small"]
+        elif seqlen_k >= configs["causal_long_min_seqlen_k"]:
+            cfg = configs["causal_long"]
+        return dict(cfg, NUM_SPLITS=1)
+    if seqlen_k <= configs["short_max_seqlen_k"]:
+        return dict(configs["short"], NUM_SPLITS=1)
+    cfg = dict(configs["default"], NUM_SPLITS=1)
+    programs = -(-total_q // cfg["BLOCK_M"]) * num_heads
+    while (
+        cfg["NUM_SPLITS"] < configs["split_kv_max_num_splits"]
+        and programs * cfg["NUM_SPLITS"] * 2 <= get_num_sms()
+        and seqlen_k // (cfg["NUM_SPLITS"] * 2 * cfg["BLOCK_N"])
+        >= configs["split_kv_min_tiles_per_split"]
+    ):
+        cfg["NUM_SPLITS"] *= 2
+    return cfg
+
+
+@functools.cache
+def _mha_varlen_layouts(block_m, num_warps):
+    """WMMA layouts of the 128-dim QK and PV products and of the 64 PE dims."""
+    layout = get_wmma_layouts(block_m, 128, num_warps)[0]
+    layout_pe = gl.amd.AMDWMMALayout(
+        3,
+        transposed=True,
+        warp_bases=layout.warp_bases,
+        reg_bases=layout.reg_bases,
+        instr_shape=[16, 16, 64],
+    )
+    return layout, layout_pe
 
 
 def mha_fwd(
@@ -209,6 +257,200 @@ def mha_fwd(
     return o
 
 
+def _descale_strides(t: torch.Tensor, name: str, rows: int, heads: int, device):
+    assert (
+        t.dtype == torch.float32 and t.device == device
+    ), f"{name} must be float32 on {device}, got {t.dtype} on {t.device}"
+    if t.numel() == 1:
+        return (0, 0)
+    assert t.shape == (
+        rows,
+        heads,
+    ), f"{name} must have one element or be [{rows}, {heads}], got {list(t.shape)}"
+    return t.stride()
+
+
+def _mha_varlen_fwd_gfx1250(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    q_descale,
+    k_descale,
+    v_descale,
+    softmax_scale,
+    causal,
+    return_lse,
+    out,
+    lse,
+    config,
+    k_pe,
+    o_init,
+    lse_init,
+):
+    D_NOPE, D_PE = 128, 64
+    if k_pe is None:
+        assert (
+            k.dim() == 3 and k.shape[2] == D_NOPE + D_PE
+        ), f"k must be [T, H, {D_NOPE + D_PE}] when k_pe is not given, got {list(k.shape)}"
+        k, k_pe = k[..., :D_NOPE], k[..., D_NOPE:]
+    for t in (q, k, v, k_pe):
+        assert t.dtype == torch.float8_e4m3fn and t.dim() == 3
+        assert t.device == q.device, "q, k, v and k_pe must be on the same device"
+    total_q, num_heads, _ = q.shape
+    num_k_heads, head_dim_v = k.shape[1], v.shape[2]
+    num_seqs = cu_seqlens_q.numel() - 1
+    assert (
+        q.shape[2] == D_NOPE + D_PE and k.shape[2] == D_NOPE and k_pe.shape[2] == D_PE
+    ), f"needs d_qk {D_NOPE + D_PE} with {D_PE} rope dims, got q {list(q.shape)}"
+    assert head_dim_v in (64, 128), f"d_v must be 64 or 128, got {head_dim_v}"
+    assert v.shape[:2] == k.shape[:2], "v must have the tokens and heads of k"
+    assert k_pe.shape[0] == k.shape[0] and k_pe.shape[1] in (1, num_k_heads)
+    assert num_heads % num_k_heads == 0
+    for cu in (cu_seqlens_q, cu_seqlens_k):
+        assert (
+            cu.dtype == torch.int32 and cu.is_contiguous() and cu.device == q.device
+        ), "cu_seqlens_q and cu_seqlens_k must be contiguous int32 on the device of q"
+    assert cu_seqlens_k.numel() == cu_seqlens_q.numel(), "cu_seqlens sizes differ"
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+    assert softmax_scale >= 0, "softmax_scale must not be negative"
+    has_scales = q_descale is not None
+    assert (k_descale is not None) == has_scales and (
+        v_descale is not None
+    ) == has_scales, "give all of q_descale, k_descale and v_descale, or none"
+    if has_scales:
+        qs_strides = _descale_strides(
+            q_descale, "q_descale", num_seqs, num_heads, q.device
+        )
+        ks_strides = _descale_strides(
+            k_descale, "k_descale", num_seqs, num_k_heads, q.device
+        )
+        vs_strides = _descale_strides(
+            v_descale, "v_descale", num_seqs, num_k_heads, q.device
+        )
+        assert vs_strides == ks_strides, "v_descale must have the strides of k_descale"
+    else:
+        qs_strides = ks_strides = (0, 0)
+    if out is None:
+        out = q.new_empty((total_q, num_heads, head_dim_v), dtype=torch.bfloat16)
+    assert out.shape == (
+        total_q,
+        num_heads,
+        head_dim_v,
+    ), f"out must be [{total_q}, {num_heads}, {head_dim_v}], got {list(out.shape)}"
+    for t in (q, k, v, k_pe, out):
+        assert t.data_ptr() % 16 == 0 and t.stride(-1) == 1
+        assert all(s * t.element_size() % 16 == 0 for s in t.stride()[:-1])
+    assert (o_init is None) == (lse_init is None), "give o_init and lse_init together"
+    if lse is None and (return_lse or o_init is not None):
+        lse = torch.empty((num_heads, total_q), dtype=torch.float32, device=q.device)
+    if lse is not None:
+        assert lse.shape == (num_heads, total_q) and lse.dtype == torch.float32
+        assert lse.stride(-1) == 1
+    if o_init is not None:
+        if o_init.data_ptr() != out.data_ptr():
+            out.copy_(o_init)
+        if lse_init.data_ptr() != lse.data_ptr():
+            lse.copy_(lse_init)
+    if total_q == 0 or num_seqs == 0:
+        return (out, lse) if return_lse else out
+
+    cfg = get_mha_varlen_config(causal, max_seqlen_k, total_q, num_heads)
+    cfg.update(config or {})
+    BLOCK_M, num_splits = cfg["BLOCK_M"], cfg["NUM_SPLITS"]
+    qblk_per_seq = -(-max_seqlen_q // BLOCK_M)
+    num_qblk = total_q // BLOCK_M + num_seqs
+    if 0 < num_seqs * qblk_per_seq <= num_qblk:
+        num_qblk = num_seqs * qblk_per_seq
+    else:
+        qblk_per_seq = 0
+    if num_splits > 1:
+        # One partial per split. lse_merge also merges o_init as one more partial.
+        num_parts = num_splits + (o_init is not None)
+        o_k = torch.empty(
+            (num_parts, total_q, num_heads, head_dim_v),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        lse_k = torch.empty(
+            (num_parts, num_heads, total_q), dtype=torch.float32, device=q.device
+        )
+        if o_init is not None:
+            o_k[num_splits].copy_(out)
+            lse_k[num_splits].copy_(lse)
+    else:
+        o_k = out.unsqueeze(0)
+        lse_k = (out if lse is None else lse).unsqueeze(0)
+    wmma_layout, wmma_layout_pe = _mha_varlen_layouts(BLOCK_M, cfg["num_warps"])
+    fast_rowsum = bool(cfg.get("ROWSUM_MMA", lse is None and o_init is None))
+    _mha_varlen_fwd_kernel[(num_qblk * num_heads, num_splits)](
+        q,
+        k,
+        k_pe,
+        v,
+        o_k,
+        lse_k,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        q_descale if has_scales else q,
+        k_descale if has_scales else q,
+        v_descale if has_scales else q,
+        q.stride(0),
+        q.stride(1),
+        k.stride(0),
+        k.stride(1),
+        v.stride(0),
+        v.stride(1),
+        k_pe.stride(0),
+        0 if k_pe.shape[1] == 1 else k_pe.stride(1),
+        o_k.stride(1),
+        o_k.stride(2),
+        o_k.stride(0),
+        lse_k.stride(1),
+        lse_k.stride(2),
+        lse_k.stride(0),
+        *qs_strides,
+        *ks_strides,
+        softmax_scale,
+        num_seqs,
+        num_heads,
+        num_heads // num_k_heads,
+        qblk_per_seq,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=cfg["BLOCK_N"],
+        HEAD_DIM=D_NOPE,
+        PE_DIM=D_PE,
+        HEAD_DIM_V=head_dim_v,
+        CAUSAL=causal,
+        NUM_SPLITS=num_splits,
+        RETURN_LSE=num_splits > 1 or lse is not None,
+        HAS_INIT=num_splits == 1 and o_init is not None,
+        HAS_SCALES=has_scales,
+        WMMA_LAYOUT=wmma_layout,
+        WMMA_LAYOUT_PE=wmma_layout_pe,
+        PV_SPLIT_K=fast_rowsum,
+        ROWSUM_MMA=fast_rowsum,
+        NUM_K_BUFFERS=int(cfg.get("NUM_K_BUFFERS", 3)),
+        EARLY_K=bool(cfg.get("EARLY_K", True)),
+        num_warps=cfg["num_warps"],
+        waves_per_eu=cfg["waves_per_eu"],
+        enable_fp_fusion=True,
+    )
+    if num_splits > 1:
+        lse_merge(
+            o_k,
+            lse_k,
+            out.unsqueeze(0),
+            None if lse is None else lse.unsqueeze(0),
+            row_bounds=cu_seqlens_q,
+        )
+    return (out, lse) if return_lse else out
+
+
 def _get_varlen_config(causal: bool) -> dict:
     cfg_dir = resolve_config_dir("attention", "MHA", backend="gluon")
     configs = load_config_json(f"{cfg_dir}/DEFAULT.json")["fwd_varlen_fp8"]
@@ -236,8 +478,11 @@ def mha_varlen_fwd(
     out: torch.Tensor | None = None,
     lse: torch.Tensor | None = None,
     config: dict | None = None,
+    k_pe: torch.Tensor | None = None,
+    o_init: torch.Tensor | None = None,
+    lse_init: torch.Tensor | None = None,
 ):
-    """FP8 varlen MHA forward (gfx950).
+    """FP8 varlen MHA forward (gfx950, gfx1250).
 
     Args:
         q, k: [T, H, d_qk] float8_e4m3fn. v: [T, H, d_v] float8_e4m3fn. The last dim is contiguous.
@@ -254,14 +499,42 @@ def mha_varlen_fwd(
         out, lse: optional preallocated outputs.
         config: optional kernel config. The default comes from the JSON config.
 
+        k_pe, o_init, lse_init: gfx1250 only; separate k rope dims, and a prior (out, lse) to merge.
     Returns:
         out [Tq, H, d_v] bfloat16, and with ``return_lse`` also lse [H, Tq] float32 (natural log,
         -inf for a row that sees no key).
 
-    Limits: gfx950 only. d_v must be 128. d_qk - d_v, the rope part, must be 0 or 64.
+    Limits: gfx950: d_v 128, rope 0 or 64. gfx1250: d_qk 192 (64 rope), d_v 64 or 128.
     """
     arch = get_arch()
-    assert arch == "gfx950", f"mha_varlen_fwd is only supported on gfx950, got {arch}"
+    if arch == "gfx1250":
+        return _mha_varlen_fwd_gfx1250(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            q_descale,
+            k_descale,
+            v_descale,
+            softmax_scale,
+            causal,
+            return_lse,
+            out,
+            lse,
+            config,
+            k_pe,
+            o_init,
+            lse_init,
+        )
+    assert (
+        arch == "gfx950"
+    ), f"mha_varlen_fwd is only supported on gfx950 and gfx1250, got {arch}"
+    assert (
+        k_pe is None and o_init is None and lse_init is None
+    ), "k_pe, o_init and lse_init are only supported on gfx1250"
     assert q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn
     Tq, H, DQK = q.shape
     DV = v.shape[-1]
