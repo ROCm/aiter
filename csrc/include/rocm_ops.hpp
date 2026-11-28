@@ -2833,6 +2833,25 @@ namespace py = pybind11;
           py::arg("s"),                                                                 \
           py::arg("w4"));
 
+#define M3_TP1_MOE_G2_PYBIND                                                            \
+    m.def("m3_tp1_moe_g2",                                                              \
+          &aiter::m3_tp1_moe_g2,                                                        \
+          "MiniMax-M3.1 TP1 ragged-tile MXFP4 MoE GEMM2, per-route bf16 rows (gfx950)", \
+          py::arg("a2"),                                                                \
+          py::arg("a2_scale"),                                                          \
+          py::arg("w2_b"),                                                              \
+          py::arg("w2_bs"),                                                             \
+          py::arg("sorted_ids"),                                                        \
+          py::arg("sorted_weights"),                                                    \
+          py::arg("sorted_expert_ids"),                                                 \
+          py::arg("num_valid_ids"),                                                     \
+          py::arg("cnt"),                                                               \
+          py::arg("tiles"),                                                             \
+          py::arg("ntiles"),                                                            \
+          py::arg("out"),                                                               \
+          py::arg("m"),                                                                 \
+          py::arg("topk"));
+
 #define MHC_PYBIND                                \
     AITER_SET_STREAM_PYBIND;                      \
     m.def("mhc_pre_gemm_sqrsum",                  \

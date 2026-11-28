@@ -30,4 +30,21 @@ void m3_tp1_norm_mx(const aiter_tensor_t& x, // [m, n] bf16, [m, 4, n] with RED4
 // bf16 [rows, K] -> e4m3 [rows, K] + e8m0 scales, row-major [rows, K / 32] or shuffle_scale_w4.
 void m3_tp1_mx8_quant(const aiter_tensor_t& x, aiter_tensor_t& q, aiter_tensor_t& s, bool w4);
 
+// MoE GEMM2 (H 6144, I 3072, sort block 128) on ragged 256-row expert tiles: the per-route bf16
+// rows out[token, slot] of aiter's v2 "reduce" GEMM2. cnt / tiles / ntiles: tile-list scratch.
+void m3_tp1_moe_g2(const aiter_tensor_t& a2,                // [sorted, 1536] MXFP4, GEMM1's output
+                   const aiter_tensor_t& a2_scale,          // its sorted, shuffled e8m0 scales
+                   const aiter_tensor_t& w2_b,              // relayout_w2 weight bytes
+                   const aiter_tensor_t& w2_bs,             // relayout_w2 scale bytes
+                   const aiter_tensor_t& sorted_ids,        // [sorted] int32, token | slot << 24
+                   const aiter_tensor_t& sorted_weights,    // [sorted] fp32
+                   const aiter_tensor_t& sorted_expert_ids, // [sorted / 128] int32
+                   const aiter_tensor_t& num_valid_ids,     // [>= 1] int32
+                   aiter_tensor_t& cnt,                     // [>= sorted / 128] int32
+                   aiter_tensor_t& tiles,                   // [>= sorted / 128, 4] int32
+                   aiter_tensor_t& ntiles,                  // [>= 1] int32
+                   aiter_tensor_t& out,                     // [m, topk, 6144] bf16
+                   int64_t m,
+                   int64_t topk);
+
 } // namespace aiter
