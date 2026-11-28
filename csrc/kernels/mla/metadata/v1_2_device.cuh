@@ -1036,10 +1036,15 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
             max_blocks =
                 aiter::warpReduce<aiter::MaxFunctor, int32_t, opus::get_warp_size()>(max_blocks);
 
-            // At x = max(bpf, max_blocks) every batch is one group, and num_batches fits w_lo
-            // waves, so the search below always ends on a fitting x.
+            // Wave counts searched: w_lo is the fewest waves that can hold every batch as one
+            // group (at x = max(bpf, max_blocks) every batch is one group, and num_batches fits
+            // w_lo waves, so the search below always ends on a fitting x); w_hi is the wave count
+            // the budget's own cut needs. raw_groups is groups_at(bpf), bpf is the search's floor,
+            // so from w_hi on x_w = bpf and the cost w * (bpf + overhead) only grows: more waves
+            // than w_hi never pay, and trying every count in [w_lo, w_hi] (one binary search over
+            // x each) makes the pick exact (max: empty batches take no fragment).
             const int32_t w_lo = integer_divide_ceil(num_batches, wave_groups);
-            const int32_t w_hi = min(integer_divide_ceil(raw_groups, wave_groups), w_lo + 3);
+            const int32_t w_hi = max(w_lo, integer_divide_ceil(raw_groups, wave_groups));
             int32_t best_x     = bpf;
             int32_t best_cost  = 0x7fffffff;
             for(int32_t w = w_lo; w <= w_hi; ++w)
