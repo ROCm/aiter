@@ -14,11 +14,13 @@ from aiter.ops import attention
 from aiter.ops.attention import (
     _MLA_ASM_STATUSES,
     _MLA_BACKENDS,
+    MLA_DECODE_KERNEL_HEAD_COUNTS,
     MlaAsmStatus,
     MlaBackend,
     _mla_decode_head_plan,
     _mla_decode_launch_plan,
     decode_update_mla_metadata_v1,
+    get_mla_decode_num_heads,
     get_mla_decode_shape_support,
     mla_decode_asm_query,
 )
@@ -206,6 +208,73 @@ def test_gfx1250_flydsl_ps1_backend(monkeypatch):
     assert support(128, 1, flydsl_ps1=True).backend is MlaBackend.FLYDSL_PS1
     s = support(64, 1, flydsl_ps1=True, fast_mode=False)
     assert (s.backend, s.fold_factor, s.supported) == (MlaBackend.FLYDSL_PS1, 4, False)
+
+
+def test_decode_num_heads(monkeypatch):
+    monkeypatch.delenv("AITER_MLA_DECODE_PS1_ASM", raising=False)
+    bf16 = torch.bfloat16
+
+    def heads(n, msq, **kw):
+        # A gfx1250 DCP decode: round-robin KV shards, LSE for the merge.
+        return get_mla_decode_num_heads(
+            *(n, msq, bf16, bf16),
+            arch="gfx1250",
+            enable_experimental=False,
+            flydsl_ps1=True,
+            return_lse=True,
+            cp_world_size=8,
+            cp_round_robin=True,
+            **kw,
+        )
+
+    # Kept if it runs, else padded to the next that does (PS1: 16/32 heads up
+    # to qlen 4, 64 up to qlen 2, 96 at any qlen).
+    assert [heads(16, q) for q in (1, 4, 5)] == [16, 16, 96]
+    assert [heads(64, q) for q in (2, 3, 9)] == [64, 96, 96]
+    assert heads(65, 1) == 96
+    # A folded PS1 route does not count (fast_mode=False folds 64 and 96).
+    assert heads(64, 1, fast_mode=False) == 128
+    # Every answer is one the shape query says runs.
+    for n, q in itertools.product((1, 16, 33, 64, 96), (1, 3, 8)):
+        h = heads(n, q)
+        s = get_mla_decode_shape_support(
+            h,
+            q,
+            bf16,
+            bf16,
+            arch="gfx1250",
+            enable_experimental=False,
+            flydsl_ps1=True,
+            return_lse=True,
+            cp_world_size=8,
+            cp_round_robin=True,
+        )
+        assert h >= n and s.supported is not False, (n, q, h, s.reasons)
+        assert h == n or h in MLA_DECODE_KERNEL_HEAD_COUNTS, (n, q, h)
+
+    # HK (gfx950, experimental) ignores q/kv scales: never counted.
+    fp8 = torch.float8_e4m3fn
+    hk = {"arch": "gfx950", "enable_experimental": True}
+    s = get_mla_decode_shape_support(128, 1, fp8, fp8, **hk)
+    assert (s.backend, s.supported) == (MlaBackend.HK, None), s.reasons
+    assert get_mla_decode_num_heads(128, 1, fp8, fp8, **hk) is None
+
+    # OPUS (as in test_opus_cp): counted only where its rules accept the call.
+    monkeypatch.setenv("AITER_MLA_USE_OPUS", "1")
+    get_mla_decode_shape_support.cache_clear()
+    opus = {"cp_world_size": 4, "arch": "gfx950", "enable_experimental": False}
+    try:
+        s = get_mla_decode_shape_support(16, 1, fp8, fp8, cp_round_robin=True, **opus)
+        assert (s.backend, s.supported) == (MlaBackend.OPUS, None), s.reasons
+        assert (
+            get_mla_decode_num_heads(16, 1, fp8, fp8, cp_round_robin=True, **opus) == 16
+        )
+        for dtype, rr in ((fp8, False), (bf16, True)):
+            h = get_mla_decode_num_heads(16, 1, dtype, dtype, cp_round_robin=rr, **opus)
+            assert h is None or h > 16, (dtype, rr, h)
+    finally:
+        monkeypatch.delenv("AITER_MLA_USE_OPUS")
+        get_mla_decode_shape_support.cache_clear()
 
 
 def test_ps1_asm_cprr_kernel(monkeypatch):

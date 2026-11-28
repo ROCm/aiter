@@ -2760,6 +2760,48 @@ get_mla_decode_shape_support.cache_clear = (  # type: ignore[attr-defined]
     _get_mla_decode_shape_support_cached.cache_clear
 )
 
+# Head counts get_mla_decode_num_heads pads to. Source of truth: the widths the
+# decode backends are built for (per-arch asm tables, FlyDSL / OPUS kernels).
+MLA_DECODE_KERNEL_HEAD_COUNTS = (16, 32, 64, 96, 128)
+
+# JIT routes (no availability table) whose supported=None counts as running.
+# HK is left out: it ignores q_scale and kv_scale.
+_MLA_DECODE_JIT_BACKENDS_THAT_RUN = (MlaBackend.FLYDSL_PS1, MlaBackend.OPUS)
+
+
+def get_mla_decode_num_heads(
+    num_heads: int,
+    max_seqlen_qo: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    **kwargs,
+) -> int | None:
+    """The first of num_heads and the wider MLA_DECODE_KERNEL_HEAD_COUNTS that runs.
+
+    For a caller that pads its query heads (e.g. a DCP gather). Each candidate
+    goes through get_mla_decode_shape_support with kwargs, which must describe
+    the call the caller will make (return_lse, cp_world_size, ...). It runs if
+    supported is True, or None on a FlyDSL PS1 / OPUS route. None if no
+    candidate up to 128 runs.
+
+    "Runs" is the shape rules' answer with their limits (MlaDecodeShapeSupport);
+    nothing is launched. Narrower counts some arches accept (gfx950 fp8: 8 and
+    12 heads) are not tried, and fewer heads are not always faster.
+    """
+    for heads in sorted(
+        {num_heads, *(n for n in MLA_DECODE_KERNEL_HEAD_COUNTS if n > num_heads)}
+    ):
+        s = get_mla_decode_shape_support(
+            heads, max_seqlen_qo, q_dtype, kv_dtype, **kwargs
+        )
+        if s.supported or (
+            s.supported is None
+            and s.asm_status is MlaAsmStatus.NOT_ASM
+            and s.backend in _MLA_DECODE_JIT_BACKENDS_THAT_RUN
+        ):
+            return heads
+    return None
+
 
 @compile_ops("module_mla_metadata")
 def mla_metadata_cluster_multiplier_v1(
