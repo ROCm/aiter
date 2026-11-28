@@ -9,6 +9,11 @@ gemm_a8w8_mxfp8_bpreshuffle and checks it against an fp32 reference.
 Both gfx950 and gfx1250 read row-major x_scale [M, K/32]. gfx950 reads
 row-major w_scale [N, K/32]; gfx1250 reads 32x4 shuffled w_scale, as laid out
 by shuffle_mxfp8_bpreshuffle_scale (whose layout test_w_scale_layout checks).
+
+On gfx950 it also runs the 8-wave kernel with preshuffled
+(aiter.ops.shuffle.shuffle_scale, flattened) x/w scales over the shapes given by
+-mnk_preshuffled: the result must equal the row-major-scale result bit for bit,
+rows of a partial 32-row scale group included.
 """
 
 import argparse
@@ -26,7 +31,7 @@ from aiter.ops import shuffle
 from aiter.ops.gemm_op_a8w8 import _get_mxfp8_bpreshuffle_config
 from aiter.ops.quant import per_group_quant_hip
 from aiter.ops.shuffle import shuffle_mxfp8_bpreshuffle_scale, shuffle_weight
-from aiter.test_common import benchmark, checkAllclose, perftest
+from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
 
 # Shapes for a gfx950 without tuned rows: DeepSeek-V3 dense projections, ragged M included.
 DEFAULT_MNK_GFX950 = [
@@ -34,6 +39,13 @@ DEFAULT_MNK_GFX950 = [
     for n, k in ((2112, 7168), (7168, 2048), (24576, 1536), (7168, 16384))
     for m in (1, 16, 37, 64, 300, 1024, 4096)
 ]
+# MiniMax-M3.1 TP1 qkv, o_proj, shared gate_up / down, and M 1, 17, 37 in one M tile;
+# M % 32 != 0 (and N=6160 for w_scale) leaves rows in a partial 32-row scale group.
+PRESHUFFLED_MNK = [
+    (m, n, k)
+    for n, k in ((9856, 6144), (6144, 8192), (6144, 6144), (6144, 3072))
+    for m in (1000, 3001, 8191, 8192, 16384)
+] + [(1024, 6160, 3072), (1, 6144, 3072), (17, 7168, 2048), (37, 2112, 7168)]
 
 # gfx950, untuned K that 128 does not divide: no mxpsh tile runs it, so the
 # entry falls back to the batched GEMM's heuristic (DeepSeek-V4.1's
@@ -88,6 +100,41 @@ def test_gemm(m, n, k, dtype=dtypes.bf16):
     }
 
 
+@benchmark()
+def test_gemm_8wave_preshuffled_scales(m, n, k):
+    from aiter.ops.flydsl.gemm_a8w8_mxfp8_8wave import flydsl_mxfp8_8wave_gemm
+
+    x = torch.randn(m, k).to(dtypes.fp8)
+    weight = (torch.randn(n, k) * 0.02).to(dtypes.fp8)
+    # A scale per row and 32-K group: a row read with a wrong (or zero) scale shows.
+    x_scale = torch.randint(124, 131, (m, k // 32), dtype=torch.uint8)
+    w_scale = torch.randint(122, 127, (n, k // 32), dtype=torch.uint8)
+    x_scale, w_scale = x_scale.view(dtypes.fp8_e8m0), w_scale.view(dtypes.fp8_e8m0)
+    ref = run_torch(x, x_scale, weight, w_scale, (1, 32))
+    weight = shuffle_weight(weight, layout=(16, 16))
+    candidates = {
+        "row": (x_scale, w_scale),
+        "preshuffled": (
+            shuffle.shuffle_scale(x_scale).view(-1),
+            shuffle.shuffle_scale(w_scale).view(-1),
+        ),
+    }
+    ret, outs = {}, {}
+    for name, (xs, ws) in candidates.items():
+        out = torch.full((m, n), float("nan"), dtype=dtypes.bf16)
+        outs[name], us = run_perftest(flydsl_mxfp8_8wave_gemm, x, weight, xs, ws, out)
+        err = checkAllclose(ref, outs[name].float(), msg=f"{name} M={m} N={n} K={k}: ")
+        assert err == 0, f"{name} M={m} N={n} K={k}: {err:.2%} off the fp32 reference"
+        ret[f"{name} us"] = round(us, 2)
+        ret[f"{name} TFLOPS"] = round(2 * m * n * k / us / 1e6, 1)
+        ret[f"{name} TB/s"] = round((m * k + n * k + m * n * 2) / us / 1e6, 2)
+        ret[f"{name} err"] = err
+    assert torch.equal(
+        outs["preshuffled"], outs["row"]
+    ), f"M={m} N={n} K={k}: preshuffled scales differ from row-major scales"
+    return ret
+
+
 def test_w_scale_layout(n=64, kb=16):
     """[N, K/32] e8m0: gfx1250 family at n32k4 offsets, gfx950 unchanged; bad shapes raise."""
     w_scale = torch.randint(0, 255, (n, kb), dtype=torch.uint8, device="cpu")
@@ -136,6 +183,14 @@ if __name__ == "__main__":
         help="""M,N,K shapes; default: every tuned shape of this arch.
         e.g.: -mnk 512,7168,16384 1000,65536,1536""",
     )
+    parser.add_argument(
+        "-mnk_preshuffled",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=PRESHUFFLED_MNK,
+        help="""M,N,K shapes of the gfx950 8-wave preshuffled-scale check.
+        e.g.: -mnk_preshuffled 3001,9856,6144""",
+    )
     args = parser.parse_args()
 
     test_w_scale_layout()
@@ -147,3 +202,8 @@ if __name__ == "__main__":
             shapes = shapes + RAGGED_K_MNK_GFX950
         df = pd.DataFrame([test_gemm(*mnk) for mnk in shapes])
         aiter.logger.info(f"gemm_a8w8_mxfp8_bpreshuffle summary:\n{df.to_markdown()}")
+    if get_gfx() == "gfx950":
+        df = pd.DataFrame(
+            [test_gemm_8wave_preshuffled_scales(*mnk) for mnk in args.mnk_preshuffled]
+        )
+        aiter.logger.info(f"8-wave preshuffled scales summary:\n{df.to_markdown()}")
