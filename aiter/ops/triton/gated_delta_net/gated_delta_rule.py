@@ -27,6 +27,9 @@ from aiter.ops.triton._triton_kernels.gated_delta_net import (
     chunk_gated_delta_rule_fwd_opt,
     chunk_gated_delta_rule_fwd_opt_vk,
 )
+from aiter.ops.triton._triton_kernels.gated_delta_net.gated_delta_rule_utils import (
+    get_gdn_decode_config,
+)
 from aiter.ops.triton._triton_kernels.gated_delta_net.utils import (
     GatedDeltaRulePrefillMetadata,
     l2norm_fwd,
@@ -167,7 +170,30 @@ def fused_recurrent_gated_delta_rule(
 
     # Calculate block sizes
     BK = triton.next_power_of_2(K)
-    BV = min(8, triton.next_power_of_2(V)) if gv is None else triton.next_power_of_2(V)
+    mode_key = (
+        "recurrent" if ((T > N) if cu_seqlens is not None else (T > 1)) else "decode"
+    )
+    num_state_bufs = int(initial_state is not None) + int(output_final_state)
+    state_elem_bytes = initial_state.element_size() if initial_state is not None else 4
+    state_kb = (max(1, num_state_bufs) * N * HV * K * V * state_elem_bytes) // 1024
+    cfg = get_gdn_decode_config("FUSED_RECURRENT_GATED_DELTA_RULE", mode_key, state_kb)
+
+    if cfg is not None:
+        cfg_bv, num_warps, num_stages, waves_per_eu = cfg
+        BV = (
+            min(triton.next_power_of_2(V), cfg_bv)
+            if gv is None
+            else triton.next_power_of_2(V)
+        )
+    else:
+        BV = (
+            min(8, triton.next_power_of_2(V))
+            if gv is None
+            else triton.next_power_of_2(V)
+        )
+        num_warps = 1
+        num_stages = 3
+        waves_per_eu = None
     NV = triton.cdiv(V, BV)
 
     # Prepare output tensors
@@ -175,6 +201,13 @@ def fused_recurrent_gated_delta_rule(
     final_state = (
         q.new_empty(N, HV, K, V, dtype=torch.float32) if output_final_state else None
     )
+
+    launch_kwargs = {
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+    }
+    if waves_per_eu is not None:
+        launch_kwargs["waves_per_eu"] = waves_per_eu
 
     # Launch kernel
     grid = (NV, N * HV)
@@ -201,8 +234,7 @@ def fused_recurrent_gated_delta_rule(
         BV=BV,
         IS_BETA_HEADWISE=beta.ndim != v.ndim,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
-        num_warps=1,
-        num_stages=3,
+        **launch_kwargs,
     )
 
     return o, final_state
