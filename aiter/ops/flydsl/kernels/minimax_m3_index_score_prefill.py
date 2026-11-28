@@ -105,8 +105,11 @@ from aiter.ops.flydsl.kernels.minimax_m3_index_score import (
 from aiter.ops.flydsl.kernels.tensor_shim import (
     _run_compiled,
     buf_copy_atom,
+    check_plan_operand,
+    current_raw_stream,
     ptr_arg,
     ptr_buf_tensor,
+    tensor_layout,
 )
 
 # MXFP4 index-cache layout, per token: packed e2m1 bytes and e8m0 scale bytes.
@@ -2380,6 +2383,87 @@ def score_prefill_flydsl(
     """
     import torch
 
+    bound = _bind_score_prefill(
+        idx_q,
+        cache,
+        block_table,
+        cu_seqlens_q,
+        seq_lens,
+        prefix_lens,
+        max_query_len,
+        max_seq_len,
+        sm_scale,
+        out,
+        k_scale,
+        nvfp4,
+    )
+    _launch_score_prefill(
+        bound,
+        idx_q,
+        cache,
+        k_scale,
+        torch.cuda.current_stream(idx_q.device).cuda_stream,
+    )
+    return bound.out
+
+
+class _BoundScorePrefill:
+    """What `_bind_score_prefill` resolved: the launcher, the output and every launch
+    argument that does not change from one layer to the next."""
+
+    __slots__ = ("arg_types", "dev", "k_fp4", "launch", "out", "tail")
+
+    def __init__(self, launch, out, dev, k_fp4, arg_types, tail):
+        self.launch = launch
+        self.out = out
+        self.dev = dev
+        self.k_fp4 = k_fp4
+        self.arg_types = (
+            arg_types  # FlyDSL element types of idx_q, then cache[, k_scale]
+        )
+        self.tail = (
+            tail  # arguments from the score pointer up to, not incl., the stream
+        )
+
+
+def _launch_score_prefill(bound, idx_q, cache, k_scale, stream):
+    """Launch `bound` on the operands that change per layer: only their pointers are
+    read, so they must have the layout `_bind_score_prefill` validated."""
+    import torch
+
+    if bound.k_fp4:
+        if getattr(cache, "dtype", None) == dtypes.fp4x2:
+            cache = cache.view(torch.uint8)
+        if getattr(k_scale, "dtype", None) == dtypes.fp8_e8m0:
+            k_scale = k_scale.view(torch.uint8)
+    ops = (idx_q, cache) if k_scale is None else (idx_q, cache, k_scale)
+    with torch.cuda.device(bound.dev):
+        _run_compiled(
+            bound.launch,
+            *[ptr_arg(t, d) for t, d in zip(ops, bound.arg_types)],
+            *bound.tail,
+            stream,
+        )
+
+
+def _bind_score_prefill(
+    idx_q,
+    cache,
+    block_table,
+    cu_seqlens_q,
+    seq_lens,
+    prefix_lens,
+    max_query_len,
+    max_seq_len,
+    sm_scale,
+    out,
+    k_scale,
+    nvfp4,
+):
+    """Validate one scorer call and resolve everything but the per-layer pointers.
+    Arguments as in `score_prefill_flydsl`."""
+    import torch
+
     total_q, heads, head_dim = idx_q.shape
     two_view = k_scale is not None
     k_fp4 = two_view and nvfp4 is None
@@ -2544,45 +2628,44 @@ def score_prefill_flydsl(
     # free, as those CTAs exit on the first bound check.
     chunks = -(-chunks // XCD_COUNT) * XCD_COUNT
     launch = _get(geom, idx_q.device, k_fp4, q_fp8, nvfp4)
-    q_arg = ptr_arg(idx_q, fx.Float8E4M3FN if q_fp8 else fx.BFloat16)
-    # The kernel's argument list differs: the MXFP4 one takes the scale view (and
-    # its page stride) after the data view, the fp8 one a token stride it ignores.
-    k_args = (
-        (ptr_arg(cache, fx.Uint8), ptr_arg(k_scale, fx.Uint8))
-        if two_view
-        else (ptr_arg(cache, fx.Float8E4M3FN),)
-    )
+    # The MXFP4 / NVFP4 kernel takes the scale view (and its page stride) after the
+    # data view, the fp8 one a token stride it ignores.
     k_strides = (
         (cache.stride(0), k_scale.stride(0))
         if two_view
         else (cache.stride(0), cache.stride(1))
     )
-    with torch.cuda.device(idx_q.device):
-        _run_compiled(
-            launch,
-            q_arg,
-            *k_args,
-            ptr_arg(out, fx.Float32),
-            ptr_arg(block_table, fx.Int32),
-            ptr_arg(cu_seqlens_q, fx.Int32),
-            ptr_arg(seq_lens, fx.Int32),
-            ptr_arg(prefix_lens, fx.Int32),
-            heads,
-            cb,
-            idx_q.stride(0),
-            idx_q.stride(1),
-            *k_strides,
-            out.stride(0),
-            out.stride(1),
-            out.stride(2),
-            block_table.stride(0),
-            scaled_f32,
-            q_tiles,
-            batch * heads,
-            chunks,
-            torch.cuda.current_stream(idx_q.device).cuda_stream,
-        )
-    return out
+    tail = (
+        ptr_arg(out, fx.Float32),
+        ptr_arg(block_table, fx.Int32),
+        ptr_arg(cu_seqlens_q, fx.Int32),
+        ptr_arg(seq_lens, fx.Int32),
+        ptr_arg(prefix_lens, fx.Int32),
+        heads,
+        cb,
+        idx_q.stride(0),
+        idx_q.stride(1),
+        *k_strides,
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        block_table.stride(0),
+        scaled_f32,
+        q_tiles,
+        batch * heads,
+        chunks,
+    )
+    return _BoundScorePrefill(
+        launch,
+        out,
+        idx_q.device,
+        k_fp4,
+        (
+            fx.Float8E4M3FN if q_fp8 else fx.BFloat16,
+            *((fx.Uint8, fx.Uint8) if two_view else (fx.Float8E4M3FN,)),
+        ),
+        tail,
+    )
 
 
 def score_prefill_flydsl_fp4(
@@ -2658,4 +2741,86 @@ def score_prefill_flydsl_nvfp4(
         out=out,
         k_scale=k_scale,
         nvfp4=k_round,
+    )
+
+
+class ScorePrefillPlan:
+    """`score_prefill_flydsl` with the validation done once. Built by
+    `make_score_prefill_plan`; `plan(idx_q, cache, k_scale=None)` then scores one
+    layer's operands into the plan's `out` and returns it."""
+
+    __slots__ = ("_batch", "_bound", "_checks")
+
+    def __init__(self, bound, checks, batch):
+        self._bound = bound
+        self._checks = checks
+        self._batch = batch  # keeps the tensors the launch holds raw pointers to
+
+    @property
+    def out(self):
+        return self._bound.out
+
+    def __call__(self, idx_q, cache, k_scale=None):
+        checks = self._checks
+        ops = (idx_q, cache) if k_scale is None else (idx_q, cache, k_scale)
+        if len(ops) != len(checks):
+            raise ValueError(f"plan takes {len(checks)} per-layer operands")
+        for t, (layout, alignment, name) in zip(ops, checks):
+            check_plan_operand(t, layout, alignment, name)
+        bound = self._bound
+        _launch_score_prefill(
+            bound, idx_q, cache, k_scale, current_raw_stream(bound.dev)
+        )
+        return bound.out
+
+
+def make_score_prefill_plan(
+    idx_q,
+    cache,
+    block_table,
+    cu_seqlens_q,
+    seq_lens,
+    prefix_lens,
+    max_query_len,
+    max_seq_len,
+    sm_scale,
+    out=None,
+    k_scale=None,
+    *,
+    nvfp4=None,
+):
+    """A launch plan for a forward pass: every layer scores into the same `out` with
+    the same ragged batch, so the checks, the geometry and the argument list are
+    resolved once and a layer's call only swaps the `idx_q`, `cache` (and `k_scale`)
+    pointers. Arguments, contract and results are those of `score_prefill_flydsl`;
+    `idx_q`, `cache` and `k_scale` here are one layer's operands, standing for the
+    layout of all of them.
+
+    `plan(idx_q, cache, k_scale=None)` raises ValueError unless each operand has the
+    dtype, device, shape and strides of the one the plan was built from and the same
+    base alignment; anything else needs a new plan. The plan holds the batch tensors
+    and `out` by pointer: a tensor reallocated between layers needs a new plan, and
+    their contents are read at launch, as in `score_prefill_flydsl`.
+    """
+    bound = _bind_score_prefill(
+        idx_q,
+        cache,
+        block_table,
+        cu_seqlens_q,
+        seq_lens,
+        prefix_lens,
+        max_query_len,
+        max_seq_len,
+        sm_scale,
+        out,
+        k_scale,
+        nvfp4,
+    )
+    ops = ((idx_q, 16, "idx_q"), (cache, 16, "cache"))
+    if k_scale is not None:
+        ops += ((k_scale, 4, "k_scale"),)
+    return ScorePrefillPlan(
+        bound,
+        tuple((tensor_layout(t), al, nm) for t, al, nm in ops),
+        (block_table, cu_seqlens_q, seq_lens, prefix_lens),
     )

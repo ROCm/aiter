@@ -315,6 +315,28 @@ def current_stream_arg(device=None):
     return fx.Stream(current_raw_stream(device))
 
 
+def tensor_layout(t: torch.Tensor):
+    """What a launch wrapper's validation reads off a tensor besides its contents:
+    dtype, device, shape and strides. Two tensors with an equal layout (and a base
+    address of the same alignment) pass or fail those checks alike, so a launch plan
+    validates one tensor and only compares this against the rest."""
+    return (t.dtype, t.device, t.shape, t.stride())
+
+
+def check_plan_operand(t, layout, alignment, name):
+    """Refuse a per-layer operand whose layout is not the one a launch plan was
+    built for (see `tensor_layout`) or whose base is misaligned."""
+    if (
+        not isinstance(t, torch.Tensor)
+        or tensor_layout(t) != layout
+        or t.data_ptr() % alignment
+    ):
+        raise ValueError(
+            f"{name}: expected the dtype, device, shape and strides the plan was "
+            f"built for and a {alignment}-byte aligned base; build a new plan"
+        )
+
+
 def ptr_arg(t: torch.Tensor, dtype=None):
     """Wrap a torch.Tensor as an fx.Pointer (PointerJitArg) for kernel launch."""
     if dtype is None:

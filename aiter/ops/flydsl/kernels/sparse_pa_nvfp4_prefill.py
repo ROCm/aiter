@@ -64,13 +64,17 @@ from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_common import (
     pk_f16,
     require,
     scales_up_to,
+    unit_scale,
     xlane4,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import (
     _run_compiled,
     buf_copy_load,
     buf_copy_store,
+    check_plan_operand,
+    current_raw_stream,
     ptr_buf_tensor,
+    tensor_layout,
 )
 
 TOPK = 16  # selected blocks per row (one lane per (row, slot): TQ x 16 <= 64 lanes)
@@ -536,6 +540,85 @@ def sparse_pa_nvfp4_prefill(
     device value, not checked). Block ids within a row should be distinct; a repeated id
     counts once per slot, as in decode (see the module docstring). ``rounds`` needs ``tq``.
     """
+    bound = _bind_sparse_pa_prefill(
+        q,
+        kv_cache,
+        topk_idx,
+        block_table,
+        row_req_id,
+        row_kv_lens,
+        sm_scale,
+        out,
+        k_scale,
+        v_scale,
+        tq,
+        rounds,
+    )
+    if bound.launch is not None:
+        _launch_sparse_pa_prefill(
+            bound,
+            q,
+            kv_cache,
+            topk_idx,
+            bound.out,
+            bound.ks,
+            bound.vs,
+            torch.cuda.current_stream(q.device),
+        )
+    return bound.out
+
+
+class _BoundSparsePaPrefill:
+    """What `_bind_sparse_pa_prefill` resolved: the launcher, the output, the global
+    scales and every launch argument that does not change from one layer to the next.
+    ``launch`` is None for an empty batch."""
+
+    __slots__ = ("batch_ptrs", "dev", "ks", "launch", "out", "tail", "vs")
+
+    def __init__(self, launch, out, ks, vs, dev, batch_ptrs, tail):
+        self.launch = launch
+        self.out = out
+        self.ks = ks
+        self.vs = vs
+        self.dev = dev
+        self.batch_ptrs = batch_ptrs  # block_table, row_req_id, row_kv_lens
+        self.tail = tail  # arguments from ``rows`` up to, not incl., the stream
+
+
+def _launch_sparse_pa_prefill(bound, q, kv_cache, topk_idx, out, ks, vs, stream):
+    """Launch `bound` on the operands that change per layer: only their pointers are
+    read (``topk_idx``'s strides are fixed in ``bound.tail``)."""
+    with torch.cuda.device(bound.dev):
+        _run_compiled(
+            bound.launch,
+            q.data_ptr(),
+            kv_cache.data_ptr(),
+            topk_idx.data_ptr(),
+            *bound.batch_ptrs,
+            out.data_ptr(),
+            ks.data_ptr(),
+            vs.data_ptr(),
+            *bound.tail,
+            stream,
+        )
+
+
+def _bind_sparse_pa_prefill(
+    q,
+    kv_cache,
+    topk_idx,
+    block_table,
+    row_req_id,
+    row_kv_lens,
+    sm_scale,
+    out,
+    k_scale,
+    v_scale,
+    tq,
+    rounds,
+):
+    """Validate one prefill call and resolve everything but the per-layer pointers.
+    Arguments as in `sparse_pa_nvfp4_prefill`."""
     if q.device.type != "cuda":
         raise ValueError(f"q must be a CUDA tensor, got {q.device}")
     arch = get_gfx_runtime()
@@ -547,7 +630,7 @@ def sparse_pa_nvfp4_prefill(
     if out is None:
         out = torch.empty_like(q)
     if rows == 0:
-        return out
+        return _BoundSparsePaPrefill(None, out, None, None, q.device, (), ())
     group = check_operands(q, out, kv_cache, topk_idx, block_table)
     require(topk_idx.shape[-1] == TOPK, f"topk_idx must have {TOPK} slots per row")
     require(block_table.shape[0] >= 1, "block_table needs at least one request row")
@@ -565,18 +648,14 @@ def sparse_pa_nvfp4_prefill(
     elif rounds is None:
         rounds = 2 if tq == 4 else 1
     ks, vs, c = host_scales(q, k_scale, v_scale, sm_scale)
-    with torch.cuda.device(q.device):
-        _run_compiled(
-            _get_kernel(tq, rounds, dev),
-            q.data_ptr(),
-            kv_cache.data_ptr(),
-            topk_idx.data_ptr(),
-            block_table.data_ptr(),
-            row_req_id.data_ptr(),
-            row_kv_lens.data_ptr(),
-            out.data_ptr(),
-            ks.data_ptr(),
-            vs.data_ptr(),
+    return _BoundSparsePaPrefill(
+        _get_kernel(tq, rounds, dev),
+        out,
+        ks,
+        vs,
+        q.device,
+        (block_table.data_ptr(), row_req_id.data_ptr(), row_kv_lens.data_ptr()),
+        (
             rows,
             num_heads,
             hkv,
@@ -586,6 +665,97 @@ def sparse_pa_nvfp4_prefill(
             block_table.stride(0),
             kv_cache.stride(0),
             c,
-            torch.cuda.current_stream(q.device),
+        ),
+    )
+
+
+class SparsePaPrefillPlan:
+    """`sparse_pa_nvfp4_prefill` with the validation done once. Built by
+    `make_sparse_pa_prefill_plan`; see there for the per-layer call."""
+
+    __slots__ = ("_batch", "_bound", "_layouts")
+
+    def __init__(self, bound, layouts, batch):
+        self._bound = bound
+        self._layouts = layouts
+        self._batch = batch  # keeps the tensors the launch holds raw pointers to
+
+    @property
+    def out(self):
+        return self._bound.out
+
+    def __call__(self, q, kv_cache, topk_idx, out=None, k_scale=None, v_scale=None):
+        bound = self._bound
+        if out is None:
+            out = bound.out
+        if bound.launch is None:
+            return out
+        lq, lkv, ltopk, lout = self._layouts
+        check_plan_operand(q, lq, 4, "q")
+        check_plan_operand(kv_cache, lkv, 4, "kv_cache")
+        check_plan_operand(topk_idx, ltopk, 1, "topk_idx")
+        check_plan_operand(out, lout, 4, "out")
+        # As in the plain call, a scale left out is one; host_scales cached it at build.
+        one = unit_scale(bound.dev.index)
+        ks = one if k_scale is None else k_scale
+        vs = one if v_scale is None else v_scale
+        for t in (ks, vs):
+            if t.device != bound.dev or t.dtype != torch.float32 or t.numel() != 1:
+                raise ValueError(
+                    "k_scale and v_scale must be one float32 element on q's device"
+                )
+        _launch_sparse_pa_prefill(
+            bound, q, kv_cache, topk_idx, out, ks, vs, current_raw_stream(bound.dev)
         )
-    return out
+        return out
+
+
+def make_sparse_pa_prefill_plan(
+    q,
+    kv_cache,
+    topk_idx,
+    block_table,
+    row_req_id,
+    row_kv_lens,
+    sm_scale,
+    out=None,
+    k_scale=None,
+    v_scale=None,
+    tq=None,
+    rounds=None,
+):
+    """A launch plan for a forward pass: the batch (``block_table``, ``row_req_id``,
+    ``row_kv_lens``), ``sm_scale`` and the tile are the same for every layer, so the
+    checks, the tile choice and the argument list are resolved once and a layer's call
+    only swaps pointers. Arguments, contract and results are those of
+    `sparse_pa_nvfp4_prefill`; ``q``, ``kv_cache``, ``topk_idx``, ``out`` and the
+    scales are one layer's operands, standing for the layout of all of them.
+
+    ``plan(q, kv_cache, topk_idx, out=None, k_scale=None, v_scale=None)`` attends one
+    layer and returns ``out`` (default: the plan's own, allocated here when ``out`` is
+    None). It raises ValueError unless ``q``, ``kv_cache``, ``topk_idx`` and ``out``
+    have the dtype, device, shape and strides they had here, with the same base
+    alignment where the kernel needs one; anything else needs a new plan. A scale left
+    out is one, as in the plain call (not the one the plan was built with). The batch
+    tensors are held by pointer: one reallocated between layers needs a new plan; their
+    contents are read at launch.
+    """
+    bound = _bind_sparse_pa_prefill(
+        q,
+        kv_cache,
+        topk_idx,
+        block_table,
+        row_req_id,
+        row_kv_lens,
+        sm_scale,
+        out,
+        k_scale,
+        v_scale,
+        tq,
+        rounds,
+    )
+    return SparsePaPrefillPlan(
+        bound,
+        tuple(tensor_layout(t) for t in (q, kv_cache, topk_idx, bound.out)),
+        (block_table, row_req_id, row_kv_lens),
+    )
