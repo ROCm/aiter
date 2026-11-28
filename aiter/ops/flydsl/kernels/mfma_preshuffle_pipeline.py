@@ -385,9 +385,18 @@ def xcd_remap_bx_by(
 
     grid_n = (N + tile_n - 1) // tile_n if N % tile_n else N // tile_n
     _gy = (c_m + tile_m - 1) // tile_m
+    return xcd_remap_grid(
+        bx, by, _gy, grid_n, xcd_swizzle=xcd_swizzle, num_xcds=num_xcds
+    )
 
+
+def xcd_remap_grid(bx, by, grid_m, grid_n, *, xcd_swizzle: int, num_xcds: int = 8):
+    """The remap of ``xcd_remap_bx_by`` (``xcd_swizzle > 0``) for a ``grid_m`` x
+    ``grid_n`` launch whose sizes the caller computes (either may be a DSL
+    value). The remap is a permutation for any workgroup count: the first
+    ``num_wgs % num_xcds`` XCDs take one workgroup more than the others."""
     _linear_id = bx * grid_n + by
-    _num_wgs = grid_n * _gy
+    _num_wgs = grid_n * grid_m
 
     _q = _num_wgs // num_xcds
     _r = _num_wgs % num_xcds
@@ -396,7 +405,7 @@ def xcd_remap_bx_by(
     _clip = (_xcd < _r).select(_xcd, _r)
     _wgid = _xcd * _q + _clip + _in_xcd
 
-    return group_m_major(_wgid, _gy, grid_n, fx.Index(xcd_swizzle))
+    return group_m_major(_wgid, grid_m, grid_n, fx.Index(xcd_swizzle))
 
 
 def group_m_major(wgid, grid_m, grid_n, group):
@@ -425,4 +434,5 @@ __all__ = [
     "swizzle_xor16",
     "tile_chunk_coord_i32",
     "xcd_remap_bx_by",
+    "xcd_remap_grid",
 ]
