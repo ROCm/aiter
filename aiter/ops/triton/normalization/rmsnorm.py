@@ -336,6 +336,10 @@ class _RMSNorm(torch.autograd.Function):
         is_grad = is_grad_enabled and any(
             tensor.requires_grad for tensor in [x, weight]
         )
+        # The kernels read each row with a unit column stride; a row stride
+        # (e.g. a slice of a wider tensor) needs no copy.
+        if x.stride(1) != 1:
+            x = x.contiguous()
         M, N = x.shape
         if _should_use_large_m_small_n(M, N):
             out = _rmsnorm_forward_large_m_small_n(

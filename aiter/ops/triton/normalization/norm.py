@@ -179,6 +179,10 @@ class _LayerNorm(torch.autograd.Function):
             tensor.requires_grad for tensor in [x, weight, bias]
         )
 
+        # The kernels read each row with a unit column stride; a row stride
+        # (e.g. a slice of a wider tensor) needs no copy.
+        if x.stride(1) != 1:
+            x = x.contiguous()
         y = torch.empty_like(x)
         M = x.shape[0]
         mean = torch.empty((M,), dtype=torch.float32, device=x.device)

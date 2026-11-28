@@ -236,6 +236,34 @@ def test_rmsnorm_non_default_layouts(layout, in_dtype_str):
     torch.testing.assert_close(dg_triton, dg_torch, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("in_dtype_str", ["fp32", "bf16"])
+@pytest.mark.parametrize("layout", ["col_step", "transposed"])
+def test_rmsnorm_non_contiguous(layout, in_dtype_str):
+    # Inputs with a column stride other than 1.
+    dtype = str_to_torch_dtype[in_dtype_str]
+    torch.manual_seed(0)
+    if layout == "col_step":
+        x = torch.randn(4, 128, dtype=dtype, device="cuda")[:, ::2]
+    else:
+        x = torch.randn(64, 4, dtype=dtype, device="cuda").t()
+    weight = torch.randn(x.shape[1], dtype=dtype, device="cuda")
+    dy = torch.randn(x.shape, dtype=dtype, device="cuda")
+    x.requires_grad_(True)
+    weight.requires_grad_(True)
+
+    y_torch, *_ = run_torch(x, weight, 1e-5)
+    y_triton, *_ = run_triton(x, weight, 1e-5)
+    y_triton.backward(dy, retain_graph=True)
+    dx_triton, dg_triton = x.grad.clone(), weight.grad.clone()
+    x.grad, weight.grad = None, None
+    y_torch.backward(dy, retain_graph=True)
+    dx_torch, dg_torch = x.grad.clone(), weight.grad.clone()
+
+    torch.testing.assert_close(y_triton, y_torch, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(dx_triton, dx_torch, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(dg_triton, dg_torch, atol=1e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize("in_dtype_str", ["fp32", "fp16", "bf16"])
 @pytest.mark.parametrize(
     "M, N",
