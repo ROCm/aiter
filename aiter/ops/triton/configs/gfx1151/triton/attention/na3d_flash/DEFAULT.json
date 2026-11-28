@@ -1,0 +1,46 @@
+{
+    "na3d_flash_3d_small_k": {
+        "BT": 2,
+        "BH": 4,
+        "BW": 4,
+        "BLOCK_KV": 32,
+        "SWIZZLE_T": 4,
+        "SWIZZLE_H": 2,
+        "num_warps": 2,
+        "num_stages": 1,
+        "waves_per_eu": 2
+    },
+    "na3d_flash_3d_medium_k": {
+        "BT": 2,
+        "BH": 2,
+        "BW": 4,
+        "BLOCK_KV": 16,
+        "SWIZZLE_T": 4,
+        "SWIZZLE_H": 4,
+        "num_warps": 1,
+        "num_stages": 2,
+        "waves_per_eu": 0
+    },
+    "na3d_flash_3d_large_kt": {
+        "BT": 4,
+        "BH": 2,
+        "BW": 2,
+        "BLOCK_KV": 16,
+        "SWIZZLE_T": 1,
+        "SWIZZLE_H": 4,
+        "num_warps": 1,
+        "num_stages": 2,
+        "waves_per_eu": 0
+    },
+    "na3d_flash_3d_large_hd": {
+        "BT": 4,
+        "BH": 2,
+        "BW": 2,
+        "BLOCK_KV": 16,
+        "SWIZZLE_T": 1,
+        "SWIZZLE_H": 4,
+        "num_warps": 1,
+        "num_stages": 1,
+        "waves_per_eu": 0
+    }
+}

@@ -25,7 +25,7 @@ from op_tests.triton_tests.attention.test_na3d_flash import (
     _na3d_sdpa_exact,
 )
 
-SUPPORTED_GFX = ["gfx942", "gfx950"]
+SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1151"]
 _SUPPORTED_DTYPES = (torch.bfloat16,)
 
 
