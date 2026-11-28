@@ -74,7 +74,9 @@ struct SplitKCounters
 //
 // Regions come from per-device chunks that are zeroed once and never freed
 // (graphs keep pointers into them). HIP cannot allocate during capture, so a
-// chunk is added outside of capture whenever less than half a chunk is free.
+// chunk is added outside of capture whenever less than half a chunk is free,
+// or less than a whole chunk once the device has captured: the captures of one
+// warmed-up batch size can take most of a chunk.
 // Without a region (no free space under capture, the chunk budget used up, or
 // more than kMaxTiles tiles), per-call counters are zeroed in the stream.
 inline SplitKCounters splitk_counters(const torch::Tensor& Y, int64_t tiles, hipStream_t stream)
@@ -112,9 +114,10 @@ inline SplitKCounters splitk_counters(const torch::Tensor& Y, int64_t tiles, hip
     {
         const bool capturing = capture != hipStreamCaptureStatusNone;
         std::lock_guard<std::mutex> lock(mu);
-        Device& dev = devices[Y.get_device()];
+        Device& dev           = devices[Y.get_device()];
+        const int64_t reserve = dev.captures.empty() ? kChunkTiles / 2 : kChunkTiles;
         if(!capturing && dev.chunks.size() < kMaxChunks &&
-           (dev.chunks.empty() || dev.chunks.back().used > kChunkTiles / 2))
+           (dev.chunks.empty() || kChunkTiles - dev.chunks.back().used < reserve))
         {
             const size_t bytes = kChunkTiles * kSplitKCounterStride * sizeof(uint32_t);
             void* p            = nullptr;
