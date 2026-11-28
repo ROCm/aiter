@@ -245,8 +245,8 @@ def get_flydsl_stage1_kernels(
     is_fp4_a = a_dtype == "fp4"
     is_fp4_b = b_dtype == "fp4"
     # a16w4 (bf16 A x MXFP4 W) gemm1 is fully CSV/registry-driven: register the
-    # extra tile_k=128 and xcd_swizzle=1 variants its tuned kernelNames name
-    # (t32x{64,128,192,256}x128 / _xcd1), which the other dtypes don't use.
+    # extra tile_k=128 variants its tuned kernelNames name
+    # (t32x{64,128,192,256}x128), which the other dtypes don't use.
     is_a16w4 = a_dtype == "bf16" and is_fp4_b
 
     tile_ns = [32, 64, 128] if is_fp4_b else [128]
@@ -261,7 +261,7 @@ def get_flydsl_stage1_kernels(
     waves_per_eus = [1, 2, 3, 4]
     k_batches = [1, 2, 4, 7, 14]
     b_nts = [0, 2]
-    xcd_swizzles = [0, 1, 4] if is_a16w4 else [0, 4]
+    xcd_swizzles = [0, 1, 4]
 
     for tm in tile_ms:
         # tile_m=16 shares tile_m=32's N-tile set: m_repeat<=2 either way.
@@ -809,6 +809,7 @@ def compile_flydsl_moe_stage1(
     k_wave: int = 1,
     v2_output_layout: bool = False,
     activation_bf16: bool = False,
+    stage2_skips_inter_pad: bool = False,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     if activation_bf16 and act != "silu_clamped":
@@ -875,6 +876,7 @@ def compile_flydsl_moe_stage1(
             xcd_swizzle=xcd_swizzle,
             k_wave=k_wave,
             v2_output_layout=v2_output_layout,
+            stage2_skips_inter_pad=stage2_skips_inter_pad,
         )
     else:
         raise ValueError(
@@ -956,11 +958,10 @@ def compile_flydsl_moe_stage2(
             use_async_copy=use_async_copy,
             use_global_a=use_global_a,
             cu_num_mul=cu_num_mul,
-            # API parity (reviewer #3): forward `b_nt` and `xcd_swizzle`
-            # from the kernel-name parser. They are accepted as ignored
-            # kwargs on the fp4xfp4 path so callers parsing the
-            # `_bnt{N}` / `_xcd{N}` registry suffixes don't need
-            # per-dtype special cases.
+            # Forward `b_nt` and `xcd_swizzle` from the kernel-name parser
+            # so callers parsing the `_bnt{N}` / `_xcd{N}` registry suffixes
+            # don't need per-dtype special cases. This builder ignores
+            # `b_nt`; `xcd_swizzle` selects the XCD workgroup remap.
             b_nt=b_nt,
             xcd_swizzle=xcd_swizzle,
             model_dim_pad=model_dim_pad,
@@ -1655,6 +1656,7 @@ def _flydsl_moe_stage1_impl(
     fused_shared_w1_scale: torch.Tensor | None = None,
     shared_inter_bf16: torch.Tensor | None = None,
     shared_tile: dict | None = None,
+    stage2_skips_inter_pad: bool = False,
     _compile_kernel=compile_flydsl_moe_stage1,
     _build_mx_args=_s1_args_fp4,
 ):
@@ -1958,6 +1960,8 @@ def _flydsl_moe_stage1_impl(
     # The injected FHMoE compiler does not implement the v2 sorted-row layout.
     if _v2_output_layout:
         compile_kwargs["v2_output_layout"] = True
+        if stage2_skips_inter_pad and inter_dim_pad > 0:
+            compile_kwargs["stage2_skips_inter_pad"] = True
     exe = _compile_kernel(**compile_kwargs)
     _run_compiled(exe, args)
 
@@ -2144,6 +2148,7 @@ def flydsl_moe_stage1(
     fused_shared_w1_scale: torch.Tensor | None = None,
     shared_inter_bf16: torch.Tensor | None = None,
     shared_tile: dict | None = None,
+    stage2_skips_inter_pad: bool = False,
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -2160,6 +2165,10 @@ def flydsl_moe_stage1(
     add into a zeroed buffer, then silu_and_mul fuses activation + reduction.
 
     gate_mode controls the gate/up computation strategy (see GateMode enum).
+
+    stage2_skips_inter_pad (v2_output_layout only): the consuming v2 stage2
+    skips the inter_dim padding, so output columns past the unpadded width
+    rounded up to 32 may be left unwritten.
 
     Returns:
         Basic:                      out
@@ -2206,6 +2215,7 @@ def flydsl_moe_stage1(
         fused_shared_w1_scale=fused_shared_w1_scale,
         shared_inter_bf16=shared_inter_bf16,
         shared_tile=shared_tile,
+        stage2_skips_inter_pad=stage2_skips_inter_pad,
     )
 
 

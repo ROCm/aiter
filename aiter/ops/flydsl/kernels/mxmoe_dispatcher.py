@@ -146,9 +146,18 @@ def compile_gemm2_a4w4_port(
     _output_n_range=None,
     use_valid_token_count=False,
     g2_scatter_lds_pairs=False,
+    K_VALID=None,
 ):
-    """Compile gemm2 a4w4 down-proj; epilog 'atomic' (weighted atomic-fadd) or 'reduce' (store into out[token_id*topk+slot]). INTER_MAX must equal the runtime inter_dim (unrolled K-loop); SBM None -> SBM==BM byte-identical."""
+    """Compile gemm2 a4w4 down-proj; epilog 'atomic' (weighted atomic-fadd) or 'reduce' (store into out[token_id*topk+slot]). INTER_MAX must equal the runtime inter_dim (unrolled K-loop); SBM None -> SBM==BM byte-identical.
+    K_VALID < INTER_MAX: K columns from K_VALID on are zero padding the kernel neither reads nor needs finite.
+    """
     SBM = _norm_sbm(SBM, BM)
+    if K_VALID is None or K_VALID >= INTER_MAX:
+        K_VALID = INTER_MAX
+    if K_VALID % 32 or K_VALID <= 0:
+        raise AssertionError(
+            f"K_VALID must be a positive multiple of 32, got {K_VALID}"
+        )
     if BM not in (16, 32, 64, 128) or epilog not in ("atomic", "reduce", "scatter"):
         raise AssertionError(
             f"mxfp4_moe_gemm2 supports only (BM in {{16,32,64,128}}, "
@@ -258,7 +267,7 @@ def compile_gemm2_a4w4_port(
                 "g2_scatter_lds_pairs (_ldspa) needs epilog='scatter', bf16 output and no bias"
             )
         lds_bytes = max(lds_bytes, scatter_lds_pairs_bytes(BM, BN))
-    K_TILES_RT_MAX = INTER_MAX // BK
+    K_TILES_RT_MAX = (K_VALID + BK - 1) // BK
     g2_apre = aStages >= K_TILES_RT_MAX
     a_preload = min(aStages, K_TILES_RT_MAX) if g2_apre else kStages
     # N_OUT = model_dim/hidden is runtime; HIDDEN_MAX is a compile/cache bucket
@@ -338,8 +347,9 @@ def compile_gemm2_a4w4_port(
     tile_tag = "" if (BN, BK) == (256, 256) else f"_bn{BN}_bk{BK}"
     bias_tag = "_bias" if enable_bias else ""
     ldspa_tag = "_ldspa" if g2_scatter_lds_pairs else ""
+    kvalid_tag = "" if K_VALID == INTER_MAX else f"_kv{K_VALID}"
     g2_epi_lanes = _pick_epi_lanes(BM, BN, route_out_fp8 or route_out_fp4, g2_scale_blk)
-    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{shared_scale_tag}{persist_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{noil_tag}{dw_tag}{pitch_tag}{sblk_tag}{out_tag}{compact_tag}{bias_tag}{output_range_tag}{ldspa_tag}_v2_biasabi7{route_guard_tag}"
+    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}{kvalid_tag}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{shared_scale_tag}{persist_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{noil_tag}{dw_tag}{pitch_tag}{sblk_tag}{out_tag}{compact_tag}{bias_tag}{output_range_tag}{ldspa_tag}_v2_biasabi7{route_guard_tag}"
     name = f"gemm2_a4w4_port_{tag}{valid_tokens_tag}" + (
         "_idpf" if g2_prefetch_ids else ""
     )
@@ -420,6 +430,9 @@ def compile_gemm2_a4w4_port(
                     k_bytes,
                     BM=BM,
                     resolved_rows=resolved_input_rows,
+                    k_valid_bytes=(
+                        None if K_VALID == INTER_MAX else K_VALID // (1 if is_f8 else 2)
+                    ),
                 )
 
         # Keep capacity for addressing and scheduling. Only atomic writes use
@@ -453,6 +466,7 @@ def compile_gemm2_a4w4_port(
                 BK=BK,
                 use_nt=use_nt,
                 INTER_MAX=INTER_MAX,
+                K_VALID=K_VALID,
                 aStages=aStages,
                 a_slot_alias=a_slot_alias,
                 a_dtype=a_dtype,
@@ -745,6 +759,7 @@ def get_g2(
     g2_prefetch_ids=False,
     use_valid_token_count=False,
     g2_scatter_lds_pairs=False,
+    K_VALID=None,
 ):
     # Cache key uses compile-time buckets; runtime model_dim shares a launcher
     # within HIDDEN_MAX (INTER_MAX is the exact inter_dim: the K-loop is unrolled).
@@ -754,6 +769,8 @@ def get_g2(
     persist = bool(persist or epilog == "scatter")
     use_valid_token_count = bool(use_valid_token_count and epilog == "atomic")
     cu_key = cu_num if persist else 0
+    if K_VALID is None or K_VALID >= INTER_MAX:
+        K_VALID = INTER_MAX
     # gemm2 perf knobs enter the key; defaults ON (env override), matching compile_gemm2_a4w4_port.
     g2_bhoist = os.environ.get("MXFP4_G2_BHOIST", "1") == "1"
     g2_ascale_pf = os.environ.get("MXFP4_G2_ASCALE_PF", "1") == "1"
@@ -786,6 +803,7 @@ def get_g2(
         g2_prefetch_ids,
         use_valid_token_count,
         bool(g2_scatter_lds_pairs),
+        K_VALID,
     )
     launch = G2_CACHE.get(key)
     if launch is None:
@@ -813,6 +831,7 @@ def get_g2(
             g2_prefetch_ids=g2_prefetch_ids,
             use_valid_token_count=use_valid_token_count,
             g2_scatter_lds_pairs=g2_scatter_lds_pairs,
+            K_VALID=K_VALID,
         )
         # The key holds every compile argument, the env knobs resolved above
         # included. The cache builds an entry from a launcher it compiles
@@ -860,8 +879,12 @@ def mxfp4_moe_gemm2(
     out_scale=None,
     use_valid_token_count=False,
     g2_scatter_lds_pairs=False,
+    D_INTER_VALID=None,
 ):
     """Stage-2 down-proj gemm for unpadded dimensions.
+
+    D_INTER_VALID < D_INTER: K columns from D_INTER_VALID on are zero padding of
+    w2 (and of the intermediate), neither read nor required to be finite.
 
     out_dtype='fp4' (epilog='scatter' only): ``out`` is uint8 [max_sorted, D_HIDDEN//2]
     packed fp4 and ``out_scale`` is uint8 [max_sorted, D_HIDDEN//32] e8m0, both unweighted.
@@ -962,6 +985,7 @@ def mxfp4_moe_gemm2(
         g2_prefetch_ids=g2_prefetch_ids,
         use_valid_token_count=use_valid_token_count,
         g2_scatter_lds_pairs=g2_scatter_lds_pairs,
+        K_VALID=D_INTER_VALID,
     )
     max_m_blocks = (max_sorted + BM - 1) // BM
     if persist:

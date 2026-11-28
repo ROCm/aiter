@@ -21,6 +21,8 @@ A8W4 path is selected by `a_dtype='fp8', b_dtype='fp4'` plus
 `gate_mode=GateMode.INTERLEAVE` + `a_scale_one=True` in stage1.
 """
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
@@ -52,6 +54,7 @@ from .mfma_preshuffle_pipeline import (
     make_preshuffle_scale_layout,
     swizzle_xor16,
     tile_chunk_coord_i32,
+    xcd_remap_grid,
 )
 from .tensor_shim import ptr_rsrc
 
@@ -100,6 +103,43 @@ def _barrier(vmcnt=63, lgkmcnt=63):
 # HEAD generic path uses `barrier`; a16w4 uses `_barrier`.
 barrier = _barrier
 
+# Trace-time hooks for moe_fused_s12.py, which traces the stage-1 and stage-2
+# bodies below into one kernel. All are empty for the normal launches:
+#   "bid", "grid": {"x": ..., "y": ...} used instead of gpu.block_id / grid_dim;
+#   "wt": stage-1 FP8 rows and sorted e8m0 scales are stored write-through at
+#         device scope (sc1), so a workgroup on another XCD can read them;
+#   "s1_done": fn(sort_block, blk_valid, exp_valid) after a stage-1 tile;
+#   "s2_wait" / "s2_done": the same, before / after a stage-2 tile's body;
+#   "alloc": the fused kernel's SharedAllocator (one per kernel).
+_FUSED_S12_HOOKS = {}
+# id(launcher) -> body, grid and build data of a stage-1 / stage-2 build
+_FUSED_S12_BUILT = {}
+
+
+def _block_id(axis):
+    bid = _FUSED_S12_HOOKS.get("bid")
+    return gpu.block_id(axis) if bid is None else bid[axis]
+
+
+def _grid_dim(axis):
+    grid = _FUSED_S12_HOOKS.get("grid")
+    return getattr(gpu.grid_dim, axis) if grid is None else grid[axis]
+
+
+def _shared_allocator():
+    alloc = _FUSED_S12_HOOKS.get("alloc")
+    return fx.SharedAllocator() if alloc is None else alloc
+
+
+def _s1_fp8_store(ptr, value):
+    if _FUSED_S12_HOOKS.get("wt"):
+        # agent-scope atomic store = global_store with sc1 on gfx950 (write-through)
+        fx.generic_store(
+            ptr, value, memory_order=fx.AtomicOrdering.Monotonic, syncscope="agent"
+        )
+    else:
+        fx.generic_store(ptr, value, nontemporal=True)
+
 
 def _idx_to_fly_ptr(idx_val, value, alignment):
     """Build a typed global pointer with the access's proven byte alignment."""
@@ -139,8 +179,29 @@ def compile_mixed_moe_gemm1_common(
     shared_expert_id: int | None = None,
     clamp_shared: bool = True,
     v2_output_layout: bool = False,
+    stage2_skips_inter_pad: bool = False,
+    fp8_exact: bool | None = None,
 ):
-    """Compile stage1 kernel: act(X @ W_gate.T, X @ W_up.T) -> [tokens*topk, inter_dim]."""
+    """Compile stage1 kernel: act(X @ W_gate.T, X @ W_up.T) -> [tokens*topk, inter_dim].
+
+    fp8_exact (None: env AITER_MOE_S1_FP8_EXACT=1): the FP8 epilogue quantizes like
+    the bf16 output followed by fused_dynamic_mxfp8_quant_moe_sort (values rounded
+    to bf16, amax floored at 1e-10, e8m0 = ceil_pow2(amax / 448)), so its MXFP8
+    codes and scales equal the two-kernel path bit for bit.
+    """
+    if fp8_exact is None:
+        # Builds with an xcd_swizzle get the exact rule only if listed in
+        # AITER_MOE_S1_FP8_EXACT_KEYS ("<tile_m>/<waves_per_eu>/<xcd_swizzle>,...").
+        # No new local names here: the locals below are this build's arguments.
+        fp8_exact = os.environ.get("AITER_MOE_S1_FP8_EXACT", "0") == "1" and (
+            xcd_swizzle == 0
+            or f"{tile_m}/{waves_per_eu}/{xcd_swizzle}"
+            in [
+                k.strip()
+                for k in os.environ.get("AITER_MOE_S1_FP8_EXACT_KEYS", "").split(",")
+            ]
+        )
+    _fused_s12_kwargs = dict(locals())  # the build arguments, to rebuild the body
     heterogeneous_b = shared_expert_id is not None
     if heterogeneous_b and shared_expert_id != experts - 1:
         raise ValueError(
@@ -254,9 +315,10 @@ def compile_mixed_moe_gemm1_common(
     need_fp8 = out_dtype == "fp8"
     need_quant = need_fp4 or need_fp8
     need_sort = need_quant
+    fp8_exact = bool(fp8_exact) and need_fp8 and not is_splitk
 
     fp4q_tag = "_fp4q" if need_fp4 else ""
-    fp8q_tag = "_fp8q" if need_fp8 else ""
+    fp8q_tag = ("_fp8qx" if fp8_exact else "_fp8q") if need_fp8 else ""
     sort_tag = "_sort" if need_sort else ""
     async_tag = "_async" if use_async_copy else ""
     sk_tag = f"_sk{k_batch}" if is_splitk else ""
@@ -457,7 +519,6 @@ def compile_mixed_moe_gemm1_common(
         ):
 
             tokens_in = fx.Index(i32_tokens_in)
-            n_in = fx.Index(i32_n_in)
             k_in = fx.Index(i32_k_in)
             size_expert_ids_in = fx.Index(i32_size_expert_ids_in)
             # Runtime clamp bound for the activation.  Host passes the configured
@@ -510,43 +571,39 @@ def compile_mixed_moe_gemm1_common(
             layout_lds = fx.make_layout(shape_lds, stride_lds)
 
             tx = gpu.thread_id("x")
-            by = gpu.block_id("x")
-            bx_persist = gpu.block_id("y")
+            by = _block_id("x")
+            bx_persist = _block_id("y")
+
+            numids_rsrc = ptr_rsrc(arg_num_valid_ids, fx.Int32(4))
+            num_valid_i32 = buffer_ops.buffer_load(
+                numids_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32
+            )
 
             if const_expr(xcd_swizzle > 0):
                 num_xcds = 8
-                one = 1
-                tile_n_idx = tile_n
-                inter_pad_idx = 2 * inter_dim_pad
-                if const_expr(mock_gate_only or gate_up_interleave):
-                    grid_x = (n_in - inter_pad_idx + tile_n_idx - one) // tile_n_idx
-                else:
-                    two = 2
-                    grid_x = (
-                        (n_in - inter_pad_idx + two * tile_n_idx - one)
-                        // tile_n_idx
-                        // two
-                    )
-                persist_m_idx = persist_m
-                grid_y = (size_expert_ids_in + persist_m_idx - one) // persist_m_idx
-                linear_id = bx_persist * grid_x + by
-                num_workgroups = grid_x * grid_y
-                num_xcds_idx = num_xcds
-                workgroups_per_xcd = num_workgroups // num_xcds_idx
-                workgroup_id = (linear_id % num_xcds_idx) * workgroups_per_xcd + (
-                    linear_id // num_xcds_idx
+                # Use the launch dimensions, including the stage2 tail padding.
+                grid_x = fx.Index(_grid_dim("x"))
+                grid_y = fx.Index(_grid_dim("y"))
+                # grid_y covers the worst-case padded row count. Remap only the
+                # rows valid at runtime so the empty tail is not concentrated
+                # on the last XCDs; rows past them keep their ids and exit.
+                rows_per_y = sort_block_m * persist_m
+                valid_y = (
+                    fx.Index(fx.Int32(num_valid_i32)) + rows_per_y - 1
+                ) // rows_per_y
+                valid_y = (valid_y < grid_y).select(valid_y, grid_y)
+                valid_y = (valid_y > 0).select(valid_y, fx.Index(1))
+                remap_m, remap_n = xcd_remap_grid(
+                    bx_persist,
+                    by,
+                    grid_m=valid_y,
+                    grid_n=grid_x,
+                    xcd_swizzle=xcd_swizzle,
+                    num_xcds=num_xcds,
                 )
-                group_m = xcd_swizzle
-                workgroups_per_group = group_m * grid_x
-                group_id = workgroup_id // workgroups_per_group
-                first_m = group_id * group_m
-                remaining_m = grid_y - first_m
-                group_size_m = (fx.Index(remaining_m) < group_m).select(
-                    remaining_m, group_m
-                )
-                workgroup_in_group = workgroup_id % workgroups_per_group
-                bx_persist = first_m + (workgroup_in_group % group_size_m)
-                by = workgroup_in_group // group_size_m
+                wg_live = bx_persist < valid_y
+                bx_persist = wg_live.select(remap_m, bx_persist)
+                by = wg_live.select(remap_n, by)
 
             by_n = by * tile_n
 
@@ -573,7 +630,7 @@ def compile_mixed_moe_gemm1_common(
                 pong: fx.Array[fx.Uint8, pong_field_bytes, 16]
                 ping: fx.Array[fx.Uint8, ping_field_bytes, 16]
 
-            _lds = fx.SharedAllocator().allocate(_MoeGemm1Smem).peek()
+            _lds = _shared_allocator().allocate(_MoeGemm1Smem).peek()
             lds_x_pong = _lds.pong.ptr
             lds_x_ping = _lds.ping.ptr
             base_ptr_pong = lds_x_pong
@@ -600,11 +657,6 @@ def compile_mixed_moe_gemm1_common(
             x_rsrc = ptr_rsrc(arg_x, x_nbytes_i32)
 
             shared_w_rsrc = ptr_rsrc(arg_shared_w, shared_w_nbytes)
-
-            numids_rsrc = ptr_rsrc(arg_num_valid_ids, fx.Int32(4))
-            num_valid_i32 = buffer_ops.buffer_load(
-                numids_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32
-            )
 
             sx_rsrc = 1
             sw_rsrc = 1
@@ -2204,9 +2256,12 @@ def compile_mixed_moe_gemm1_common(
                     if const_expr(need_quant and not is_splitk):
                         frag_vals = []
                         for i in range_constexpr(e_vec):
-                            frag_vals.append(fx.Vector(frag)[i])
+                            v_i = fx.Vector(frag)[i]
+                            if const_expr(fp8_exact):
+                                v_i = v_i.to(fx.BFloat16).to(fx.Float32)
+                            frag_vals.append(v_i)
 
-                        local_max = c0_f32
+                        local_max = fx.Float32(1e-10) if fp8_exact else c0_f32
                         for i in range_constexpr(e_vec):
                             abs_v = fx.math.absf(frag_vals[i])
                             local_max = fx.maximumf(local_max, abs_v)
@@ -2216,14 +2271,25 @@ def compile_mixed_moe_gemm1_common(
                             peer = local_max.shuffle_xor(off, c64_i32)
                             local_max = fx.maximumf(local_max, peer)
 
-                        max_i32 = local_max.bitcast(fx.Uint32)
-                        max_rounded = (max_i32 + c0x400000_i32) & fx.Uint32(
-                            c0xFF800000_i32
-                        )
-                        exp_field = max_rounded >> c23_i32
-                        e8m0_biased = fx.max(
-                            fx.Int32(exp_field) - c_headroom_i32, c0_i32
-                        )
+                        if const_expr(fp8_exact):
+                            # ceil_pow2(amax / 448), as fp_f32_to_e8m0_scale<RoundUp>
+                            u_i32 = (local_max * fx.Float32(1.0 / 448.0)).bitcast(
+                                fx.Int32
+                            )
+                            exp_u = (u_i32 >> c23_i32) & fx.Int32(255)
+                            bump = ((u_i32 & fx.Int32(0x7FFFFF)) != c0_i32) & (
+                                exp_u < fx.Int32(255)
+                            )
+                            e8m0_biased = bump.select(exp_u + c1_i32, exp_u)
+                        else:
+                            max_i32 = local_max.bitcast(fx.Uint32)
+                            max_rounded = (max_i32 + c0x400000_i32) & fx.Uint32(
+                                c0xFF800000_i32
+                            )
+                            exp_field = max_rounded >> c23_i32
+                            e8m0_biased = fx.max(
+                                fx.Int32(exp_field) - c_headroom_i32, c0_i32
+                            )
 
                         quant_exp = c254_i32 - e8m0_biased
                         quant_scale = (quant_exp << c23_i32).bitcast(fx.Float32)
@@ -2289,10 +2355,9 @@ def compile_mixed_moe_gemm1_common(
                                     )
                                 if const_expr(e_vec == 2):
                                     store_val = fx.Int16(packed_i32)
-                                    fx.generic_store(
+                                    _s1_fp8_store(
                                         _idx_to_fly_ptr(ptr_addr_idx, store_val, 2),
                                         store_val,
-                                        nontemporal=True,
                                     )
                                 else:
                                     packed_raw = (
@@ -2300,10 +2365,9 @@ def compile_mixed_moe_gemm1_common(
                                         if hasattr(packed_i32, "_value")
                                         else packed_i32
                                     )
-                                    fx.generic_store(
+                                    _s1_fp8_store(
                                         _idx_to_fly_ptr(ptr_addr_idx, packed_raw, 4),
                                         packed_raw,
-                                        nontemporal=True,
                                     )
                             else:
                                 for wg in range_constexpr(e_vec // 4):
@@ -2329,10 +2393,9 @@ def compile_mixed_moe_gemm1_common(
                                         if hasattr(packed_w, "_value")
                                         else packed_w
                                     )
-                                    fx.generic_store(
+                                    _s1_fp8_store(
                                         _idx_to_fly_ptr(word_ptr, packed_raw, 4),
                                         packed_raw,
-                                        nontemporal=True,
                                     )
 
                         if const_expr(need_sort):
@@ -2362,6 +2425,9 @@ def compile_mixed_moe_gemm1_common(
                                     sorted_scale_rsrc,
                                     byte_off,
                                     offset_is_bytes=True,
+                                    cache_modifier=(
+                                        16 if _FUSED_S12_HOOKS.get("wt") else 0
+                                    ),
                                 )
 
                             @flyc.jit
@@ -2645,6 +2711,8 @@ def compile_mixed_moe_gemm1_common(
                     )
                 _gemm1_dispatch()
                 gpu.barrier()
+                if const_expr("s1_done" in _FUSED_S12_HOOKS):
+                    _FUSED_S12_HOOKS["s1_done"](bx, blk_valid, exp_valid)
 
             c0_p = fx.Index(0)
             c1_p = fx.Index(1)
@@ -2790,29 +2858,7 @@ def compile_mixed_moe_gemm1_common(
         # manual finalize is needed.
         ctx = CompilationContext.get_current()
 
-        inter_dim_pad_total = 2 * inter_dim_pad
-        tile2_pad = 0
-        if const_expr(not gate_only):
-            tile_k_stage2 = tile_k // 2
-            tile2_pad = (
-                tile_k_stage2 - (inter_dim - inter_dim_pad) % tile_k_stage2
-            ) % tile_k_stage2
-
-        inter_in = fx.Int64(i32_inter_in)
-        tile_n_index = tile_n
-        if const_expr(mock_gate_only or gate_up_interleave):
-            gx = (
-                inter_in - inter_dim_pad_total + tile2_pad + tile_n_index - 1
-            ) // tile_n_index
-        else:
-            gx = (
-                (inter_in - inter_dim_pad_total + tile2_pad + 2 * tile_n_index - 1)
-                // tile_n_index
-                // 2
-            )
-
-        c_pm_l = persist_m
-        gy = (fx.Int64(i32_size_expert_ids_in) + c_pm_l - 1) // c_pm_l
+        gx, gy = _grid1(i32_inter_in, i32_size_expert_ids_in)
 
         if const_expr(heterogeneous_b):
             launcher = moe_gemm1(
@@ -2870,6 +2916,40 @@ def compile_mixed_moe_gemm1_common(
         launcher.launch(
             grid=(gx, gy, k_batch), block=(total_threads, 1, 1), stream=stream
         )
+
+    def _grid1(i32_inter_in, i32_size_expert_ids_in):
+        inter_dim_pad_total = 2 * inter_dim_pad
+        tile2_pad = 0
+        if const_expr(not gate_only):
+            tile_k_stage2 = tile_k // 2
+            tile2_pad = (
+                tile_k_stage2 - (inter_dim - inter_dim_pad) % tile_k_stage2
+            ) % tile_k_stage2
+
+        if const_expr(stage2_skips_inter_pad and not gate_only):
+            # Stage 2 reads the unpadded width rounded up to its 32-wide K
+            # blocks and skips the rest of the padding. Like inter_in, this
+            # counts the padding in both gate and up.
+            tile2_pad = 2 * min(
+                inter_dim_pad, (32 - (inter_dim - inter_dim_pad) % 32) % 32
+            )
+
+        inter_in = fx.Int64(i32_inter_in)
+        tile_n_index = tile_n
+        if const_expr(mock_gate_only or gate_up_interleave):
+            gx = (
+                inter_in - inter_dim_pad_total + tile2_pad + tile_n_index - 1
+            ) // tile_n_index
+        else:
+            gx = (
+                (inter_in - inter_dim_pad_total + tile2_pad + 2 * tile_n_index - 1)
+                // tile_n_index
+                // 2
+            )
+
+        c_pm_l = persist_m
+        gy = (fx.Int64(i32_size_expert_ids_in) + c_pm_l - 1) // c_pm_l
+        return gx, gy
 
     if heterogeneous_b:
 
@@ -2977,6 +3057,20 @@ def compile_mixed_moe_gemm1_common(
                 stream,
             )
 
+    _FUSED_S12_BUILT[id(launch_mixed_moe_gemm1)] = {
+        "emit": _emit_moe_gemm1,
+        "grid": _grid1,
+        "module_name": module_name,
+        "total_threads": total_threads,
+        "heterogeneous_b": heterogeneous_b,
+        "persist_m": persist_m,
+        "k_batch": k_batch,
+        "sort_block_m": sort_block_m,
+        "need_fp8": need_fp8,
+        "v2_output_layout": v2_output_layout,
+        "kwargs": _fused_s12_kwargs,
+        "lds_bytes": pong_field_bytes + ping_field_bytes,
+    }
     return launch_mixed_moe_gemm1
 
 
@@ -3273,8 +3367,8 @@ def compile_mixed_moe_gemm2_common(
             layout_lds = fx.make_layout(shape_lds, stride_lds)
 
             tx = gpu.thread_id("x")
-            by_outer = gpu.block_id("x")
-            bx_persist = gpu.block_id("y")
+            by_outer = _block_id("x")
+            bx_persist = _block_id("y")
 
             if const_expr(xcd_swizzle > 0):
                 num_xcds = 8
@@ -3287,24 +3381,14 @@ def compile_mixed_moe_gemm2_common(
                 else:
                     persist_m_idx = persist_m
                     grid_y = (size_expert_ids_in + persist_m_idx - one) // persist_m_idx
-                linear_id = bx_persist * grid_x + by_outer
-                num_workgroups = grid_x * grid_y
-                num_xcds_idx = num_xcds
-                workgroups_per_xcd = num_workgroups // num_xcds_idx
-                workgroup_id = (linear_id % num_xcds_idx) * workgroups_per_xcd + (
-                    linear_id // num_xcds_idx
+                bx_persist, by_outer = xcd_remap_grid(
+                    bx_persist,
+                    by_outer,
+                    grid_m=grid_y,
+                    grid_n=grid_x,
+                    xcd_swizzle=xcd_swizzle,
+                    num_xcds=num_xcds,
                 )
-                group_m = xcd_swizzle
-                workgroups_per_group = group_m * grid_x
-                group_id = workgroup_id // workgroups_per_group
-                first_m = group_id * group_m
-                remaining_m = grid_y - first_m
-                group_size_m = (fx.Index(remaining_m) < group_m).select(
-                    remaining_m, group_m
-                )
-                workgroup_in_group = workgroup_id % workgroups_per_group
-                bx_persist = first_m + (workgroup_in_group % group_size_m)
-                by_outer = workgroup_in_group // group_size_m
 
             by = by_outer
 
@@ -3326,7 +3410,7 @@ def compile_mixed_moe_gemm2_common(
             class _MoeGemm2Smem:
                 slab: fx.Array[fx.Uint8, lds_alloc_bytes, 16]
 
-            _lds = fx.SharedAllocator().allocate(_MoeGemm2Smem).peek()
+            _lds = _shared_allocator().allocate(_MoeGemm2Smem).peek()
             lds_x = _lds.slab.ptr
             lds_out = (
                 fx.recast_iter(lds_out_fly_dtype, lds_x)
@@ -4856,6 +4940,9 @@ def compile_mixed_moe_gemm2_common(
                 else:
                     guard = blk_valid & (exp_valid & tile_has_tokens)
 
+                if const_expr("s2_wait" in _FUSED_S12_HOOKS):
+                    _FUSED_S12_HOOKS["s2_wait"](sort_blk, blk_valid, exp_valid)
+
                 @flyc.jit
                 def _gemm2_valid_dispatch():
                     if guard:
@@ -4863,6 +4950,8 @@ def compile_mixed_moe_gemm2_common(
 
                 _gemm2_valid_dispatch()
                 gpu.barrier()
+                if const_expr("s2_done" in _FUSED_S12_HOOKS):
+                    _FUSED_S12_HOOKS["s2_done"](sort_blk, blk_valid, exp_valid)
                 return [cur_active] if persistent else [expert_i32, expert_b_base]
 
             @flyc.jit
@@ -5123,4 +5212,27 @@ def compile_mixed_moe_gemm2_common(
                 stream,
             )
 
+    _FUSED_S12_BUILT[id(launch_mixed_moe_gemm2)] = {
+        "emit": _emit_moe_gemm2,
+        "module_name": module_name,
+        "tile_m": tile_m,
+        "tile_n": tile_n,
+        "model_dim_pad": model_dim_pad,
+        "heterogeneous_b": heterogeneous_b,
+        "persistent": persistent,
+        "persist_m": persist_m,
+        "sort_block_m": _sort_block_m,
+        "accumulate": accumulate,
+        "lds_bytes": lds_alloc_bytes,
+    }
     return launch_mixed_moe_gemm2
+
+
+# AITER_MOE_FUSED_S12=1: every fusable stage-1 + stage-2 pair of a fused_moe
+# call runs as one launch (moe_fused_s12.py).
+if os.environ.get("AITER_MOE_FUSED_S12", "0") == "1":
+    from aiter.ops.flydsl.kernels import moe_fused_s12 as _moe_fused_s12
+
+    # else moe_fused_s12 is being imported first and installs itself at its end
+    if hasattr(_moe_fused_s12, "install"):
+        _moe_fused_s12.install()
