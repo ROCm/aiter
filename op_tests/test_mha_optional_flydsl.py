@@ -78,6 +78,8 @@ def _dispatcher(name, *, available, flydsl=None, triton=None):
         "get_gfx": lambda: "gfx1151",
         "is_gfx1250_asm_supported": lambda: False,
         "_IS_GFX1250_ASM_DEVICE": False,
+        "get_mha_fwd_tuned_backend": lambda **_kwargs: None,
+        "record_mha_fwd_selection": lambda _backend: None,
         "_reject_sink_autograd": lambda *_args: None,
     }
     node = _top_level_node(name, ast.FunctionDef)
