@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Block-native gfx942 QSA sparse attention, without cross-query union construction.
+"""Block-native QSA sparse attention (gfx942, gfx950), without cross-query union construction.
 
 Layouts whose packed PK/PV scratch fits the platform's packed-KV budget, or whose
 context has at most pack_tokens_per_row tokens per query row, use the private
@@ -32,6 +32,8 @@ import numpy as np
 import torch
 from flydsl.expr import rocdl
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
+
 from . import sparse_prefill_common as prim
 from . import sparse_prefill_direct_packed as packed
 from .sparse_prefill_common import (
@@ -39,6 +41,8 @@ from .sparse_prefill_common import (
     MAX_ROW_PACKED_KV_BYTES,
     _buffer,
     _buffer_words,
+    _kv_extent,
+    _kv_offset,
     _lds_load,
     _lds_store,
     _maximum,
@@ -105,6 +109,9 @@ class DirectPlan:
     wide: bool = False
     # Gated raw: K3's list of the row groups holding a direct row (count in direct_flag[1]).
     group_list: torch.Tensor | None = None
+    # Packed direct runs gfx950's K32 loop; batch-invariant plans keep the K16 loop raw
+    # direct runs, so that packed and raw K/V give the same bits.
+    k32: bool = False
 
 
 def scratch_specs(prepared: DirectPlan) -> list:
@@ -121,6 +128,7 @@ def prepare(
     inputs,
     union=None,
     scratch: bool = True,
+    invariant: bool = False,
 ):
     """Bind private scratch; attention's recovery refreshes sorted block_indices each call."""
     # Each request with queries packs its KV into whole four-token blocks at a
@@ -133,18 +141,19 @@ def prepare(
     slotted = inputs.kv_slots is not None
     pack_bytes = int(blocks.sum()) * 4 * hk * 1024
     # Pack while PK+PV fit the budget, or while the context has at most pack_tokens_per_row
-    # tokens per query row. PK/PV, and without a slot table all of K/V, take unsigned 32-bit
-    # byte offsets in the pack kernel (a slot table gives each source block a 64-bit base).
-    addressed = int(blocks.sum()) * 4
+    # tokens per query row. PK/PV, and without a slot table all of K/V (rows kv_stride
+    # elements apart), take unsigned 32-bit byte offsets in the pack kernel (a slot table
+    # gives each source block a 64-bit base).
+    addressed = int(blocks.sum()) * 4 * hk * 512
     if not slotted:
-        addressed = max(addressed, int(lengths.sum()))
+        addressed = max(addressed, int(lengths.sum()) * inputs.kv_stride * 2)
     packed = (
         pack_bytes <= config.max_packed_kv_bytes
         or (
             int(blocks.sum()) * 4 <= config.pack_tokens_per_row * int(q_lens.sum())
             and pack_bytes <= MAX_ROW_PACKED_KV_BYTES
         )
-    ) and addressed * hk * 512 < 2**32
+    ) and addressed < 2**32
     waves = 1 if packed else 4
     k_starts, p_starts = np.cumsum(lengths) - lengths, np.cumsum(blocks) - blocks
     counts = -(-q_lens // waves)
@@ -195,6 +204,7 @@ def prepare(
         slotted=slotted,
         wide=inputs.wide,
         group_list=group_list,
+        k32=get_gfx_runtime() == "gfx950" and not invariant,
     )
     if scratch:
         allocate_scratch(prepared, scratch_specs(prepared), device)
@@ -214,27 +224,32 @@ def _source_token(cached_blocks, n, visible, tail_start, topk):
     return token, n < width
 
 
-def _source_offset(cached_blocks, n, visible, extent, hk, topk, tail_start):
+def _source_offset(cached_blocks, n, visible, extent, row_bytes, topk, tail_start):
     token, valid = _source_token(cached_blocks, n, visible, tail_start, topk)
-    return valid.select(fx.Uint32(token) * (hk * 256 * 2), extent)
+    return valid.select(fx.Uint32(token) * row_bytes, extent)
 
 
-def _source_row(cached_blocks, n, visible, fallback, hk, topk, tail_start):
+def _source_row(cached_blocks, n, visible, fallback, row_bytes, topk, tail_start):
     # Global loads have no range check: positions past the selection read the request's
     # first row (K masked, V weighted 0) instead of an out-of-range offset.
     token, valid = _source_token(cached_blocks, n, visible, tail_start, topk)
     return valid.select(token, fx.Int32(fallback))
 
 
-def _kv_resources(K, V, k0, kv_len, nk, hkv, hk, slotted):
+def _kv_resources(K, V, k0, kv_len, nk, hkv, hk, slotted, stride):
     """(K, V buffers, byte extent) over the request in packed K/V, or the whole slot-table
-    pool (whose span the host keeps within unsigned 32-bit offsets)."""
-    first = fx.Int64(0) if slotted else fx.Int64(k0) * hk
-    extent = (fx.Uint32(nk if slotted else kv_len) * hk - hkv) * 512
+    pool (whose span the host keeps within unsigned 32-bit offsets). K/V rows sit stride
+    elements apart: hk * 256 values, then a gap of padding."""
+    rows, gap = nk if slotted else kv_len, stride - hk * 256
+    first = fx.Int64(0) if slotted else fx.Int64(k0)
+    extent = _kv_extent(rows, hkv, hk, gap)
     layout = fx.make_layout(extent // 2, 1)
-    kr = _buffer(fx.make_view(fx.get_iter(K) + (first + hkv) * 256, layout), extent)
-    vr = _buffer(fx.make_view(fx.get_iter(V) + (first + hkv) * 256, layout), extent)
-    return kr, vr, extent
+
+    def resource(tensor):
+        pointer = fx.get_iter(tensor) + _kv_offset(first, hkv, hk, gap)
+        return _buffer(fx.make_view(pointer, layout), extent)
+
+    return resource(K), resource(V), extent
 
 
 def _pool_bases(K, V, hkv):
@@ -249,7 +264,17 @@ def _pool_bases(K, V, hkv):
 
 
 def _load_v_global(
-    resource, source_base, tile, segment, half, lane, visible, extent, hk, bn, topk
+    resource,
+    source_base,
+    tile,
+    segment,
+    half,
+    lane,
+    visible,
+    extent,
+    row_bytes,
+    bn,
+    topk,
 ):
     first = tile * bn + segment * 16 + (lane >> 4) * 4
     complete = _min(visible >> 2, fx.Int32(topk))
@@ -257,13 +282,13 @@ def _load_v_global(
     base = fx.Uint32(source_base) + (lane & 15) * 16 + half * 256
     parts = []
     for r in range(4):
-        offset = (first + r < width).select(base + r * (hk * 256 * 2), extent)
+        offset = (first + r < width).select(base + r * row_bytes, extent)
         parts.append(_buffer_words(resource, offset))
     return fx.Vector.from_elements([p[i] for p in parts for i in range(4)], fx.Int32)
 
 
 def _load_v_rows(
-    base, source_row, tile, segment, half, lane, visible, fallback, hk, bn, topk
+    base, source_row, tile, segment, half, lane, visible, fallback, row_bytes, bn, topk
 ):
     first = tile * bn + segment * 16 + (lane >> 4) * 4
     complete = _min(visible >> 2, fx.Int32(topk))
@@ -272,7 +297,7 @@ def _load_v_rows(
     parts = []
     for r in range(4):
         row = (first + r < width).select(source_row + r, fx.Int32(fallback))
-        parts.append(_global_words(base + fx.Int64(row) * (hk * 512) + lane_bytes))
+        parts.append(_global_words(base + fx.Int64(row) * row_bytes + lane_bytes))
     return fx.Vector.from_elements([p[i] for p in parts for i in range(4)], fx.Int32)
 
 
@@ -280,8 +305,8 @@ class _Raw(_DirectLoop):
     """Raw K/V (the public tensors, or a slot-table pool) for _DirectLoop: four
     adjacent lanes load one token's 64 bytes of K, transposed at the QK by ds_bpermute;
     V rows load straight to registers and are transposed by v_perm_b32 at the PV.
-    WIDE pools use 64-bit global loads; slot-table block ids come from the wave's LDS
-    table."""
+    K/V rows sit row_bytes apart. WIDE pools use 64-bit global loads; slot-table block
+    ids come from the wave's LDS table."""
 
     # In K's load layout, lanes 0/16/32/48 hold block-first offsets.
     row_lane = 64
@@ -298,7 +323,7 @@ class _Raw(_DirectLoop):
         tail_start,
         count,
         lane,
-        hk,
+        row_bytes,
         topk,
         scale,
         slotted,
@@ -306,12 +331,12 @@ class _Raw(_DirectLoop):
     ):
         self.kr, self.vr, self.blocks, self.table, self.row = kr, vr, blocks, table, row
         self.visible, self.invalid, self.tail_start = visible, invalid, tail_start
-        self.count, self.lane, self.hk, self.topk = count, lane, hk, topk
+        self.count, self.lane, self.row_bytes, self.topk = count, lane, row_bytes, topk
         self.scale, self.slotted = scale, slotted
         self.source_offset = _source_row if wide else _source_offset
         self.load_v = _load_v_rows if wide else _load_v_global
         self.load_k = (
-            functools.partial(_wide_key, row_bytes=hk * 512) if wide else _load_key
+            functools.partial(_wide_key, row_bytes=row_bytes) if wide else _load_key
         )
 
     def values(self, row, t, segment, half):
@@ -324,7 +349,7 @@ class _Raw(_DirectLoop):
             self.lane,
             self.visible,
             self.invalid,
-            self.hk,
+            self.row_bytes,
             32,
             self.topk,
         )
@@ -377,7 +402,7 @@ class _Raw(_DirectLoop):
             position + (self.lane >> 2),
             self.visible,
             self.invalid,
-            self.hk,
+            self.row_bytes,
             self.topk,
             self.tail_start,
         )
@@ -420,8 +445,11 @@ def _body(
     TOPK: fx.Constexpr[int],
     SLOTTED: fx.Constexpr[bool],
     WIDE: fx.Constexpr[bool],
+    KV_STRIDE: fx.Constexpr[int],
 ):
-    load_key = functools.partial(_wide_key, row_bytes=HK * 512) if WIDE else _load_key
+    # K/V rows sit KV_STRIDE elements apart (HK * 256 when dense).
+    row_bytes = KV_STRIDE * 2
+    load_key = functools.partial(_wide_key, row_bytes=row_bytes) if WIDE else _load_key
     source_offset = _source_row if WIDE else _source_offset
     storage = (
         fx.SharedAllocator()
@@ -452,7 +480,9 @@ def _body(
     if fx.const_expr(WIDE):
         kr, vr, invalid = _pool_bases(K, V, hkv)
     else:
-        kr, vr, invalid = _kv_resources(K, V, k0, kv_len, NK, hkv, HK, SLOTTED)
+        kr, vr, invalid = _kv_resources(
+            K, V, k0, kv_len, NK, hkv, HK, SLOTTED, KV_STRIDE
+        )
     row = _min(first + wave, fx.Int32(NQ - 1))
     blocks = rocdl.make_buffer_tensor(BLOCKS)
     maximum, total = fx.Float32(_MAX_FLOOR), fx.Float32(0.0)
@@ -487,7 +517,7 @@ def _body(
             _lds_store(table + (chunk + 1) * 256, pools[chunk + 1] >> 2)
         cached_blocks, tail_start = pools[0] >> 2, pool_tail
     initial = source_offset(
-        cached_blocks, lane >> 2, visible, invalid, HK, TOPK, tail_start
+        cached_blocks, lane >> 2, visible, invalid, row_bytes, TOPK, tail_start
     )
     initial = valid_wave.select(initial, invalid)
     kval = load_key(kr, initial, lane)
@@ -497,7 +527,7 @@ def _body(
         _min(fx.Int32(16), (((count + 15) >> 4) - 1) * 16) + (lane >> 2),
         visible,
         invalid,
-        HK,
+        row_bytes,
         TOPK,
         tail_start,
     )
@@ -516,7 +546,7 @@ def _body(
         tail_start,
         count,
         lane,
-        HK,
+        row_bytes,
         TOPK,
         SCALE_LOG2,
         SLOTTED,
@@ -588,6 +618,7 @@ def _kernel(
     TOPK: fx.Constexpr[int],
     SLOTTED: fx.Constexpr[bool],
     WIDE: fx.Constexpr[bool],
+    KV_STRIDE: fx.Constexpr[int],
 ):
     body = _body
     if fx.const_expr(GATED):
@@ -619,6 +650,7 @@ def _kernel(
                 TOPK,
                 SLOTTED,
                 WIDE,
+                KV_STRIDE,
             )
     else:
         body(
@@ -644,6 +676,7 @@ def _kernel(
             TOPK,
             SLOTTED,
             WIDE,
+            KV_STRIDE,
         )
 
 
@@ -672,6 +705,7 @@ def _launch(
     TOPK: fx.Constexpr[int],
     SLOTTED: fx.Constexpr[bool],
     WIDE: fx.Constexpr[bool],
+    KV_STRIDE: fx.Constexpr[int],
     stream: fx.Stream,
 ):
     if TASKS > 0:
@@ -699,6 +733,7 @@ def _launch(
             TOPK,
             SLOTTED,
             WIDE,
+            KV_STRIDE,
             value_attrs=prim.kernel_attrs(),
         ).launch(grid=(TASKS, 1, 1), block=(THREADS, 1, 1), stream=stream)
 
@@ -742,6 +777,7 @@ def _bound(inputs, prepared, out, stream):
         inputs.topk,
         prepared.slotted,
         prepared.wide,
+        inputs.kv_stride,
         stream,
     )
     key = (
@@ -751,6 +787,8 @@ def _bound(inputs, prepared, out, stream):
         prepared.gated,
         inputs.topk,
         prepared.slotted,
+        inputs.kv_stride,
+        prepared.k32,
     )
     compiled = _COMPILED.get((*key, prepared.wide))
     if compiled is None:

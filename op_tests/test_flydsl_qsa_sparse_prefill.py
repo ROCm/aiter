@@ -20,18 +20,46 @@ more KV heads. Cases listed in CASE_GROUPS run once, at their own group, whateve
 prefill against long cached contexts (one whose packed KV exceeds the direct
 kernel's 64 MiB budget, one packed by the per-row rule, one only raw direct
 reads), nine 1M-token requests whose packed K/V exceed 4 GiB (the last, a
-1024-row chunk, starts at 4 GiB), one request whose K and V each span the
-4 GiB - 1 MiB limit (raw direct and union), ragged batches with an empty request,
-HK > 1 (HK = 16 with over 4096 tasks to route), T = 256/768/1024 selections and
-constant Q/K whose logits sit near +1e11 on the union path (``large_logits``).
-The graph case captures a union layout on its own stream, replays it after
-rewriting its indices in place, then again after another layout grows the
-stream's scratch arena, which must keep the captured scratch allocated. The
+1024-row chunk, starts at 4 GiB), requests whose K and V each span the
+4 GiB - 1 MiB limit (raw direct, and union with gated raw direct at 768 rows on
+gfx942 and 1536 rows on gfx950), ragged batches with an empty request, HK > 1
+(HK = 16 with over 4096 tasks to route), T = 256/768/1024 selections and constant
+Q/K whose logits sit near +1e11 on the union path (``large_logits``; on gfx950 the
+2048-row chunk, which must run union tiles there).
+Each graph case captures a layout on its own stream, replays it after rewriting
+its indices in place, then again after another layout grows the stream's scratch
+arena, which must keep the captured scratch allocated. The
 kv_slots cases scatter a layout's K/V into random 64-token pages of a NaN-filled
 token pool (past 4 GiB for the ``pool_4g`` cases) and read it in place through
 the slot table; the result must equal the packed call on the gathered rows bit
 for bit. The span limit cases must be rejected: one request whose K/V spans one
 token past 4 GiB - 1 MiB, or whose int32 slot table spans one entry past it.
+The paged cases store a layout's K/V in a paged cache [pages, page, HK, 256] on random
+pages (NaN elsewhere): the halves of one K|V record per token with pages further apart
+than they are long (1568-token pages 19,992 rows apart), or two
+dense buffers. qsa_paged_kv_pool and qsa_paged_kv_slots must give the packed K/V back
+row for row, and the op over them must equal the packed call bit for bit; on gfx942 the
+record cases must report the gfx950-only stride rule instead.
+On gfx950 the strided cases store the same layouts' K/V as interleaved K|V
+records (one per token, as vLLM's QSA cache does) or as padded rows and read them
+in place, packed and through kv_slots (past 4 GiB for the ``pool_4g`` cases); the
+result must equal the call on the rows gathered into contiguous K/V bit for bit.
+Elsewhere strided rows must be rejected. The UNION_LAYOUTS and RAW_DIRECT_LAYOUTS
+cases (1536 rows or more) clear gfx950's 1536-row union gate (and gfx942's). The
+summaries report the union tiles of each call (``union tiles``) and how its direct
+side read K/V (``direct``); on gfx950, whose entry proposes union for every tile,
+the UNION_LAYOUTS cases must run some, and the 1536-row request at the
+4 GiB - 1 MiB limit must build a union plan whose direct side reads the raw K/V.
+The route cases run that request with each route forced (AITER_QSA_PLATFORM):
+every proposed tile on union (gfx950 proposes every tile), then none proposed (every
+tile on gated raw direct). The max stride cases read a request through K/V rows
+2**28 - 8 elements apart, the largest stride accepted: packed and through kv_slots
+(past 4 GiB for ``wide``), on packed direct and on raw direct, and a 1536-row
+request on union tiles (its blocks all read the same four pool rows). K/V rows
+that are not 16-byte aligned, overlap, differ in stride between K and V, or sit
+2**28 elements or more apart, K/V heads or dims that are not dense, a
+non-contiguous Q, and an interleaved request whose rows span past 4 GiB - 1 MiB,
+must be rejected.
 Cases needing more device memory than is free are skipped with a warning.
 Performance cases are single-request full prefills of 1k-32k tokens plus the
 12000-token serving prompt (T = 512); they are checked as well and are the only
@@ -81,6 +109,8 @@ and batch mode; input errors and the entry's signature; batch invariance with
 batch_invariant=True. The 12000-token prefill is timed against the BF16 path on the
 dequantized K/V and aiter's Triton FP8 GQA (qsa_sparse_paged_gqa). The FP8 cases assert
 their paths too, including the FP8 split, core/residual union tiles and the skipped pack.
+The FP8 suites run on gfx942 only; elsewhere every FP8 call must be rejected before any
+launch (``fp8 off gfx942``).
 
 ``triton`` is SGLang's native QSA extend path, copied below under SGLang's
 Apache-2.0 license (see the notice there) and called as its backend does:
@@ -114,15 +144,23 @@ import triton.language as tl
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.flydsl import qsa_sparse_prefill as flydsl_prefill
 from aiter.ops.flydsl.kernels import qsa as qsa_kernels
-from aiter.ops.qsa import qsa_sparse_paged_gqa, qsa_sparse_prefill
+from aiter.ops.flydsl.kernels.qsa import sparse_prefill_common
+from aiter.ops.qsa import (
+    can_use_flydsl_qsa_sparse_prefill,
+    qsa_paged_kv_pool,
+    qsa_paged_kv_slots,
+    qsa_sparse_paged_gqa,
+    qsa_sparse_prefill,
+    qsa_sparse_prefill_problem,
+)
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 
-SUPPORTED_GFX = ["gfx942"]
+SUPPORTED_GFX = ["gfx942", "gfx950"]
 HEAD_DIM = 256
 SCALE = HEAD_DIM**-0.5
 FP8 = dtypes.fp8
@@ -133,18 +171,22 @@ FP8_TOL = (0.06, 0.16)
 
 # name -> (query_lens, prefix_lens, kv_heads, selection, blocks per row T)
 FUNCTIONAL_CASES = {
-    # Below the union row threshold: direct only (packed, raw, HK2 with an empty request).
+    # Below both archs' union row thresholds: direct only (packed, raw, HK2 with an
+    # empty request).
     "one_row": ((1,), (0,), 1, "shared", 512),
     "extend_17_ctx_30017": ((17,), (30000,), 1, "random", 512),
     "extend_64_ctx_70065": ((64,), (70001,), 1, "random", 512),
     "hk2_ragged": ((7, 0, 9), (0, 5, 3000), 2, "shared", 512),
-    # Union + packed direct; random rows route every tile direct, 4096 rows pack per row.
+    # On gfx942 (union from 384 rows): union + packed direct; random rows route every
+    # tile direct, 4096 rows pack per row. Below gfx950's 1536 rows: direct only.
     "ragged_4": ((300, 129, 1001, 63), (0, 517, 4093, 12345), 1, "shared", 512),
     "chunk_1024_ctx_31024_random": ((1024,), (30000,), 1, "random", 512),
     "chunk_4096_ctx_131072": ((4096,), (126976,), 1, "shared", 512),
-    # Union + gated raw direct over a windowed K2.
+    # gfx942: union + gated raw direct over a windowed K2 (gfx950:
+    # chunk_1536_ctx_8386560).
     "chunk_1024_ctx_132096": ((1024,), (131072,), 1, "shared", 512),
-    # Packed K/V over 4 GiB: the 1024-row request starts at 4 GiB (union, 4 K2 windows).
+    # Packed K/V over 4 GiB: the 1024-row request starts at 4 GiB (union on gfx942, 4 K2
+    # windows).
     "batch_9_ctx_1048576": (
         (2,) * 8 + (1024,),
         (2**20 - 2,) * 8 + (2**20 - 1024,),
@@ -152,7 +194,7 @@ FUNCTIONAL_CASES = {
         "shared",
         512,
     ),
-    # One request at the 4 GiB - 1 MiB K/V limit, by raw direct and by union.
+    # One request at the 4 GiB - 1 MiB K/V limit, by raw direct and (gfx942) by union.
     "extend_64_ctx_8386560": (
         (64,),
         ((2**32 - 2**20) // (HEAD_DIM * 2) - 64,),
@@ -175,13 +217,46 @@ FUNCTIONAL_CASES = {
 }
 # name -> (shape as above, (Q, K)): constant Q/K and V = 1, so O = 1. Logits near
 # +1e11 check union centering, which an FMA against the rounded row max overflowed.
+# The 768-row prefill takes union tiles on gfx942 and direct tiles only on gfx950;
+# the 2048-row chunk clears gfx950's 1536-row union gate.
 CONSTANT_CASES = {
     "large_logits_prefill_768": (((768,), (0,), 1, "shared", 512), (65536.0, 66048.0)),
+    "large_logits_chunk_2048_ctx_30720": (
+        ((2048,), (28672,), 1, "shared", 512),
+        (65536.0, 66048.0),
+    ),
 }
 # Performance: one full prefill of 1k-32k tokens, plus the 12000-token serving prompt.
 PERF_CASES = {
     f"prefill_{tokens}": ((tokens,), (0,), 1, "correlated", 512)
     for tokens in (1024, 2048, 4096, 8192, 12000, 16384, 32768)
+}
+# Layouts of the strided, kv_slots and graph cases, also run as functional cases (seeded
+# by name, see NAMED_LAYOUTS): the 1024-row chunk takes union tiles on gfx942 only, the
+# 2048-row chunks also clear gfx950's 1536-row union gate.
+STRIDE_LAYOUTS = {
+    "hk2_chunk_1024_ctx_8192": ((1024,), (7168,), 2, "shared", 512),
+    "chunk_2048_ctx_30720": ((2048,), (28672,), 1, "shared", 512),
+    "hk2_chunk_2048_ctx_8192": ((2048,), (6144,), 2, "shared", 512),
+}
+# Functional layouts over gfx950's 1536-row union gate (seeded by name, as above):
+# ragged requests, and one request at the 4 GiB - 1 MiB K/V limit whose direct side
+# reads the raw K/V.
+UNION_CASES = {
+    "ragged_4_rows_2986": (
+        (600, 258, 2002, 126),
+        (0, 517, 4093, 12345),
+        1,
+        "shared",
+        512,
+    ),
+    "chunk_1536_ctx_8386560": (
+        (1536,),
+        ((2**32 - 2**20) // (HEAD_DIM * 2) - 1536,),
+        1,
+        "shared",
+        512,
+    ),
 }
 # Two requests with their own selections: the shared one runs union, the random one direct.
 MIXED_CASES = {
@@ -227,13 +302,45 @@ FP8_LAYOUTS = {
 CASES = {
     **FUNCTIONAL_CASES,
     **PERF_CASES,
-    **{name: shape for name, (shape, _) in CONSTANT_CASES.items()},
+    "large_logits_prefill_768": CONSTANT_CASES["large_logits_prefill_768"][0],
     **MIXED_CASES,
     **FP8_LAYOUTS,
 }
-# name -> (captured union layout, layout whose first call then grows the scratch arena:
-# its packed KV outgrows the captured layout's)
-GRAPH_CASES = {"graph_ragged_4": ("ragged_4", "chunk_1024_ctx_31024_random")}
+# Layouts seeded by their name (case_seed), the others by their position in CASES:
+# adding one changes no other layout's data.
+NAMED_LAYOUTS = {
+    **STRIDE_LAYOUTS,
+    **UNION_CASES,
+    "large_logits_chunk_2048_ctx_30720": CONSTANT_CASES[
+        "large_logits_chunk_2048_ctx_30720"
+    ][0],
+}
+CASES.update(NAMED_LAYOUTS)
+# Layouts whose calls must keep union tiles on gfx950, and those that must build a union
+# plan there whose direct side reads the raw K/V (gated raw direct); gfx942's route is
+# reported only.
+UNION_LAYOUTS = {
+    "chunk_2048_ctx_30720",
+    "hk2_chunk_2048_ctx_8192",
+    "ragged_4_rows_2986",
+    "large_logits_chunk_2048_ctx_30720",
+}
+RAW_DIRECT_LAYOUTS = {"chunk_1536_ctx_8386560"}
+# name -> (RAW_DIRECT_LAYOUTS layout, route forced through AITER_QSA_PLATFORM): every
+# proposed tile kept on union (no union cost), or none proposed (every tile on gated raw
+# direct).
+FORCED_ROUTES = {"union": "union_fixed=0,union_step=0", "direct": "union_ratio=0"}
+ROUTE_CASES = {
+    f"route_{route}_{layout}": (layout, route)
+    for layout in sorted(RAW_DIRECT_LAYOUTS)
+    for route in FORCED_ROUTES
+}
+# name -> (captured layout, layout whose first call then grows the scratch arena: its
+# packed KV outgrows the captured layout's)
+GRAPH_CASES = {
+    "graph_ragged_4": ("ragged_4", "chunk_1024_ctx_31024_random"),
+    "graph_chunk_2048_ctx_30720": ("chunk_2048_ctx_30720", "chunk_4096_ctx_131072"),
+}
 # name -> (layout, pool rows or None for twice the pages needed, first pool page)
 PAGE = 64
 POOL_4G_ROWS = 9_000_000 // PAGE * PAGE
@@ -259,6 +366,24 @@ SLOT_CASES = {
     ),
     # At group 16 (see CASE_GROUPS): a 16-head direct wave per KV head, over two KV heads.
     "kv_slots_g16_hk2_ragged": ("hk2_ragged", None, 1),
+    "kv_slots_chunk_2048_ctx_30720": ("chunk_2048_ctx_30720", None, 1),
+    "kv_slots_pool_4g_chunk_2048_ctx_30720": (
+        "chunk_2048_ctx_30720",
+        POOL_4G_ROWS,
+        8_000_000 // PAGE,
+    ),
+}
+# name -> (layout, page tokens, rows between pages, "record" (K|V halves of one record per
+# token) or "separate" (two dense buffers)).
+PAGED_CASES = {
+    "paged_ragged_4_pitched_pages": ("ragged_4", 1568, 19992, "record"),
+    "paged_hk2_ragged_pages_apart": ("hk2_ragged", 64, 96, "record"),
+    "paged_extend_64_ctx_70065_dense_pages": (
+        "extend_64_ctx_70065",
+        64,
+        64,
+        "separate",
+    ),
 }
 # name -> (K/V tokens of one request, read through kv_slots): one past the
 # 4 GiB - 1 MiB byte span of the request's K/V, or of the int32 slot table
@@ -266,6 +391,156 @@ SPAN_LIMIT_CASES = {
     "span_over_limit": ((2**32 - 2**20) // (HEAD_DIM * 2) + 1, False),
     "kv_slots_span_over_limit": ((2**32 - 2**20) // 4 + 1, True),
 }
+# name -> (layout, padding elements after each K/V row (None: one interleaved K|V record
+# per token, as vLLM's QSA cache stores them), pool rows (None: packed K/V; 0: twice the
+# pages needed), first pool page)
+POOL_4G_RECORDS = 4_500_000 // PAGE * PAGE  # 1 KiB HK1 records: a 4.29 GiB pool
+FIRST_PAGE_4G = 4_200_000 // PAGE  # pages from here on start past 4 GiB
+STRIDE_CASES = {
+    "interleaved_ragged_4": ("ragged_4", None, None, 0),
+    "interleaved_extend_64_ctx_70065": ("extend_64_ctx_70065", None, None, 0),
+    "interleaved_hk2_ragged": ("hk2_ragged", None, None, 0),
+    "interleaved_hk2_chunk_1024_ctx_8192": ("hk2_chunk_1024_ctx_8192", None, None, 0),
+    "padded_ragged_4": ("ragged_4", 8, None, 0),
+    "kv_slots_interleaved_ragged_4": ("ragged_4", None, 0, 1),
+    "kv_slots_interleaved_hk2_ragged": ("hk2_ragged", None, 0, 1),
+    "kv_slots_interleaved_hk2_chunk_1024_ctx_8192": (
+        "hk2_chunk_1024_ctx_8192",
+        None,
+        0,
+        1,
+    ),
+    "kv_slots_padded_extend_64_ctx_70065": ("extend_64_ctx_70065", 8, 0, 1),
+    "kv_slots_interleaved_pool_4g_extend_64_ctx_70065": (
+        "extend_64_ctx_70065",
+        None,
+        POOL_4G_RECORDS,
+        FIRST_PAGE_4G,
+    ),
+    "kv_slots_interleaved_pool_4g_chunk_1024_ctx_132096": (
+        "chunk_1024_ctx_132096",
+        None,
+        POOL_4G_RECORDS,
+        FIRST_PAGE_4G,
+    ),
+    "interleaved_chunk_2048_ctx_30720": ("chunk_2048_ctx_30720", None, None, 0),
+    "padded_chunk_2048_ctx_30720": ("chunk_2048_ctx_30720", 8, None, 0),
+    "interleaved_hk2_chunk_2048_ctx_8192": ("hk2_chunk_2048_ctx_8192", None, None, 0),
+    "kv_slots_interleaved_chunk_2048_ctx_30720": ("chunk_2048_ctx_30720", None, 0, 1),
+    "kv_slots_interleaved_hk2_chunk_2048_ctx_8192": (
+        "hk2_chunk_2048_ctx_8192",
+        None,
+        0,
+        1,
+    ),
+    "kv_slots_interleaved_pool_4g_chunk_2048_ctx_30720": (
+        "chunk_2048_ctx_30720",
+        None,
+        POOL_4G_RECORDS,
+        FIRST_PAGE_4G,
+    ),
+    "interleaved_ragged_4_rows_2986": ("ragged_4_rows_2986", None, None, 0),
+    "kv_slots_interleaved_ragged_4_rows_2986": ("ragged_4_rows_2986", None, 0, 1),
+}
+# The wrapper's bound on the K/V row stride (elements): strides below it are accepted.
+KV_STRIDE_LIMIT = 2**28
+# name -> (tokens of one request, KV heads, K and V (row, head, dim) strides in
+# elements, Q's element step along dims (2: not contiguous), the rejection's message):
+# K/V or Q the kernels cannot read, and interleaved rows whose span passes
+# 4 GiB - 1 MiB although the request's K values alone would fit. The K/V messages are
+# the row check's own, so that off gfx950 the strided-row rejection cannot stand in.
+DENSE = (HEAD_DIM, HEAD_DIM, 1)
+ROWS = "dense [heads, 256]"
+STRIDE_REJECT_CASES = {
+    "stride_over_limit": (
+        2,
+        1,
+        (KV_STRIDE_LIMIT, HEAD_DIM, 1),
+        (KV_STRIDE_LIMIT, HEAD_DIM, 1),
+        1,
+        ROWS,
+    ),
+    "stride_not_16_byte_aligned": (
+        4 * 512 + 3,
+        1,
+        (HEAD_DIM + 4, HEAD_DIM, 1),
+        (HEAD_DIM + 4, HEAD_DIM, 1),
+        1,
+        ROWS,
+    ),
+    "stride_below_row": (
+        4 * 512 + 3,
+        1,
+        (HEAD_DIM - 8, HEAD_DIM, 1),
+        (HEAD_DIM - 8, HEAD_DIM, 1),
+        1,
+        ROWS,
+    ),
+    "k_v_strides_differ": (
+        4 * 512 + 3,
+        1,
+        (2 * HEAD_DIM, HEAD_DIM, 1),
+        (3 * HEAD_DIM, HEAD_DIM, 1),
+        1,
+        ROWS,
+    ),
+    # Per-head K|V records: each head's values 512 elements apart.
+    "heads_not_dense": (
+        4 * 512 + 3,
+        2,
+        (4 * HEAD_DIM, 2 * HEAD_DIM, 1),
+        (4 * HEAD_DIM, 2 * HEAD_DIM, 1),
+        1,
+        ROWS,
+    ),
+    "dims_strided": (
+        4 * 512 + 3,
+        1,
+        (2 * HEAD_DIM, HEAD_DIM, 2),
+        (2 * HEAD_DIM, HEAD_DIM, 2),
+        1,
+        ROWS,
+    ),
+    # Dense K, strided V; and two heads whose values overlap, rows HK x 256 apart.
+    "v_strided_k_dense": (
+        4 * 512 + 3,
+        1,
+        DENSE,
+        (2 * HEAD_DIM, HEAD_DIM, 1),
+        1,
+        ROWS,
+    ),
+    "heads_overlap": (
+        4 * 512 + 3,
+        2,
+        (2 * HEAD_DIM, HEAD_DIM // 2, 1),
+        (2 * HEAD_DIM, HEAD_DIM // 2, 1),
+        1,
+        ROWS,
+    ),
+    "q_not_contiguous": (4 * 512 + 3, 1, DENSE, DENSE, 2, "Q must be contiguous"),
+    "interleaved_span_over_limit": (
+        (2**32 - 2**20) // (4 * HEAD_DIM) + 1,
+        1,
+        (2 * HEAD_DIM, HEAD_DIM, 1),
+        (2 * HEAD_DIM, HEAD_DIM, 1),
+        1,
+        "byte span",
+    ),
+}
+# name -> (K/V view rows KV_STRIDE_LIMIT - 8 elements apart, the first of the four view
+# rows holding K/V, kv_slots, wide, query rows of the one request): a 2-row request over
+# 4 tokens in the packed request's 4 rows (1.5 GiB); in pool rows 4-7 of a 3.5 GiB view;
+# in pool rows 8-11 of a 5.5 GiB view, which raw direct reads with 64-bit (wide) loads;
+# and a 1536-row prefill (gfx950's union gate) whose four-token blocks all read pool
+# rows 4-7. These requests pack; RAW_DIRECT makes direct read the raw K/V instead.
+MAX_STRIDE_CASES = {
+    "max_stride": (4, 0, False, False, 2),
+    "kv_slots_max_stride": (8, 4, True, False, 2),
+    "kv_slots_wide_max_stride": (12, 8, True, True, 2),
+    "kv_slots_union_max_stride": (8, 4, True, False, 1536),
+}
+RAW_DIRECT = "max_packed_kv_bytes=0,pack_tokens_per_row=0"
 # name -> (layout, Q heads per KV head, read through kv_slots, softmax scales no other
 # case uses: one captured, one called eagerly). Union with packed direct, and through a
 # slot table union with raw direct, so that every kernel taking the scale runs.
@@ -433,6 +708,9 @@ FP8_GRAPH_CASES = {
 # name -> (layout, Q heads per KV head)
 FP8_WORKSPACE_CASES = {"fp8_workspace_key_ragged_4": ("ragged_4", 12)}
 FP8_ERROR_CASES = {"fp8_input_errors": ("extend_9_ctx_139", 3)}
+# name -> (layout, Q heads per KV head): off gfx942, whose E4M3FNUZ kernels these are,
+# FP8 calls are rejected.
+FP8_OFF_GFX942_CASES = {"fp8_off_gfx942": ("extend_9_ctx_139", 3)}
 # As BATCH_CASES, with FP8 K/V (per token scales) and batch_invariant=True. By default
 # the first two requests alone have few enough union tasks to split their key ranges and
 # batched they do not: batch_invariant=True must not split.
@@ -450,6 +728,7 @@ FP8_LAYOUT_CASES = {
     **FP8_GRAPH_CASES,
     **FP8_WORKSPACE_CASES,
     **FP8_ERROR_CASES,
+    **FP8_OFF_GFX942_CASES,
 }
 # name -> Q heads per KV head: these cases run once, at this group, whatever -g selects.
 # Group 16 is the most the interface accepts (BQ8 union tiles, a 16-head direct wave).
@@ -1071,14 +1350,14 @@ def routes():
     the context for the direct kernel ("pack_k": never for raw direct, and no pack runs
     when every tile runs union whole).
 
-    The helpers from latest_workspace to scratch_arena (and test_qsa_graph_replay's arena)
-    are the only code reading prefill internals:
+    The helpers from latest_workspace to scratch_arena (and test_qsa_graph_replay's
+    arena, test_qsa_route's tile count) are the only code reading prefill internals:
       - flydsl_prefill._workspaces, the most recently used workspace last;
       - a workspace's fp8 (None for BF16 K/V, else the scale layout), its BF16
-        direct.pack_shape (empty when direct reads the raw K/V) or FP8 direct.raw, and
-        its union plan (None
-        without one): .active (the tiles the latest call ran union), .query_tile, and
-        .union_ratio / .route_model (the calibration it routes with); FP8 plans add
+        direct.pack_shape (empty when direct reads the raw K/V), .packed_key, .wide and
+        .gated, or FP8 direct.raw, and its union plan (None without one): .active (the
+        tiles the latest call ran union), .query_tile, .num_tiles and .union_ratio /
+        .route_model (the calibration it routes with); FP8 plans add
         .split, .core_ratio, .residual (each tile's residual direct steps, written when
         core_ratio > 0), .residual_rows (each row's residual blocks, written per call
         when core_ratio > 0) and .direct_flag (entry 0 set when the pack must run);
@@ -1112,11 +1391,10 @@ def routes():
 
 
 @contextlib.contextmanager
-def raw_direct():
-    """Direct rows read the raw K/V whatever its size: the platform's pack budget is zeroed
-    (AITER_QSA_PLATFORM, read when the calibration is first used; a user's overrides stay,
-    the later fields win) and workspaces planned with it are dropped, on entry and on
-    exit."""
+def platform_entry(override):
+    """Calls inside run with the platform entry's fields `override` (AITER_QSA_PLATFORM,
+    read when the calibration is first used; a user's overrides stay, the later fields
+    win); workspaces planned with another entry are dropped, on entry and on exit."""
 
     def replan():
         flydsl_prefill.platform.cache_clear()
@@ -1124,18 +1402,24 @@ def raw_direct():
         for key in [key for key, value in workspaces.items() if not value.captured]:
             del workspaces[key]
 
-    previous = os.environ.get("AITER_QSA_PLATFORM", "").strip()
-    raw = "max_packed_kv_bytes=0,pack_tokens_per_row=0"
-    os.environ["AITER_QSA_PLATFORM"] = f"{previous},{raw}" if previous else raw
+    name = sparse_prefill_common.OVERRIDE
+    previous = os.environ.get(name, "").strip()
+    os.environ[name] = ",".join(fields for fields in (previous, override) if fields)
     replan()
     try:
         yield
     finally:
         if previous:
-            os.environ["AITER_QSA_PLATFORM"] = previous
+            os.environ[name] = previous
         else:
-            del os.environ["AITER_QSA_PLATFORM"]
+            del os.environ[name]
         replan()
+
+
+def raw_direct():
+    """Direct rows read the raw K/V whatever its size: the platform's pack budget is
+    zeroed (platform_entry)."""
+    return platform_entry(RAW_DIRECT)
 
 
 def check_routes(case, heads):
@@ -1145,6 +1429,33 @@ def check_routes(case, heads):
     expected = EXPECTED_ROUTES[case]
     assert get_cu_num() != 80 or taken == expected, f"{case} H{heads}: took {taken}"
     return taken
+
+
+def direct_path(plan):
+    """How the direct side of a call reads K/V: packed by the pack kernel, or the raw
+    K/V (64-bit loads past 4 GiB: wide)."""
+    if plan.packed_key is not None:
+        return "packed"
+    return "raw wide" if plan.wide else "raw"
+
+
+def check_union(ret, layout, label):
+    """Report the latest call's union tiles (the route of sparse_prefill_order_masks
+    writes 1 per union tile to the union plan's active array) and direct path in ret. On
+    gfx950 a UNION_LAYOUTS call must have run union tiles, and a RAW_DIRECT_LAYOUTS call
+    must have had a union plan whose direct side reads the raw K/V."""
+    workspace = latest_workspace()
+    plan = workspace.union
+    ret["union tiles"] = 0 if plan is None else int((plan.active != 0).sum().item())
+    ret["direct"] = direct_path(workspace.direct)
+    if get_gfx_runtime() != "gfx950":
+        return
+    if layout in UNION_LAYOUTS:
+        assert ret["union tiles"] > 0, f"{label}: no union tile ran"
+    if layout in RAW_DIRECT_LAYOUTS:
+        assert workspace.direct.gated and ret["direct"].startswith(
+            "raw"
+        ), f"{label}: direct {ret['direct']}, gated {workspace.direct.gated}"
 
 
 def plan_terms():
@@ -1170,6 +1481,7 @@ def calibrated_terms(scales):
         config.union_step,
         config.row_step,
         config.route_margin,
+        config.route_all_or_none,
     )
     return config.union_ratio, route_model
 
@@ -1218,12 +1530,21 @@ def mismatched_bits(a, b, msg):
     return int((a.view(torch.int16) != b.view(torch.int16)).sum().item())
 
 
+def rejected_off_gfx950(label, *args, **kwargs):
+    """Strided K/V rows are validated on gfx950 only: elsewhere the call must raise."""
+    try:
+        qsa_sparse_prefill(*args, **kwargs)
+        message = ""
+    except ValueError as error:
+        message = str(error)
+    assert "gfx950 only" in message, f"{label}: strided K/V gave {message!r}"
+    return {"gfx": get_gfx_runtime(), "rejected off gfx950": True}
+
+
 @benchmark()
 def test_qsa_sparse_attention(case, heads):
     query_lens, prefix_lens, kv_heads, _, topk = CASES[case]
-    generator = torch.Generator(device="cuda").manual_seed(
-        list(CASES).index(case) * 16 + heads
-    )
+    generator = torch.Generator(device="cuda").manual_seed(case_seed(case, heads))
     q, k, v, indices = make_inputs(case, heads, generator)
     rows, kv_tokens = q.shape[0], k.shape[0]
 
@@ -1246,7 +1567,7 @@ def test_qsa_sparse_attention(case, heads):
     flops = 4 * heads * HEAD_DIM * int((indices >= 0).sum().item())
     nbytes = 2 * q.nbytes + k.nbytes + v.nbytes + indices.nbytes
     ret = {
-        "gfx": get_gfx(),
+        "gfx": get_gfx_runtime(),
         "rows": rows,
         "kv_tokens": kv_tokens,
         "kv_heads": kv_heads,
@@ -1269,6 +1590,7 @@ def test_qsa_sparse_attention(case, heads):
         ret[f"{name} err"] = err
     # The SGLang kernels are only the baseline: FlyDSL alone must pass the check.
     assert ret["flydsl err"] == 0, f"{case} H{heads}: mismatch {ret['flydsl err']}"
+    check_union(ret, case, f"{case} H{heads}")
     return ret
 
 
@@ -1286,7 +1608,7 @@ def released(pointer):
 
 @benchmark()
 def test_qsa_graph_replay(case, heads):
-    """A graph-captured union layout replayed with indices rewritten in place, before
+    """A graph-captured layout replayed with indices rewritten in place, before
     and after another layout's first call grows the stream's scratch arena."""
     captured, growth = GRAPH_CASES[case]
     query_lens, prefix_lens, _, selection, topk = CASES[captured]
@@ -1321,6 +1643,8 @@ def test_qsa_graph_replay(case, heads):
         )
 
     errors = [replay(second, "replay")]
+    ret = {"gfx": get_gfx_runtime(), "rows": q.shape[0], "growth": growth}
+    check_union(ret, captured, f"{case} H{heads} replay")
     arena = flydsl_prefill._arenas[(q.device, stream.cuda_stream)]
     generation, scratch = arena.generation, [b.data_ptr() for b in arena.buffers]
     growth_lens, growth_prefix = CASES[growth][:2]
@@ -1337,21 +1661,16 @@ def test_qsa_graph_replay(case, heads):
     assert not any(map(released, scratch)), f"{growth} freed the captured scratch"
     errors.append(replay(first, "replay after arena growth"))
     assert max(errors) == 0, f"{case} H{heads}: mismatch {errors}"
-    return {
-        "gfx": get_gfx(),
-        "rows": q.shape[0],
-        "growth": growth,
-        "flydsl graph err": max(errors),
-    }
+    ret["flydsl graph err"] = max(errors)
+    return ret
 
 
-def make_pool(
-    k, v, query_lens, prefix_lens, pool_rows, first_page, generator, last_page=False
+def make_slots(
+    query_lens, prefix_lens, pool_rows, first_page, generator, last_page=False
 ):
-    """K/V token pools and int32 slots: each request's packed K/V rows scattered to
-    random PAGE-token pages from first_page on (with last_page, the last request's last
-    page is the pool's last page); every other pool row is NaN (FP8: the E4M3FNUZ NaN
-    byte 0x80)."""
+    """int32 slots placing each request's tokens on random PAGE-token pages from
+    first_page on (with last_page, the last request's last page is the pool's last
+    page), and the pool's rows (pool_rows, or twice the pages needed if 0 or None)."""
     lengths = [n + p for n, p in zip(query_lens, prefix_lens)]
     counts = [-(-n // PAGE) for n in lengths]
     pool_rows = pool_rows or (2 * sum(counts) + first_page) * PAGE
@@ -1369,7 +1688,18 @@ def make_pool(
             pages[first : first + count][tokens // PAGE] * PAGE + tokens % PAGE
         )
         first += count
-    slots = torch.cat(slots).to(dtypes.i32)
+    return torch.cat(slots).to(dtypes.i32), pool_rows
+
+
+def make_pool(
+    k, v, query_lens, prefix_lens, pool_rows, first_page, generator, last_page=False
+):
+    """K/V token pools and int32 slots (make_slots): each request's packed K/V rows
+    scattered to random PAGE-token pages; every other pool row is NaN (FP8: the E4M3FNUZ
+    NaN byte 0x80)."""
+    slots, pool_rows = make_slots(
+        query_lens, prefix_lens, pool_rows, first_page, generator, last_page
+    )
     pools = []
     for packed in (k, v):
         if packed.dtype == FP8:
@@ -1391,9 +1721,7 @@ def test_qsa_kv_slots(case, heads):
     the gathered rows (what a caller without kv_slots runs); both match bit for bit."""
     layout, pool_rows, first_page = SLOT_CASES[case]
     query_lens, prefix_lens, kv_heads, *_ = CASES[layout]
-    generator = torch.Generator(device="cuda").manual_seed(
-        list(CASES).index(layout) * 16 + heads
-    )
+    generator = torch.Generator(device="cuda").manual_seed(case_seed(layout, heads))
     q, k, v, indices = make_inputs(layout, heads, generator)
     ref = run_torch(q, k, v, indices, query_lens, prefix_lens, SCALE)
     pool_k, pool_v, slots = make_pool(
@@ -1422,7 +1750,7 @@ def test_qsa_kv_slots(case, heads):
     kv_bytes = slots.numel() * pool_k.stride(0) * pool_k.element_size()
     nbytes = 2 * q.nbytes + 2 * kv_bytes + indices.nbytes + slots.nbytes
     ret = {
-        "gfx": get_gfx(),
+        "gfx": get_gfx_runtime(),
         "rows": q.shape[0],
         "kv_tokens": slots.numel(),
         "kv_heads": kv_heads,
@@ -1445,6 +1773,7 @@ def test_qsa_kv_slots(case, heads):
         )
         outputs[name] = out
     assert ret["flydsl_kv_slots err"] == 0, f"{case} H{heads}: kv_slots mismatch"
+    check_union(ret, layout, f"{case} H{heads}")
     bitwise = checkAllclose(
         outputs["flydsl_gather"],
         outputs["flydsl_kv_slots"],
@@ -1456,6 +1785,226 @@ def test_qsa_kv_slots(case, heads):
     return ret
 
 
+def make_paged(k, v, query_lens, prefix_lens, case, generator):
+    """K and V [pages, page, HK, 256] of a paged cache holding each request's packed K/V on
+    random pages (every other element NaN), and the int32 block table [requests, pages].
+    """
+    _, page, pitch, kind = PAGED_CASES[case]
+    lengths = [n + p for n, p in zip(query_lens, prefix_lens)]
+    counts = [-(-n // page) for n in lengths]
+    pages = 2 * sum(counts) + 1
+    chosen = torch.randperm(pages, generator=generator, device="cuda")
+    if kind == "record":
+        record = torch.full(
+            (pages, pitch, 2, *k.shape[1:]), float("nan"), dtype=k.dtype
+        )
+        caches = (record[:, :page, 0], record[:, :page, 1])
+    else:
+        caches = tuple(
+            torch.full((pages, page, *k.shape[1:]), float("nan"), dtype=k.dtype)
+            for _ in range(2)
+        )
+    table = torch.zeros(len(lengths), max(counts), dtype=dtypes.i32)
+    first = used = 0
+    for r, (n, count) in enumerate(zip(lengths, counts)):
+        table[r, :count] = chosen[used : used + count].to(dtypes.i32)
+        tokens = torch.arange(n)
+        for cache, packed in zip(caches, (k, v)):
+            cache[table[r, tokens // page].long(), tokens % page] = packed[
+                first : first + n
+            ]
+        first += n
+        used += count
+    return *caches, table
+
+
+@benchmark()
+def test_qsa_paged_kv(case, heads):
+    """K/V read in place from a paged cache through qsa_paged_kv_pool and
+    qsa_paged_kv_slots: the pools hold the packed K/V at the slots, the op accepts them,
+    and its output equals the packed call bit for bit."""
+    layout, page, pitch, kind = PAGED_CASES[case]
+    query_lens, prefix_lens, *_ = CASES[layout]
+    generator = torch.Generator(device="cuda").manual_seed(case_seed(layout, heads))
+    q, k, v, indices = make_inputs(layout, heads, generator)
+    k_cache, v_cache, table = make_paged(k, v, query_lens, prefix_lens, case, generator)
+    pool = qsa_paged_kv_pool(k_cache, v_cache)
+    assert pool is not None, f"{case}: no pool"
+    assert (pool.page_size, pool.rows_per_page) == (page, pitch), f"{case}: {pool[2:]}"
+    # The table is built without a host synchronization: a step's first layer builds it
+    # among that step's launches.
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        slots = qsa_paged_kv_slots(
+            query_lens, prefix_lens, table, pool.page_size, pool.rows_per_page
+        )
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    rows = slots.long()
+    # Rows of the pool, not the formula: the packed K/V sit where the slots say.
+    assert torch.equal(pool.k[rows], k) and torch.equal(pool.v[rows], v), case
+    kwargs = {
+        "query_lens": query_lens,
+        "prefix_lens": prefix_lens,
+        "softmax_scale": SCALE,
+    }
+    problem = qsa_sparse_prefill_problem(
+        q, pool.k, pool.v, indices, **kwargs, kv_slots=slots
+    )
+    ret = {
+        "gfx": get_gfx_runtime(),
+        "rows": q.shape[0],
+        "kv_tokens": slots.numel(),
+        "pages": k_cache.shape[0],
+    }
+    if kind == "record" and get_gfx_runtime() != "gfx950":
+        # Interleaved rows are strided: the op reads them on gfx950 only.
+        assert problem == "Strided K/V rows are supported on gfx950 only", problem
+        assert not can_use_flydsl_qsa_sparse_prefill(
+            q, pool.k, pool.v, indices, **kwargs, kv_slots=slots
+        )
+        return ret
+    assert problem is None, f"{case}: {problem}"
+    ref = run_torch(q, k, v, indices, query_lens, prefix_lens, SCALE)
+    packed = qsa_sparse_prefill(q, k, v, indices, **kwargs)
+    paged = qsa_sparse_prefill(q, pool.k, pool.v, indices, **kwargs, kv_slots=slots)
+    ret["flydsl err"] = checkAllclose(
+        ref, paged.to(dtypes.fp32), rtol=2e-2, atol=2e-2, msg=f"{case} H{heads}: out"
+    )
+    assert ret["flydsl err"] == 0, f"{case} H{heads}: mismatch {ret['flydsl err']}"
+    bitwise = checkAllclose(
+        packed, paged, rtol=0, atol=0, msg=f"{case} H{heads} paged vs packed: out"
+    )
+    assert bitwise == 0, f"{case} H{heads}: the paged call differs from the packed call"
+    return ret
+
+
+def make_rows(rows, kv_heads, padding):
+    """NaN-filled K and V views [rows, kv_heads, 256] with strided rows: the halves of
+    one interleaved K|V record per row (padding None), or rows of two buffers with
+    padding elements after their values."""
+    if padding is None:
+        records = torch.full(
+            (rows, 2, kv_heads, HEAD_DIM), float("nan"), dtype=dtypes.bf16
+        )
+        return records[:, 0], records[:, 1]
+    width = kv_heads * HEAD_DIM
+    return tuple(
+        torch.full((rows, width + padding), float("nan"), dtype=dtypes.bf16)[
+            :, :width
+        ].unflatten(1, (kv_heads, HEAD_DIM))
+        for _ in range(2)
+    )
+
+
+@benchmark()
+def test_qsa_strided_kv(case, heads):
+    """K/V read in place through strided row views (interleaved K|V records or padded
+    rows), packed or through kv_slots, against the call on the same rows gathered into
+    contiguous K/V; both match bit for bit."""
+    layout, padding, pool_rows, first_page = STRIDE_CASES[case]
+    query_lens, prefix_lens, kv_heads, *_ = CASES[layout]
+    generator = torch.Generator(device="cuda").manual_seed(case_seed(layout, heads))
+    q, k, v, indices = make_inputs(layout, heads, generator)
+    ref = None
+    if get_gfx_runtime() == "gfx950":
+        ref = run_torch(q, k, v, indices, query_lens, prefix_lens, SCALE)
+    if pool_rows is None:
+        slots, pool_rows = None, k.shape[0]
+        rows = torch.arange(pool_rows)
+    else:
+        slots, pool_rows = make_slots(
+            query_lens, prefix_lens, pool_rows, first_page, generator
+        )
+        rows = slots.long()
+    strided_k, strided_v = make_rows(pool_rows, kv_heads, padding)
+    strided_k[rows], strided_v[rows] = k, v
+    del k, v
+    kwargs = {
+        "query_lens": query_lens,
+        "prefix_lens": prefix_lens,
+        "softmax_scale": SCALE,
+    }
+    if get_gfx_runtime() != "gfx950":
+        return rejected_off_gfx950(
+            f"{case} H{heads}",
+            q,
+            strided_k,
+            strided_v,
+            indices,
+            **kwargs,
+            kv_slots=slots,
+        )
+
+    def gather(q, k, v, indices):
+        return qsa_sparse_prefill(q, k[rows], v[rows], indices, **kwargs)
+
+    candidates = {
+        "flydsl_gather": (gather, (q, strided_k, strided_v, indices), {}),
+        "flydsl_strided": (
+            qsa_sparse_prefill,
+            (q, strided_k, strided_v, indices),
+            {**kwargs, "kv_slots": slots},
+        ),
+    }
+    flops = 4 * heads * HEAD_DIM * int((indices >= 0).sum().item())
+    # Compulsory traffic, the same for both candidates: Q in, O out, the requests' K and
+    # V values once (not padding, the interleaved other half, or the gather's copy),
+    # indices and slots.
+    nbytes = 2 * q.nbytes + 2 * rows.numel() * kv_heads * HEAD_DIM * 2
+    nbytes += indices.nbytes + (0 if slots is None else slots.nbytes)
+    span = ((pool_rows - 1) * strided_k.stride(0) + kv_heads * HEAD_DIM) * 2
+    ret = {
+        "gfx": get_gfx_runtime(),
+        "rows": q.shape[0],
+        "kv_tokens": rows.numel(),
+        "kv_heads": kv_heads,
+        "row stride": strided_k.stride(0),
+        "K span GiB": span / 2**30,
+    }
+    outputs = {}
+    for name, (fn, args, kw) in candidates.items():
+        out, us = run_perftest(
+            fn, *args, **kw, num_rotate_args=10 if span < 2**30 else 1
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = checkAllclose(
+            ref,
+            out.to(dtypes.fp32),
+            rtol=2e-2,
+            atol=2e-2,
+            msg=f"{case} H{heads} {name}: out",
+        )
+        outputs[name] = out
+    assert ret["flydsl_strided err"] == 0, f"{case} H{heads}: strided K/V mismatch"
+    check_union(ret, layout, f"{case} H{heads}")
+    bitwise = checkAllclose(
+        outputs["flydsl_gather"],
+        outputs["flydsl_strided"],
+        rtol=0,
+        atol=0,
+        msg=f"{case} H{heads} flydsl_strided vs flydsl_gather: out",
+    )
+    assert bitwise == 0, f"{case} H{heads}: strided K/V differ from the gathered call"
+    return ret
+
+
+def last_row_selection(tokens):
+    """A valid T = 512 selection of the last row of a tokens-token request (its first
+    min(tokens // 4, 512) blocks, then the causal tail), so that a missing check fails
+    the rejection's assertion rather than faulting in a kernel."""
+    blocks = min(tokens // 4, 512)
+    indices = torch.full((1, 4 * 512 + 3), -1, dtype=dtypes.i32)
+    indices[0, : 4 * blocks] = torch.arange(4 * blocks)
+    indices[0, 4 * blocks : 4 * blocks + tokens % 4] = torch.arange(
+        tokens // 4 * 4, tokens
+    )
+    return indices
+
+
 @benchmark()
 def test_qsa_span_limit(case, heads):
     """A request whose K/V or slot table spans more than 4 GiB - 1 MiB is rejected
@@ -1465,11 +2014,7 @@ def test_qsa_span_limit(case, heads):
     kv = torch.empty(PAGE if slotted else tokens, 1, HEAD_DIM, dtype=dtypes.bf16)
     slots = torch.zeros(tokens, dtype=dtypes.i32) if slotted else None
     span = (kv if slots is None else slots).nbytes
-    # A valid selection (blocks 0-511, then the causal tail), so that a missing check
-    # fails the assertion rather than faulting in a kernel.
-    indices = torch.full((1, 4 * 512 + 3), -1, dtype=dtypes.i32)
-    indices[0, : 4 * 512] = torch.arange(4 * 512)
-    indices[0, 4 * 512 : 4 * 512 + tokens % 4] = torch.arange(tokens // 4 * 4, tokens)
+    indices = last_row_selection(tokens)
     try:
         qsa_sparse_prefill(
             q,
@@ -1486,13 +2031,167 @@ def test_qsa_span_limit(case, heads):
         rejected = "byte span" in message and ("kv_slots" in message) == slotted
     assert rejected, f"{case} H{heads}: a {span}-byte span was accepted"
     return {
-        "gfx": get_gfx(),
+        "gfx": get_gfx_runtime(),
         "kv_tokens": tokens,
         "kv_slots": slotted,
         "span bytes": span,
         "limit bytes": 2**32 - 2**20,
         "rejected": rejected,
     }
+
+
+@benchmark()
+def test_qsa_stride_rejected(case, heads):
+    """K/V the kernels cannot read (rows not 16-byte aligned, overlapping, with K and V
+    strides differing or KV_STRIDE_LIMIT elements or more apart; heads not dense; a
+    strided last dim), a non-contiguous Q, or interleaved rows spanning past
+    4 GiB - 1 MiB, are rejected before any launch."""
+    tokens, kv_heads, k_strides, v_strides, q_step, expected = STRIDE_REJECT_CASES[case]
+    q = torch.zeros(1, heads * kv_heads, HEAD_DIM * q_step, dtype=dtypes.bf16)
+    q = q[..., ::q_step]
+    k, v = (
+        torch.empty(
+            sum(
+                (n - 1) * step for n, step in zip((tokens, kv_heads, HEAD_DIM), strides)
+            )
+            + 1,
+            dtype=dtypes.bf16,
+        ).as_strided((tokens, kv_heads, HEAD_DIM), strides)
+        for strides in (k_strides, v_strides)
+    )
+    indices = last_row_selection(tokens)
+    try:
+        qsa_sparse_prefill(q, k, v, indices, query_lens=(1,), prefix_lens=(tokens - 1,))
+        message = ""
+    except ValueError as error:
+        message = str(error)
+    rejected = expected in message
+    strides = f"K/V {k.stride()}/{v.stride()}, Q {q.stride()}"
+    assert rejected, f"{case} H{heads}: {strides} gave {message!r}"
+    return {
+        "gfx": get_gfx_runtime(),
+        "kv_tokens": tokens,
+        "k strides": k_strides,
+        "v strides": v_strides,
+        "q contiguous": q.is_contiguous(),
+        "rejected": rejected,
+    }
+
+
+@benchmark()
+def test_qsa_max_stride(case, heads):
+    """A request read in place through K/V rows KV_STRIDE_LIMIT - 8 elements apart, the
+    largest stride accepted (packed rows, or pool rows through kv_slots), by packed
+    direct and by raw direct (RAW_DIRECT), against the call on the same rows in
+    contiguous K/V; both match bit for bit. Token t reads view row first + t % 4; the
+    other view rows are NaN. The 1536-row request runs with every tile forced onto union
+    (FORCED_ROUTES) and must run union tiles."""
+    view_rows, first, slotted, wide, rows = MAX_STRIDE_CASES[case]
+    tokens = max(rows, 4)
+    query_lens, prefix_lens = (rows,), (tokens - rows,)
+    generator = torch.Generator(device="cuda").manual_seed(heads)
+    q = torch.randn(rows, heads, HEAD_DIM, generator=generator, dtype=dtypes.bf16)
+    k4, v4 = (
+        torch.randn(4, 1, HEAD_DIM, generator=generator, dtype=dtypes.bf16)
+        for _ in range(2)
+    )
+    indices = make_indices(query_lens, prefix_lens, "shared", generator, 512)
+    stride = KV_STRIDE_LIMIT - 8
+    strided_k, strided_v = (
+        torch.full(
+            ((view_rows - 1) * stride + HEAD_DIM,), float("nan"), dtype=dtypes.bf16
+        ).as_strided((view_rows, 1, HEAD_DIM), (stride, HEAD_DIM, 1))
+        for _ in range(2)
+    )
+    strided_k[first : first + 4], strided_v[first : first + 4] = k4, v4
+    k, v = k4[torch.arange(tokens) % 4], v4[torch.arange(tokens) % 4]
+    kwargs = {
+        "query_lens": query_lens,
+        "prefix_lens": prefix_lens,
+        "softmax_scale": SCALE,
+    }
+    slots = (first + torch.arange(tokens) % 4).to(dtypes.i32) if slotted else None
+    if get_gfx_runtime() != "gfx950":
+        return rejected_off_gfx950(
+            f"{case} H{heads}",
+            q,
+            strided_k,
+            strided_v,
+            indices,
+            kv_slots=slots,
+            **kwargs,
+        )
+    ref = run_torch(q, k, v, indices, query_lens, prefix_lens, SCALE)
+    ret = {
+        "gfx": get_gfx_runtime(),
+        "rows": rows,
+        "row stride": stride,
+        "K span GiB": strided_k.untyped_storage().nbytes() / 2**30,
+        "kv_slots": slotted,
+    }
+    union = [FORCED_ROUTES["union"]] if rows >= 1536 else []
+    for override, expected in (
+        ([], "packed"),
+        ([RAW_DIRECT], "raw wide" if wide else "raw"),
+    ):
+        with platform_entry(",".join(override + union)):
+            out = qsa_sparse_prefill(
+                q, strided_k, strided_v, indices, kv_slots=slots, **kwargs
+            )
+            check_union(ret, case, f"{case} H{heads}")
+            contiguous = qsa_sparse_prefill(q, k, v, indices, **kwargs)
+        label = f"{case} H{heads} flydsl_strided {ret['direct']}"
+        err = checkAllclose(
+            ref, out.to(dtypes.fp32), rtol=2e-2, atol=2e-2, msg=f"{label}: out"
+        )
+        bitwise = checkAllclose(
+            contiguous, out, rtol=0, atol=0, msg=f"{label} vs contiguous: out"
+        )
+        assert ret["direct"] == expected, f"{label}: expected direct {expected}"
+        if union:
+            assert ret["union tiles"] > 0, f"{label}: no union tile ran"
+        assert err == 0 and bitwise == 0, f"{label}: mismatch {err}, {bitwise}"
+        ret[f"{expected} err"] = err
+        ret[f"{expected} union tiles"] = ret.pop("union tiles")
+    del ret["direct"]
+    return ret
+
+
+@benchmark()
+def test_qsa_route(case, heads):
+    """A RAW_DIRECT_LAYOUTS layout with its route forced (FORCED_ROUTES), against the
+    reference: on gfx950 the union route must run union tiles, and the direct route must
+    run every tile on gated raw direct (gfx942 reports the route only)."""
+    layout, route = ROUTE_CASES[case]
+    query_lens, prefix_lens, *_ = CASES[layout]
+    generator = torch.Generator(device="cuda").manual_seed(case_seed(layout, heads))
+    q, k, v, indices = make_inputs(layout, heads, generator)
+    ref = run_torch(q, k, v, indices, query_lens, prefix_lens, SCALE)
+    label = f"{case} H{heads}"
+    ret = {"gfx": get_gfx_runtime(), "rows": q.shape[0], "route": route}
+    with platform_entry(FORCED_ROUTES[route]):
+        out = qsa_sparse_prefill(
+            q,
+            k,
+            v,
+            indices,
+            query_lens=query_lens,
+            prefix_lens=prefix_lens,
+            softmax_scale=SCALE,
+        )
+        check_union(ret, layout, label)
+        tiles = latest_workspace().union.num_tiles
+    ret["tiles"] = tiles
+    ret["flydsl err"] = checkAllclose(
+        ref, out.to(dtypes.fp32), rtol=2e-2, atol=2e-2, msg=f"{label}: out"
+    )
+    assert ret["flydsl err"] == 0, f"{label}: mismatch {ret['flydsl err']}"
+    if get_gfx_runtime() == "gfx950":
+        if route == "union":
+            assert ret["union tiles"] > 0, f"{label}: no union tile ran"
+        else:
+            assert ret["union tiles"] == 0, f"{label}: {ret['union tiles']} union tiles"
+    return ret
 
 
 @benchmark()
@@ -1506,9 +2205,7 @@ def test_qsa_graph_new_scale(case, heads):
     specialization."""
     layout, _, slotted, (new_scale, eager_scale) = SCALE_CASES[case]
     query_lens, prefix_lens, _, selection, topk = CASES[layout]
-    generator = torch.Generator(device="cuda").manual_seed(
-        list(CASES).index(layout) * 16 + heads
-    )
+    generator = torch.Generator(device="cuda").manual_seed(case_seed(layout, heads))
     q, k, v, first = make_inputs(layout, heads, generator)
     second = make_indices(query_lens, prefix_lens, selection, generator, topk)
     kwargs = {"query_lens": query_lens, "prefix_lens": prefix_lens}
@@ -1575,7 +2272,7 @@ def test_qsa_graph_new_scale(case, heads):
         f"specializations ({before} -> {after})"
     )
     return {
-        "gfx": get_gfx(),
+        "gfx": get_gfx_runtime(),
         "rows": q.shape[0],
         "kv_slots": slotted,
         "captured scales": f"{SCALE:.4g}, {new_scale:.4g}",
@@ -1597,7 +2294,9 @@ def test_qsa_batch_invariance(case, heads):
     workspace (its plan would change the requests' bits)."""
     _, requests = BATCH_CASES[case]
     generator = torch.Generator(device="cuda").manual_seed(
-        len(CASES) * 16 + list(BATCH_CASES).index(case) * 16 + heads
+        (len(CASES) - len(NAMED_LAYOUTS)) * 16
+        + list(BATCH_CASES).index(case) * 16
+        + heads
     )
     parts = []
     for rows, prefix, selection in requests:
@@ -1662,7 +2361,7 @@ def test_qsa_batch_invariance(case, heads):
         "elements"
     )
     return {
-        "gfx": get_gfx(),
+        "gfx": get_gfx_runtime(),
         "rows": q.shape[0],
         "requests": len(requests),
         "flydsl err": err,
@@ -1671,8 +2370,16 @@ def test_qsa_batch_invariance(case, heads):
     }
 
 
+def case_seed(layout, heads):
+    """Generator seed of a CASES layout at `heads` Q heads: from its position in CASES,
+    or for NAMED_LAYOUTS from its name (fp8_seed)."""
+    if layout in NAMED_LAYOUTS:
+        return fp8_seed(layout, heads)
+    return list(CASES).index(layout) * 16 + heads
+
+
 def fp8_seed(case, heads):
-    """Generator seed of an FP8 case."""
+    """Generator seed of a case by its name: an FP8 case, or a NAMED_LAYOUTS layout."""
     return zlib.crc32(f"{case} H{heads}".encode())
 
 
@@ -1854,7 +2561,7 @@ def test_qsa_fp8(case, heads):
     flops = 4 * heads * HEAD_DIM * int((indices >= 0).sum().item())
     nbytes = 2 * q.nbytes + k8.nbytes + v8.nbytes + indices.nbytes
     ret = {
-        "gfx": get_gfx(),
+        "gfx": get_gfx_runtime(),
         "rows": q.shape[0],
         "kv_tokens": k8.shape[0],
         "kv_heads": kv_heads,
@@ -2014,7 +2721,7 @@ def test_qsa_fp8_sink(case, heads):
         mean < 0.01 and worst < 0.03
     ), f"{case} H{heads}: error mean {mean:.4f}, worst {worst:.4f}"
     return {
-        "gfx": get_gfx(),
+        "gfx": get_gfx_runtime(),
         "rows": rows,
         "scales": scales,
         "routes": taken,
@@ -2073,7 +2780,7 @@ def test_qsa_fp8_uniform(case, heads):
         msg=f"{case} H{heads}: out",
     )
     assert err == 0, f"{case} H{heads}: mismatch {err}"
-    return {"gfx": get_gfx(), "rows": rows, "routes": taken, "flydsl err": err}
+    return {"gfx": get_gfx_runtime(), "rows": rows, "routes": taken, "flydsl err": err}
 
 
 @benchmark()
@@ -2088,7 +2795,7 @@ def test_qsa_fp8_query(case, heads):
     query_lens, prefix_lens = CASES[layout][:2]
     generator = torch.Generator(device="cuda").manual_seed(fp8_seed(case, heads))
     q, k8, ks, v8, vs, indices = make_fp8_inputs(layout, heads, True, generator)
-    ret = {"gfx": get_gfx(), "rows": q.shape[0]}
+    ret = {"gfx": get_gfx_runtime(), "rows": q.shape[0]}
 
     def call(query, k_scale):
         return qsa_sparse_prefill(
@@ -2265,7 +2972,7 @@ def test_qsa_fp8_graph(case, heads):
         f"specializations ({before} -> {after})"
     )
     return {
-        "gfx": get_gfx(),
+        "gfx": get_gfx_runtime(),
         "rows": live[0].shape[0],
         "scales": scales,
         "kv_slots": slotted,
@@ -2362,7 +3069,7 @@ def test_qsa_fp8_workspace(case, heads):
     assert not any(
         alive.values()
     ), f"{case} H{heads}: workspaces keep caller tensors alive {alive}"
-    return {"gfx": get_gfx(), "rows": q.shape[0], "calls": len(calls)}
+    return {"gfx": get_gfx_runtime(), "rows": q.shape[0], "calls": len(calls)}
 
 
 # API.md section 1: qsa_sparse_prefill's parameters as (name, kind, default).
@@ -2471,7 +3178,11 @@ def test_qsa_fp8_input_errors(case, heads):
         f"qsa_sparse_prefill's parameters {parameters} are not API.md's "
         f"{ENTRY_PARAMETERS}"
     )
-    return {"gfx": get_gfx(), "rejected": len(bad), "parameters": len(parameters)}
+    return {
+        "gfx": get_gfx_runtime(),
+        "rejected": len(bad),
+        "parameters": len(parameters),
+    }
 
 
 @benchmark()
@@ -2547,7 +3258,7 @@ def test_qsa_fp8_batch_invariance(case, heads):
         "elements"
     )
     return {
-        "gfx": get_gfx(),
+        "gfx": get_gfx_runtime(),
         "rows": q.shape[0],
         "requests": len(requests),
         "batch routes": taken,
@@ -2558,18 +3269,71 @@ def test_qsa_fp8_batch_invariance(case, heads):
     }
 
 
+@benchmark()
+def test_qsa_fp8_off_gfx942(case, heads):
+    """Off gfx942 every FP8 call raises the FP8 rule, with compute="fp8" and "bf16" and
+    per-token and per-tensor scales, before any launch (no FlyDSL specialization is
+    added)."""
+    layout, _ = FP8_OFF_GFX942_CASES[case]
+    query_lens, prefix_lens = CASES[layout][:2]
+    generator = torch.Generator(device="cuda").manual_seed(fp8_seed(case, heads))
+    q, k8, ks, v8, vs, indices = make_fp8_inputs(layout, heads, True, generator)
+    one = torch.ones(1)
+    before = flydsl_variants()
+    messages = []
+    for compute in ("fp8", "bf16"):
+        for k_scale, v_scale in ((ks, vs), (one, one)):
+            try:
+                qsa_sparse_prefill(
+                    q,
+                    k8,
+                    v8,
+                    indices,
+                    query_lens=query_lens,
+                    prefix_lens=prefix_lens,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                    compute=compute,
+                )
+                messages.append("")
+            except ValueError as error:
+                messages.append(str(error))
+    after = flydsl_variants()
+    expected = "FP8 K/V are supported on gfx942 only"
+    assert all(m == expected for m in messages), f"{case} H{heads}: {messages}"
+    assert after == before, (
+        f"{case} H{heads}: rejected calls took FlyDSL specializations "
+        f"({before} -> {after})"
+    )
+    return {"gfx": get_gfx_runtime(), "calls": len(messages), "rejected": True}
+
+
 def kv_bytes(case):
     """K/V bytes a case allocates, pools included (graph and batch invariance cases
     stay small). FP8 K/V count twice their bytes: the FP8 pack holds another copy; FP8
     cases add three times their Q bytes (Q, out, the FP8 Q and run_perftest's outputs:
     FP8_LARGE_Q_CASES pass 2 GiB)."""
+    if case in MAX_STRIDE_CASES:
+        return 2 * MAX_STRIDE_CASES[case][0] * KV_STRIDE_LIMIT * 2
+    if case in ROUTE_CASES:
+        case = ROUTE_CASES[case][0]
     if case in SPAN_LIMIT_CASES:
         tokens, slotted = SPAN_LIMIT_CASES[case]
         return tokens * (4 if slotted else HEAD_DIM * 2)
+    if case in STRIDE_REJECT_CASES:
+        tokens, _, k_strides, v_strides, *_ = STRIDE_REJECT_CASES[case]
+        return tokens * (k_strides[0] + v_strides[0]) * 2
+    if case in PAGED_CASES:
+        layout, page, pitch, _ = PAGED_CASES[case]
+        query_lens, prefix_lens, hk = CASES[layout][:3]
+        pages = 2 * sum(-(-(n + p) // page) for n, p in zip(query_lens, prefix_lens))
+        return (pages + 1) * pitch * 2 * hk * HEAD_DIM * 2
     group = 0
     if case in FP8_CASES:
         layout, group, *_, pool = FP8_CASES[case]
         pool_rows = None if pool is None else pool[0]
+    elif case in STRIDE_CASES:
+        layout, _, pool_rows, _ = STRIDE_CASES[case]
     else:
         layout, pool_rows, _ = SLOT_CASES.get(case, (case, None, None))
     if layout not in CASES:
@@ -2581,24 +3345,12 @@ def kv_bytes(case):
 
 
 def main():
-    if get_gfx() not in SUPPORTED_GFX:
-        aiter.logger.warning(
-            "qsa_sparse_prefill unsupported on %s; skipping", get_gfx()
-        )
+    gfx = get_gfx_runtime()
+    if gfx not in SUPPORTED_GFX:
+        aiter.logger.warning("qsa_sparse_prefill unsupported on %s; skipping", gfx)
         return
 
-    suites = (
-        (
-            "functional",
-            [*FUNCTIONAL_CASES, *CONSTANT_CASES, "mixed_union_raw"],
-            test_qsa_sparse_attention,
-        ),
-        ("graph", list(GRAPH_CASES), test_qsa_graph_replay),
-        ("kv_slots", list(SLOT_CASES), test_qsa_kv_slots),
-        ("span limit", list(SPAN_LIMIT_CASES), test_qsa_span_limit),
-        ("performance", list(PERF_CASES), test_qsa_sparse_attention),
-        ("new-scale graph", list(SCALE_CASES), test_qsa_graph_new_scale),
-        ("batch invariance", list(BATCH_CASES), test_qsa_batch_invariance),
+    fp8_suites = (
         ("fp8", list(FP8_CASES), test_qsa_fp8),
         ("fp8 attention sink", list(FP8_SINK_CASES), test_qsa_fp8_sink),
         ("fp8 uniform", list(FP8_UNIFORM_CASES), test_qsa_fp8_uniform),
@@ -2607,6 +3359,36 @@ def main():
         ("fp8 workspace", list(FP8_WORKSPACE_CASES), test_qsa_fp8_workspace),
         ("fp8 input errors", list(FP8_ERROR_CASES), test_qsa_fp8_input_errors),
         ("fp8 batch invariance", list(FP8_BATCH_CASES), test_qsa_fp8_batch_invariance),
+    )
+    if gfx != "gfx942":
+        # The FP8 kernels are gfx942's (E4M3FNUZ).
+        fp8_suites = (
+            ("fp8 off gfx942", list(FP8_OFF_GFX942_CASES), test_qsa_fp8_off_gfx942),
+        )
+    suites = (
+        (
+            "functional",
+            [
+                *FUNCTIONAL_CASES,
+                *CONSTANT_CASES,
+                "mixed_union_raw",
+                *STRIDE_LAYOUTS,
+                *UNION_CASES,
+            ],
+            test_qsa_sparse_attention,
+        ),
+        ("route", list(ROUTE_CASES), test_qsa_route),
+        ("graph", list(GRAPH_CASES), test_qsa_graph_replay),
+        ("kv_slots", list(SLOT_CASES), test_qsa_kv_slots),
+        ("paged", list(PAGED_CASES), test_qsa_paged_kv),
+        ("strided", list(STRIDE_CASES), test_qsa_strided_kv),
+        ("span limit", list(SPAN_LIMIT_CASES), test_qsa_span_limit),
+        ("stride rejected", list(STRIDE_REJECT_CASES), test_qsa_stride_rejected),
+        ("max stride", list(MAX_STRIDE_CASES), test_qsa_max_stride),
+        ("performance", list(PERF_CASES), test_qsa_sparse_attention),
+        ("new-scale graph", list(SCALE_CASES), test_qsa_graph_new_scale),
+        ("batch invariance", list(BATCH_CASES), test_qsa_batch_invariance),
+        *fp8_suites,
     )
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
@@ -2618,9 +3400,14 @@ def main():
         case
         for case in (
             *CASES,
+            *ROUTE_CASES,
             *GRAPH_CASES,
             *SLOT_CASES,
+            *PAGED_CASES,
+            *STRIDE_CASES,
             *SPAN_LIMIT_CASES,
+            *STRIDE_REJECT_CASES,
+            *MAX_STRIDE_CASES,
             *SCALE_CASES,
             *BATCH_CASES,
             *FP8_LAYOUT_CASES,
@@ -2635,8 +3422,9 @@ def main():
         nargs="*",
         choices=all_cases,
         default=all_cases,
-        help="input layouts to run (functional, graph, kv_slots, span limit, "
-        "performance, new-scale graph, batch invariance and FP8 cases)",
+        help="input layouts to run (functional, route, graph, kv_slots, paged, "
+        "strided, span limit, stride rejection, max stride, performance, new-scale "
+        "graph, batch invariance and FP8 cases)",
     )
     parser.add_argument(
         "-g",
@@ -2649,7 +3437,15 @@ def main():
     )
     args = parser.parse_args()
 
-    layouts = {**GRAPH_CASES, **SLOT_CASES, **SCALE_CASES, **FP8_LAYOUT_CASES}
+    layouts = {
+        **ROUTE_CASES,
+        **GRAPH_CASES,
+        **SLOT_CASES,
+        **PAGED_CASES,
+        **STRIDE_CASES,
+        **SCALE_CASES,
+        **FP8_LAYOUT_CASES,
+    }
     for suite, cases, test in suites:
         df = []
         selected = [case for case in args.case if case in cases]

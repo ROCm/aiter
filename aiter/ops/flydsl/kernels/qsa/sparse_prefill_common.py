@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Settings and gfx942 D256 helpers shared by the QSA sparse attention kernels.
+"""Settings and gfx942/gfx950 D256 helpers shared by the QSA sparse attention kernels.
 
 The first part holds the per-platform calibration and the private resource
 policy. The platform entry is picked by gfx model and CU count (nearest
@@ -12,9 +12,12 @@ The second part holds raw-buffer operations and pipeline barriers. The third
 part holds the QK and PV MFMA loops and the lazy softmax rescale, each defined
 once for the union and both direct kernels. The fourth part holds the
 BM128/BN64 MFMA, softmax and LDS pieces of the eight-wave staggered D256
-pipeline that the union kernel runs. The fifth part holds what both FP8 K/V
-kernels share: the FP8 MFMA, the lazy max of their softmax, the BF16 output
-rounding and the FP8 quantization of Q. Everything below FlyDSL's stable API
+pipeline that the union kernel runs. The fifth part holds their gfx950 (CDNA4)
+forms: 16x16x32 MFMAs, ds_read_b64_tr_b16 V operands, v_cvt_pk_bf16_f32 and K/V LDS
+swizzles for 64 banks. On gfx950 the union kernel and the packed direct kernel take
+their gfx950 paths; the raw direct kernel runs as on gfx942. The sixth part holds what
+both FP8 K/V kernels (gfx942) share: the FP8 MFMA, the lazy max of their softmax, the
+BF16 output rounding and the FP8 quantization of Q. Everything below FlyDSL's stable API
 (flydsl.expr, flydsl.expr.rocdl __all__, flydsl.compiler) is in the low-level
 section, each item with the reason it stays: empty inline asm register pins (no
 public asm entry or placement hint), the target-features attribute, ROCDL
@@ -27,6 +30,7 @@ import functools
 import logging
 import math
 import os
+from typing import NamedTuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -227,6 +231,12 @@ def cvt_pk_fp8(a, b, word=None, high=False):
     return fx.Int32(rocdl.cvt_pk_fp8_f32(fx.Int32.ir_type, a, b, old, high))
 
 
+def cvt_pk_bf16_f32(a, b):
+    """FP32 a, b as two BF16 (round to nearest even), a in the low half
+    (v_cvt_pk_bf16_f32, gfx950)."""
+    return fx.Uint32(rocdl.cvt_pk_bf16_f32(a, b))
+
+
 def log2(value):
     """log2 by one bare v_log_f32."""
     # fx.math.log2 adds denormal range reduction.
@@ -255,7 +265,7 @@ def _load_lds(storage, offset, immediate=0):
     return fx.Vector(fx.generic_load(ptr, count=4, volatile=True))
 
 
-LGKMCNT_MAX = 15  # gfx942 s_waitcnt lgkmcnt field
+LGKMCNT_MAX = 15  # gfx942/gfx950 s_waitcnt lgkmcnt field
 
 
 class _LdsQueue:
@@ -267,14 +277,21 @@ class _LdsQueue:
     bpermute(), one instruction each (volatile LDS loads are neither merged nor
     reordered). A ledger starts after every LDS op retired (lgkmcnt(0)), and no SMEM load
     (also counted, out of order) may be issued while it waits partially.
+
+    capped: a wait past LGKMCNT_MAX younger ops waits for LGKMCNT_MAX, which retires
+    more than needed (gfx950's 32 transposed V reads per half, waited 16 at a time);
+    otherwise such a wait raises.
     """
 
-    def __init__(self):
+    def __init__(self, capped=False):
         self.issued = 0
+        self.capped = capped
 
-    def load(self, storage, offset, immediate=0):
-        """_load_lds, counted."""
+    def load(self, storage, offset, immediate=0, transposed=False):
+        """_load_lds (transposed: _load_lds_tr, gfx950), counted."""
         self.issued += 1
+        if transposed:
+            return _load_lds_tr(storage, offset, immediate)
         return _load_lds(storage, offset, immediate)
 
     def bpermute(self, address, value):
@@ -298,7 +315,9 @@ class _LdsQueue:
             raise ValueError(f"wait for {upto} of {self.issued} issued LDS operations")
         lgkmcnt = self.issued - upto
         if lgkmcnt > LGKMCNT_MAX:
-            raise ValueError(f"lgkmcnt({lgkmcnt}) exceeds the counter")
+            if not self.capped:
+                raise ValueError(f"lgkmcnt({lgkmcnt}) exceeds the counter")
+            lgkmcnt = LGKMCNT_MAX
         rocdl.s_waitcnt(vmcnt=vmcnt, lgkmcnt=lgkmcnt)
 
 
@@ -314,7 +333,9 @@ MAX_ROW_PACKED_KV_BYTES = 1 << 30  # PK+PV bytes of the pack_tokens_per_row rule
 
 @dataclasses.dataclass(frozen=True)
 class Platform:
-    """Calibrated per GPU; the route-model terms are microseconds."""
+    """Calibrated per GPU. The route-model terms are microseconds where an entry says
+    they are phase timings (gfx942); a decision-tuned entry (gfx950) gives weights
+    chosen for the route they produce, not timings."""
 
     union_fixed: float  # fixed cost of the union phase
     union_step: float  # per N64 step of the slowest union CTA
@@ -331,6 +352,10 @@ class Platform:
     # Past that budget, direct still packs a context of at most this many tokens per query row
     # (packing copies the whole context each call).
     pack_tokens_per_row: int
+    # sparse_prefill_order_masks also weighs keeping every union tile against none when the
+    # union phase is set by throughput (sparse_prefill_prepare.py _route); a compile-time
+    # switch of that kernel.
+    route_all_or_none: bool = False
 
 
 PLATFORMS = {
@@ -350,12 +375,38 @@ PLATFORMS = {
         max_packed_kv_bytes=64 * 1024 * 1024,
         pack_tokens_per_row=32,
     ),
+    # MI355X, decision-tuned: the route terms and route_margin of sparse_prefill_order_masks
+    # were chosen on 91 calibration layouts so that routed calls stay near the faster of
+    # all-union and all-direct under a union plan (90 within 1.05x, worst 1.06x); they are not
+    # phase timings.
+    # union_ratio 1e30: sparse_prefill_compact proposes union for every tile;
+    # route_all_or_none: sparse_prefill_order_masks also weighs keeping every union tile
+    # against none when the union phase is throughput-bound.
+    ("gfx950", 256): Platform(
+        union_fixed=345.2,
+        union_step=2.228,
+        row_step=8.528,
+        route_margin=0.0,
+        direct_fixed=0.001456,
+        pack_block=0.001067,
+        direct_cu_step=0.5711,
+        union_ratio=1e30,
+        union_min_rows=1536,
+        union_min_rows_per_head=0,
+        wide_tiles_per_cu=8 / 21,  # BQ21 from 2048 rows, BQ42 from 4096 (256 CUs)
+        max_packed_kv_bytes=64 * 1024 * 1024,
+        pack_tokens_per_row=32,
+        route_all_or_none=True,
+    ),
 }
-# FP8 K/V (sparse_prefill_*_fp8, by K/V scale layout): route terms fitted on the FP8 kernels'
-# phase timings, synthetic and SGLang-captured selections (median error 3%); the per-tile
-# ratio is the sweep's best with the global route on. Past the packed-KV budget, FP8 direct
-# packs up to 320 tokens per query row (its raw K/V reads cost more than BF16's). Union and
-# minimum-row thresholds otherwise follow the BF16 entry.
+# The part each gfx model's entries are tuned on.
+TUNED_PARTS = {"gfx942": "MI308X", "gfx950": "MI355X"}
+# FP8 K/V (sparse_prefill_*_fp8, gfx942 only, by K/V scale layout): route terms fitted
+# on the FP8 kernels' phase timings, synthetic and SGLang-captured selections (median
+# error 3%); the per-tile ratio is the sweep's best with the global route on. Past the
+# packed-KV budget, FP8 direct packs up to 320 tokens per query row (its raw K/V reads
+# cost more than BF16's). Union and minimum-row thresholds otherwise follow the BF16
+# entry.
 FP8_ROUTES = {
     ("gfx942", 80): {
         "tensor": {
@@ -393,13 +444,18 @@ def _calibrated() -> tuple:
         raise ValueError(f"QSA sparse attention has no calibration for {gfx}")
     key = min(keys, key=lambda key: abs(key[1] - cus))
     if key[1] != cus:
+        part = TUNED_PARTS[gfx]
         logging.getLogger("aiter").warning(
-            "QSA sparse attention is tuned only for MI308X (gfx942, 80 CUs); this %s has "
-            "%d CUs and reuses the %d-CU MI308X settings: plans and routes follow the CU "
-            "count, performance may not be optimal",
+            "QSA sparse attention is tuned only for %s (%s, %d CUs); this %s has %d CUs "
+            "and reuses the %d-CU %s settings: plans and routes follow the CU count, "
+            "performance may not be optimal",
+            part,
+            gfx,
+            key[1],
             gfx,
             cus,
             key[1],
+            part,
         )
     return key
 
@@ -422,7 +478,10 @@ def platform(fp8=None) -> Platform:
             raise ValueError(
                 f"{OVERRIDE}: expected name=value with name in {sorted(names)}"
             )
-        values[name] = type(getattr(entry, name))(value)
+        kind = type(getattr(entry, name))
+        if kind is bool and value not in ("0", "1"):
+            raise ValueError(f"{OVERRIDE}: {name} is a switch, written 0 or 1")
+        values[name] = value == "1" if kind is bool else kind(value)
     entry = dataclasses.replace(entry, **values)
     values = dataclasses.astuple(entry)
     if not all(math.isfinite(v) and v >= 0 for v in values) or entry.route_margin >= 1:
@@ -450,16 +509,19 @@ def _exp(value):
     return fx.math.exp2(fx.Float32(value), fastmath=fx.FastMathFlags.afn)
 
 
-def _mfma(a, b, c):
-    """One 16x16x16 BF16 MFMA on register vectors: a/b hold 4 BF16 bit patterns, c 4 FP32."""
-    frag_a = fx.make_rmem_tensor(4, fx.BFloat16)
-    frag_b = fx.make_rmem_tensor(4, fx.BFloat16)
+def _mfma(a, b, c, depth=16):
+    """One 16x16xdepth BF16 MFMA on register vectors (depth 32: gfx950): a/b hold
+    depth // 4 BF16 values, their bit patterns or their words, c 4 FP32."""
+    frags = []
+    for value in (a, b):
+        value = fx.Vector(value)
+        frag = fx.make_rmem_tensor(depth // 4, fx.BFloat16)
+        frag.store(value if value.dtype is fx.BFloat16 else value.bitcast(fx.BFloat16))
+        frags.append(frag)
     frag_c = fx.make_rmem_tensor(4, fx.Float32)
-    frag_a.store(fx.Vector(a).bitcast(fx.BFloat16))
-    frag_b.store(fx.Vector(b).bitcast(fx.BFloat16))
     frag_c.store(fx.Vector(c))
-    mma = fx.make_mma_atom(rocdl.MFMA(16, 16, 16, fx.BFloat16))
-    fx.gemm(mma, frag_c, frag_a, frag_b, frag_c)
+    mma = fx.make_mma_atom(rocdl.MFMA(16, 16, depth, fx.BFloat16))
+    fx.gemm(mma, frag_c, frags[0], frags[1], frag_c)
     return fx.Vector(frag_c.load())
 
 
@@ -497,10 +559,11 @@ def _schedule(pairs, count, group, exp=False):
         sched_group_barrier(TRANS if exp else VALU, count, group)
 
 
-def _schedule_exps(count, group):
-    # Per value: subtraction, MFMA, exp, MFMA (the fastest order measured).
+def _schedule_exps(count, group, mfmas=2):
+    # Per value: subtraction, MFMA, exp, MFMA (the fastest order measured on gfx942); gfx950's
+    # K32 QK has one MFMA per value.
     for _ in range(count):
-        for mask in (VALU, MFMA, TRANS, MFMA):
+        for mask in (VALU, MFMA, TRANS, MFMA)[: 2 + mfmas]:
             sched_group_barrier(mask, 1, group)
 
 
@@ -519,6 +582,26 @@ def _buffer_at(address, size_bytes):
         fx.Int64(address),
     )
     return rocdl.make_buffer_ptr(pointer, num_records_bytes=size_bytes)
+
+
+# K/V rows: hk * 256 values (KV heads of 256 dims), then gap elements of padding.
+def _kv_extent(rows, hkv, hk, gap):
+    """Bytes from KV head hkv of the first of `rows` K/V rows to the end of the last."""
+    extent = (fx.Uint32(rows) * hk - hkv) * 512
+    if gap:
+        extent = extent + fx.Uint32(rows - 1) * (gap * 2)
+    return extent
+
+
+def _kv_offset(row, head, hk, gap, scale=1, dim=None):
+    """Element offset of dim `dim` (None: 0) of KV head `head` of K/V row `row`, times
+    scale (2: the byte offset), in row's integer type."""
+    offset = (row * hk + head) * (256 * scale)
+    if dim is not None:
+        offset = offset + dim * scale
+    if gap:
+        offset = offset + row * (gap * scale)
+    return offset
 
 
 def _buffer_words(buffer, offset, words=4, cache=0):
@@ -664,6 +747,24 @@ def _v_pair(values, row, n):
     ]
 
 
+def _new_max(center):
+    """m' (the row max + 1 once it exceeds m + 7) and its ballot, from center = (S, lane
+    max, other maxima, scale, m)."""
+    _, candidate, maxima, scale, maximum = center
+    candidate = (
+        _maximum(_maximum(candidate, maxima[0]), _maximum(maxima[1], maxima[2])) * scale
+    )
+    predicate = candidate > maximum + 7.0
+    return predicate.select(candidate + 1.0, maximum), ballot(predicate)
+
+
+def _sum_and_max(sum_max):
+    """l + the lane row sums and the lane max of S, from sum_max = (S, lane sum, other
+    sums, l)."""
+    current, total, sums, row_sum = sum_max
+    return row_sum + ((total + sums[0]) + (sums[1] + sums[2])), _max(current)
+
+
 def _tiles(values):
     """FP32 values as MFMA accumulator tiles of 4."""
     values = fx.Vector(values)
@@ -715,6 +816,12 @@ def _exps(values, maximum):
     )
 
 
+def _key_row(lane):
+    """Key of the lane's first K read: lane 16g + 4b + a reads keys a + 8b (+ 4n, + 32 per
+    half), in the mask order of sparse_prefill_order_masks."""
+    return (lane & 3) + ((lane & 12) << 1)
+
+
 def _k_phase(token):
     return (token & 3) | ((token >> 3) & 1) * 4
 
@@ -732,16 +839,20 @@ def _copy_coordinates(wave, packet, page=0):
     return token, (wave >> 2) * 128
 
 
+def _k_read_order(lower_first):
+    """(n, k) of a K half's 16 reads in issue order; lower_first takes k 0-3 of both n first."""
+    if lower_first:
+        return [
+            (n, k + high * 4) for high in range(2) for n in range(2) for k in range(4)
+        ]
+    return [(n, k) for n in range(2) for k in range(8)]
+
+
 def _k_reads(addresses, half, lower_first=False):
     """(slot, address, immediate) of one K half's 16 LDS reads, in issue order."""
-    order = (
-        [(n, k + high * 4) for high in range(2) for n in range(2) for k in range(4)]
-        if lower_first
-        else [(n, k) for n in range(2) for k in range(8)]
-    )
     return [
         (n * 8 + k, addresses[n * 2 + k % 2], half * 16384 + (k // 2) * 128)
-        for n, k in order
+        for n, k in _k_read_order(lower_first)
     ]
 
 
@@ -756,17 +867,24 @@ def _v_reads(address, half):
 
 def _lds_words(parts):
     return fx.Vector.from_elements(
-        [part[i] for part in parts for i in range(4)], fx.Int32
+        [part[i] for part in parts for i in range(part.numel)], fx.Int32
     )
 
 
+class _ReadPlan(NamedTuple):
+    """LDS reads of one K or V operand from storage."""
+
+    storage: object
+    reads: list  # (slot, address, immediate) in issue order
+    transposed: bool = False  # ds_read_b64_tr_b16 (gfx950 V), else ds_read_b128
+
+
 def _read_s2r(plan, queue):
-    """Issue a (storage, reads) plan; ready(n) waits until its first n reads have landed."""
-    storage, reads = plan
+    """Issue a _ReadPlan; ready(n) waits until its first n reads have landed."""
     first = queue.issued
-    parts = [None] * len(reads)
-    for slot, address, immediate in reads:
-        parts[slot] = queue.load(storage, address, immediate)
+    parts = [None] * len(plan.reads)
+    for slot, address, immediate in plan.reads:
+        parts[slot] = queue.load(plan.storage, address, immediate, plan.transposed)
     return _lds_words(parts), queue.ready(first, queue.issued - first)
 
 
@@ -842,23 +960,12 @@ def _pv(
             acc,
         )
         if center is not None:
-            current, candidate, maxima, scale, maximum = center
             if step == 0:
-                candidate = (
-                    _maximum(
-                        _maximum(candidate, maxima[0]), _maximum(maxima[1], maxima[2])
-                    )
-                    * scale
-                )
-                predicate = candidate > maximum + 7.0
-                voted = ballot(predicate)
-                new_max = predicate.select(candidate + 1.0, maximum)
+                new_max, voted = _new_max(center)
             for i in range(step * 4, step * 4 + 4):
-                scaled.append(fx.Float32(current[i]) * scale)
+                scaled.append(fx.Float32(center[0][i]) * center[3])
         if sum_max is not None and step == 3:
-            current, total, sums, row_sum = sum_max
-            row_sum = row_sum + ((total + sums[0]) + (sums[1] + sums[2]))
-            candidate = _max(current)
+            row_sum, candidate = _sum_and_max(sum_max)
         if step + 1 < steps and step + 1 >= prepared_steps:
             _schedule(8, 3 if center is not None else 2, 20 + step)
         elif sum_max is not None:
@@ -875,7 +982,238 @@ def _pv(
     return result
 
 
-# ---- FP8 (E4M3FNUZ) K/V: MFMA, lazy max, output rounding and Q quantization ----
+# ---- gfx950 (CDNA4): K32 MFMAs, transposed V reads, native BF16, 64-bank swizzles ----
+#
+# The union pipeline keeps its stages and data flow (a capped lgkmcnt ledger, the
+# rendezvous its double buffer makes redundant dropped: sparse_prefill_union._body); the
+# MFMA shape, the V operand path, the BF16 conversion and the K/V LDS layouts change
+# (g = lane >> 4 below).
+#   QK: per K half, two M tiles of eight v_mfma_f32_16x16x32_bf16; step s takes K read
+#       m * 8 + s and Q part s, both dims 32s + 8g .. + 7. The K reads keep gfx942's keys
+#       and the S order (value i + 4m), so the masks of sparse_prefill_order_masks are
+#       unchanged.
+#   PV: per V half, two K32 steps (keys 32s + 8g .. + 7: P values 8s .. 8s + 7) over eight
+#       16-dim groups n; the A operand of (s, n) is two ds_read_b64_tr_b16 of four keys.
+#       Output word 4n + i of a half is dim 32g + 4(n ^ (g & 1)) + i (_v_tr_bases950).
+#   LDS: K and V are half-major: dims half h of key t at _lds_row950(t, h), so one 16-byte
+#       (x4) LDS DMA writes four keys' half rows, 1 KiB. The 16-byte chunks of a half row are
+#       swizzled by _k_swizzle950 (K) and _v_swizzle950 (V); the DMA (sparse_prefill_union)
+#       and the reads below take their addresses from these. Each swizzle stays inside its
+#       256-byte half row and leaves the bits the read immediates move alone.
+
+
+HALF950 = 64 * 256  # bytes of one dims half of a 64-key K or V tile in LDS
+
+
+def _k_phase950(token):
+    """4-bit K chunk swizzle from token bits 0, 1, 3, 4 (keys of one read: token & 3 and token >> 3 & 3). A bijection,
+    so the 16 keys of a 16-lane ds_read_b128 group take 16 chunk positions of a 256-byte bank row; bit 1 is the parity
+    of the four bits, so lanes 0-7 with 32-39 (bit 4 equal, dims 32 bytes apart) take 16 distinct positions too.
+    """
+    a0, a1 = token & 1, (token >> 1) & 1
+    b0, b1 = (token >> 3) & 1, (token >> 4) & 1
+    return a0 | (a0 ^ a1 ^ b0 ^ b1) * 2 | a1 * 4 | b0 * 8
+
+
+def _k_swizzle950(token, chunk):
+    """K LDS swizzle: position of 16-byte chunk `chunk` (0-15) in key `token`'s half row. An XOR, so its own inverse:
+    position p holds chunk _k_swizzle950(token, p)."""
+    return chunk ^ _k_phase950(token)
+
+
+def _v_swizzle950(token, chunk):
+    """V LDS swizzle: the chunk XORed with gfx942's K phase _k_phase (K uses _k_phase950). In BF16 elements of (key, (dim, dims half)),
+    it is Swizzle<2,3,4> o Swizzle<1,5,5> over the layout (64,(128,2)):(128,(1,8192)) of _lds_row950's rows.
+    """
+    return chunk ^ _k_phase(token)
+
+
+def _lds_row950(token, half):
+    """Byte address of dims half `half` of key `token` in a half-major K or V tile."""
+    return half * HALF950 + token * 256
+
+
+def _k_lds_address950(token, chunk):
+    """Byte address of 16-byte chunk `chunk` (0-31, dims 8 * chunk ..) of key `token` in k_lds."""
+    half, chunk = chunk >> 4, _k_swizzle950(token, chunk & 15)
+    return _lds_row950(token, half) + chunk * 16
+
+
+def _k_bases950(lane):
+    """Per-lane addresses of _k_reads950: key _key_row(lane), chunks (lane >> 4) + 4j, j = 0..3."""
+    return tuple(
+        _k_lds_address950(_key_row(lane), (lane >> 4) + 4 * j) for j in range(4)
+    )
+
+
+def _k_reads950(addresses, half, lower_first=False):
+    """(slot, address, immediate) of one K half's 16 LDS reads (_k_reads' order and slots; read (n, k) is key
+    key_row + 4n + 32 * half, dims 8g + 32k .. + 7); addresses = _k_bases950(lane)."""
+    return [
+        (n * 8 + k, addresses[k & 3], _lds_row950(half * 32 + n * 4, k >> 2))
+        for n, k in _k_read_order(lower_first)
+    ]
+
+
+def _v_lds_address950(token, granule):
+    """Byte address of 8-byte granule `granule` (0-63, dims 4 * granule .. + 3) of value `token` in v_lds."""
+    chunk = _v_swizzle950(token, (granule & 31) >> 1)
+    return _lds_row950(token, granule >> 5) + chunk * 16 + (granule & 1) * 8
+
+
+def _v_tr_bases950(lane):
+    """Per-lane addresses of a V half's eight 16-dim groups n for ds_read_b64_tr_b16: lane 16g + 4r + q reads key
+    8g + r, dims 32q + 4(n ^ (q & 1)) .. + 3 (n's XOR is the address bits 3-5). The q & 1 term gives the lanes of a
+    32-lane group both 8-byte halves of the 16-byte chunks, so they cover the 64 banks once; output word 4n + i is
+    then dim 32g + 4(n ^ (g & 1)) + i (_o_piece950). Keys + 4h + 32s and dims + 128 go by immediate.
+    """
+    q = lane & 3
+    token = (lane >> 4) * 8 + ((lane & 15) >> 2)
+    base = _v_lds_address950(token, q * 8 + (q & 1))
+    return tuple(base ^ (n * 8) for n in range(8))
+
+
+def _v_tr_reads950(bases, half):
+    """(slot, address, immediate) of one V half's 32 transposed reads in issue order: PV step s, group n, key quad h
+    (keys 32s + 8g + 4h .. + 3); slot (s * 8 + n) * 2 + h, so PV step s needs the first 16 (s + 1).
+    """
+    return [
+        ((s * 8 + n) * 2 + h, bases[n], _lds_row950(s * 32 + h * 4, half))
+        for s in range(2)
+        for n in range(8)
+        for h in range(2)
+    ]
+
+
+def _load_lds_tr(storage, address, immediate=0):
+    """ds_read_b64_tr_b16 at an LDS byte address; 2 words. Lane 4r + q of each 16-lane group reads four BF16 at its
+    address; lane i then holds element i % 4 of lane 4r + i // 4's read as BF16 r = 0..3.
+    """
+    pointer = fx.recast_iter(
+        fx.PointerType.get(fx.BFloat16.ir_type, fx.AddressSpace.Shared, 8),
+        fx.get_iter(storage) + (fx.Int32(address) + immediate),
+    )
+    data = fx.make_rmem_tensor(4, fx.BFloat16)
+    fx.copy(
+        fx.make_copy_atom(rocdl.cdna4.LDSReadTrans(16, 64), fx.BFloat16),
+        fx.make_view(pointer, fx.make_layout(4, 1)),
+        data,
+    )
+    return fx.Vector(data.load()).bitcast(fx.Int32)
+
+
+def _pack_bf16_950(values):
+    """_pack_bf16 with v_cvt_pk_bf16_f32 (round to nearest even): element i in the low half."""
+    values = fx.Vector(values)
+    return fx.Vector.from_elements(
+        [cvt_pk_bf16_f32(values[i], values[i + 1]) for i in range(0, values.numel, 2)],
+        fx.Uint32,
+    )
+
+
+def _k_operands950(words):
+    """The _qk950 A operands of one K half's 64 LDS words (as _k_operands): read
+    m * 8 + s holds K step s of M tile m."""
+    _keep_vgpr(words)
+    sched_barrier(0)
+    return fx.Vector(words)
+
+
+def _qk950(q, k):
+    """_qk with 16x16x32 BF16 MFMAs (q from _read_q_g2r, k from _k_operands950), issued
+    a K step at a time (both M tiles of a step together)."""
+    mma = fx.make_tiled_mma(
+        fx.make_mma_atom(rocdl.MFMA(16, 16, 32, fx.BFloat16)),
+        fx.make_layout((1, 8, 1), (1, 1, 0)),
+    )
+    b = mma.make_fragment_B(
+        fx.make_rmem_tensor(fx.make_layout((128, 256), (1, 128)), fx.BFloat16)
+    )
+    b.store(fx.Vector(q).bitcast(fx.BFloat16))
+    a = fx.make_rmem_tensor(fx.make_layout((8, 8, 2), (1, 8, 64)), fx.BFloat16)
+    a.store(fx.Vector(k).bitcast(fx.BFloat16))
+    a = fx.make_view(fx.get_iter(a), fx.make_layout((8, 2, 8), (1, 64, 8)))
+    acc = mma.make_fragment_C(
+        fx.make_rmem_tensor(fx.make_layout((32, 128), (1, 32)), fx.Float32)
+    )
+    acc.fill(0.0)
+    fx.gemm(mma, acc, a, b, acc, traversal_order="mkn")
+    return acc.load()
+
+
+def _pv950_words(step, n):
+    """V words of PV MFMA (step, n): reads (step * 8 + n) * 2 + h, h = 0 (keys 0-3 of the lane's eight), 1 (4-7)."""
+    return [(step * 8 + n) * 4 + i for i in range(4)]
+
+
+def _o_piece950(i, g):
+    """Output words of the lane's dims 8i .. 8i + 7 of a half in lane group g (dim 32g + 4n + j is word
+    4(n ^ (g & 1)) + j, _v_tr_bases950)."""
+    return [i * 8 + (e ^ (g & 1) * 4) for e in range(8)]
+
+
+def _v_operands950(values, step, ready=None):
+    """The 32 words of PV step `step`; with ready, waits for its reads and keeps them in VGPRs (as _v_operands)."""
+    raw = fx.Vector(values)
+    words = fx.Vector.from_elements([raw[step * 32 + i] for i in range(32)], fx.Int32)
+    if ready is not None:
+        ready(16 * (step + 1))
+        _keep_vgpr(words)
+        sched_barrier(0)
+    return words
+
+
+def _pv950(
+    probabilities,
+    values,
+    output,
+    ready=None,
+    prepared=None,
+    center=None,
+    sum_max=None,
+):
+    """_pv on gfx950: O += P V over one V half in two K32 steps of eight MFMAs. values holds the words of one
+    _v_tr_reads950 plan; prepared (any value) says the memory stage already ran _v_operands950(values, 0, ready).
+    center and sum_max as for _pv."""
+    p, raw = fx.Vector(probabilities), fx.Vector(values)
+    acc = [
+        fx.Vector.from_elements([output[n * 4 + i] for i in range(4)], fx.Float32)
+        for n in range(8)
+    ]
+    scaled = []
+    sched_barrier(0)
+    for step in range(2):
+        if ready is not None and (step or prepared is None):
+            _v_operands950(raw, step, ready)
+        b = fx.Vector.from_elements([p[step * 8 + i] for i in range(8)], fx.BFloat16)
+        for n in range(8):
+            a = fx.Vector.from_elements(
+                [raw[i] for i in _pv950_words(step, n)], fx.Int32
+            )
+            acc[n] = _mfma(a, b, acc[n], 32)
+        if center is not None:
+            if step == 0:
+                new_max, ballot = _new_max(center)
+            for i in range(step * 8, step * 8 + 8):
+                scaled.append(fx.Float32(center[0][i]) * center[3])
+        if sum_max is not None and step == 1:
+            row_sum, candidate = _sum_and_max(sum_max)
+        if center is not None or sum_max is not None:
+            _schedule(8, 2, 20 + step)
+        sched_barrier(0)
+    result = fx.Vector.from_elements(
+        [acc[n][i] for n in range(8) for i in range(4)], fx.Float32
+    )
+    if center is not None:
+        # Pinned, as in _pv.
+        scaled = _pin(fx.Vector.from_elements(scaled, fx.Float32))
+        return result, scaled, new_max, ballot
+    if sum_max is not None:
+        return result, row_sum, candidate
+    return result
+
+
+# ---- FP8 (E4M3FNUZ, gfx942) K/V: MFMA, lazy max, output rounding, Q quantization ----
 
 FP8_MAX = 240.0  # largest finite E4M3FNUZ
 # Lazy max of the FP8 kernels: m moves only when some S'' exceeds LAZY (P' <= 2**7.5 fits

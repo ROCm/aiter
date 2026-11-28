@@ -1279,6 +1279,26 @@ def _compile(cache, key, launch, args, empty, device, stream, hints=None):
     return compiled
 
 
+def _other_direct_args(inputs, prepared, direct):
+    """direct's arguments for the other of packed and raw direct, its K/V, scale records and
+    table stand-ins of their types: compiled with an empty grid, nothing reads them."""
+    raw = not prepared.raw
+    other = list(direct)
+    if raw:
+        other[2:4] = inputs.k, inputs.v
+    else:
+        blocks = torch.empty(
+            (1, BLOCK_BYTES), dtype=torch.uint8, device=inputs.q.device
+        )
+        other[2:4] = blocks, blocks
+    other[4] = _standin(prepared)
+    other[8] = (
+        inputs.kv_slots if raw and prepared.slotted else prepared.metadata.view(-1)
+    )
+    other[26:29] = raw, raw and prepared.slotted, raw and inputs.wide
+    return other
+
+
 def _compiled(inputs, prepared, out, stream):
     device = inputs.q.device
     pack = _pack_args(inputs, prepared, stream)
@@ -1289,19 +1309,22 @@ def _compiled(inputs, prepared, out, stream):
     pack_fn = _compile(
         _PACK, (device, *pack[27:33]), _pack_launch, pack, 23, device, stream
     )
-    key = (device, *direct[16:18], *direct[22:29])
-    # Two direct waves per SIMD.
-    direct_fn = _compile(
-        _DIRECT,
-        key,
-        _direct_launch,
-        direct,
-        29,
-        device,
-        stream,
-        {"waves_per_eu": 2},
-    )
-    return pack, direct, pack_fn, direct_fn
+
+    def key(args):
+        return (device, *args[16:18], *args[22:29])
+
+    def compile_direct(args):
+        # Two direct waves per SIMD.
+        hints = {"waves_per_eu": 2}
+        return _compile(
+            _DIRECT, key(args), _direct_launch, args, 29, device, stream, hints
+        )
+
+    if key(direct) not in _DIRECT:
+        # Packed and raw direct compile together, as BF16 direct's do: a later call whose
+        # context crosses the pack budget never compiles.
+        compile_direct(_other_direct_args(inputs, prepared, direct))
+    return pack, direct, pack_fn, compile_direct(direct)
 
 
 def run(*, inputs, prepared, out, stage="both"):

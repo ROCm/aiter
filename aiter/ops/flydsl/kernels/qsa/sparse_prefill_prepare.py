@@ -97,7 +97,8 @@ class SparsePlan:
     union_tiles: int
     grid: int
     route_costs: tuple
-    route_model: tuple  # platform union_fixed, union_step, row_step, route_margin
+    # Platform union_fixed, union_step, row_step, route_margin, route_all_or_none.
+    route_model: tuple
     union_ratio: float
     routing: bool = True
     # Slot-table launches (K/V read from a token pool through kv_slots): K3 writes each union block's
@@ -138,11 +139,6 @@ _DPP_XOR = {1: (0xB1,), 2: (0x4E,), 4: (0x141, 0x1B), 8: (0x140, 0x141)}
 
 def _lane_xor(value, mask):
     """The value of lane ^ mask; every lane of the wave must be active."""
-    if isinstance(value, fx.Int64):
-        halves = fx.Vector.from_elements([value], fx.Int64).bitcast(fx.Int32)
-        return fx.Vector.from_elements(
-            [_lane_xor(halves[0], mask), _lane_xor(halves[1], mask)], fx.Int32
-        ).bitcast(fx.Int64)[0]
     if mask not in _DPP_XOR:
         return fx.gpu.shuffle_xor(value, mask, 64)
     # Row-local DPP moves instead of LDS-crossbar shuffles cut the latency-bound K1 by
@@ -158,35 +154,22 @@ def _wave_reduce(value, op):
     return value
 
 
-def _exchange(keys, scratch, tid, partner, wide):
+def _exchange(keys, scratch, tid, partner):
     """The keys of thread partner, swapped through LDS a round at a time."""
-    words = 2 if wide else 1
-    chunk = min(len(keys), EXCHANGE_WORDS // (THREADS * words))
+    chunk = min(len(keys), EXCHANGE_WORDS // THREADS)
     peers = []
     for first in range(0, len(keys), chunk):
         for e in range(first, first + chunk):
-            slot = (tid * chunk + e - first) * words
-            if wide:
-                pair = fx.Vector.from_elements([keys[e]], fx.Int64).bitcast(fx.Int32)
-                scratch[slot] = pair[0]
-                scratch[slot + 1] = pair[1]
-            else:
-                scratch[slot] = keys[e]
+            scratch[tid * chunk + e - first] = keys[e]
         fx.gpu.barrier()
         for e in range(first, first + chunk):
-            slot = (partner * chunk + e - first) * words
-            if wide:
-                pair = [scratch[slot], scratch[slot + 1]]
-                pair = fx.Vector.from_elements(pair, fx.Int32).bitcast(fx.Int64)
-                peers.append(pair[0])
-            else:
-                peers.append(scratch[slot])
+            peers.append(scratch[partner * chunk + e - first])
         fx.gpu.barrier()
     return peers
 
 
 def _bitonic(keys, lane, descending, cta=None):
-    """Bitonic sort of one wave's keys, or with cta = (scratch, tid, wave, wide) of the CTA's.
+    """Bitonic sort of one wave's keys, or with cta = (scratch, tid, wave) of the CTA's.
 
     Thread t holds the keys t * w .. t * w + w - 1, w = len(keys) a power of two.
     """
@@ -223,9 +206,9 @@ def _bitonic(keys, lane, descending, cta=None):
             if bit < log_width + 6:
                 peers = [_lane_xor(key, 1 << (bit - log_width)) for key in keys]
             else:
-                scratch, tid, _, wide = cta
+                scratch, tid, _ = cta
                 partner = tid ^ (64 << (bit - log_width - 6))
-                peers = _exchange(keys, scratch, tid, partner, wide)
+                peers = _exchange(keys, scratch, tid, partner)
             for e, peer in enumerate(peers):
                 low, high = fx.min(keys[e], peer), fx.max(keys[e], peer)
                 if descending:
@@ -1032,7 +1015,7 @@ def _route_cost(
     union_sum, union_max, direct_sum, direct_max, task_share, step, fixed, model
 ):
     # Separate multiplies and adds, as in the fitted model.
-    union_fixed, union_step, row_step, _ = model
+    union_fixed, union_step, row_step = model[:3]
     union = fx.Float32(union_fixed) + fx.Float32(union_step) * fx.max(
         fx.Float32(union_max), fx.Float32(union_sum) * task_share
     )
@@ -1045,7 +1028,7 @@ def _route_cost(
 
 def _route_choice(totals, limits, task_share, step, fixed, model):
     """The limit of the cheapest candidate; totals hold 4 sums per candidate."""
-    for j in range(LIMITS):
+    for j in range(len(limits)):
         cost = _route_cost(*totals[4 * j : 4 * j + 4], task_share, step, fixed, model)
         if j == 0:
             # Keeping every union tile wins ties and must be route_margin slower to lose.
@@ -1091,7 +1074,13 @@ def _route(
     ] + [fx.Int32(-1)]
     threshold = union_max
     # Only a union phase set by its longest task, not by throughput, gains from a shorter one.
-    if fx.Float32(union_max) > fx.Float32(union_sum) * TASK_SHARE:
+    # A throughput-bound one can still cost more than no union at all: a tile's union grows with
+    # how far its rows' selections spread, its direct work only with each row's top-k. So with
+    # route_all_or_none (ROUTE_MODEL[4]), sparse_prefill_order_masks weighs keeping every union
+    # tile against none there.
+    longest = fx.Float32(union_max) > fx.Float32(union_sum) * TASK_SHARE
+    compare = True if fx.const_expr(ROUTE_MODEL[4]) else longest
+    if compare:
         kept_sum, kept_max = [zero] * LIMITS, [zero] * LIMITS
         direct_sum, direct_max = [zero] * LIMITS, [zero] * LIMITS
         for tile in range(tid, TILES, THREADS):
@@ -1121,6 +1110,16 @@ def _route(
         threshold = _route_choice(
             totals, limits, TASK_SHARE, DIRECT_STEP, DIRECT_FIXED, ROUTE_MODEL
         )
+        if fx.const_expr(ROUTE_MODEL[4]):
+            every_or_none = _route_choice(
+                totals[:4] + totals[-4:],
+                [limits[0], limits[-1]],
+                TASK_SHARE,
+                DIRECT_STEP,
+                DIRECT_FIXED,
+                ROUTE_MODEL,
+            )
+            threshold = longest.select(threshold, every_or_none)
     return threshold
 
 
@@ -1142,13 +1141,11 @@ def _order(
     SHIFT: fx.Int32,
     HK: fx.Constexpr[int],
     SLICES: fx.Constexpr[int],
-    WIDE: fx.Constexpr[bool],
     WIDTH: fx.Constexpr[int],
     SPLIT: fx.Constexpr[int],
     CORE: fx.Constexpr[bool],
     CHUNKED: fx.Constexpr[bool],
 ):
-    key = fx.Int64 if WIDE else fx.Int32
     tid = fx.thread_idx.x
     lane, wave = tid & 63, _uniform(tid >> 6)
     per_head = TASKS // HK
@@ -1238,9 +1235,12 @@ def _order(
             # Part 0 of a split task runs the first ceil(steps / 2) N64 steps.
             cost = (split[e] != 0).select((steps + 1 - part) >> 1, cost)
             valid = valid & ((part == 0) | (split[e] != 0))
-        rank_key = (key(cost) << key(SHIFT)) + key(entries - 1 - rank)
-        keys.append(valid.select(rank_key, key(-1)))
-    cta = (scratch, tid, wave, WIDE)
+        # A CTA sorts its own chunk of SIZE <= 4096 entries, so the key breaks cost ties
+        # by the position in the chunk. cost <= block_capacity / 16 < 2**12 (at most 42
+        # rows of 1025 blocks), so the key stays below 2**24.
+        rank_key = (cost << SHIFT) + (SIZE - 1 - (tid * WIDTH + e))
+        keys.append(valid.select(rank_key, fx.Int32(-1)))
+    cta = (scratch, tid, wave)
     keys = _bitonic(keys, tid & 63, True, cta)
     # The FP8 union kernel ends a CTA's task loop at its first idle entry. With several order
     # CTAs (CHUNKED: chunks of SIZE entries) each places its runnable entries after those of the
@@ -1252,17 +1252,17 @@ def _order(
             COUNTS, COSTS, scratch, program, threshold, entries, SIZE, per_head, SLICES
         )
     # Sort hkv-major (tie order), publish the tile-major task the union kernel runs.
-    mask = (key(1) << key(SHIFT)) - 1
+    mask = (fx.Int32(1) << SHIFT) - 1
     rounded = (entries + GRID - 1) // GRID * GRID
     for e in fx.range_constexpr(WIDTH):
         position = tid * WIDTH + e
         rank = program * SIZE + position
         if fx.const_expr(CHUNKED):
-            runnable = (keys[e] >> key(SHIFT)) > key(0)
+            runnable = (keys[e] >> SHIFT) > fx.Int32(0)
             rank = runnable.select(
                 before + position, total + program * SIZE - before + position - own
             )
-        entry = entries - 1 - fx.Int32(keys[e] & mask)
+        entry = program * SIZE + SIZE - 1 - (keys[e] & mask)
         task = entry
         if fx.const_expr(SPLIT > 1):
             task = entry % TASKS
@@ -1473,7 +1473,6 @@ def _order_masks_kernel(
     DIRECT_FIXED: fx.Float32,
     HK: fx.Constexpr[int],
     SLICES: fx.Constexpr[int],
-    WIDE: fx.Constexpr[bool],
     ROUTE: fx.Constexpr[bool],
     ROUTE_MODEL: fx.Constexpr[tuple],
     SLOTTED: fx.Constexpr[bool],
@@ -1527,7 +1526,6 @@ def _order_masks_kernel(
                         SHIFT,
                         HK,
                         SLICES,
-                        WIDE,
                         width,
                         SPLIT,
                         CORE,
@@ -1600,7 +1598,6 @@ def _order_masks_launch(
     DIRECT_FIXED: fx.Float32,
     HK: fx.Constexpr[int],
     SLICES: fx.Constexpr[int],
-    WIDE: fx.Constexpr[bool],
     ROUTE: fx.Constexpr[bool],
     ROUTE_MODEL: fx.Constexpr[tuple],
     SLOTTED: fx.Constexpr[bool],
@@ -1642,7 +1639,6 @@ def _order_masks_launch(
             DIRECT_FIXED,
             HK,
             SLICES,
-            WIDE,
             ROUTE,
             ROUTE_MODEL,
             SLOTTED,
@@ -1801,6 +1797,21 @@ def _tile_rows(group, query_tile, rows, full):
     )
 
 
+def plan_query_tile(group, hk, query_lens, prefix_lens, query_tile: int) -> int:
+    """BQ of a union plan whose decisions span the batch (allocate_plan without
+    min_request_rows) for a layout of Q heads per KV head `group`, `hk` KV heads and
+    these requests, from the `query_tile` asked for."""
+    full = hk == 1 and len(query_lens) == 1 and prefix_lens[0] == 0
+    return _tile_rows(group, query_tile, int(query_lens[0]) if full else 0, full)
+
+
+def whole_task_rows(group, hk, query_tile: int) -> int:
+    """Rows of one request, in whole `query_tile`-row tiles, whose FP8 plan keeps its tasks
+    whole: allocate_plan splits a plan of fewer tasks than min(CUs, SPLIT_TASKS)."""
+    slices = _cdiv(query_tile * group, 128)
+    return query_tile * _cdiv(min(get_cu_num(), SPLIT_TASKS), hk * slices)
+
+
 def packed_block_starts(query_lens, prefix_lens):
     """Each request's first block in the FP8 pack's four-token blocks of every request with
     queries (a request's ceil(length / 4) blocks, in request order)."""
@@ -1839,8 +1850,7 @@ def allocate_plan(
     prefix = np.asarray(inputs.prefix_lens, dtype=np.int64)
     lengths = q_lens + prefix
     if min_request_rows is None:
-        full = hk == 1 and len(q_lens) == 1 and prefix[0] == 0
-        query_tile = _tile_rows(group, query_tile, int(q_lens[0]), full)
+        query_tile = plan_query_tile(group, hk, q_lens, prefix, query_tile)
         union = np.ones(len(q_lens), dtype=bool)
         rows = np.full(len(q_lens), query_tile)
         max_blocks = _cdiv(inputs.max_seqlen_k, 4)
@@ -1937,6 +1947,7 @@ def allocate_plan(
             config.union_step,
             config.row_step,
             config.route_margin,
+            config.route_all_or_none,
         ),
         union_ratio=config.union_ratio,
         routing=min_request_rows is None,
@@ -2019,13 +2030,12 @@ def _launches(inputs, plan, stream):
     # Order CTAs cover every tile (a direct-only tile publishes 0 and raises the direct flag);
     # mask CTAs only the union tiles.
     tasks = plan.num_tiles * hk * slices
-    entries = tasks * plan.split
     numel = plan.task_order.numel()
     # One order CTA sorts the whole task order up to the widest variant, else chunks of it
     # (a split plan always fits one), runnable entries of every chunk first.
     size = min(THREADS * SORT_WIDTHS[-1], numel)
-    shift = max(1, (entries - 1).bit_length())
-    wide = ((plan.block_capacity // 16) << shift) + entries - 1 >= 2**31
+    shift = max(1, (size - 1).bit_length())  # bits of a position in a chunk
+    chunked = numel > size
     standin = plan.counts  # slot-table tensors K3 does not read without a slot table
     args = (
         inputs.kv_slots if plan.slotted else standin,
@@ -2057,28 +2067,32 @@ def _launches(inputs, plan, stream):
         *plan.route_costs,
         hk,
         slices,
-        wide,
         plan.routing,
         plan.route_model,
         plan.slotted,
         plan.split,
         core,
-        numel > size,
+        chunked,
         stream,
     )
     constants = (
         hk,
         slices,
-        wide,
         plan.routing,
         plan.route_model,
         members64,
         plan.slotted,
         plan.split,
         core,
-        numel > size,
     )
-    yield _compiled(_order_masks_launch, args, 24, constants), args
+    if (_order_masks_launch, args[0].device, *constants, chunked) not in _COMPILED:
+        # CHUNKED follows the task count, so both variants compile together: no task
+        # count compiles a new K3 later (as the direct kernel compiles packed and raw
+        # together).
+        other = list(args)
+        other[-2] = not chunked
+        _compiled(_order_masks_launch, other, 24, (*constants, not chunked))
+    yield _compiled(_order_masks_launch, args, 24, (*constants, chunked)), args
 
 
 def run(*, inputs, plan):
