@@ -333,6 +333,7 @@ def gemm_a4w4_fake(
     apreshuffle: bool | None = False,
     global_A_scale: Tensor | None = None,  # NVFP4 per-tensor
     global_B_scale: Tensor | None = None,  # NVFP4 per-tensor
+    deterministic: bool = False,
 ) -> torch.Tensor:
     if dtype == dtypes.fp8:
         raise NotImplementedError(
@@ -449,12 +450,19 @@ def gemm_a4w4(
     apreshuffle: bool | None = False,
     global_A_scale: Tensor | None = None,  # NVFP4 per-tensor
     global_B_scale: Tensor | None = None,  # NVFP4 per-tensor
+    deterministic: bool = False,
 ) -> torch.Tensor:
     """A4W4 GEMM (4-bit quantized matmul) returning one plain-dtype tensor.
 
     On gfx1250 the a4w4_mxscale_bpreshuffle table picks FlyDSL or the F4GEMM asm
     kernels per shape. MXFP4 vs NVFP4 is selected by the presence of ``global_A_scale``/
     ``global_B_scale`` (NVFP4 per-tensor global scales).
+
+    ``deterministic=True`` gives bitwise the same output for a row whatever M, and
+    from run to run. The tuned table mixes kernel families, and the persistent asm
+    kernel sums K in another order, so it skips both: the asm heuristic picks among
+    the non-persistent tiles, which all sum K in one order, without split K. gfx950
+    MXFP4 only, with B preshuffled, a bf16 output and no bias term.
     """
     # Low-precision output has a different return arity/shape (mxfp8 is a
     # (data, scale) tuple), so it lives on a separate fixed-arity op.
@@ -467,6 +475,34 @@ def gemm_a4w4(
     n = B.shape[0]
     k = A.shape[-1] * 2
     gfx_arch = get_gfx()
+    if deterministic:
+        if not (
+            gfx_arch == "gfx950"
+            and dtype == dtypes.bf16
+            and bpreshuffle
+            and not apreshuffle
+            and global_A_scale is None
+            and global_B_scale is None
+            and bias is None
+            and alpha in (None, 1.0)
+            and beta in (None, 0.0)
+        ):
+            raise NotImplementedError(
+                "gemm_a4w4(deterministic=True) supports gfx950 MXFP4 with B "
+                "preshuffled, a bf16 output and no bias term"
+            )
+        out = torch.empty(((m + 31) // 32 * 32, n), dtype=dtype, device=A.device)
+        gemm_a4w4_asm(
+            A.view(m, k // 2),
+            B,
+            A_scale,
+            B_scale,
+            out,
+            bpreshuffle=True,
+            log2_k_split=0,
+            allow_ps=False,
+        )
+        return out[:m].view(*A.shape[:-1], n)
     if gfx_arch in ["gfx1250", "gfx1250-strict"]:
         # FlyDSL serves plain MXFP4 with row-major A and a bf16 output; the rest is asm.
         plain_mxfp4 = (
@@ -595,6 +631,7 @@ def _gemm_a4w4_asm(
     beta: float = 0.0,
     bpreshuffle: int = 1,
     log2_k_split: int = 0,
+    allow_ps: int = 1,
 ) -> None: ...
 
 
@@ -610,6 +647,7 @@ def gemm_a4w4_asm(
     beta: float | None = 0.0,
     bpreshuffle: bool | None = True,
     log2_k_split: int | None = None,
+    allow_ps: bool = True,
 ) -> Tensor:
     _gemm_a4w4_asm(
         A,
@@ -623,6 +661,7 @@ def gemm_a4w4_asm(
         beta if beta is not None else 0.0,
         int(bpreshuffle) if bpreshuffle is not None else 1,
         log2_k_split if log2_k_split is not None else 0,
+        int(allow_ps),
     )
     return out
 

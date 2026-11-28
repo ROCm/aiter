@@ -267,10 +267,12 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
         shuffle_df = (
             df[df["bpreshuffle"] == 1]
             .reset_index()
-            .sort_values(by=["tile_M", "tile_N", "splitK", "ps"])
+            .sort_values(by=["tile_M", "tile_N", "splitK", "ps", "full_tile_N"])
         )
         kernel_dict = (
-            shuffle_df.groupby(["tile_M", "tile_N", "splitK", "ps"])["knl_name"]
+            shuffle_df.groupby(["tile_M", "tile_N", "splitK", "ps", "full_tile_N"])[
+                "knl_name"
+            ]
             .apply(list)
             .to_dict()
         )
@@ -382,7 +384,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
             asm_kernels = self.get_asm_kernels(asm_kernel_list_csv)
             asm_tiles = [key for key in asm_kernels]
             for key in asm_tiles if "asm" in backends else ():
-                tile_m, tile_n, splitk, _ps = key
+                tile_m, tile_n, splitk, _ps, full_tile_n = key
                 maxsplitK = (
                     aiter.compute_gemm_SplitK(M, N, K, tile_m, tile_n, 256)
                     if useSplitK
@@ -394,7 +396,9 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                     continue
                 if splitk == 0:
                     maxsplitK = 0
-                for splitK in range(maxsplitK + 1):
+                # full_tile_N kernels store past column N without split K
+                min_splitK = 1 if full_tile_n and N % tile_n else 0
+                for splitK in range(min_splitK, maxsplitK + 1):
                     kernel_name = kernelName[0]
                     info = ((gfx, cu_num, M, N, K), asm_kernels_id, splitK, kernel_name)
                     task.append(
