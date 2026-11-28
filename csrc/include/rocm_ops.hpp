@@ -1498,6 +1498,13 @@ namespace py = pybind11;
           py::arg("routed_scaling_factor") = 1.0f,                             \
           py::arg("num_valid_rows")        = std::nullopt,                     \
           "Apply biased grouped topk softmax to the gating outputs.");         \
+    m.def("topk_reg_mw_supports",                                              \
+          &topk_reg_mw_supports,                                               \
+          py::arg("num_experts"),                                              \
+          py::arg("topk"),                                                     \
+          py::arg("gating_dtype"),                                             \
+          py::arg("bias_dtype"),                                               \
+          py::arg("device_id") = -1);                                          \
     m.def("moe_fused_gate",                                                    \
           &moe_fused_gate,                                                     \
           py::arg("input"),                                                    \

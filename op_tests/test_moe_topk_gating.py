@@ -24,8 +24,9 @@ import pandas as pd
 import torch
 
 import aiter
-from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.topk import biased_grouped_topk, biased_grouped_topk_hip
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
+from aiter.ops.topk import biased_grouped_topk_hip
+from aiter.ops.triton.moe.moe_routing.topk_gating import exact_sigmoid_biased_topk
 from aiter.test_common import (
     benchmark,
     checkAllclose,
@@ -399,7 +400,7 @@ def bench_topk_sigmoid(num_experts, num_tokens, topk, dtype):
 def bench_biased_grouped_sigmoid(
     num_experts, num_tokens, topk, dtype, renormalize=True, route_scale=1.0
 ):
-    """Compare the gfx1250 caller-owned specialization with its HIP fallback."""
+    """Compare the gfx1250 Triton sigmoid top-k with biased_grouped_topk_hip."""
     torch.random.manual_seed(0)
     gating_output = _make_gating(num_experts, num_tokens, dtype)
     correction_bias = (torch.randn(num_experts) * 0.1).to(torch.bfloat16)
@@ -409,15 +410,15 @@ def bench_biased_grouped_sigmoid(
     hip_ids = torch.empty_like(triton_ids)
 
     def run_triton():
-        biased_grouped_topk(
+        # biased_grouped_topk sends these rows to the HIP kernel except at E=900.
+        exact_sigmoid_biased_topk(
             gating_output,
             correction_bias,
             triton_weights,
             triton_ids,
-            1,
-            1,
             renormalize,
             route_scale,
+            None,
         )
         return triton_weights, triton_ids
 
@@ -1117,7 +1118,13 @@ def main():
             failed_sections.append("sigmoid")
 
     # -- gfx1250 caller-owned biased sigmoid: Triton versus HIP -------------
-    if "biased-sigmoid" in sections:
+    # The Triton kernel keeps the wave32 tie order, which wave64 HIP does not.
+    if "biased-sigmoid" in sections and get_gfx_runtime() not in (
+        "gfx1250",
+        "gfx1250-strict",
+    ):
+        aiter.logger.warning("biased-sigmoid needs gfx1250; skipping")
+    elif "biased-sigmoid" in sections:
         biased_configs = list(
             itertools.product(
                 [e for e in num_experts_list if e in (512, 768, 896, 900, 1024)],

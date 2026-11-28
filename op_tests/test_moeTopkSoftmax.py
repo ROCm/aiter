@@ -271,11 +271,12 @@ def test_biased_grouped_topk(
     num_iters=101,
     num_warmup=2,
     gating_output=None,
+    bias_dtype=None,
 ):
     ret = {}
     if gating_output is None:
         gating_output = torch.randn((token, expert), dtype=dtype)
-    correction_bias = torch.randn((expert,), dtype=dtype)
+    correction_bias = torch.randn((expert,), dtype=bias_dtype or dtype)
 
     (w_ref, id_ref, score_ref), us_ref = run_perftest(
         aiter.biased_grouped_topk_torch,
@@ -386,6 +387,10 @@ def test_grouped_topk_stable(
     strided_output,
     num_expert_group=1,
     topk_group=1,
+    bias_dtype=None,
+    strided_input=False,
+    ref_experts=None,
+    unaligned_input=False,
 ):
     mode_id = {"biased": 0, "sigmoid": 1, "softmax": 2}[mode]
     pattern_id = {
@@ -396,6 +401,7 @@ def test_grouped_topk_stable(
         "all_nan": 4,
         "masked_scores": 5,
         "all_zero_sigmoid": 6,
+        "forty_way_tie": 7,
     }[pattern]
     torch.manual_seed(
         5632 + token * 17 + expert * 3 + topk + mode_id * 1009 + pattern_id * 101
@@ -432,6 +438,29 @@ def test_grouped_topk_stable(
             raise AssertionError("all_zero_sigmoid is not a softmax pattern")
         gating.fill_(-100)
         bias.zero_()
+    elif pattern == "forty_way_tie":
+        # More tied candidates than a wave32 lane keeps in one register slot,
+        # fewer than the 64 the register paths stage.
+        gating.fill_(-4)
+        hot = torch.rand((token, expert)).argsort(dim=1)[:, :40]
+        gating.scatter_(1, hot, 0.0)
+        bias.zero_()
+
+    # The reference below reads gating and bias as they are here.
+    run_gating, run_bias = gating, bias
+    if strided_input:
+        # Rows of a wider buffer, as a fused projection leaves the logits.
+        backing = torch.empty((token, expert + 128), dtype=dtype)
+        run_gating = backing[:, 64 : 64 + expert]
+        run_gating.copy_(gating)
+    if bias_dtype is not None:
+        run_bias = bias.to(bias_dtype)
+    if unaligned_input:
+        # One element past an aligned base, with a pitch of whole quads.
+        flat = torch.empty(token * (expert + 4) + 1, dtype=dtype)
+        run_gating = flat[1:].view(token, expert + 4)[:, :expert]
+        run_gating.copy_(gating)
+        run_bias = torch.cat([run_bias.new_zeros(1), run_bias])[1:]
 
     def make_output(dtype):
         if strided_output:
@@ -443,8 +472,8 @@ def test_grouped_topk_stable(
     if mode == "biased":
         _, us = run_perftest(
             aiter.biased_grouped_topk_hip,
-            gating,
-            bias,
+            run_gating,
+            run_bias,
             w,
             ids,
             num_expert_group,
@@ -457,7 +486,7 @@ def test_grouped_topk_stable(
     else:
         _, us = run_perftest(
             aiter.grouped_topk,
-            gating,
+            run_gating,
             w,
             ids,
             num_expert_group,
@@ -510,9 +539,10 @@ def test_grouped_topk_stable(
     else:
         if num_expert_group != 1:
             raise AssertionError("the padded legacy reference needs one expert group")
-        legacy_gating = torch.full((token, expert + 4), -torch.inf, dtype=dtype)
+        legacy_experts = ref_experts or expert + 4
+        legacy_gating = torch.full((token, legacy_experts), -torch.inf, dtype=dtype)
         legacy_gating[:, :expert] = gating
-        legacy_bias = torch.full((expert + 4,), -torch.inf, dtype=dtype)
+        legacy_bias = torch.full((legacy_experts,), -torch.inf, dtype=dtype)
         legacy_bias[:expert] = bias
         legacy_w = make_output(dtypes.fp32)
         legacy_ids = make_output(dtypes.i32)
@@ -1001,10 +1031,12 @@ aiter.logger.info("moeTopkSoftmax_grouped_topk summary (markdown):\n%s", df_md)
 reg_tokens = [1, 128]
 df = []
 for token in reg_tokens:
-    for expert, topk, dtype in (
-        (128, 4, dtypes.bf16),
-        (128, 32, dtypes.fp32),
-        (2048, 32, dtypes.bf16),
+    for expert, topk, dtype, bias_dtype in (
+        (128, 4, dtypes.bf16, None),
+        (128, 32, dtypes.fp32, None),
+        (2048, 32, dtypes.bf16, None),
+        # gfx1250 runs the multi-wave kernel (E = 128 * waves); Kimi-K3's FP32 bias.
+        (896, 17, dtypes.bf16, dtypes.fp32),
     ):
         ret = test_biased_grouped_topk(
             token,
@@ -1016,6 +1048,7 @@ for token in reg_tokens:
             dtype,
             num_iters=args.iters,
             num_warmup=args.warmup,
+            bias_dtype=bias_dtype,
         )
         df.append(ret)
 df = pd.DataFrame(df)
@@ -1053,8 +1086,62 @@ stable_cases = [
     (1, 256, 8, dtypes.bf16, "softmax", True, "all_nan", False),
     (1, 256, 8, dtypes.bf16, "biased", True, "all_zero_sigmoid", False),
     (1, 256, 8, dtypes.bf16, "sigmoid", False, "all_zero_sigmoid", False),
+    # gfx1250 topk_reg_kernel at wave32 with 40 tied candidates, two slots a lane.
+    (64, 256, 8, dtypes.bf16, "softmax", True, "forty_way_tie", False),
+    # gfx1250 multi-wave register path: E = 128 * waves, topk <= 17 (HERD's
+    # top-(K + 1) for K = 16).
+    (160, 896, 16, dtypes.bf16, "biased", True, "random", True),  # Kimi-K3 router
+    (64, 512, 8, dtypes.bf16, "biased", False, "random", True),
+    (64, 768, 4, dtypes.bf16, "biased", True, "random", False),
+    (64, 1024, 9, dtypes.bf16, "biased", True, "random", False),
+    (64, 896, 1, dtypes.bf16, "biased", True, "random", False),
+    (64, 896, 17, dtypes.bf16, "biased", True, "forty_way_tie", False),
+    (1, 896, 16, dtypes.bf16, "biased", True, "sixteen_way_tie", False),
+    # The fallback takes one of 880 tied experts.
+    (1, 896, 17, dtypes.bf16, "biased", True, "sixteen_way_tie", False),
+    (1, 896, 17, dtypes.bf16, "biased", True, "one_finite", False),
+    (1, 896, 16, dtypes.bf16, "biased", True, "all_nan", False),
+    (1, 896, 17, dtypes.bf16, "biased", True, "all_zero_sigmoid", False),
 ]
-df = pd.DataFrame([test_grouped_topk_stable(*case) for case in stable_cases])
+# Kimi-K3's FP32 bias, which the reference reads in the logits dtype, and logits
+# in rows of a wider buffer. At E=256 the FP32 bias keeps the row off
+# biased_grouped_topk_w32_kernel, so gfx1250 runs topk_reg_kernel's two-slot path.
+# Only the register paths take a bias of another dtype, so the FP16 rows check
+# that gfx1250 launches topk_reg_kernel at wave32 EPL 6, 16 and 32.
+fp32_bias_cases = [
+    (160, 896, 17, dtypes.bf16, "biased", True, "random", False),
+    (64, 256, 8, dtypes.bf16, "biased", True, "forty_way_tie", False),
+    (64, 192, 8, dtypes.fp16, "biased", True, "random", False),
+    (64, 512, 16, dtypes.fp16, "biased", False, "random", False),
+    (64, 1024, 4, dtypes.fp16, "biased", True, "forty_way_tie", False),
+]
+# References padded to 260 experts, which take the LDS kernel at either wave
+# size (E + 4 would take topk_reg_kernel at wave64, not for E=128 at wave32).
+# At E=252 topk_reg_kernel masks its last round.
+ref260_cases = [
+    (64, 128, 8, dtypes.bf16, "biased", True, "forty_way_tie", False),
+    (64, 252, 8, dtypes.bf16, "softmax", True, "random", False),
+]
+# On gfx1250, logits and bias one element past an aligned base still take the
+# multi-wave kernel, which reads them with unaligned vector loads; the last case
+# takes its fallback, which reloads the row.
+unaligned_cases = [
+    ((160, 896, 17, dtypes.bf16, "biased", True, "random", False), dtypes.fp32),
+    ((64, 512, 8, dtypes.bf16, "biased", True, "forty_way_tie", False), None),
+    ((1, 896, 17, dtypes.bf16, "biased", True, "sixteen_way_tie", False), None),
+]
+df = pd.DataFrame(
+    [test_grouped_topk_stable(*case) for case in stable_cases]
+    + [
+        test_grouped_topk_stable(*case, bias_dtype=dtypes.fp32, strided_input=True)
+        for case in fp32_bias_cases
+    ]
+    + [test_grouped_topk_stable(*case, ref_experts=260) for case in ref260_cases]
+    + [
+        test_grouped_topk_stable(*case, bias_dtype=bias_dtype, unaligned_input=True)
+        for case, bias_dtype in unaligned_cases
+    ]
+)
 aiter.logger.info(
     "moeTopkSoftmax_reg_stable summary (markdown):\n%s",
     df.to_markdown(index=False),

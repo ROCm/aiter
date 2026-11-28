@@ -61,7 +61,18 @@ def _can_use_gfx1250_exact_sigmoid_topk(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
 ) -> bool:
-    """Whether tensors satisfy a measured gfx1250 sigmoid top-k contract."""
+    """Whether biased_grouped_topk sends this call to the gfx1250 Triton
+    sigmoid top-k: the tensors satisfy its measured contract and miss the
+    multi-wave kernel of biased_grouped_topk_hip.
+
+    The multi-wave test is the HIP entry's: the memoised topk_reg_mw_supports
+    for the shape and dtypes, plus a row pitch of whole quads (the validated
+    range; test_exact_sigmoid_topk_matches_torch relies on pitch E + 17 taking
+    Triton) and equal output row strides (the HIP op writes both outputs with
+    the row stride of topk_ids). The kernel's loads take any pointer alignment,
+    so the test reads no data_ptr(). biased_grouped_topk is an opaque custom
+    op, so torch.compile never traces this: compiled and eager calls run it on
+    the same real tensors."""
     if not gating_output.is_cuda or gating_output.ndim != 2:
         return False
     rows, experts = gating_output.shape
@@ -74,34 +85,74 @@ def _can_use_gfx1250_exact_sigmoid_topk(
         or topk not in _GFX1250_SIGMOID_TOPKS
     ):
         return False
+    pitch = gating_output.stride(0)
+    w_pitch = topk_weights.stride(0)
+    id_pitch = topk_ids.stride(0)
+    bias_dtype = correction_bias.dtype
+    device = gating_output.device
     input_ok = (
         gating_output.dtype == torch.bfloat16
         and gating_output.stride(1) == 1
-        and gating_output.stride(0) >= experts
+        and pitch >= experts
     )
-    # An FP32 bias with BF16 logits has no wave32 HIP path: the HIP kernel
-    # takes a bias of another dtype only on its wave64 register top-k path.
     bias_ok = (
         correction_bias.shape == (experts,)
-        and correction_bias.dtype in (torch.bfloat16, torch.float32)
+        and bias_dtype in (torch.bfloat16, torch.float32)
         and correction_bias.stride(0) == 1
     )
     outputs_ok = (
         topk_weights.shape == topk_ids.shape == (rows, topk)
         and (topk_weights.dtype, topk_ids.dtype) == (torch.float32, torch.int32)
         and topk_weights.stride(1) == topk_ids.stride(1) == 1
-        and topk_weights.stride(0) >= topk
-        and topk_ids.stride(0) >= topk
+        and w_pitch >= topk
+        and id_pitch >= topk
     )
     same_device = (
-        correction_bias.device
-        == topk_weights.device
-        == topk_ids.device
-        == gating_output.device
+        correction_bias.device == topk_weights.device == topk_ids.device == device
     )
     if not input_ok or not bias_ok or not outputs_ok or not same_device:
         return False
-    return get_gfx_runtime() in ("gfx1250", "gfx1250-strict")
+    if get_gfx_runtime() not in ("gfx1250", "gfx1250-strict"):
+        return False
+    return not (
+        pitch % 4 == 0
+        and w_pitch == id_pitch
+        and _reg_mw_supports_cached(
+            experts, topk, torch.bfloat16, bias_dtype, device.index
+        )
+    )
+
+
+@compile_ops("module_moe_asm")
+def topk_reg_mw_supports(
+    num_experts: int,
+    topk: int,
+    gating_dtype: int,
+    bias_dtype: int,
+    device_id: int = -1,
+) -> bool: ...
+
+
+@functools.lru_cache(maxsize=256)
+def _reg_mw_supports_cached(
+    num_experts: int,
+    topk: int,
+    gating_dtype: torch.dtype,
+    bias_dtype: torch.dtype,
+    device: int,
+) -> bool:
+    """topk_reg_mw_supports() memoised. Safe to cache: it is a pure function of
+    these arguments and of the device's architecture, and the device is in the
+    key."""
+    return bool(
+        topk_reg_mw_supports(
+            num_experts,
+            topk,
+            dtypes._aiter_dtype_id(gating_dtype),
+            dtypes._aiter_dtype_id(bias_dtype),
+            device,
+        )
+    )
 
 
 def _gfx1250_exact_sigmoid_topk(

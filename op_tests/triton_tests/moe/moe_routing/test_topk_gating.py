@@ -130,12 +130,8 @@ def test_exact_sigmoid_topk_matches_torch(
         device="cuda",
     )
 
-    assert topk_ops._can_use_gfx1250_exact_sigmoid_topk(
-        logits,
-        bias,
-        weights,
-        ids,
-    )
+    # A pitch of experts + 17 keeps biased_grouped_topk on the Triton kernel.
+    assert topk_ops._can_use_gfx1250_exact_sigmoid_topk(logits, bias, weights, ids)
     topk_ops.biased_grouped_topk(
         logits,
         bias,
@@ -190,8 +186,11 @@ def test_exact_sigmoid_topk_matches_torch(
     ],
 )
 def test_exact_sigmoid_topk_herd_widths(experts, topk, rows, need_renorm, bias_dtype):
-    """K+1 widths pad their slots to a power of two and mask the stores, and an
-    FP32 bias (Kimi-K3's) takes the same path as a BF16 one."""
+    """The Triton kernel pads K+1 widths to a power of two and masks the
+    stores, with a BF16 or an FP32 bias (Kimi-K3's). biased_grouped_topk sends
+    these aligned rows to the HIP multi-wave kernel, so the test calls the
+    Triton kernel itself, checks it against the HIP one, and then checks that
+    biased_grouped_topk gives the HIP results."""
     torch.manual_seed(experts * topk + rows)
     logits = torch.randn((rows, experts), dtype=torch.bfloat16, device="cuda")
     bias = (torch.randn(experts, device="cuda", dtype=torch.float32) * 0.1).to(
@@ -211,22 +210,151 @@ def test_exact_sigmoid_topk_herd_widths(experts, topk, rows, need_renorm, bias_d
     ids_buf = torch.full((rows, stride), -7, dtype=torch.int32, device="cuda")
     weights, ids = weights_buf[:, :topk], ids_buf[:, :topk]
 
-    assert topk_ops._can_use_gfx1250_exact_sigmoid_topk(logits, bias, weights, ids)
-    topk_ops.biased_grouped_topk(
-        logits, bias, weights, ids, 1, 1, need_renorm, 2.5, num_valid_rows
+    # biased_grouped_topk sends these rows to the HIP multi-wave kernel.
+    assert not topk_ops._can_use_gfx1250_exact_sigmoid_topk(logits, bias, weights, ids)
+    topk_ops._gfx1250_exact_sigmoid_topk(
+        logits, bias, weights, ids, need_renorm, 2.5, num_valid_rows
     )
 
     assert torch.equal(ids, expected_ids)
     torch.testing.assert_close(weights, expected_weights, atol=2e-5, rtol=2e-5)
     assert torch.all(ids_buf[:, topk:] == -7)
     assert torch.all(weights_buf[:, topk:] == -7.0)
-    if bias_dtype != logits.dtype:
-        # The wave32 HIP kernel aborts on a bias of another dtype.
-        return
     hip_weights = torch.empty_like(weights)
     hip_ids = torch.empty_like(ids)
     topk_ops.biased_grouped_topk_hip(
         logits, bias, hip_weights, hip_ids, 1, 1, need_renorm, 2.5, num_valid_rows
     )
     assert torch.equal(ids, hip_ids)
-    torch.testing.assert_close(weights, hip_weights, atol=2e-5, rtol=2e-5)
+    torch.testing.assert_close(weights, hip_weights, atol=1e-6, rtol=1e-6)
+
+    # The public entry gives the HIP kernel's bits.
+    weights.fill_(-7.0)
+    ids.fill_(-7)
+    topk_ops.biased_grouped_topk(
+        logits, bias, weights, ids, 1, 1, need_renorm, 2.5, num_valid_rows
+    )
+    assert torch.equal(ids, hip_ids)
+    assert torch.equal(weights, hip_weights)
+    assert torch.all(ids_buf[:, topk:] == -7)
+    assert torch.all(weights_buf[:, topk:] == -7.0)
+
+
+@pytest.mark.parametrize(
+    "experts,weights_pitch",
+    [
+        (512, 9),  # The HIP op writes both outputs with the row stride of ids.
+        (900, 8),  # No multi-wave instance; contiguous rows.
+    ],
+)
+def test_exact_sigmoid_topk_triton_route(experts, weights_pitch, monkeypatch):
+    """Rows of whole quads that the multi-wave kernel cannot take stay on the
+    Triton kernel, with the reference's ids and weights."""
+    torch.manual_seed(experts + weights_pitch)
+    rows, topk = 32, 8
+    logits = torch.randn((rows, experts), dtype=torch.bfloat16, device="cuda")
+    bias = (torch.randn(experts, device="cuda") * 0.1).to(torch.bfloat16)
+    weights = torch.full((rows, weights_pitch), -7.0, device="cuda")[:, :topk]
+    ids = torch.full((rows, topk), -7, dtype=torch.int32, device="cuda")
+
+    def no_hip(*args):
+        raise AssertionError("biased_grouped_topk took the HIP kernel")
+
+    monkeypatch.setattr(topk_ops, "biased_grouped_topk_hip", no_hip)
+    topk_ops.biased_grouped_topk(logits, bias, weights, ids, 1, 1, True, 2.5)
+
+    expected_weights, expected_ids = _torch_reference(logits, bias, topk, True, 2.5)
+    assert torch.equal(ids, expected_ids)
+    torch.testing.assert_close(weights, expected_weights, atol=2e-5, rtol=2e-5)
+
+
+def _unaligned_copy(t: torch.Tensor, pad: int) -> torch.Tensor:
+    """t's values in a view one element past an aligned base; a 2-D t gets a
+    row pitch of t.shape[1] + pad elements."""
+    rows, cols = (1, t.shape[0]) if t.ndim == 1 else t.shape
+    pitch = cols + pad
+    view = t.new_zeros(rows * pitch + 1)[1:].view(rows, pitch)[:, :cols]
+    view.copy_(t.view(rows, cols))
+    return view[0] if t.ndim == 1 else view
+
+
+@pytest.mark.parametrize("bias_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("case", ["random", "ties"])
+@pytest.mark.parametrize(
+    "experts,topk,rows",
+    [(512, 8, 1), (768, 9, 8), (896, 16, 64), (896, 17, 64), (1024, 16, 128)],
+)
+def test_exact_sigmoid_topk_unaligned_base(experts, topk, rows, case, bias_dtype):
+    """Logits and bias one element past an aligned address, with a row pitch of
+    whole quads, take the HIP multi-wave kernel. It gives the bits it gives for
+    an aligned copy, the torch reference's ids and the Triton kernel's."""
+    torch.manual_seed(experts + topk + rows)
+    logits = torch.randn((rows, experts), dtype=torch.bfloat16, device="cuda")
+    bias = (torch.randn(experts, device="cuda", dtype=torch.float32) * 0.1).to(
+        bias_dtype
+    )
+    if case == "ties":
+        logits[:, ::3] = 0.0
+        bias[::5] = 0.0
+    u_logits, u_bias = _unaligned_copy(logits, 4), _unaligned_copy(bias, 0)
+    assert u_logits.stride(0) % 4 == 0
+    assert u_logits.data_ptr() % (4 * u_logits.element_size()) != 0
+    assert u_bias.data_ptr() % (4 * u_bias.element_size()) != 0
+
+    def outputs():
+        return (
+            torch.full((rows, topk), -7.0, dtype=torch.float32, device="cuda"),
+            torch.full((rows, topk), -7, dtype=torch.int32, device="cuda"),
+        )
+
+    weights, ids = outputs()
+    assert not topk_ops._can_use_gfx1250_exact_sigmoid_topk(
+        u_logits, u_bias, weights, ids
+    )
+    topk_ops.biased_grouped_topk(u_logits, u_bias, weights, ids, 1, 1, True, 2.5)
+
+    aligned_w, aligned_ids = outputs()
+    topk_ops.biased_grouped_topk_hip(
+        logits, bias, aligned_w, aligned_ids, 1, 1, True, 2.5
+    )
+    assert torch.equal(ids, aligned_ids)
+    assert torch.equal(weights, aligned_w)
+
+    expected_weights, expected_ids = _torch_reference(logits, bias, topk, True, 2.5)
+    assert torch.equal(ids, expected_ids)
+    torch.testing.assert_close(weights, expected_weights, atol=2e-5, rtol=2e-5)
+
+    triton_w, triton_ids = outputs()
+    topk_ops._gfx1250_exact_sigmoid_topk(
+        u_logits, u_bias, triton_w, triton_ids, True, 2.5, None
+    )
+    assert torch.equal(ids, triton_ids)
+    torch.testing.assert_close(weights, triton_w, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("unaligned", [False, True])
+def test_exact_sigmoid_topk_compiled_call(unaligned):
+    """biased_grouped_topk is an opaque custom op, so a compiled call runs the
+    HIP multi-wave kernel as an eager one does and returns the same bits."""
+    torch.manual_seed(0)
+    logits = torch.randn((64, 896), dtype=torch.bfloat16, device="cuda")
+    bias = torch.randn(896, device="cuda", dtype=torch.float32) * 0.1
+    if unaligned:
+        logits, bias = _unaligned_copy(logits, 4), _unaligned_copy(bias, 0)
+    eager_w = torch.full((64, 17), -7.0, dtype=torch.float32, device="cuda")
+    eager_ids = torch.full((64, 17), -7, dtype=torch.int32, device="cuda")
+    assert not topk_ops._can_use_gfx1250_exact_sigmoid_topk(
+        logits, bias, eager_w, eager_ids
+    )
+    topk_ops.biased_grouped_topk(logits, bias, eager_w, eager_ids, 1, 1, True, 2.5)
+
+    weights, ids = torch.empty_like(eager_w), torch.empty_like(eager_ids)
+    for dynamic in (False, True):
+        weights.fill_(-7.0)
+        ids.fill_(-7)
+        torch._dynamo.reset()
+        torch.compile(topk_ops.biased_grouped_topk, fullgraph=True, dynamic=dynamic)(
+            logits, bias, weights, ids, 1, 1, True, 2.5
+        )
+        assert torch.equal(ids, eager_ids), f"dynamic={dynamic}"
+        assert torch.equal(weights, eager_w), f"dynamic={dynamic}"
