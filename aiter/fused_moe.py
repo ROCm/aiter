@@ -5133,7 +5133,18 @@ def get_2stage_cfgs(
         and cfg is not None
         and str(cfg.get("kernelName1", "")).startswith("impl__flydsl_gfx942__")
     )
-    if clamp_silu_limit and cfg is not None and not flydsl_gfx942_row:
+    # The gfx950 block-FP8 whole-forward backend applies the limit itself.
+    flydsl_bspp_row = (
+        q_type == QuantType.per_1x128
+        and cfg is not None
+        and str(cfg.get("kernelName1", "")).startswith("impl__flydsl_bspp__")
+    )
+    if (
+        clamp_silu_limit
+        and cfg is not None
+        and not flydsl_gfx942_row
+        and not flydsl_bspp_row
+    ):
         cfg_ksplit = int(cfg.get("ksplit", 0) or 0)
         if (
             cfg.get("run_1stage", False)
