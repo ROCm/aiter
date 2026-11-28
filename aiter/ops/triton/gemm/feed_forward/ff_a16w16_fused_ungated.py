@@ -24,9 +24,12 @@ def ff_a16w16_fused_ungated(
     y: torch.Tensor | None = None,
     config: dict | None = None,
     activation: str | None = None,
+    b_up: torch.Tensor | None = None,
+    b_down: torch.Tensor | None = None,
 ):
     """
-    Computes a full feed-forward operation with activation (e.g FF with Relu)
+    Computes a full feed-forward operation with activation (e.g FF with Relu):
+    Y = act(X @ w_up.T + b_up) @ w_down + b_down.
 
     Key parameters:
     - X: Matrix X with shape (M, K).
@@ -35,8 +38,18 @@ def ff_a16w16_fused_ungated(
     - dtype: Optional parameter to specify bf16 or fp16 datatype. Default is bf16
     - Y: Output Matrix Y with shape (M, K).
     If this is none, then it's created by this API and returned as output.
+    If it is given, the kernel adds the result to it, so it must hold zeros.
     - activation: Optional activation function to apply.
     One of ("gelu", "gelu_tanh", "silu", "silu_exp2", "relu", None)
+    - b_up: Optional contiguous bias of the up-projection, shape (N,). It is
+    added in fp32 before the activation.
+    - b_down: Optional contiguous bias of the down-projection, shape (K,). It is
+    added in fp32 to the result.
+
+    When Y is not given and BLOCK_SIZE_N of the config covers N (one program
+    along N), each program stores its rows of Y: Y is allocated without a
+    zero fill and the call is one launch. Otherwise the kernel adds partial
+    results to a zero-filled Y with atomic adds.
 
     Returns:
     - Y: The output matrix with shape (M, K).
@@ -59,17 +72,26 @@ def ff_a16w16_fused_ungated(
 
     N, K = w_up.shape
     M = x.shape[0]
+    assert N > 0, f"w_up must have at least one row, got shape {tuple(w_up.shape)}"
+    # The kernel reads each bias with unit stride.
+    if b_up is not None:
+        assert b_up.shape == (N,), f"b_up must have shape ({N},), got {b_up.shape}"
+        assert (
+            b_up.is_contiguous()
+        ), f"b_up must be contiguous, got stride {b_up.stride()}"
+    if b_down is not None:
+        assert b_down.shape == (
+            K,
+        ), f"b_down must have shape ({K},), got {b_down.shape}"
+        assert (
+            b_down.is_contiguous()
+        ), f"b_down must be contiguous, got stride {b_down.stride()}"
     if M > 64:
         warnings.warn(
             "The fused FF kernel is slower than the unfused equivalent for large batch sizes (>64)."
         )
 
     w_up = w_up.T
-
-    if y is None:
-        y = torch.zeros(
-            (M, K), dtype=dtype, device=x.device
-        )  # zeros, as this does atomic adds on top
 
     if config is None:
         config, _ = _get_config(M, N, K)
@@ -78,6 +100,17 @@ def ff_a16w16_fused_ungated(
     # selectable split-K; strip it (without mutating a caller-supplied dict) so
     # it is not forwarded as an unknown kernel argument.
     config = {k: v for k, v in config.items() if k != "NUM_KSPLIT"}
+
+    # With one program along N, each element of y is written by one program,
+    # so the kernel can store instead of adding to a zero-filled y.
+    atomic_y = y is not None or triton.cdiv(N, config["BLOCK_SIZE_N"]) > 1
+    if y is None:
+        if atomic_y:
+            y = torch.zeros(
+                (M, K), dtype=dtype, device=x.device
+            )  # zeros, as this does atomic adds on top
+        else:
+            y = torch.empty((M, K), dtype=dtype, device=x.device)
 
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
@@ -100,6 +133,11 @@ def ff_a16w16_fused_ungated(
         y.stride(1),
         activation=_get_activation_from_str(activation) if activation else "",
         use_activation=activation is not None,
+        b_up_ptr=b_up,
+        b_down_ptr=b_down,
+        HAS_BIAS_UP=b_up is not None,
+        HAS_BIAS_DOWN=b_down is not None,
+        ATOMIC_Y=atomic_y,
         **config,
     )
 

@@ -89,6 +89,8 @@ def bench_fn(
     gating: bool,
     activation: str | None = None,
     e2e_fused: bool = False,
+    bias: bool = False,
+    no_y: bool = False,
     **kwargs,
 ):
     # NOTE: Assume bias and output has the same dtype
@@ -134,8 +136,17 @@ def bench_fn(
     else:
         fn = ff_a16w16_gated if gating else ff_a16w16_nogate
 
+    fn_kwargs = {"activation": activation}
+    if not no_y:
+        fn_kwargs["y"] = y
+    if bias:
+        fn_kwargs["b_up"] = torch.randn(intermediate_dim, dtype=c_dtype, device="cuda")
+        fn_kwargs["b_down"] = torch.randn(hidden_dim, dtype=c_dtype, device="cuda")
+        mem_read += (intermediate_dim + hidden_dim) * x.element_size()
+        mem = mem_read + mem_write
+
     ms = triton.testing.do_bench(
-        lambda: fn(x, w1, w2, c_dtype, y=y, activation=activation),
+        lambda: fn(x, w1, w2, c_dtype, **fn_kwargs),
         warmup=25,
         rep=100,
     )
@@ -176,6 +187,8 @@ def run_model_benchmark(args):
             gating=not args.ungated,
             activation=args.activation,
             e2e_fused=args.e2e,
+            bias=args.bias,
+            no_y=args.no_y,
         )
 
     bench_a16w16.run(save_path="." if args.o else None, print_data=True)
@@ -204,6 +217,8 @@ def run_shape_benchmark(args):
             gating=not args.ungated,
             activation=args.activation,
             e2e_fused=args.e2e,
+            bias=args.bias,
+            no_y=args.no_y,
         )
 
     bench_a16w16.run(save_path="." if args.o else None, print_data=True)
@@ -248,7 +263,20 @@ def parse_args():
     parser.add_argument(
         "-e2e", action="store_true", help="Bench end-to-end (E2E) fused kernel."
     )
-    return get_ff_args(parser)
+    parser.add_argument(
+        "-bias",
+        action="store_true",
+        help="Pass b_up and b_down (ungated E2E fused kernel only).",
+    )
+    parser.add_argument(
+        "-no_y",
+        action="store_true",
+        help="Do not pass y; the call allocates the output.",
+    )
+    args, defaults = get_ff_args(parser)
+    if args.bias and not (args.e2e and args.ungated):
+        parser.error("-bias needs -e2e and -ungated")
+    return args, defaults
 
 
 def main():

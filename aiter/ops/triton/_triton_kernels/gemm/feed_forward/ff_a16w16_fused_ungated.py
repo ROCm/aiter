@@ -22,6 +22,9 @@ _ff_a16w16_fused_ungated_repr = make_kernel_repr(
         "cache_modifier",
         "activation",
         "use_activation",
+        "HAS_BIAS_UP",
+        "HAS_BIAS_DOWN",
+        "ATOMIC_Y",
     ],
 )
 
@@ -57,9 +60,21 @@ def _ff_a16w16_fused_ungated(
     cache_modifier: tl.constexpr,
     activation: tl.constexpr,
     use_activation: tl.constexpr,
+    b_up_ptr=None,
+    b_down_ptr=None,
+    HAS_BIAS_UP: tl.constexpr = False,
+    HAS_BIAS_DOWN: tl.constexpr = False,
+    ATOMIC_Y: tl.constexpr = True,
 ):
-    """Kernel for computing the matmul C = A x B.
-    A has shape (M, K), B has shape (K, N) and C has shape (M, N)
+    """Kernel for computing Y = act(X x W1 + b_up) x W2 + b_down.
+    X has shape (M, K), W1 has shape (K, N), W2 has shape (N, K) and Y has shape (M, K).
+
+    - HAS_BIAS_UP: add b_up (N values) to the fp32 up-projection, before the activation.
+    - HAS_BIAS_DOWN: add b_down (K values) to Y. With more than one program along N,
+      only the programs with pid_n == 0 add it, so that it is added once.
+    - ATOMIC_Y: add the partial products to Y with atomic adds (Y must hold zeros).
+      Without it, each program stores its rows of Y; this needs one program along N
+      (BLOCK_SIZE_N >= N).
     """
 
     tl.assume(stride_xm > 0)
@@ -96,6 +111,9 @@ def _ff_a16w16_fused_ungated(
     offs_w1n = pid_n.to(tl.int64) * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     w1_ptrs = w1_ptr + (offs_k[:, None] * stride_w1k + offs_w1n[None, :] * stride_w1n)
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
+    if HAS_BIAS_UP:
+        # Loaded before the K loop, added after it.
+        b_up = tl.load(b_up_ptr + offs_w1n, mask=offs_w1n < N, other=0.0)
 
     for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the K dimension.
@@ -125,6 +143,9 @@ def _ff_a16w16_fused_ungated(
         # Advance the ptrs to the next K block.
         x_ptrs += BLOCK_SIZE_K * stride_xk
         w1_ptrs += BLOCK_SIZE_K * stride_w1k
+
+    if HAS_BIAS_UP:
+        acc += b_up.to(acc_dtype)[None, :]
 
     if use_activation:
         acc = activation(acc)
@@ -159,11 +180,21 @@ def _ff_a16w16_fused_ungated(
         partial_sum_y = tl.dot(acc, w2)
         # tl.device_print("w2:", w2)
         # tl.device_print("partial y:", partial_sum_y)
+        if HAS_BIAS_DOWN:
+            offs_bk = offs_k + BLOCK_SIZE_K * k_cyclic_offset
+            b_down = tl.load(
+                b_down_ptr + offs_bk, mask=(offs_bk < K) & (pid_n == 0), other=0.0
+            )
+            partial_sum_y += b_down.to(partial_sum_y.dtype)[None, :]
         y_mask = (offs_ym[:, None] < M) & (
             (offs_k[None, :] + BLOCK_SIZE_K * k_cyclic_offset) < K
         )
-        tl.atomic_add(y_ptrs, partial_sum_y, mask=y_mask, sem="relaxed", scope="gpu")
-        # tl.store(y_ptrs, partial_sum_y, mask=y_mask)
+        if ATOMIC_Y:
+            tl.atomic_add(
+                y_ptrs, partial_sum_y, mask=y_mask, sem="relaxed", scope="gpu"
+            )
+        else:
+            tl.store(y_ptrs, partial_sum_y.to(y_ptr.type.element_ty), mask=y_mask)
         k_cyclic_offset += 1
         if k_cyclic_offset >= tl.cdiv(K, BLOCK_SIZE_K):
             k_cyclic_offset = 0
