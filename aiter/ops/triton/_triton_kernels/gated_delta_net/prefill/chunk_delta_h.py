@@ -985,7 +985,11 @@ def chunk_gated_delta_rule_fwd_h_opt(
     key=["H", "K", "V", "BT", "IS_VARLEN"],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=["T", "T_flat"])
+# Metadata can be slices of one packed tensor; their alignment changes per batch.
+@triton.jit(
+    do_not_specialize=["T", "T_flat"],
+    do_not_specialize_on_alignment=["cu_seqlens", "chunk_offsets"],
+)
 def chunk_gated_delta_rule_fwd_kernel_h_opt_vk(
     k,
     v,
