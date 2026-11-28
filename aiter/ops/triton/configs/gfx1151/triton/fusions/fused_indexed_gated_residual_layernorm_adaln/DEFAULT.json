@@ -1,0 +1,26 @@
+{
+    "N_LEQ_2048": {
+        "BLOCK_M": 1,
+        "BLOCK_N": 2048,
+        "num_warps": 2,
+        "waves_per_eu": 2
+    },
+    "N_LEQ_3072": {
+        "BLOCK_M": 1,
+        "BLOCK_N": 4096,
+        "num_warps": 4,
+        "waves_per_eu": 1
+    },
+    "N_LEQ_8192": {
+        "BLOCK_M": 1,
+        "BLOCK_N": 8192,
+        "num_warps": 8,
+        "waves_per_eu": 2
+    },
+    "any": {
+        "BLOCK_M": 1,
+        "BLOCK_N": 4096,
+        "num_warps": 8,
+        "waves_per_eu": 2
+    }
+}
