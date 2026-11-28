@@ -107,9 +107,11 @@ def test_topk_softmax(dtype, token, E, topk, renormalize=True):
     gating_output = torch.randn((token, E + 10), dtype=dtype, device="cuda")
     # making gating_output as strided tensor for testing
     gating_output = gating_output[:, :E]
-    (topk_weights_a, topk_ids_a), _avg_a = test_nofuse(gating_output, topk, renormalize)
-    id_ref, _ref = torch.sort(topk_ids_a)
-    w_ref = topk_weights_a.gather(1, _ref)
+    (_, topk_ids_a), _avg_a = test_nofuse(gating_output, topk, renormalize)
+    # Experts with equal probability are interchangeable for top-k, and bf16
+    # gating ties often. Compare the selected probabilities, not the expert ids.
+    probs = torch.softmax(gating_output.float(), dim=-1)
+    probs_ref = probs.gather(1, topk_ids_a.long()).sort(dim=-1).values
 
     func_dict = {"hip": test_fuse, "asm": test_asm}
     ret = {}
@@ -124,10 +126,31 @@ def test_topk_softmax(dtype, token, E, topk, renormalize=True):
         gating_output = gating_output.contiguous() if tag == "asm" else gating_output
         (topk_weights, topk_ids), us = func(gating_output, topk, renormalize)
         topk_ids = topk_ids.to(dtypes.i32)
-        id, _ref = torch.sort(topk_ids)
-        weight = topk_weights.gather(1, _ref)
-        ret[f"{tag} err"] = checkAllclose(w_ref, weight, msg=f"{tag} topk_weights")
-        checkAllclose(id_ref, id, msg=f"{tag} topk_ids")
+        # A duplicated tied id still matches on value, so check uniqueness too.
+        s = topk_ids.sort(dim=-1).values
+        invalid = (s[:, 1:] == s[:, :-1]).any(dim=-1) | (s[:, 0] < 0) | (s[:, -1] >= E)
+        checkAllclose(
+            invalid.to(dtypes.fp32),
+            torch.zeros_like(invalid, dtype=dtypes.fp32),
+            rtol=0,
+            atol=0,
+            tol_err_ratio=0,
+            msg=f"{tag} topk_ids unique and in range",
+        )
+        ids = topk_ids.long().clamp(0, E - 1)
+        w_ref = probs.gather(1, ids)
+        if renormalize:
+            w_ref = w_ref / w_ref.sum(dim=-1, keepdim=True)
+        ret[f"{tag} err"] = checkAllclose(
+            w_ref, topk_weights, msg=f"{tag} topk_weights"
+        )
+        checkAllclose(
+            probs_ref,
+            probs.gather(1, ids).sort(dim=-1).values,
+            rtol=0,
+            atol=0,
+            msg=f"{tag} topk_ids",
+        )
         ret[f"{tag} us"] = us
     return ret
 
