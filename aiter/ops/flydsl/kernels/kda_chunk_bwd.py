@@ -1,0 +1,2564 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""FlyDSL kernels of the KDA chunk backward (K = V = 128, chunk 64, no GVA).
+
+Stage-for-stage ports of ``chunk_delta_attn_bwd`` in
+``aiter/ops/triton/_triton_kernels/kimi_delta_attn/chunk_bwd.py``:
+
+* ``dav``: ``dAqk = tril(do @ v_new^T) * scale``, ``dv = tril(Aqk)^T @ do``.
+* ``dhu``: reverse-time state gradient ``dh`` per chunk, ``dh0`` and
+  ``dv2 = dv + kg @ dh``.
+* ``wy_dqkg``: inter-chunk ``dq``/``dk``/``dg``, the WY gradients
+  ``dv``/``dbeta`` and ``dAkk``.
+* ``intra``: intra-chunk ``dq``/``dk``/``dg``/``dbeta``; optionally the l2norm
+  backward of q/k and the beta-sigmoid backward.
+* ``gate_cumsum``: reverse chunk cumsum of ``dg``; optionally the gate
+  activation backward with per-program ``dA_log`` / ``dt_bias`` partials.
+
+Every program owns one 64-token chunk of one head (``dhu``: one 32-column V
+block of one state) with 256 threads. Operand tiles are staged in LDS and the
+contractions run as fp32 FMAs: thread ``tid`` owns row ``tid // 4`` and the
+columns ``tid % 4 + 4 * e`` of each ``[64, *]`` output, so a row reduction is
+two lane shuffles. The LDS budget (up to ~147 KB in ``wy_dqkg``) needs gfx950.
+
+Layouts are token-major ``[B, T, H, *]`` throughout, except ``h`` (the FlyDSL
+K5 snapshot, ``[B, NT, H, V, K]``) and ``v_new`` (head-major ``[B, H, T, V]``),
+which are read as the K5 kernel writes them; ``dh`` is ``[B, NT, H, K, V]``.
+"""
+
+import functools
+
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+import torch
+from flydsl.expr import const_expr, gpu, range_constexpr
+
+BT = 64
+K = 128
+V = 128
+BV = 32
+NUM_THREADS = 256
+_LOG2E = 1.4426950408889634
+_EXTENT = 1 << 30
+
+
+def _num(dtype: torch.dtype):
+    if dtype == torch.bfloat16:
+        return fx.BFloat16
+    if dtype == torch.float32:
+        return fx.Float32
+    raise ValueError(f"KDA FlyDSL backward: unsupported dtype {dtype}")
+
+
+def _flat(tensor, base):
+    """1-D element view of ``tensor`` starting at element ``base``."""
+    it = fx.get_iter(fx.rocdl.make_buffer_tensor(tensor, max_size=True))
+    if base is not None:
+        it = fx.add_offset(it, base)
+    return fx.Tensor(fx.make_view(it, fx.make_layout((_EXTENT, 1), (1, 1))))
+
+
+def _lds(arr, n):
+    return arr.view(fx.make_layout((n, 1), (1, 1)))
+
+
+def _g_atom(num):
+    if num is fx.BFloat16:
+        return fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16)
+    return fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+
+
+def _s_atom(num):
+    return fx.make_copy_atom(fx.UniversalCopy(16 if num is fx.BFloat16 else 32), num)
+
+
+def _rd(atom, view, i, num):
+    frag = fx.make_rmem_tensor(1, num)
+    fx.copy(atom, fx.slice(view, (i, None)), frag)
+    val = frag.load()[0]
+    return val if num is fx.Float32 else val.to(fx.Float32)
+
+
+def _wr(atom, view, i, val, num):
+    frag = fx.make_rmem_tensor(1, num)
+    val = fx.Float32(val)
+    if num is not fx.Float32:
+        val = val.to(num)
+    frag.store(fx.Vector.from_elements([val], dtype=num))
+    fx.copy(atom, frag, fx.slice(view, (i, None)))
+
+
+def ldg(view, i, num):
+    return _rd(_g_atom(num), view, i, num)
+
+
+def stg(view, i, val, num):
+    _wr(_g_atom(num), view, i, val, num)
+
+
+def lds_ld(view, i, num=fx.Float32):
+    return _rd(_s_atom(num), view, i, num)
+
+
+def lds_st(view, i, val, num=fx.Float32):
+    _wr(_s_atom(num), view, i, val, num)
+
+
+def _results(res, n):
+    return [res] if n == 1 and not isinstance(res, (list, tuple)) else list(res)
+
+
+def _zero():
+    return fx.Float32(0.0)
+
+
+def _sel(cond, a, b):
+    return cond.select(a, b)
+
+
+def _min(a, b):
+    return (a < b).select(a, b)
+
+
+def _exp2(x):
+    return fx.exp2(x, fastmath="afn")
+
+
+def _decay(x):
+    """``exp2(x)`` of a log2 gate difference, which is <= 0 for every causal pair.
+
+    Clamping keeps a masked or padded pair from overflowing to inf, which a
+    zeroed operand would turn into NaN (0 * inf).
+    """
+    return _exp2(_min(x, fx.Float32(0.0)))
+
+
+def _sigmoid(x):
+    return fx.Float32(1.0) / (fx.Float32(1.0) + _exp2(-x * _LOG2E))
+
+
+def _row_sum(x):
+    """Sum over the 4 lanes that share a row."""
+    x = x + x.shuffle_xor(fx.Int32(1), fx.Int32(64))
+    return x + x.shuffle_xor(fx.Int32(2), fx.Int32(64))
+
+
+def _load_tile(view, ld_stride, lds_view, rows, cols, nvalid, tid, num, lds_num):
+    """Stage a ``[rows, cols]`` token tile into LDS, zeroing rows ``>= nvalid``."""
+    for e in range_constexpr(rows * cols // NUM_THREADS):
+        i = tid + e * NUM_THREADS
+        t = i // cols
+        c = i % cols
+        ok = t < nvalid
+        x = ldg(view, _sel(ok, t, 0) * ld_stride + c, num)
+        lds_st(lds_view, i, _sel(ok, x, _zero()), lds_num)
+
+
+def ldi(view, i):
+    frag = fx.make_rmem_tensor(1, fx.Int32)
+    atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
+    fx.copy(atom, fx.slice(view, (i, None)), frag)
+    return frag.load()[0]
+
+
+def _chunk(i_t, T):
+    t0 = i_t * BT
+    return t0, _min(T - t0, fx.Int32(BT))
+
+
+def _chunk_pos(i_t, T, cu, ci, varlen):
+    """Start ``pos`` of program chunk ``i_t`` within its batch row and its valid rows.
+
+    Dense: chunk ``i_t`` of a length-``T`` row. Varlen (``B = 1``): ``ci`` is
+    ``chunk_indices`` (``[NT, 2]`` int32 ``(sequence, chunk)``), ``cu`` the int32
+    ``cu_seqlens``; the chunk stops at its sequence's end.
+    """
+    if const_expr(varlen):
+        ci_v = _flat(ci, None)
+        cu_v = _flat(cu, None)
+        i_n = ldi(ci_v, i_t * 2)
+        t0 = ldi(ci_v, i_t * 2 + 1) * BT
+        bos = ldi(cu_v, i_n)
+        eos = ldi(cu_v, i_n + 1)
+        return bos + t0, _min(eos - bos - t0, fx.Int32(BT))
+    return _chunk(i_t, T)
+
+
+# ---------------------------------------------------------------------------
+# dav
+# ---------------------------------------------------------------------------
+@functools.cache
+def compile_dav(
+    H: int, v_dtype: torch.dtype, a_dtype: torch.dtype, varlen: bool = False
+):
+    VN = _num(v_dtype)
+    AN = _num(a_dtype)
+
+    @fx.struct
+    class Smem:
+        do: fx.Array[fx.Float32, BT * V, 16]
+        vn: fx.Array[fx.Float32, BT * V, 16]
+        a: fx.Array[fx.Float32, BT * BT, 16]
+
+    @flyc.kernel(name="kda_bwd_dav_flydsl")
+    def kernel(
+        vnew: fx.Tensor,
+        A: fx.Tensor,
+        do: fx.Tensor,
+        dA: fx.Tensor,
+        dv: fx.Tensor,
+        cu: fx.Tensor,
+        ci: fx.Tensor,
+        T: fx.Int32,
+        scale: fx.Float32,
+    ):
+        i_t = fx.block_idx.x
+        i_bh = fx.block_idx.y
+        b = i_bh // H
+        h = i_bh % H
+        tid = fx.thread_idx.x
+        r = tid // 4
+        seg = tid % 4
+        t0, nvalid = _chunk_pos(i_t, T, cu, ci, varlen)
+        tok = fx.Int64(b * T + t0)
+        do_v = _flat(do, (tok * H + fx.Int64(h)) * V)
+        dv_v = _flat(dv, (tok * H + fx.Int64(h)) * V)
+        vn_v = _flat(vnew, (fx.Int64(i_bh) * fx.Int64(T) + fx.Int64(t0)) * V)
+        a_v = _flat(A, (tok * H + fx.Int64(h)) * BT)
+        da_v = _flat(dA, (tok * H + fx.Int64(h)) * BT)
+
+        lds = fx.SharedAllocator().allocate(Smem).peek()
+        s_do = _lds(lds.do, BT * V)
+        s_vn = _lds(lds.vn, BT * V)
+        s_a = _lds(lds.a, BT * BT)
+        _load_tile(do_v, H * V, s_do, BT, V, nvalid, tid, VN, fx.Float32)
+        _load_tile(vn_v, V, s_vn, BT, V, nvalid, tid, VN, fx.Float32)
+        _load_tile(a_v, H * BT, s_a, BT, BT, nvalid, tid, AN, fx.Float32)
+        gpu.barrier()
+
+        # dA[r, j] = scale * sum_v do[r, v] v_new[j, v], j <= r
+        for c, st in range(0, V, 1, init=[_zero()] * 16):
+            cc = fx.Int32(c)
+            d = lds_ld(s_do, r * V + cc)
+            acc = [
+                st[e] + d * lds_ld(s_vn, (seg + 4 * e) * V + cc)
+                for e in range_constexpr(16)
+            ]
+            res = yield acc
+        acc_da = _results(res, 16)
+        # dv[r, v] = sum_{t >= r} A[t, r] do[t, v]
+        for t, st in range(0, BT, 1, init=[_zero()] * 32):
+            tt = fx.Int32(t)
+            a = _sel(tt >= r, lds_ld(s_a, tt * BT + r), _zero())
+            acc = [
+                st[e] + a * lds_ld(s_do, tt * V + seg + 4 * e)
+                for e in range_constexpr(32)
+            ]
+            res = yield acc
+        acc_dv = _results(res, 32)
+        if r < nvalid:
+            for e in range_constexpr(16):
+                j = seg + 4 * e
+                stg(
+                    da_v,
+                    r * (H * BT) + j,
+                    _sel(j <= r, acc_da[e] * scale, _zero()),
+                    fx.Float32,
+                )
+            for e in range_constexpr(32):
+                stg(dv_v, r * (H * V) + seg + 4 * e, acc_dv[e], VN)
+
+    @flyc.jit
+    def launch(
+        vnew: fx.Tensor,
+        A: fx.Tensor,
+        do: fx.Tensor,
+        dA: fx.Tensor,
+        dv: fx.Tensor,
+        cu: fx.Tensor,
+        ci: fx.Tensor,
+        T: fx.Int32,
+        scale: fx.Float32,
+        NT: fx.Int32,
+        NBH: fx.Int32,
+        stream: fx.Stream,
+    ):
+        kernel(vnew, A, do, dA, dv, cu, ci, T, scale).launch(
+            grid=(NT, NBH, 1), block=(NUM_THREADS, 1, 1), stream=stream
+        )
+
+    return launch
+
+
+# ---------------------------------------------------------------------------
+# dhu
+# ---------------------------------------------------------------------------
+@functools.cache
+def compile_dhu(
+    H: int,
+    k_dtype: torch.dtype,
+    v_dtype: torch.dtype,
+    use_initial_state: bool,
+    use_final_state_gradient: bool,
+    transpose_state: bool,
+    varlen: bool = False,
+):
+    KN = _num(k_dtype)
+    VN = _num(v_dtype)
+    NE = BV * K // NUM_THREADS  # 16 state cells per thread
+
+    @fx.struct
+    class Smem:
+        kg: fx.Array[fx.Float32, BT * K, 16]
+        qg: fx.Array[fx.Float32, BT * K, 16]
+        w: fx.Array[fx.Float32, BT * K, 16]
+        dh: fx.Array[fx.Float32, K * BV, 16]
+        do: fx.Array[fx.Float32, BT * BV, 16]
+        dv: fx.Array[fx.Float32, BT * BV, 16]
+        dv2: fx.Array[fx.Float32, BT * BV, 16]
+        gl: fx.Array[fx.Float32, K, 16]
+
+    @flyc.kernel(name="kda_bwd_dhu_flydsl")
+    def kernel(
+        qg: fx.Tensor,
+        kg: fx.Tensor,
+        w: fx.Tensor,
+        g: fx.Tensor,
+        do: fx.Tensor,
+        dv: fx.Tensor,
+        dht: fx.Tensor,
+        dh: fx.Tensor,
+        dh0: fx.Tensor,
+        dv2: fx.Tensor,
+        cu: fx.Tensor,
+        co: fx.Tensor,
+        T: fx.Int32,
+        scale: fx.Float32,
+    ):
+        i_v = fx.block_idx.x
+        i_bh = fx.block_idx.y
+        b = i_bh // H
+        h = i_bh % H
+        tid = fx.thread_idx.x
+        kr = tid // 2  # state row (K)
+        sc = tid % 2
+        r = tid // 4  # chunk row for dv2
+        seg = tid % 4
+        # Varlen (B = 1): state i_bh is sequence b's, which spans tokens
+        # [bos, eos) and global chunks from chunk_offsets[b].
+        if const_expr(varlen):
+            cu_v = _flat(cu, None)
+            bos = ldi(cu_v, b)
+            T_loc = ldi(cu_v, b + 1) - bos
+            boh = ldi(_flat(co, None), b)
+            row0 = bos
+        else:
+            T_loc = T
+            boh = b * ((T + (BT - 1)) // BT)
+            row0 = b * T
+        NT = (T_loc + (BT - 1)) // BT
+        v0 = i_v * BV
+
+        lds = fx.SharedAllocator().allocate(Smem).peek()
+        s_kg = _lds(lds.kg, BT * K)
+        s_qg = _lds(lds.qg, BT * K)
+        s_w = _lds(lds.w, BT * K)
+        s_dh = _lds(lds.dh, K * BV)
+        s_do = _lds(lds.do, BT * BV)
+        s_dv = _lds(lds.dv, BT * BV)
+        s_dv2 = _lds(lds.dv2, BT * BV)
+        s_gl = _lds(lds.gl, K)
+
+        state_v = _flat(dht, fx.Int64(i_bh) * (K * V))
+        h0_v = _flat(dh0, fx.Int64(i_bh) * (K * V))
+
+        def state_idx(kk, vv):
+            return vv * K + kk if transpose_state else kk * V + vv
+
+        init = []
+        for e in range_constexpr(NE):
+            if const_expr(use_final_state_gradient):
+                init.append(ldg(state_v, state_idx(kr, v0 + sc + 2 * e), fx.Float32))
+            else:
+                init.append(_zero())
+
+        for i, st in range(0, NT, 1, init=init):
+            it = NT - 1 - fx.Int32(i)
+            t0, nvalid = _chunk(it, T_loc)
+            tok = fx.Int64(row0 + t0)
+            hk = (tok * H + fx.Int64(h)) * K
+            hv = (tok * H + fx.Int64(h)) * V
+            gpu.barrier()
+            dh_v = _flat(dh, ((fx.Int64(boh + it)) * H + fx.Int64(h)) * (K * V))
+            for e in range_constexpr(NE):
+                c = sc + 2 * e
+                stg(dh_v, kr * V + v0 + c, st[e], KN)
+                lds_st(s_dh, kr * BV + c, st[e])
+            _load_tile(_flat(kg, hk), H * K, s_kg, BT, K, nvalid, tid, KN, fx.Float32)
+            _load_tile(_flat(qg, hk), H * K, s_qg, BT, K, nvalid, tid, KN, fx.Float32)
+            _load_tile(_flat(w, hk), H * K, s_w, BT, K, nvalid, tid, KN, fx.Float32)
+            _load_tile(
+                _flat(do, hv + fx.Int64(v0)),
+                H * V,
+                s_do,
+                BT,
+                BV,
+                nvalid,
+                tid,
+                VN,
+                fx.Float32,
+            )
+            _load_tile(
+                _flat(dv, hv + fx.Int64(v0)),
+                H * V,
+                s_dv,
+                BT,
+                BV,
+                nvalid,
+                tid,
+                VN,
+                fx.Float32,
+            )
+            if tid < K:
+                gl = ldg(_flat(g, hk), (nvalid - 1) * (H * K) + tid, fx.Float32)
+                lds_st(s_gl, tid, gl)
+            gpu.barrier()
+
+            # dv2 = dv + kg @ dh
+            for kk, st2 in range(0, K, 1, init=[_zero()] * 8):
+                kq = fx.Int32(kk)
+                a = lds_ld(s_kg, r * K + kq)
+                acc = [
+                    st2[e] + a * lds_ld(s_dh, kq * BV + seg + 4 * e)
+                    for e in range_constexpr(8)
+                ]
+                res2 = yield acc
+            acc2 = _results(res2, 8)
+            dv2_v = _flat(dv2, hv + fx.Int64(v0))
+            for e in range_constexpr(8):
+                c = seg + 4 * e
+                val = acc2[e] + lds_ld(s_dv, r * BV + c)
+                lds_st(s_dv2, r * BV + c, val)
+                if r < nvalid:
+                    stg(dv2_v, r * (H * V) + c, val, VN)
+            gpu.barrier()
+
+            # dh = dh * exp2(g_last) + scale * qg^T do - w^T dv2
+            decay = _decay(lds_ld(s_gl, kr))
+            for t, st3 in range(0, BT, 1, init=[_zero()] * NE):
+                tt = fx.Int32(t)
+                q_ = lds_ld(s_qg, tt * K + kr) * scale
+                w_ = lds_ld(s_w, tt * K + kr)
+                acc = [
+                    st3[e]
+                    + q_ * lds_ld(s_do, tt * BV + sc + 2 * e)
+                    - w_ * lds_ld(s_dv2, tt * BV + sc + 2 * e)
+                    for e in range_constexpr(NE)
+                ]
+                res3 = yield acc
+            acc3 = _results(res3, NE)
+            res = yield [st[e] * decay + acc3[e] for e in range_constexpr(NE)]
+        final = _results(res, NE)
+        if const_expr(use_initial_state):
+            for e in range_constexpr(NE):
+                stg(h0_v, state_idx(kr, v0 + sc + 2 * e), final[e], fx.Float32)
+
+    @flyc.jit
+    def launch(
+        qg: fx.Tensor,
+        kg: fx.Tensor,
+        w: fx.Tensor,
+        g: fx.Tensor,
+        do: fx.Tensor,
+        dv: fx.Tensor,
+        dht: fx.Tensor,
+        dh: fx.Tensor,
+        dh0: fx.Tensor,
+        dv2: fx.Tensor,
+        cu: fx.Tensor,
+        co: fx.Tensor,
+        T: fx.Int32,
+        scale: fx.Float32,
+        NBH: fx.Int32,
+        stream: fx.Stream,
+    ):
+        kernel(qg, kg, w, g, do, dv, dht, dh, dh0, dv2, cu, co, T, scale).launch(
+            grid=(V // BV, NBH, 1), block=(NUM_THREADS, 1, 1), stream=stream
+        )
+
+    return launch
+
+
+# ---------------------------------------------------------------------------
+# wy_dqkg
+# ---------------------------------------------------------------------------
+@functools.cache
+def compile_wy_dqkg(
+    H: int,
+    k_dtype: torch.dtype,
+    v_dtype: torch.dtype,
+    beta_dtype: torch.dtype,
+    a_dtype: torch.dtype,
+    h_dtype: torch.dtype,
+    varlen: bool = False,
+):
+    KN = _num(k_dtype)
+    VN = _num(v_dtype)
+    BN = _num(beta_dtype)
+    AN = _num(a_dtype)
+    HN = _num(h_dtype)
+
+    @fx.struct
+    class Smem:
+        h: fx.Array[fx.BFloat16, K * V, 16]  # h[k][v], later kg[t][k]
+        dh: fx.Array[fx.BFloat16, K * V, 16]  # dh[k][v], later dw[t][k]
+        do: fx.Array[fx.BFloat16, BT * V, 16]
+        vn: fx.Array[fx.BFloat16, BT * V, 16]  # v_new, later v
+        dv: fx.Array[fx.BFloat16, BT * V, 16]
+        a: fx.Array[fx.Float32, BT * BT, 16]
+        m: fx.Array[fx.Float32, BT * BT, 16]
+        beta: fx.Array[fx.Float32, BT, 16]
+        dgk: fx.Array[fx.Float32, K, 16]
+        col: fx.Array[fx.Float32, 4 * K, 16]
+
+    BF = fx.BFloat16
+
+    @flyc.kernel(name="kda_bwd_wy_dqkg_flydsl")
+    def kernel(
+        q: fx.Tensor,
+        k: fx.Tensor,
+        v: fx.Tensor,
+        vnew: fx.Tensor,
+        g: fx.Tensor,
+        beta: fx.Tensor,
+        A: fx.Tensor,
+        hs: fx.Tensor,
+        do: fx.Tensor,
+        dh: fx.Tensor,
+        dv: fx.Tensor,
+        dq: fx.Tensor,
+        dk: fx.Tensor,
+        dv_out: fx.Tensor,
+        dg: fx.Tensor,
+        db: fx.Tensor,
+        dA: fx.Tensor,
+        cu: fx.Tensor,
+        ci: fx.Tensor,
+        T: fx.Int32,
+        scale: fx.Float32,
+    ):
+        i_t = fx.block_idx.x
+        i_bh = fx.block_idx.y
+        b = i_bh // H
+        h = i_bh % H
+        tid = fx.thread_idx.x
+        r = tid // 4
+        seg = tid % 4
+        lane = tid % 64
+        wave = tid // 64
+        t0, nvalid = _chunk_pos(i_t, T, cu, ci, varlen)
+        last = nvalid - 1
+        rv = r < nvalid
+        tok = fx.Int64(b * T + t0)
+        hk = (tok * H + fx.Int64(h)) * K
+        hv = (tok * H + fx.Int64(h)) * V
+        # Global chunk of this program: chunk_indices enumerates them in order.
+        if const_expr(varlen):
+            i_c = i_t
+        else:
+            i_c = b * ((T + (BT - 1)) // BT) + i_t
+        state = (fx.Int64(i_c) * H + fx.Int64(h)) * (K * V)
+
+        lds = fx.SharedAllocator().allocate(Smem).peek()
+        s_h = _lds(lds.h, K * V)
+        s_dh = _lds(lds.dh, K * V)
+        s_do = _lds(lds.do, BT * V)
+        s_vn = _lds(lds.vn, BT * V)
+        s_dv = _lds(lds.dv, BT * V)
+        s_a = _lds(lds.a, BT * BT)
+        s_m = _lds(lds.m, BT * BT)
+        s_beta = _lds(lds.beta, BT)
+        s_dgk = _lds(lds.dgk, K)
+        s_col = _lds(lds.col, 4 * K)
+
+        # h is the K5 snapshot [V][K]; dh is [K][V].
+        h_v = _flat(hs, state)
+        dh_v = _flat(dh, state)
+        for e in range_constexpr(K * V // NUM_THREADS):
+            i = tid + e * NUM_THREADS
+            kk = i // V
+            vv = i % V
+            lds_st(s_h, i, ldg(h_v, vv * K + kk, HN), BF)
+            lds_st(s_dh, i, ldg(dh_v, i, HN), BF)
+        _load_tile(_flat(do, hv), H * V, s_do, BT, V, nvalid, tid, VN, BF)
+        _load_tile(
+            _flat(vnew, (fx.Int64(i_bh) * fx.Int64(T) + fx.Int64(t0)) * V),
+            V,
+            s_vn,
+            BT,
+            V,
+            nvalid,
+            tid,
+            VN,
+            BF,
+        )
+        _load_tile(_flat(dv, hv), H * V, s_dv, BT, V, nvalid, tid, VN, BF)
+        a_off = (tok * H + fx.Int64(h)) * BT
+        # Akk is lower triangular; its upper triangle is not guaranteed written.
+        a_v = _flat(A, a_off)
+        for e in range_constexpr(BT * BT // NUM_THREADS):
+            i = tid + e * NUM_THREADS
+            t = i // BT
+            sc_ = i % BT
+            ok = (t < nvalid) & (sc_ <= t)
+            x = _sel(ok, ldg(a_v, _sel(t < nvalid, t, 0) * (H * BT) + sc_, AN), _zero())
+            lds_st(s_a, i, x)
+        beta_v = _flat(beta, tok * H + fx.Int64(h))
+        if tid < BT:
+            bb = ldg(beta_v, _sel(tid < nvalid, tid, 0) * H, BN)
+            lds_st(s_beta, tid, _sel(tid < nvalid, bb, _zero()))
+        gpu.barrier()
+
+        # dgk[k] = sum_v h[k, v] dh[k, v]
+        if tid < K:
+            for vv, st in range(0, V, 1, init=[_zero()]):
+                vq = fx.Int32(vv)
+                res = yield [
+                    st[0]
+                    + lds_ld(s_h, tid * V + vq, BF) * lds_ld(s_dh, tid * V + vq, BF)
+                ]
+            lds_st(s_dgk, tid, _results(res, 1)[0])
+
+        # dq = do h^T, dk = v_new dh^T, dw = dv h^T  (per row r, columns k_e)
+        for vv, st in range(0, V, 1, init=[_zero()] * 96):
+            vq = fx.Int32(vv)
+            d_o = lds_ld(s_do, r * V + vq, BF)
+            d_n = lds_ld(s_vn, r * V + vq, BF)
+            d_v = lds_ld(s_dv, r * V + vq, BF)
+            acc = []
+            for e in range_constexpr(32):
+                kk = seg + 4 * e
+                hh = lds_ld(s_h, kk * V + vq, BF)
+                acc.append(st[e] + d_o * hh)
+            for e in range_constexpr(32):
+                kk = seg + 4 * e
+                acc.append(st[32 + e] + d_n * lds_ld(s_dh, kk * V + vq, BF))
+            for e in range_constexpr(32):
+                kk = seg + 4 * e
+                acc.append(st[64 + e] + d_v * lds_ld(s_h, kk * V + vq, BF))
+            res = yield acc
+        acc = _results(res, 96)
+        b_dq, b_dk, b_dw = acc[:32], acc[32:64], acc[64:]
+        gpu.barrier()
+
+        # v replaces v_new in LDS.
+        _load_tile(_flat(v, hv), H * V, s_vn, BT, V, nvalid, tid, VN, BF)
+        gpu.barrier()
+
+        # dA = dv v^T ; dvb = A^T dv
+        for vv, st in range(0, V, 1, init=[_zero()] * 16):
+            vq = fx.Int32(vv)
+            d_v = lds_ld(s_dv, r * V + vq, BF)
+            res = yield [
+                st[e] + d_v * lds_ld(s_vn, (seg + 4 * e) * V + vq, BF)
+                for e in range_constexpr(16)
+            ]
+        b_da = _results(res, 16)
+        for s, st in range(0, BT, 1, init=[_zero()] * 32):
+            sq = fx.Int32(s)
+            a = lds_ld(s_a, sq * BT + r)
+            res = yield [
+                st[e] + a * lds_ld(s_dv, sq * V + seg + 4 * e, BF)
+                for e in range_constexpr(32)
+            ]
+        dvb = _results(res, 32)
+        beta_r = lds_ld(s_beta, r)
+        dvo_v = _flat(dv_out, hv)
+        db_r = _zero()
+        for e in range_constexpr(32):
+            c = seg + 4 * e
+            db_r = db_r + dvb[e] * lds_ld(s_vn, r * V + c, BF)
+            if rv:
+                stg(dvo_v, r * (H * V) + c, dvb[e] * beta_r, VN)
+
+        q_v = _flat(q, hk)
+        k_v = _flat(k, hk)
+        g_v = _flat(g, hk)
+        rc = _sel(rv, r, 0)
+        gexp = []
+        kg_r = []
+        k_r = []
+        gn = []
+        for e in range_constexpr(32):
+            kk = seg + 4 * e
+            gg = ldg(g_v, rc * (H * K) + kk, fx.Float32)
+            gl = ldg(g_v, last * (H * K) + kk, fx.Float32)
+            kx = _sel(rv, ldg(k_v, rc * (H * K) + kk, KN), _zero())
+            ge = _decay(gg)
+            gexp.append(ge)
+            gn.append(gl)
+            k_r.append(kx)
+            kg_r.append(kx * ge)
+            b_dq[e] = b_dq[e] * ge * scale
+            b_dk[e] = _sel(rv, b_dk[e] * _decay(gl - gg), _zero())
+            b_dw[e] = -b_dw[e]
+        gpu.barrier()
+        for e in range_constexpr(32):
+            kk = seg + 4 * e
+            lds_st(s_h, r * K + kk, kg_r[e], BF)
+            lds_st(s_dh, r * K + kk, b_dw[e], BF)
+        gpu.barrier()
+
+        # dA += dw kg^T ; dkgb = A^T dw
+        for kk, st in range(0, K, 1, init=b_da):
+            kq = fx.Int32(kk)
+            w_ = lds_ld(s_dh, r * K + kq, BF)
+            res = yield [
+                st[e] + w_ * lds_ld(s_h, (seg + 4 * e) * K + kq, BF)
+                for e in range_constexpr(16)
+            ]
+        b_da = _results(res, 16)
+        for s, st in range(0, BT, 1, init=[_zero()] * 32):
+            sq = fx.Int32(s)
+            a = lds_ld(s_a, sq * BT + r)
+            res = yield [
+                st[e] + a * lds_ld(s_dh, sq * K + seg + 4 * e, BF)
+                for e in range_constexpr(32)
+            ]
+        dkgb = _results(res, 32)
+
+        kdk = []
+        for e in range_constexpr(32):
+            db_r = db_r + dkgb[e] * kg_r[e]
+            kdk.append(k_r[e] * b_dk[e])
+        # Column sums of k * dk: lanes sharing seg in a wave, then the 4 waves.
+        for e in range_constexpr(32):
+            x = kdk[e]
+            for sh in (4, 8, 16, 32):
+                x = x + x.shuffle_xor(fx.Int32(sh), fx.Int32(64))
+            if lane < 4:
+                lds_st(s_col, wave * K + seg + 4 * e, x)
+        gpu.barrier()
+
+        dq_v = _flat(dq, hk)
+        dk_v = _flat(dk, hk)
+        dg_v = _flat(dg, hk)
+        is_last = r == last
+        for e in range_constexpr(32):
+            kk = seg + 4 * e
+            col = (
+                lds_ld(s_col, kk)
+                + lds_ld(s_col, K + kk)
+                + lds_ld(s_col, 2 * K + kk)
+                + lds_ld(s_col, 3 * K + kk)
+            )
+            dgk = lds_ld(s_dgk, kk) * _decay(gn[e]) + col
+            qx = _sel(rv, ldg(q_v, rc * (H * K) + kk, KN), _zero())
+            dgv = (
+                qx * b_dq[e]
+                - kdk[e]
+                + _sel(is_last, dgk, _zero())
+                + kg_r[e] * dkgb[e] * beta_r
+            )
+            dkv = b_dk[e] + dkgb[e] * gexp[e] * beta_r
+            if rv:
+                stg(dq_v, r * (H * K) + kk, b_dq[e], fx.Float32)
+                stg(dk_v, r * (H * K) + kk, dkv, fx.Float32)
+                stg(dg_v, r * (H * K) + kk, dgv, fx.Float32)
+        db_r = _row_sum(db_r)
+        if rv & (seg == 0):
+            stg(_flat(db, tok * H + fx.Int64(h)), r * H, db_r, fx.Float32)
+
+        # dAkk = -mask(A^T (mask(dA * beta) A^T)), strictly lower.
+        for e in range_constexpr(16):
+            s = seg + 4 * e
+            m_a = (s < r) & rv
+            lds_st(s_m, r * BT + s, _sel(m_a, b_da[e] * lds_ld(s_beta, s), _zero()))
+        gpu.barrier()
+        for j, st in range(0, BT, 1, init=[_zero()] * 16):
+            jq = fx.Int32(j)
+            m_ = lds_ld(s_m, r * BT + jq)
+            res = yield [
+                st[e] + m_ * lds_ld(s_a, (seg + 4 * e) * BT + jq)
+                for e in range_constexpr(16)
+            ]
+        m1 = _results(res, 16)
+        gpu.barrier()
+        for e in range_constexpr(16):
+            lds_st(s_m, r * BT + seg + 4 * e, m1[e])
+        gpu.barrier()
+        for j, st in range(0, BT, 1, init=[_zero()] * 16):
+            jq = fx.Int32(j)
+            a = lds_ld(s_a, jq * BT + r)
+            res = yield [
+                st[e] + a * lds_ld(s_m, jq * BT + seg + 4 * e)
+                for e in range_constexpr(16)
+            ]
+        m2 = _results(res, 16)
+        da_v = _flat(dA, a_off)
+        if rv:
+            for e in range_constexpr(16):
+                s = seg + 4 * e
+                stg(da_v, r * (H * BT) + s, _sel(s < r, -m2[e], _zero()), fx.Float32)
+
+    @flyc.jit
+    def launch(
+        q: fx.Tensor,
+        k: fx.Tensor,
+        v: fx.Tensor,
+        vnew: fx.Tensor,
+        g: fx.Tensor,
+        beta: fx.Tensor,
+        A: fx.Tensor,
+        hs: fx.Tensor,
+        do: fx.Tensor,
+        dh: fx.Tensor,
+        dv: fx.Tensor,
+        dq: fx.Tensor,
+        dk: fx.Tensor,
+        dv_out: fx.Tensor,
+        dg: fx.Tensor,
+        db: fx.Tensor,
+        dA: fx.Tensor,
+        cu: fx.Tensor,
+        ci: fx.Tensor,
+        T: fx.Int32,
+        scale: fx.Float32,
+        NT: fx.Int32,
+        NBH: fx.Int32,
+        stream: fx.Stream,
+    ):
+        kernel(
+            q,
+            k,
+            v,
+            vnew,
+            g,
+            beta,
+            A,
+            hs,
+            do,
+            dh,
+            dv,
+            dq,
+            dk,
+            dv_out,
+            dg,
+            db,
+            dA,
+            cu,
+            ci,
+            T,
+            scale,
+        ).launch(grid=(NT, NBH, 1), block=(NUM_THREADS, 1, 1), stream=stream)
+
+    return launch
+
+
+# ---------------------------------------------------------------------------
+# intra
+# ---------------------------------------------------------------------------
+@functools.cache
+def compile_intra(
+    H: int,
+    k_dtype: torch.dtype,
+    beta_dtype: torch.dtype,
+    raw_k_dtype: torch.dtype,
+    raw_beta_dtype: torch.dtype,
+    out_k_dtype: torch.dtype,
+    out_beta_dtype: torch.dtype,
+    l2norm_qk: bool,
+    beta_sigmoid: bool,
+    varlen: bool = False,
+):
+    KN = _num(k_dtype)
+    BN = _num(beta_dtype)
+    RKN = _num(raw_k_dtype)
+    RBN = _num(raw_beta_dtype)
+    OKN = _num(out_k_dtype)
+    OBN = _num(out_beta_dtype)
+    EPS = 1e-6
+
+    @fx.struct
+    class Smem:
+        q: fx.Array[fx.Float32, BT * K, 16]
+        k: fx.Array[fx.Float32, BT * K, 16]
+        g: fx.Array[fx.Float32, BT * K, 16]
+        aq: fx.Array[fx.Float32, BT * BT, 16]
+        ak: fx.Array[fx.Float32, BT * BT, 16]
+        beta: fx.Array[fx.Float32, BT, 16]
+
+    def l2norm_bwd(x, dy):
+        """``dx`` for ``y = x / sqrt(sum(x^2) + eps)`` along this thread's row."""
+        ss = _zero()
+        for e in range_constexpr(32):
+            ss = ss + x[e] * x[e]
+        rstd = fx.rsqrt(_row_sum(ss) + EPS)
+        y = [x[e] * rstd for e in range_constexpr(32)]
+        sdy = _zero()
+        for e in range_constexpr(32):
+            sdy = sdy + dy[e] * y[e]
+        sdy = _row_sum(sdy)
+        return [dy[e] * rstd - sdy * y[e] * rstd for e in range_constexpr(32)]
+
+    @flyc.kernel(name="kda_bwd_intra_flydsl")
+    def kernel(
+        q: fx.Tensor,
+        k: fx.Tensor,
+        g: fx.Tensor,
+        beta: fx.Tensor,
+        dAqk: fx.Tensor,
+        dAkk: fx.Tensor,
+        dq: fx.Tensor,
+        dk: fx.Tensor,
+        dg: fx.Tensor,
+        db: fx.Tensor,
+        q_raw: fx.Tensor,
+        k_raw: fx.Tensor,
+        beta_raw: fx.Tensor,
+        dq2: fx.Tensor,
+        dk2: fx.Tensor,
+        dg2: fx.Tensor,
+        db2: fx.Tensor,
+        cu: fx.Tensor,
+        ci: fx.Tensor,
+        T: fx.Int32,
+    ):
+        i_t = fx.block_idx.x
+        i_bh = fx.block_idx.y
+        b = i_bh // H
+        h = i_bh % H
+        tid = fx.thread_idx.x
+        r = tid // 4
+        seg = tid % 4
+        t0, nvalid = _chunk_pos(i_t, T, cu, ci, varlen)
+        rv = r < nvalid
+        rc = _sel(rv, r, 0)
+        tok = fx.Int64(b * T + t0)
+        hk = (tok * H + fx.Int64(h)) * K
+        hb = tok * H + fx.Int64(h)
+
+        lds = fx.SharedAllocator().allocate(Smem).peek()
+        s_q = _lds(lds.q, BT * K)
+        s_k = _lds(lds.k, BT * K)
+        s_g = _lds(lds.g, BT * K)
+        s_aq = _lds(lds.aq, BT * BT)
+        s_ak = _lds(lds.ak, BT * BT)
+        s_b = _lds(lds.beta, BT)
+        _load_tile(_flat(q, hk), H * K, s_q, BT, K, nvalid, tid, KN, fx.Float32)
+        _load_tile(_flat(k, hk), H * K, s_k, BT, K, nvalid, tid, KN, fx.Float32)
+        _load_tile(_flat(g, hk), H * K, s_g, BT, K, nvalid, tid, fx.Float32, fx.Float32)
+        _load_tile(
+            _flat(dAqk, hb * BT),
+            H * BT,
+            s_aq,
+            BT,
+            BT,
+            nvalid,
+            tid,
+            fx.Float32,
+            fx.Float32,
+        )
+        _load_tile(
+            _flat(dAkk, hb * BT),
+            H * BT,
+            s_ak,
+            BT,
+            BT,
+            nvalid,
+            tid,
+            fx.Float32,
+            fx.Float32,
+        )
+        if tid < BT:
+            bb = ldg(_flat(beta, hb), _sel(tid < nvalid, tid, 0) * H, BN)
+            lds_st(s_b, tid, _sel(tid < nvalid, bb, _zero()))
+        gpu.barrier()
+
+        g_r = [lds_ld(s_g, r * K + seg + 4 * e) for e in range_constexpr(32)]
+
+        # dq2 / dk2 = sum_{j <= r} dA[r, j] k[j] exp2(g[r] - g[j])
+        for j, st in range(0, BT, 1, init=[_zero()] * 64):
+            jq = fx.Int32(j)
+            ok = (jq <= r) & (jq < nvalid)
+            aq = _sel(ok, lds_ld(s_aq, r * BT + jq), _zero())
+            ak = _sel(ok, lds_ld(s_ak, r * BT + jq), _zero())
+            acc_q, acc_k = [], []
+            for e in range_constexpr(32):
+                kk = seg + 4 * e
+                ex = _decay(_sel(ok, g_r[e] - lds_ld(s_g, jq * K + kk), _zero()))
+                kx = lds_ld(s_k, jq * K + kk) * ex
+                acc_q.append(st[e] + aq * kx)
+                acc_k.append(st[32 + e] + ak * kx)
+            res = yield acc_q + acc_k
+        acc = _results(res, 64)
+        b_dq2, b_dk2 = acc[:32], acc[32:]
+
+        k_r = [lds_ld(s_k, r * K + seg + 4 * e) for e in range_constexpr(32)]
+        q_r = [lds_ld(s_q, r * K + seg + 4 * e) for e in range_constexpr(32)]
+        beta_r = lds_ld(s_b, r)
+        db_r = _zero()
+        for e in range_constexpr(32):
+            db_r = db_r + b_dk2[e] * k_r[e]
+        db_r = _row_sum(db_r)
+        b_dk2 = [b_dk2[e] * beta_r for e in range_constexpr(32)]
+
+        dq_v = _flat(dq, hk)
+        dk_v = _flat(dk, hk)
+        dg_v = _flat(dg, hk)
+        b_dg2 = [q_r[e] * b_dq2[e] for e in range_constexpr(32)]
+        b_dq2 = [
+            b_dq2[e] + ldg(dq_v, rc * (H * K) + seg + 4 * e, fx.Float32)
+            for e in range_constexpr(32)
+        ]
+        if const_expr(l2norm_qk):
+            qraw_v = _flat(q_raw, hk)
+            xr = [
+                ldg(qraw_v, rc * (H * K) + seg + 4 * e, RKN)
+                for e in range_constexpr(32)
+            ]
+            b_dq2 = l2norm_bwd(xr, b_dq2)
+        dq2_v = _flat(dq2, hk)
+        if rv:
+            for e in range_constexpr(32):
+                stg(dq2_v, r * (H * K) + seg + 4 * e, b_dq2[e], OKN)
+
+        db_r = db_r + ldg(_flat(db, hb), rc * H, fx.Float32)
+        if const_expr(beta_sigmoid):
+            sgm = _sigmoid(ldg(_flat(beta_raw, hb), rc * H, RBN))
+            db_r = db_r * sgm * (fx.Float32(1.0) - sgm)
+        if rv & (seg == 0):
+            stg(_flat(db2, hb), r * H, db_r, OBN)
+
+        # dkt = sum_{j >= r} (dAqk[j, r] q[j] + dAkk[j, r] beta[j] k[j]) exp2(g[j] - g[r])
+        for j, st in range(0, BT, 1, init=[_zero()] * 32):
+            jq = fx.Int32(j)
+            # Padded rows j >= nvalid hold g = 0, so g[j] - g[r] > 0 there.
+            ok = (jq >= r) & (jq < nvalid)
+            aq = _sel(ok, lds_ld(s_aq, jq * BT + r), _zero())
+            ak = _sel(ok, lds_ld(s_ak, jq * BT + r) * lds_ld(s_b, jq), _zero())
+            acc = []
+            for e in range_constexpr(32):
+                kk = seg + 4 * e
+                ex = _decay(_sel(ok, lds_ld(s_g, jq * K + kk) - g_r[e], _zero()))
+                acc.append(
+                    st[e]
+                    + (aq * lds_ld(s_q, jq * K + kk) + ak * lds_ld(s_k, jq * K + kk))
+                    * ex
+                )
+            res = yield acc
+        dkt = _results(res, 32)
+
+        dk_out = []
+        for e in range_constexpr(32):
+            kk = seg + 4 * e
+            b_dg2[e] = (
+                b_dg2[e]
+                + (b_dk2[e] - dkt[e]) * k_r[e]
+                + ldg(dg_v, rc * (H * K) + kk, fx.Float32)
+            )
+            dk_out.append(b_dk2[e] + ldg(dk_v, rc * (H * K) + kk, fx.Float32) + dkt[e])
+        if const_expr(l2norm_qk):
+            kraw_v = _flat(k_raw, hk)
+            xr = [
+                ldg(kraw_v, rc * (H * K) + seg + 4 * e, RKN)
+                for e in range_constexpr(32)
+            ]
+            dk_out = l2norm_bwd(xr, dk_out)
+        dk2_v = _flat(dk2, hk)
+        dg2_v = _flat(dg2, hk)
+        if rv:
+            for e in range_constexpr(32):
+                kk = seg + 4 * e
+                stg(dk2_v, r * (H * K) + kk, dk_out[e], OKN)
+                stg(dg2_v, r * (H * K) + kk, b_dg2[e], fx.Float32)
+
+    @flyc.jit
+    def launch(
+        q: fx.Tensor,
+        k: fx.Tensor,
+        g: fx.Tensor,
+        beta: fx.Tensor,
+        dAqk: fx.Tensor,
+        dAkk: fx.Tensor,
+        dq: fx.Tensor,
+        dk: fx.Tensor,
+        dg: fx.Tensor,
+        db: fx.Tensor,
+        q_raw: fx.Tensor,
+        k_raw: fx.Tensor,
+        beta_raw: fx.Tensor,
+        dq2: fx.Tensor,
+        dk2: fx.Tensor,
+        dg2: fx.Tensor,
+        db2: fx.Tensor,
+        cu: fx.Tensor,
+        ci: fx.Tensor,
+        T: fx.Int32,
+        NT: fx.Int32,
+        NBH: fx.Int32,
+        stream: fx.Stream,
+    ):
+        kernel(
+            q,
+            k,
+            g,
+            beta,
+            dAqk,
+            dAkk,
+            dq,
+            dk,
+            dg,
+            db,
+            q_raw,
+            k_raw,
+            beta_raw,
+            dq2,
+            dk2,
+            dg2,
+            db2,
+            cu,
+            ci,
+            T,
+        ).launch(grid=(NT, NBH, 1), block=(NUM_THREADS, 1, 1), stream=stream)
+
+    return launch
+
+
+# ---------------------------------------------------------------------------
+# gate_cumsum
+# ---------------------------------------------------------------------------
+@functools.cache
+def compile_gate_cumsum(
+    H: int,
+    g_dtype: torch.dtype,
+    out_dtype: torch.dtype,
+    use_gate: bool,
+    has_bias: bool,
+    use_lower_bound: bool,
+    varlen: bool = False,
+):
+    GN = _num(g_dtype)
+    ON = _num(out_dtype)
+
+    @flyc.kernel(name="kda_bwd_gate_cumsum_flydsl")
+    def kernel(
+        s: fx.Tensor,
+        g: fx.Tensor,
+        A_log: fx.Tensor,
+        dt_bias: fx.Tensor,
+        o: fx.Tensor,
+        dA_part: fx.Tensor,
+        db_part: fx.Tensor,
+        cu: fx.Tensor,
+        ci: fx.Tensor,
+        T: fx.Int32,
+        lower_bound: fx.Float32,
+        NBH: fx.Int32,
+    ):
+        i_t = fx.block_idx.x
+        i_bh = fx.block_idx.y
+        b = i_bh // H
+        h = i_bh % H
+        kk = fx.thread_idx.x
+        t0, nvalid = _chunk_pos(i_t, T, cu, ci, varlen)
+        tok = fx.Int64(b * T + t0)
+        hk = (tok * H + fx.Int64(h)) * K
+        s_v = _flat(s, hk)
+        g_v = _flat(g, hk)
+        o_v = _flat(o, hk)
+        part = (fx.Int64(i_t) * fx.Int64(NBH) + fx.Int64(i_bh)) * K
+        if const_expr(use_gate):
+            a_raw = ldg(_flat(A_log, None), h, fx.Float32)
+            a = fx.exp(a_raw)
+            bias = _zero()
+            if const_expr(has_bias):
+                bias = ldg(_flat(dt_bias, None), h * K + kk, fx.Float32)
+
+        # Reverse chunk-local cumsum, then the gate activation backward.
+        for i, st in range(0, BT, 1, init=[_zero(), _zero(), _zero()]):
+            t = fx.Int32(BT - 1) - fx.Int32(i)
+            ok = t < nvalid
+            tc = _sel(ok, t, 0)
+            run = st[0] + _sel(ok, ldg(s_v, tc * (H * K) + kk, fx.Float32), _zero())
+            out = run
+            da = st[1]
+            dbias = st[2]
+            if const_expr(use_gate):
+                z = ldg(g_v, tc * (H * K) + kk, GN) + bias
+                if const_expr(use_lower_bound):
+                    sgm = _sigmoid(a * z)
+                    dgz = run * (lower_bound * sgm * (fx.Float32(1.0) - sgm)) * a
+                    da = da + _sel(ok, dgz * z, _zero())
+                else:
+                    sp = _sel(
+                        z > fx.Float32(20.0),
+                        z,
+                        fx.log(fx.Float32(1.0) + fx.exp(z)),
+                    )
+                    dgz = -a * (run * _sigmoid(z))
+                    da = da + _sel(ok, run * (-a * sp), _zero())
+                dbias = dbias + _sel(ok, dgz, _zero())
+                out = dgz
+            if ok:
+                stg(o_v, t * (H * K) + kk, out, ON)
+            res = yield [run, da, dbias]
+        fin = _results(res, 3)
+        if const_expr(use_gate):
+            stg(_flat(dA_part, part), kk, fin[1], fx.Float32)
+            if const_expr(has_bias):
+                stg(_flat(db_part, part), kk, fin[2], fx.Float32)
+
+    @flyc.jit
+    def launch(
+        s: fx.Tensor,
+        g: fx.Tensor,
+        A_log: fx.Tensor,
+        dt_bias: fx.Tensor,
+        o: fx.Tensor,
+        dA_part: fx.Tensor,
+        db_part: fx.Tensor,
+        cu: fx.Tensor,
+        ci: fx.Tensor,
+        T: fx.Int32,
+        lower_bound: fx.Float32,
+        NT: fx.Int32,
+        NBH: fx.Int32,
+        stream: fx.Stream,
+    ):
+        kernel(
+            s, g, A_log, dt_bias, o, dA_part, db_part, cu, ci, T, lower_bound, NBH
+        ).launch(grid=(NT, NBH, 1), block=(K, 1, 1), stream=stream)
+
+    return launch
+
+
+# ---------------------------------------------------------------------------
+# MFMA building blocks
+# ---------------------------------------------------------------------------
+# LDS row strides (elements) for MFMA operands: 4 elements of padding keep
+# each row 8-byte aligned for the b64 operand copies and stagger the banks.
+LDK = K + 4  # rows of 128 (K or V) columns
+LDT = BT + 4  # rows of 64 (token) columns
+LDC = 64 + 4  # fp32 [64, 64] accumulator staging
+
+
+def _src(tensor, base):
+    """A global tile for ``_stage``'s 128-bit loads: ``tensor`` from element ``base``."""
+    return tensor, base
+
+
+def _load_vec(atom, tile, width, numeric):
+    frag = fx.make_rmem_tensor(width, numeric)
+    fx.copy(atom, tile, frag)
+    return frag.load()
+
+
+def _stage(
+    view, ld_stride, dst, ld_dst, rows, cols, nvalid, tid, num, dst_num, transpose=False
+):
+    """Stage a ``[rows, cols]`` token tile into LDS at row stride ``ld_dst``.
+
+    ``transpose`` writes it as ``[cols, rows]``. Rows ``>= nvalid`` are zeroed.
+    With ``view = _src(tensor, base)`` each thread loads 16 contiguous bytes
+    per instruction (8 bf16 or 4 fp32); row starts must be 16-byte aligned.
+
+    A transposed stage gives consecutive lanes consecutive source rows, so their
+    LDS writes land on consecutive addresses; walking the source row-major
+    instead would put lanes ``vec * ld_dst`` elements apart, a few banks for a
+    whole wave.
+    """
+    if isinstance(view, tuple):
+        tensor, base = view
+        vec = 8 if num is fx.BFloat16 else 4
+        cv = cols // vec
+        if (rows * cv) % NUM_THREADS != 0:
+            # A ragged tile (e.g. 64 x 16 bf16) takes the scalar path below:
+            # helpers outside the kernel body cannot branch at runtime.
+            view = _flat(tensor, base)
+        else:
+            it = fx.get_iter(fx.rocdl.make_buffer_tensor(tensor, max_size=True))
+            if base is not None:
+                it = fx.add_offset(it, base)
+            v3 = fx.Tensor(
+                fx.make_view(it, fx.make_layout((rows, cv, vec), (ld_stride, vec, 1)))
+            )
+            atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), num)
+            for e in range_constexpr(rows * cv // NUM_THREADS):
+                i = tid + e * NUM_THREADS
+                if const_expr(transpose):
+                    t = i % rows
+                    cvi = i // rows
+                else:
+                    t = i // cv
+                    cvi = i % cv
+                c0 = cvi * vec
+                ok = t < nvalid
+                vals = _load_vec(
+                    atom, fx.slice(v3, (_sel(ok, t, 0), cvi, None)), vec, num
+                )
+                for p in range_constexpr(vec):
+                    x = vals[p] if num is fx.Float32 else vals[p].to(fx.Float32)
+                    x = _sel(ok, x, _zero())
+                    c = c0 + p
+                    idx = c * ld_dst + t if transpose else t * ld_dst + c
+                    lds_st(dst, idx, x, dst_num)
+            return
+    for e in range_constexpr(rows * cols // NUM_THREADS):
+        i = tid + e * NUM_THREADS
+        if const_expr(transpose):
+            t = i % rows
+            c = i // rows
+        else:
+            t = i // cols
+            c = i % cols
+        ok = t < nvalid
+        x = _sel(ok, ldg(view, _sel(ok, t, 0) * ld_stride + c, num), _zero())
+        lds_st(dst, c * ld_dst + t if transpose else t * ld_dst + c, x, dst_num)
+
+
+def _view3(tensor, base, rows, ld, cols, num):
+    """``[rows, cols]`` tile at element ``base`` (row stride ``ld``) in 16-byte vectors."""
+    vec = 8 if num is fx.BFloat16 else 4
+    it = fx.add_offset(
+        fx.get_iter(fx.rocdl.make_buffer_tensor(tensor, max_size=True)), base
+    )
+    return fx.Tensor(
+        fx.make_view(it, fx.make_layout((rows, cols // vec, vec), (ld, vec, 1)))
+    )
+
+
+def _ldv(view3, row, col0, n, num):
+    """``n`` contiguous elements of ``row`` from column ``col0`` (a multiple of the vector), as fp32."""
+    vec = 8 if num is fx.BFloat16 else 4
+    atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), num)
+    out = []
+    for j in range_constexpr(n // vec):
+        vals = _load_vec(atom, fx.slice(view3, (row, col0 // vec + j, None)), vec, num)
+        for p in range_constexpr(vec):
+            out.append(vals[p] if num is fx.Float32 else vals[p].to(fx.Float32))
+    return out
+
+
+def _stv(view3, row, col0, values, num):
+    """Store fp32 ``values`` to ``row`` from column ``col0`` in 16-byte vectors."""
+    vec = 8 if num is fx.BFloat16 else 4
+    atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), num)
+    for j in range_constexpr(len(values) // vec):
+        chunk = [fx.Float32(v) for v in values[j * vec : (j + 1) * vec]]
+        if num is not fx.Float32:
+            chunk = [v.to(num) for v in chunk]
+        frag = fx.make_rmem_tensor(vec, num)
+        frag.store(fx.Vector.from_elements(chunk, dtype=num))
+        fx.copy(atom, frag, fx.slice(view3, (row, col0 // vec + j, None)))
+
+
+def _lds_row(view, off, n, num):
+    """``n`` contiguous LDS elements from ``off`` (16-byte aligned), as fp32, in b128 reads."""
+    vec = 8 if num is fx.BFloat16 else 4
+    atom = fx.make_copy_atom(fx.UniversalCopy128b(), num)
+    v2 = fx.make_view(
+        fx.get_iter(view) + off, fx.make_layout((n // vec, vec), (vec, 1))
+    )
+    out = []
+    for j in range_constexpr(n // vec):
+        frag = fx.make_rmem_tensor(vec, num)
+        fx.copy(atom, fx.slice(v2, (j, None)), frag)
+        vals = frag.load()
+        for p in range_constexpr(vec):
+            out.append(vals[p] if num is fx.Float32 else vals[p].to(fx.Float32))
+    return out
+
+
+class _Mma:
+    """``C[64, N] += A[64, Kd] @ B[N, Kd]^T`` on bf16 LDS operands (K contiguous).
+
+    One 16x16x16 bf16 MFMA per 16-wide K slice, the 4 waves splitting M.
+    ``store`` writes C as fp32 into a row-major LDS view.
+    """
+
+    def __init__(self, tid):
+        self.atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
+        self.tiled = fx.make_tiled_mma(self.atom, fx.make_layout((4, 1, 1), (1, 0, 0)))
+        self.thr = self.tiled.thr_slice(tid)
+        self.cp64 = fx.make_copy_atom(fx.UniversalCopy64b(), fx.BFloat16)
+        self.cp32 = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
+        self.cpA = fx.make_tiled_copy_A(self.cp64, self.tiled).get_slice(tid)
+        self.cpB = fx.make_tiled_copy_B(self.cp64, self.tiled).get_slice(tid)
+        self.cpC = fx.make_tiled_copy_C(self.cp32, self.tiled).get_slice(tid)
+
+    def acc(self, c_view):
+        frag = self.thr.make_fragment_C(c_view)
+        frag.fill(0.0)
+        return frag
+
+    def gemm(self, acc, a, lda, b, ldb, n, kd):
+        """``a``/``b``: bf16 LDS views at the operand's first element."""
+        for ek in range_constexpr(kd // 16):
+            a_t = fx.make_view(
+                fx.get_iter(a) + ek * 16, fx.make_layout((64, 16), (lda, 1))
+            )
+            b_t = fx.make_view(
+                fx.get_iter(b) + ek * 16, fx.make_layout((n, 16), (ldb, 1))
+            )
+            f_a = self.thr.make_fragment_A(a_t)
+            f_b = self.thr.make_fragment_B(b_t)
+            fx.copy(self.cp64, self.cpA.partition_S(a_t), self.cpA.retile(f_a))
+            fx.copy(self.cp64, self.cpB.partition_S(b_t), self.cpB.retile(f_b))
+            fx.gemm(self.atom, acc, f_a, f_b, acc)
+
+    def store(self, acc, c_view):
+        fx.copy(self.cp32, self.cpC.retile(acc), self.cpC.partition_D(c_view))
+
+
+def _offset_view(base, off, n):
+    return fx.make_view(fx.get_iter(base) + off, fx.make_layout((n, 1), (1, 1)))
+
+
+# ---------------------------------------------------------------------------
+# wy_dqkg on MFMA
+# ---------------------------------------------------------------------------
+@functools.cache
+def compile_wy_dqkg_mfma(
+    H: int,
+    k_dtype: torch.dtype,
+    v_dtype: torch.dtype,
+    beta_dtype: torch.dtype,
+    a_dtype: torch.dtype,
+    h_dtype: torch.dtype,
+    varlen: bool = False,
+):
+    """``compile_wy_dqkg`` with every contraction on 16x16x16 bf16 MFMA.
+
+    Same arguments, outputs and launch. The operands are the bf16 values the
+    Triton kernel feeds ``tl.dot`` (h, dh, do, v_new, dv, v, Akk, and kg, dw,
+    the masked dA rounded to bf16); accumulation is fp32. Each ``[64, 128]``
+    product runs as two ``N = 64`` halves through a ``[64, 64]`` fp32 LDS
+    staging tile, from which the elementwise epilogue reads with the same
+    ``(tid // 4, tid % 4 + 4 * e)`` ownership as the FMA kernel.
+    """
+    KN = _num(k_dtype)
+    VN = _num(v_dtype)
+    BN = _num(beta_dtype)
+    AN = _num(a_dtype)
+    HN = _num(h_dtype)
+    BF = fx.BFloat16
+
+    @fx.struct
+    class KgDw:
+        kg: fx.Array[fx.BFloat16, BT * LDK, 16]
+        dw: fx.Array[fx.BFloat16, BT * LDK, 16]
+
+    @fx.union
+    class Big:
+        hd: fx.Array[fx.BFloat16, K * LDK, 16]  # h[k][v], then dh[k][v]
+        kgdw: KgDw
+
+    @fx.struct
+    class Smem:
+        big: Big
+        do: fx.Array[fx.BFloat16, BT * LDK, 16]  # do[t][v], later M[r][j]
+        vn: fx.Array[fx.BFloat16, BT * LDK, 16]  # v_new, then v, later M1^T
+        dv: fx.Array[fx.BFloat16, BT * LDK, 16]
+        dvT: fx.Array[fx.BFloat16, V * LDT, 16]  # dv^T[v][t], later dw^T[k][t]
+        a: fx.Array[fx.BFloat16, BT * LDT, 16]  # Akk[t][s]
+        aT: fx.Array[fx.BFloat16, BT * LDT, 16]  # Akk^T[t][s] = Akk[s][t]
+        c: fx.Array[fx.Float32, BT * LDC, 16]
+        beta: fx.Array[fx.Float32, BT, 16]
+        dgk: fx.Array[fx.Float32, K, 16]
+        col: fx.Array[fx.Float32, 4 * K, 16]
+
+    @flyc.kernel(name="kda_bwd_wy_dqkg_mfma_flydsl")
+    def kernel(
+        q: fx.Tensor,
+        k: fx.Tensor,
+        v: fx.Tensor,
+        vnew: fx.Tensor,
+        g: fx.Tensor,
+        beta: fx.Tensor,
+        A: fx.Tensor,
+        hs: fx.Tensor,
+        do: fx.Tensor,
+        dh: fx.Tensor,
+        dv: fx.Tensor,
+        dq: fx.Tensor,
+        dk: fx.Tensor,
+        dv_out: fx.Tensor,
+        dg: fx.Tensor,
+        db: fx.Tensor,
+        dA: fx.Tensor,
+        cu: fx.Tensor,
+        ci: fx.Tensor,
+        T: fx.Int32,
+        scale: fx.Float32,
+    ):
+        i_t = fx.block_idx.x
+        i_bh = fx.block_idx.y
+        b = i_bh // H
+        h = i_bh % H
+        tid = fx.thread_idx.x
+        r = tid // 4
+        seg = tid % 4
+        lane = tid % 64
+        wave = tid // 64
+        t0, nvalid = _chunk_pos(i_t, T, cu, ci, varlen)
+        last = nvalid - 1
+        rv = r < nvalid
+        tok = fx.Int64(b * T + t0)
+        hk = (tok * H + fx.Int64(h)) * K
+        hv = (tok * H + fx.Int64(h)) * V
+        if const_expr(varlen):
+            i_c = i_t
+        else:
+            i_c = b * ((T + (BT - 1)) // BT) + i_t
+        state = (fx.Int64(i_c) * H + fx.Int64(h)) * (K * V)
+        a_off = (tok * H + fx.Int64(h)) * BT
+
+        lds = fx.SharedAllocator().allocate(Smem)
+        s_hd = _lds(lds.big.hd.peek(), K * LDK)
+        s_kg = _lds(lds.big.kgdw.kg.peek(), BT * LDK)
+        s_dw = _lds(lds.big.kgdw.dw.peek(), BT * LDK)
+        s_do = _lds(lds.do.peek(), BT * LDK)
+        s_vn = _lds(lds.vn.peek(), BT * LDK)
+        s_dv = _lds(lds.dv.peek(), BT * LDK)
+        s_dvT = _lds(lds.dvT.peek(), V * LDT)
+        s_a = _lds(lds.a.peek(), BT * LDT)
+        s_aT = _lds(lds.aT.peek(), BT * LDT)
+        s_c = _lds(lds.c.peek(), BT * LDC)
+        s_beta = _lds(lds.beta.peek(), BT)
+        s_dgk = _lds(lds.dgk.peek(), K)
+        s_col = _lds(lds.col.peek(), 4 * K)
+        c_tile = fx.make_view(fx.get_iter(s_c), fx.make_layout((BT, 64), (LDC, 1)))
+        mma = _Mma(tid)
+
+        def run(a, lda, b_, ldb, kd, acc=None):
+            """One [64, 64] product into ``acc`` (a fresh one if None)."""
+            if const_expr(acc is None):
+                acc = mma.acc(c_tile)
+            mma.gemm(acc, a, lda, b_, ldb, 64, kd)
+            return acc
+
+        cbase = (seg % 2) * 32
+
+        def to_regs32(a, lda, b_half, ldb, kd):
+            """A [64, 128] product (two N = 64 halves) -> columns ``seg * 32 + e``."""
+            out = [_zero()] * 32
+            for half in range_constexpr(2):
+                mma.store(run(a, lda, b_half(half), ldb, kd), c_tile)
+                gpu.barrier()
+                mine = (seg // 2) == half
+                row = _lds_row(s_c, r * LDC + cbase, 32, fx.Float32)
+                for e in range_constexpr(32):
+                    out[e] = _sel(mine, row[e], out[e])
+                gpu.barrier()
+            return out
+
+        def hd_half(half):
+            return _offset_view(s_hd, half * 64 * LDK, 64 * LDK)
+
+        def dvT_half(half):
+            return _offset_view(s_dvT, half * 64 * LDT, 64 * LDT)
+
+        def to_regs(acc, half, n_e):
+            """Stage ``acc`` and read this thread's columns ``seg + 4 e`` of the half."""
+            mma.store(acc, c_tile)
+            gpu.barrier()
+            out = [
+                lds_ld(s_c, r * LDC + (seg + 4 * e) - 64 * half)
+                for e in range(16 * half, 16 * half + n_e)
+            ]
+            gpu.barrier()
+            return out
+
+        # -- stage h as [k][v] (the K5 snapshot is [v][k]), do, v_new, dv, dv^T, Akk
+        # h is the K5 snapshot [v][k]: a transposed stage writes it as [k][v].
+        _stage(_src(hs, state), K, s_hd, LDK, V, K, V, tid, HN, BF, transpose=True)
+        do_v = _src(do, hv)
+        dv_v = _src(dv, hv)
+        vn_v = _src(vnew, (fx.Int64(i_bh) * fx.Int64(T) + fx.Int64(t0)) * V)
+        _stage(do_v, H * V, s_do, LDK, BT, V, nvalid, tid, VN, BF)
+        _stage(vn_v, V, s_vn, LDK, BT, V, nvalid, tid, VN, BF)
+        _stage(dv_v, H * V, s_dv, LDK, BT, V, nvalid, tid, VN, BF)
+        _stage(dv_v, H * V, s_dvT, LDT, BT, V, nvalid, tid, VN, BF, transpose=True)
+        a_v = _flat(A, a_off)
+        # Akk is lower triangular; its upper triangle is not guaranteed written
+        # (Triton zero-fills it, other prepare backends may not), so mask it.
+        for e in range_constexpr(BT * BT // NUM_THREADS):
+            i = tid + e * NUM_THREADS
+            t = i // BT
+            sc_ = i % BT
+            ok = (t < nvalid) & (sc_ <= t)
+            x = _sel(ok, ldg(a_v, _sel(t < nvalid, t, 0) * (H * BT) + sc_, AN), _zero())
+            lds_st(s_a, t * LDT + sc_, x, BF)
+            lds_st(s_aT, sc_ * LDT + t, x, BF)
+        beta_v = _flat(beta, tok * H + fx.Int64(h))
+        if tid < BT:
+            bb = ldg(beta_v, _sel(tid < nvalid, tid, 0) * H, BN)
+            lds_st(s_beta, tid, _sel(tid < nvalid, bb, _zero()))
+        gpu.barrier()
+
+        # dq = do h^T, dw = dv h^T
+        b_dq = to_regs32(s_do, LDK, hd_half, LDK, V)
+        b_dw = to_regs32(s_dv, LDK, hd_half, LDK, V)
+
+        # dh replaces h in place: thread pair (k = tid // 2) walks half a row
+        # each, so dgk[k] = sum_v h[k, v] dh[k, v] accumulates from the h still
+        # in LDS without a serial chain of global loads.
+        it_dh = fx.add_offset(
+            fx.get_iter(fx.rocdl.make_buffer_tensor(dh, max_size=True)), state
+        )
+        dh3 = fx.Tensor(fx.make_view(it_dh, fx.make_layout((K, V // 8, 8), (V, 8, 1))))
+        cp_dh = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), HN)
+        kr = tid // 2
+        v_base = (tid % 2) * (V // 2)
+        part = _zero()
+        for e8 in range_constexpr(V // 16):
+            vals = _load_vec(cp_dh, fx.slice(dh3, (kr, v_base // 8 + e8, None)), 8, HN)
+            for p in range_constexpr(8):
+                vv = v_base + e8 * 8 + p
+                x = vals[p].to(fx.Float32)
+                part = part + lds_ld(s_hd, kr * LDK + vv, BF) * x
+                lds_st(s_hd, kr * LDK + vv, x, BF)
+        part = part + part.shuffle_xor(fx.Int32(1), fx.Int32(64))
+        if tid % 2 == 0:
+            lds_st(s_dgk, kr, part)
+        gpu.barrier()
+
+        # dk = v_new dh^T
+        b_dk = to_regs32(s_vn, LDK, hd_half, LDK, V)
+
+        # v replaces v_new; dA = dv v^T (kept in registers), dvb = A^T dv
+        _stage(_src(v, hv), H * V, s_vn, LDK, BT, V, nvalid, tid, VN, BF)
+        gpu.barrier()
+        acc_da = run(s_dv, LDK, s_vn, LDK, V)
+        dvb = to_regs32(s_aT, LDT, dvT_half, LDT, BT)
+        beta_r = lds_ld(s_beta, r)
+        c0 = seg * 32
+        db_r = _zero()
+        for e in range_constexpr(32):
+            db_r = db_r + dvb[e] * lds_ld(s_vn, r * LDK + c0 + e, BF)
+        if rv:
+            _stv(
+                _view3(dv_out, hv, BT, H * V, V, VN),
+                r,
+                c0,
+                [x * beta_r for x in dvb],
+                VN,
+            )
+
+        rc = _sel(rv, r, 0)
+        g3 = _view3(g, hk, BT, H * K, K, fx.Float32)
+        g_row = _ldv(g3, rc, c0, 32, fx.Float32)
+        g_last = _ldv(g3, last, c0, 32, fx.Float32)
+        k_row = _ldv(_view3(k, hk, BT, H * K, K, KN), rc, c0, 32, KN)
+        q_row = _ldv(_view3(q, hk, BT, H * K, K, KN), rc, c0, 32, KN)
+        gexp, kg_r, k_r, gn = [], [], [], []
+        for e in range_constexpr(32):
+            gg = g_row[e]
+            gl = g_last[e]
+            kx = _sel(rv, k_row[e], _zero())
+            ge = _decay(gg)
+            gexp.append(ge)
+            gn.append(gl)
+            k_r.append(kx)
+            kg_r.append(kx * ge)
+            b_dq[e] = b_dq[e] * ge * scale
+            b_dk[e] = _sel(rv, b_dk[e] * _decay(gl - gg), _zero())
+            b_dw[e] = -b_dw[e]
+        # kg, dw (row-major) and dw^T replace dh and dv^T.
+        gpu.barrier()
+        for e in range_constexpr(32):
+            kk = c0 + e
+            lds_st(s_kg, r * LDK + kk, kg_r[e], BF)
+            lds_st(s_dw, r * LDK + kk, b_dw[e], BF)
+            lds_st(s_dvT, kk * LDT + r, b_dw[e], BF)
+        gpu.barrier()
+
+        # dA += dw kg^T ; dkgb = A^T dw
+        acc_da = run(s_dw, LDK, s_kg, LDK, K, acc_da)
+        dkgb = to_regs32(s_aT, LDT, dvT_half, LDT, BT)
+
+        kdk = []
+        for e in range_constexpr(32):
+            db_r = db_r + dkgb[e] * kg_r[e]
+            kdk.append(k_r[e] * b_dk[e])
+        for e in range_constexpr(32):
+            x = kdk[e]
+            for sh in (4, 8, 16, 32):
+                x = x + x.shuffle_xor(fx.Int32(sh), fx.Int32(64))
+            if lane < 4:
+                lds_st(s_col, wave * K + c0 + e, x)
+        gpu.barrier()
+
+        is_last = r == last
+        o_dk, o_dg = [], []
+        cols = [_lds_row(s_col, w_ * K + c0, 32, fx.Float32) for w_ in range(4)]
+        dgk_raw = _lds_row(s_dgk, c0, 32, fx.Float32)
+        for e in range_constexpr(32):
+            col = cols[0][e] + cols[1][e] + cols[2][e] + cols[3][e]
+            dgk = dgk_raw[e] * _decay(gn[e]) + col
+            qx = _sel(rv, q_row[e], _zero())
+            dgv = (
+                qx * b_dq[e]
+                - kdk[e]
+                + _sel(is_last, dgk, _zero())
+                + kg_r[e] * dkgb[e] * beta_r
+            )
+            o_dk.append(b_dk[e] + dkgb[e] * gexp[e] * beta_r)
+            o_dg.append(dgv)
+        if rv:
+            f32 = fx.Float32
+            _stv(_view3(dq, hk, BT, H * K, K, f32), r, c0, b_dq, f32)
+            _stv(_view3(dk, hk, BT, H * K, K, f32), r, c0, o_dk, f32)
+            _stv(_view3(dg, hk, BT, H * K, K, f32), r, c0, o_dg, f32)
+        db_r = _row_sum(db_r)
+        if rv & (seg == 0):
+            stg(_flat(db, tok * H + fx.Int64(h)), r * H, db_r, fx.Float32)
+
+        # dAkk = -mask(A^T (mask(dA * beta) A^T)), strictly lower.
+        b_da = to_regs(acc_da, 0, 16)
+        s_m = _lds(lds.do.peek(), BT * LDT)  # M[r][j], bf16
+        s_m1T = _lds(lds.vn.peek(), BT * LDT)  # M1^T[s][j], bf16
+        for e in range_constexpr(16):
+            s = seg + 4 * e
+            m_a = (s < r) & rv
+            lds_st(
+                s_m, r * LDT + s, _sel(m_a, b_da[e] * lds_ld(s_beta, s), _zero()), BF
+            )
+        gpu.barrier()
+        m1 = to_regs(run(s_m, LDT, s_a, LDT, BT), 0, 16)
+        for e in range_constexpr(16):
+            lds_st(s_m1T, (seg + 4 * e) * LDT + r, m1[e], BF)
+        gpu.barrier()
+        m2 = to_regs(run(s_aT, LDT, s_m1T, LDT, BT), 0, 16)
+        da_v = _flat(dA, a_off)
+        if rv:
+            for e in range_constexpr(16):
+                s = seg + 4 * e
+                stg(da_v, r * (H * BT) + s, _sel(s < r, -m2[e], _zero()), fx.Float32)
+
+    @flyc.jit
+    def launch(
+        q: fx.Tensor,
+        k: fx.Tensor,
+        v: fx.Tensor,
+        vnew: fx.Tensor,
+        g: fx.Tensor,
+        beta: fx.Tensor,
+        A: fx.Tensor,
+        hs: fx.Tensor,
+        do: fx.Tensor,
+        dh: fx.Tensor,
+        dv: fx.Tensor,
+        dq: fx.Tensor,
+        dk: fx.Tensor,
+        dv_out: fx.Tensor,
+        dg: fx.Tensor,
+        db: fx.Tensor,
+        dA: fx.Tensor,
+        cu: fx.Tensor,
+        ci: fx.Tensor,
+        T: fx.Int32,
+        scale: fx.Float32,
+        NT: fx.Int32,
+        NBH: fx.Int32,
+        stream: fx.Stream,
+    ):
+        kernel(
+            q,
+            k,
+            v,
+            vnew,
+            g,
+            beta,
+            A,
+            hs,
+            do,
+            dh,
+            dv,
+            dq,
+            dk,
+            dv_out,
+            dg,
+            db,
+            dA,
+            cu,
+            ci,
+            T,
+            scale,
+        ).launch(grid=(NT, NBH, 1), block=(NUM_THREADS, 1, 1), stream=stream)
+
+    return launch
+
+
+# ---------------------------------------------------------------------------
+# dav on MFMA
+# ---------------------------------------------------------------------------
+@functools.cache
+def compile_dav_mfma(
+    H: int, v_dtype: torch.dtype, a_dtype: torch.dtype, varlen: bool = False
+):
+    """``compile_dav`` on 16x16x16 bf16 MFMA; same arguments and launch."""
+    VN = _num(v_dtype)
+    AN = _num(a_dtype)
+    BF = fx.BFloat16
+
+    @fx.struct
+    class Smem:
+        do: fx.Array[fx.BFloat16, BT * LDK, 16]  # do[t][v]
+        vn: fx.Array[fx.BFloat16, BT * LDK, 16]  # v_new[t][v]
+        doT: fx.Array[fx.BFloat16, V * LDT, 16]  # do^T[v][t]
+        amT: fx.Array[fx.BFloat16, BT * LDT, 16]  # mask(Aqk)^T[s][t]
+        c: fx.Array[fx.Float32, BT * LDC, 16]
+
+    @flyc.kernel(name="kda_bwd_dav_mfma_flydsl")
+    def kernel(
+        vnew: fx.Tensor,
+        A: fx.Tensor,
+        do: fx.Tensor,
+        dA: fx.Tensor,
+        dv: fx.Tensor,
+        cu: fx.Tensor,
+        ci: fx.Tensor,
+        T: fx.Int32,
+        scale: fx.Float32,
+    ):
+        i_t = fx.block_idx.x
+        i_bh = fx.block_idx.y
+        b = i_bh // H
+        h = i_bh % H
+        tid = fx.thread_idx.x
+        r = tid // 4
+        seg = tid % 4
+        t0, nvalid = _chunk_pos(i_t, T, cu, ci, varlen)
+        tok = fx.Int64(b * T + t0)
+        do_v = _src(do, (tok * H + fx.Int64(h)) * V)
+        dv_v = _flat(dv, (tok * H + fx.Int64(h)) * V)
+        vn_v = _src(vnew, (fx.Int64(i_bh) * fx.Int64(T) + fx.Int64(t0)) * V)
+        a_v = _flat(A, (tok * H + fx.Int64(h)) * BT)
+        da_v = _flat(dA, (tok * H + fx.Int64(h)) * BT)
+
+        lds = fx.SharedAllocator().allocate(Smem)
+        s_do = _lds(lds.do.peek(), BT * LDK)
+        s_vn = _lds(lds.vn.peek(), BT * LDK)
+        s_doT = _lds(lds.doT.peek(), V * LDT)
+        s_amT = _lds(lds.amT.peek(), BT * LDT)
+        s_c = _lds(lds.c.peek(), BT * LDC)
+        c_tile = fx.make_view(fx.get_iter(s_c), fx.make_layout((BT, 64), (LDC, 1)))
+        mma = _Mma(tid)
+
+        _stage(do_v, H * V, s_do, LDK, BT, V, nvalid, tid, VN, BF)
+        _stage(do_v, H * V, s_doT, LDT, BT, V, nvalid, tid, VN, BF, transpose=True)
+        _stage(vn_v, V, s_vn, LDK, BT, V, nvalid, tid, VN, BF)
+        # amT[s][t] = A[t, s] for t >= s (Aqk's upper triangle is never written).
+        for e in range_constexpr(BT * BT // NUM_THREADS):
+            i = tid + e * NUM_THREADS
+            t = i // BT
+            s = i % BT
+            ok = (t < nvalid) & (t >= s)
+            x = _sel(ok, ldg(a_v, _sel(t < nvalid, t, 0) * (H * BT) + s, AN), _zero())
+            lds_st(s_amT, s * LDT + t, x, BF)
+        gpu.barrier()
+
+        def to_regs(acc, half, n_e):
+            mma.store(acc, c_tile)
+            gpu.barrier()
+            out = [
+                lds_ld(s_c, r * LDC + (seg + 4 * e) - 64 * half)
+                for e in range(16 * half, 16 * half + n_e)
+            ]
+            gpu.barrier()
+            return out
+
+        acc = mma.acc(c_tile)
+        mma.gemm(acc, s_do, LDK, s_vn, LDK, 64, V)
+        b_da = to_regs(acc, 0, 16)
+        acc_dv = []
+        for half in range_constexpr(2):
+            acc = mma.acc(c_tile)
+            mma.gemm(
+                acc,
+                s_amT,
+                LDT,
+                _offset_view(s_doT, half * 64 * LDT, 64 * LDT),
+                LDT,
+                64,
+                BT,
+            )
+            acc_dv += to_regs(acc, half, 16)
+        if r < nvalid:
+            for e in range_constexpr(16):
+                j = seg + 4 * e
+                stg(
+                    da_v,
+                    r * (H * BT) + j,
+                    _sel(j <= r, b_da[e] * scale, _zero()),
+                    fx.Float32,
+                )
+            for e in range_constexpr(32):
+                stg(dv_v, r * (H * V) + seg + 4 * e, acc_dv[e], VN)
+
+    @flyc.jit
+    def launch(
+        vnew: fx.Tensor,
+        A: fx.Tensor,
+        do: fx.Tensor,
+        dA: fx.Tensor,
+        dv: fx.Tensor,
+        cu: fx.Tensor,
+        ci: fx.Tensor,
+        T: fx.Int32,
+        scale: fx.Float32,
+        NT: fx.Int32,
+        NBH: fx.Int32,
+        stream: fx.Stream,
+    ):
+        kernel(vnew, A, do, dA, dv, cu, ci, T, scale).launch(
+            grid=(NT, NBH, 1), block=(NUM_THREADS, 1, 1), stream=stream
+        )
+
+    return launch
+
+
+# ---------------------------------------------------------------------------
+# dhu on MFMA
+# ---------------------------------------------------------------------------
+LDB = BV + 4  # fp32 [64, BV] staging
+# intra's padded rows: fp32 g [*, 128], bf16 q/k [*, 128], fp32 dA [*, 64]. The
+# off-diagonal gathers read 4 rows apart per lane group; 16-byte padding moves
+# those groups 16 banks apart and keeps rows 16-byte aligned for b128 reads.
+LDG = K + 4
+LDQ = K + 8
+LDA = BT + 4
+
+
+@functools.cache
+def compile_dhu_mfma(
+    H: int,
+    k_dtype: torch.dtype,
+    v_dtype: torch.dtype,
+    use_initial_state: bool,
+    use_final_state_gradient: bool,
+    transpose_state: bool,
+    varlen: bool = False,
+    bv: int = BV,
+):
+    """``compile_dhu`` with the per-chunk contractions on 16x16x16 bf16 MFMA.
+
+    Same arguments and launch. Per chunk: ``dv2 = dv + kg @ dh`` (B = dh^T in
+    bf16, as Triton's ``b_dh.to(b_k.dtype)``), then the state update
+    ``dh * exp2(g_last) + scale * qg^T do - w^T dv2`` as two 64-row halves of K,
+    each from two products so ``scale`` applies after the dot as in Triton.
+    The state itself stays fp32 in registers. ``bv`` (16, 32 or 64) is the
+    V-block width per workgroup, a tunable (``AITER_CONFIG_KDA_CHUNK_BWD``).
+    """
+    assert bv in (16, 32, 64), bv
+    ldb = bv + 4
+    KN = _num(k_dtype)
+    VN = _num(v_dtype)
+    BF = fx.BFloat16
+    NE = bv * K // NUM_THREADS  # 16 state cells per thread
+
+    @fx.struct
+    class Smem:
+        kg: fx.Array[fx.BFloat16, BT * LDK, 16]  # kg[t][k]
+        qgT: fx.Array[fx.BFloat16, K * LDT, 16]  # qg^T[k][t]
+        wT: fx.Array[fx.BFloat16, K * LDT, 16]  # w^T[k][t]
+        doT: fx.Array[fx.BFloat16, bv * LDT, 16]  # do^T[c][t]
+        dv2T: fx.Array[fx.BFloat16, bv * LDT, 16]  # dv2^T[c][t]
+        dhT: fx.Array[fx.BFloat16, bv * LDK, 16]  # dh^T[c][k]
+        # One fp32 staging tile, reused by every product: it keeps LDS under
+        # 80 KB, so two workgroups fit a gfx950 CU.
+        c_q: fx.Array[fx.Float32, BT * ldb, 16]
+        gl: fx.Array[fx.Float32, K, 16]
+
+    @flyc.kernel(name="kda_bwd_dhu_mfma_flydsl")
+    def kernel(
+        qg: fx.Tensor,
+        kg: fx.Tensor,
+        w: fx.Tensor,
+        g: fx.Tensor,
+        do: fx.Tensor,
+        dv: fx.Tensor,
+        dht: fx.Tensor,
+        dh: fx.Tensor,
+        dh0: fx.Tensor,
+        dv2: fx.Tensor,
+        cu: fx.Tensor,
+        co: fx.Tensor,
+        T: fx.Int32,
+        scale: fx.Float32,
+    ):
+        i_v = fx.block_idx.x
+        i_bh = fx.block_idx.y
+        b = i_bh // H
+        h = i_bh % H
+        tid = fx.thread_idx.x
+        kr = tid // 2  # state row (K)
+        sc = tid % 2
+        r = tid // 4  # chunk row for dv2
+        seg = tid % 4
+        if const_expr(varlen):
+            cu_v = _flat(cu, None)
+            bos = ldi(cu_v, b)
+            T_loc = ldi(cu_v, b + 1) - bos
+            boh = ldi(_flat(co, None), b)
+            row0 = bos
+        else:
+            T_loc = T
+            boh = b * ((T + (BT - 1)) // BT)
+            row0 = b * T
+        NT = (T_loc + (BT - 1)) // BT
+        v0 = i_v * bv
+
+        lds = fx.SharedAllocator().allocate(Smem)
+        s_kg = _lds(lds.kg.peek(), BT * LDK)
+        s_qgT = _lds(lds.qgT.peek(), K * LDT)
+        s_wT = _lds(lds.wT.peek(), K * LDT)
+        s_doT = _lds(lds.doT.peek(), bv * LDT)
+        s_dv2T = _lds(lds.dv2T.peek(), bv * LDT)
+        s_dhT = _lds(lds.dhT.peek(), bv * LDK)
+        s_cq = _lds(lds.c_q.peek(), BT * ldb)
+        s_gl = _lds(lds.gl.peek(), K)
+        cq_tile = fx.make_view(fx.get_iter(s_cq), fx.make_layout((BT, bv), (ldb, 1)))
+        mma = _Mma(tid)
+
+        state_v = _flat(dht, fx.Int64(i_bh) * (K * V))
+        h0_v = _flat(dh0, fx.Int64(i_bh) * (K * V))
+
+        def state_idx(kk, vv):
+            return vv * K + kk if transpose_state else kk * V + vv
+
+        init = []
+        for e in range_constexpr(NE):
+            if const_expr(use_final_state_gradient):
+                init.append(ldg(state_v, state_idx(kr, v0 + sc + 2 * e), fx.Float32))
+            else:
+                init.append(_zero())
+
+        # The kg / qg / w tiles of the next chunk (in time order, the previous
+        # one) are loaded into registers while the current chunk computes, so
+        # the serial chunk chain does not wait on their global loads.
+        NVT = BT * (K // 8) // NUM_THREADS  # 128-bit loads per thread per tile
+        cp8 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+
+        def tile_coord(e, transpose):
+            """(row, 8-column group) of this thread's e-th vector of a tile; a
+            transposed tile walks rows fastest so its LDS writes are contiguous."""
+            i_ = tid + e * NUM_THREADS
+            if const_expr(transpose):
+                return i_ % BT, i_ // BT
+            return i_ // (K // 8), i_ % (K // 8)
+
+        def tile_regs(tensor, it_, transpose):
+            t0_, nv_ = _chunk(it_, T_loc)
+            v3 = _view3(
+                tensor,
+                (fx.Int64(row0 + t0_) * H + fx.Int64(h)) * K,
+                BT,
+                H * K,
+                K,
+                fx.BFloat16,
+            )
+            out = []
+            for e in range_constexpr(NVT):
+                t_, cv_ = tile_coord(e, transpose)
+                out.append(
+                    _load_vec(
+                        cp8,
+                        fx.slice(v3, (_sel(t_ < nv_, t_, 0), cv_, None)),
+                        8,
+                        fx.BFloat16,
+                    )
+                )
+            return out
+
+        def tile_store(vecs, it_, dst, ld_dst, transpose):
+            _, nv_ = _chunk(it_, T_loc)
+            for e in range_constexpr(NVT):
+                t_, cv_ = tile_coord(e, transpose)
+                ok = t_ < nv_
+                vals = fx.Vector(vecs[e])
+                for p in range_constexpr(8):
+                    c_ = cv_ * 8 + p
+                    x = _sel(ok, vals[p].to(fx.Float32), _zero())
+                    lds_st(
+                        dst, c_ * ld_dst + t_ if transpose else t_ * ld_dst + c_, x, BF
+                    )
+
+        def prefetch(it_):
+            return (
+                tile_regs(kg, it_, False)
+                + tile_regs(qg, it_, True)
+                + tile_regs(w, it_, True)
+            )
+
+        for i, st in range(0, NT, 1, init=init + prefetch(NT - 1)):
+            it = NT - 1 - fx.Int32(i)
+            t0, nvalid = _chunk(it, T_loc)
+            tok = fx.Int64(row0 + t0)
+            hk = (tok * H + fx.Int64(h)) * K
+            hv = (tok * H + fx.Int64(h)) * V
+            gpu.barrier()
+            dh_v = _flat(dh, ((fx.Int64(boh + it)) * H + fx.Int64(h)) * (K * V))
+            for e in range_constexpr(NE):
+                c = sc + 2 * e
+                stg(dh_v, kr * V + v0 + c, st[e], KN)
+                lds_st(s_dhT, c * LDK + kr, st[e], BF)
+            pf = st[NE:]
+            tile_store(pf[0:NVT], it, s_kg, LDK, False)
+            tile_store(pf[NVT : 2 * NVT], it, s_qgT, LDT, True)
+            tile_store(pf[2 * NVT :], it, s_wT, LDT, True)
+            it_next = (it > 0).select(it - 1, 0)
+            pf_next = prefetch(it_next)
+            dov = _src(do, hv + fx.Int64(v0))
+            _stage(dov, H * V, s_doT, LDT, BT, bv, nvalid, tid, VN, BF, transpose=True)
+            if tid < K:
+                gl = ldg(_flat(g, hk), (nvalid - 1) * (H * K) + tid, fx.Float32)
+                lds_st(s_gl, tid, gl)
+            gpu.barrier()
+
+            # dv2 = dv + kg @ dh
+            acc = mma.acc(cq_tile)
+            mma.gemm(acc, s_kg, LDK, s_dhT, LDK, bv, K)
+            mma.store(acc, cq_tile)
+            gpu.barrier()
+            dvv = _flat(dv, hv + fx.Int64(v0))
+            dv2_v = _flat(dv2, hv + fx.Int64(v0))
+            rc = _sel(r < nvalid, r, 0)
+            for e in range_constexpr(bv // 4):
+                c = seg + 4 * e
+                val = lds_ld(s_cq, r * ldb + c) + _sel(
+                    r < nvalid, ldg(dvv, rc * (H * V) + c, VN), _zero()
+                )
+                val = _sel(r < nvalid, val, _zero())
+                lds_st(s_dv2T, c * LDT + r, val, BF)
+                if r < nvalid:
+                    stg(dv2_v, r * (H * V) + c, val, VN)
+            gpu.barrier()
+
+            # dh = dh * exp2(g_last) + scale * qg^T do - w^T dv2, by K halves
+            decay = _decay(lds_ld(s_gl, kr))
+            upd = [_zero()] * NE
+            for half in range_constexpr(2):
+                acc_q = mma.acc(cq_tile)
+                mma.gemm(
+                    acc_q,
+                    _offset_view(s_qgT, half * 64 * LDT, 64 * LDT),
+                    LDT,
+                    s_doT,
+                    LDT,
+                    bv,
+                    BT,
+                )
+                acc_w = mma.acc(cq_tile)
+                mma.gemm(
+                    acc_w,
+                    _offset_view(s_wT, half * 64 * LDT, 64 * LDT),
+                    LDT,
+                    s_dv2T,
+                    LDT,
+                    bv,
+                    BT,
+                )
+                mine = (kr // 64) == half
+                klc = _sel(mine, kr - 64 * half, 0)
+                mma.store(acc_q, cq_tile)
+                gpu.barrier()
+                part = [
+                    lds_ld(s_cq, klc * ldb + sc + 2 * e) * scale
+                    for e in range_constexpr(NE)
+                ]
+                gpu.barrier()
+                mma.store(acc_w, cq_tile)
+                gpu.barrier()
+                for e in range_constexpr(NE):
+                    u = part[e] - lds_ld(s_cq, klc * ldb + sc + 2 * e)
+                    upd[e] = _sel(mine, u, upd[e])
+                gpu.barrier()
+            res = yield [st[e] * decay + upd[e] for e in range(NE)] + pf_next
+        final = _results(res, NE + 3 * NVT)[:NE]
+        if const_expr(use_initial_state):
+            for e in range_constexpr(NE):
+                stg(h0_v, state_idx(kr, v0 + sc + 2 * e), final[e], fx.Float32)
+
+    @flyc.jit
+    def launch(
+        qg: fx.Tensor,
+        kg: fx.Tensor,
+        w: fx.Tensor,
+        g: fx.Tensor,
+        do: fx.Tensor,
+        dv: fx.Tensor,
+        dht: fx.Tensor,
+        dh: fx.Tensor,
+        dh0: fx.Tensor,
+        dv2: fx.Tensor,
+        cu: fx.Tensor,
+        co: fx.Tensor,
+        T: fx.Int32,
+        scale: fx.Float32,
+        NBH: fx.Int32,
+        stream: fx.Stream,
+    ):
+        kernel(qg, kg, w, g, do, dv, dht, dh, dh0, dv2, cu, co, T, scale).launch(
+            grid=(V // bv, NBH, 1), block=(NUM_THREADS, 1, 1), stream=stream
+        )
+
+    return launch
+
+
+def _mfma16_f32(a_f32x4, b_f32x4, c_f32x4):
+    """``C += A @ B`` for one 16x16 fp32 tile as four 16x16x4 fp32 MFMAs.
+
+    Lane ``l`` holds ``A[l % 16][(l // 16) * 4 + p]``, ``B[(l // 16) * 4 + p][l % 16]``
+    and ``C[(l // 16) * 4 + p][l % 16]`` (``p`` < 4), as in ``gdn_prepare``.
+    """
+    frag_a = fx.make_rmem_tensor(1, fx.Float32)
+    frag_b = fx.make_rmem_tensor(1, fx.Float32)
+    frag_c = fx.make_rmem_tensor(4, fx.Float32)
+    frag_c.store(fx.Float32x4(c_f32x4))
+    a = fx.Float32x4(a_f32x4)
+    b = fx.Float32x4(b_f32x4)
+    mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 4, fx.Float32))
+    for p in range_constexpr(4):
+        frag_a[0] = a[p]
+        frag_b[0] = b[p]
+        fx.gemm(mma, frag_c, frag_a, frag_b, frag_c)
+    return fx.Float32x4(frag_c.load())
+
+
+@functools.cache
+def compile_intra_mfma(
+    H: int,
+    k_dtype: torch.dtype,
+    beta_dtype: torch.dtype,
+    raw_k_dtype: torch.dtype,
+    raw_beta_dtype: torch.dtype,
+    out_k_dtype: torch.dtype,
+    out_beta_dtype: torch.dtype,
+    l2norm_qk: bool,
+    beta_sigmoid: bool,
+    varlen: bool = False,
+):
+    """``compile_intra`` with the off-diagonal sub-chunk products on MFMA.
+
+    Same arguments and launch. Rows split into four 16-row sub-chunks, one per
+    wave. Between sub-chunks the decay factors through the sub-chunk pivot,
+    ``exp2(g[m] - g[j]) = exp2(g[m] - g_n) * exp2(g_n - g[j])`` with both
+    exponents <= 0, which makes those terms fp32 16x16x4 MFMA products (fp32
+    operands, as Triton keeps them). Pairs inside a sub-chunk stay elementwise,
+    16 per row instead of 64.
+    """
+    KN = _num(k_dtype)
+    BN = _num(beta_dtype)
+    RKN = _num(raw_k_dtype)
+    RBN = _num(raw_beta_dtype)
+    OKN = _num(out_k_dtype)
+    OBN = _num(out_beta_dtype)
+    EPS = 1e-6
+
+    @fx.struct
+    class Smem:
+        q: fx.Array[fx.BFloat16, BT * LDQ, 16]
+        k: fx.Array[fx.BFloat16, BT * LDQ, 16]
+        g: fx.Array[fx.Float32, BT * LDG, 16]
+        aq: fx.Array[fx.Float32, BT * LDA, 16]
+        ak: fx.Array[fx.Float32, BT * LDA, 16]
+        beta: fx.Array[fx.Float32, BT, 16]
+        s: fx.Array[fx.Float32, BT * LDK, 16]
+
+    def l2norm_bwd(x, dy):
+        """``dx`` for ``y = x / sqrt(sum(x^2) + eps)`` along this thread's row."""
+        ss = _zero()
+        for e in range_constexpr(32):
+            ss = ss + x[e] * x[e]
+        rstd = fx.rsqrt(_row_sum(ss) + EPS)
+        y = [x[e] * rstd for e in range_constexpr(32)]
+        sdy = _zero()
+        for e in range_constexpr(32):
+            sdy = sdy + dy[e] * y[e]
+        sdy = _row_sum(sdy)
+        return [dy[e] * rstd - sdy * y[e] * rstd for e in range_constexpr(32)]
+
+    @flyc.kernel(name="kda_bwd_intra_mfma_flydsl")
+    def kernel(
+        q: fx.Tensor,
+        k: fx.Tensor,
+        g: fx.Tensor,
+        beta: fx.Tensor,
+        dAqk: fx.Tensor,
+        dAkk: fx.Tensor,
+        dq: fx.Tensor,
+        dk: fx.Tensor,
+        dg: fx.Tensor,
+        db: fx.Tensor,
+        q_raw: fx.Tensor,
+        k_raw: fx.Tensor,
+        beta_raw: fx.Tensor,
+        dq2: fx.Tensor,
+        dk2: fx.Tensor,
+        dg2: fx.Tensor,
+        db2: fx.Tensor,
+        cu: fx.Tensor,
+        ci: fx.Tensor,
+        T: fx.Int32,
+    ):
+        i_t = fx.block_idx.x
+        i_bh = fx.block_idx.y
+        b = i_bh // H
+        h = i_bh % H
+        tid = fx.thread_idx.x
+        r = tid // 4
+        seg = tid % 4
+        t0, nvalid = _chunk_pos(i_t, T, cu, ci, varlen)
+        rv = r < nvalid
+        rc = _sel(rv, r, 0)
+        tok = fx.Int64(b * T + t0)
+        hk = (tok * H + fx.Int64(h)) * K
+        hb = tok * H + fx.Int64(h)
+
+        lds = fx.SharedAllocator().allocate(Smem).peek()
+        s_q = _lds(lds.q, BT * LDQ)
+        s_k = _lds(lds.k, BT * LDQ)
+        s_g = _lds(lds.g, BT * LDG)
+        s_aq = _lds(lds.aq, BT * LDA)
+        s_ak = _lds(lds.ak, BT * LDA)
+        s_b = _lds(lds.beta, BT)
+        s_s = _lds(lds.s, BT * LDK)
+        _stage(_src(q, hk), H * K, s_q, LDQ, BT, K, nvalid, tid, KN, fx.BFloat16)
+        _stage(_src(k, hk), H * K, s_k, LDQ, BT, K, nvalid, tid, KN, fx.BFloat16)
+        _stage(_src(g, hk), H * K, s_g, LDG, BT, K, nvalid, tid, fx.Float32, fx.Float32)
+        _stage(
+            _src(dAqk, hb * BT),
+            H * BT,
+            s_aq,
+            LDA,
+            BT,
+            BT,
+            nvalid,
+            tid,
+            fx.Float32,
+            fx.Float32,
+        )
+        _stage(
+            _src(dAkk, hb * BT),
+            H * BT,
+            s_ak,
+            LDA,
+            BT,
+            BT,
+            nvalid,
+            tid,
+            fx.Float32,
+            fx.Float32,
+        )
+        if tid < BT:
+            bb = ldg(_flat(beta, hb), _sel(tid < nvalid, tid, 0) * H, BN)
+            lds_st(s_b, tid, _sel(tid < nvalid, bb, _zero()))
+        gpu.barrier()
+
+        # Rows are read as b128: each thread owns 32 contiguous columns.
+        g_r = _lds_row(s_g, r * LDG + seg * 32, 32, fx.Float32)
+
+        # dq2 / dk2 = sum_{j <= r} dA[r, j] k[j] exp2(g[r] - g[j]), sub-chunks apart
+        lane = tid % 64
+        wave = tid // 64
+        m0 = wave * 16
+        n16 = lane % 16
+        kq4 = (lane // 16) * 4
+
+        def off_lower(s_a):
+            """s_s[m] = sum over earlier sub-chunks of s_a[m, j] k[j] exp2(g[m] - g[j])."""
+            for kt in range_constexpr(K // 16):
+                c = kt * 16 + n16
+                gn = lds_ld(s_g, m0 * LDG + c)  # pivot: first row of the sub-chunk
+                acc = fx.Float32x4(0.0)
+                for J in range_constexpr(BT // 16 - 1):
+                    # Only sub-chunks before this wave's; the branch is wave-uniform.
+                    if wave > J:
+                        a = _lds_row(
+                            s_a, (m0 + n16) * LDA + J * 16 + kq4, 4, fx.Float32
+                        )
+                        bv = []
+                        for p in range_constexpr(4):
+                            j = J * 16 + kq4 + p
+                            bv.append(
+                                lds_ld(s_k, j * LDQ + c, fx.BFloat16)
+                                * _decay(gn - lds_ld(s_g, j * LDG + c))
+                            )
+                        acc = _mfma16_f32(fx.Float32x4(a), fx.Float32x4(bv), acc)
+                for p in range_constexpr(4):
+                    m = m0 + kq4 + p
+                    lds_st(
+                        s_s, m * LDK + c, acc[p] * _decay(lds_ld(s_g, m * LDG + c) - gn)
+                    )
+            gpu.barrier()
+            out = _lds_row(s_s, r * LDK + seg * 32, 32, fx.Float32)
+            gpu.barrier()
+            return out
+
+        def off_upper():
+            """s_s[m] = sum over later sub-chunks of (dAqk[j, m] q[j] + dAkk[j, m] beta[j] k[j]) exp2(g[j] - g[m])."""
+            g_row = _min(m0 + 15, nvalid - 1)  # pivot: last valid row of the sub-chunk
+            for kt in range_constexpr(K // 16):
+                c = kt * 16 + n16
+                gn = lds_ld(s_g, g_row * LDG + c)
+                acc = fx.Float32x4(0.0)
+                for J in range_constexpr(1, BT // 16):
+                    # Only sub-chunks after this wave's; the branch is wave-uniform.
+                    if J > wave:
+                        aq, ak, bq, bk = [], [], [], []
+                        for p in range_constexpr(4):
+                            j = J * 16 + kq4 + p
+                            aq.append(lds_ld(s_aq, j * LDA + m0 + n16))
+                            ak.append(lds_ld(s_ak, j * LDA + m0 + n16) * lds_ld(s_b, j))
+                            dec = _decay(lds_ld(s_g, j * LDG + c) - gn)
+                            bq.append(lds_ld(s_q, j * LDQ + c, fx.BFloat16) * dec)
+                            bk.append(lds_ld(s_k, j * LDQ + c, fx.BFloat16) * dec)
+                        acc = _mfma16_f32(fx.Float32x4(aq), fx.Float32x4(bq), acc)
+                        acc = _mfma16_f32(fx.Float32x4(ak), fx.Float32x4(bk), acc)
+                for p in range_constexpr(4):
+                    m = m0 + kq4 + p
+                    lds_st(
+                        s_s, m * LDK + c, acc[p] * _decay(gn - lds_ld(s_g, m * LDG + c))
+                    )
+            gpu.barrier()
+            out = _lds_row(s_s, r * LDK + seg * 32, 32, fx.Float32)
+            gpu.barrier()
+            return out
+
+        jb = (r // 16) * 16
+        init = off_lower(s_aq) + off_lower(s_ak)
+        # Pairs inside the row's own sub-chunk.
+        for jj, st in range(0, 16, 1, init=init):
+            jq = jb + fx.Int32(jj)
+            ok = (jq <= r) & (jq < nvalid)
+            aq = _sel(ok, lds_ld(s_aq, r * LDA + jq), _zero())
+            ak = _sel(ok, lds_ld(s_ak, r * LDA + jq), _zero())
+            acc_q, acc_k = [], []
+            g_j = _lds_row(s_g, jq * LDG + seg * 32, 32, fx.Float32)
+            k_j = _lds_row(s_k, jq * LDQ + seg * 32, 32, fx.BFloat16)
+            for e in range_constexpr(32):
+                ex = _decay(_sel(ok, g_r[e] - g_j[e], _zero()))
+                kx = k_j[e] * ex
+                acc_q.append(st[e] + aq * kx)
+                acc_k.append(st[32 + e] + ak * kx)
+            res = yield acc_q + acc_k
+        acc = _results(res, 64)
+        b_dq2, b_dk2 = acc[:32], acc[32:]
+
+        k_r = _lds_row(s_k, r * LDQ + seg * 32, 32, fx.BFloat16)
+        q_r = _lds_row(s_q, r * LDQ + seg * 32, 32, fx.BFloat16)
+        beta_r = lds_ld(s_b, r)
+        db_r = _zero()
+        for e in range_constexpr(32):
+            db_r = db_r + b_dk2[e] * k_r[e]
+        db_r = _row_sum(db_r)
+        b_dk2 = [b_dk2[e] * beta_r for e in range_constexpr(32)]
+
+        # Each thread owns the 32 contiguous columns from c0: 16-byte row I/O.
+        c0 = seg * 32
+        f32 = fx.Float32
+
+        def row_in(t, num):
+            return _ldv(_view3(t, hk, BT, H * K, K, num), rc, c0, 32, num)
+
+        def row_out(t, vals, num):
+            _stv(_view3(t, hk, BT, H * K, K, num), r, c0, vals, num)
+
+        b_dg2 = [q_r[e] * b_dq2[e] for e in range_constexpr(32)]
+        dq_row = row_in(dq, f32)
+        b_dq2 = [b_dq2[e] + dq_row[e] for e in range_constexpr(32)]
+        if const_expr(l2norm_qk):
+            b_dq2 = l2norm_bwd(row_in(q_raw, RKN), b_dq2)
+        if rv:
+            row_out(dq2, b_dq2, OKN)
+
+        db_r = db_r + ldg(_flat(db, hb), rc * H, fx.Float32)
+        if const_expr(beta_sigmoid):
+            sgm = _sigmoid(ldg(_flat(beta_raw, hb), rc * H, RBN))
+            db_r = db_r * sgm * (fx.Float32(1.0) - sgm)
+        if rv & (seg == 0):
+            stg(_flat(db2, hb), r * H, db_r, OBN)
+
+        # dkt = sum_{j >= r} (dAqk[j, r] q[j] + dAkk[j, r] beta[j] k[j]) exp2(g[j] - g[r])
+        for jj, st in range(0, 16, 1, init=off_upper()):
+            jq = jb + fx.Int32(jj)
+            # Padded rows j >= nvalid hold g = 0, so g[j] - g[r] > 0 there.
+            ok = (jq >= r) & (jq < nvalid)
+            aq = _sel(ok, lds_ld(s_aq, jq * LDA + r), _zero())
+            ak = _sel(ok, lds_ld(s_ak, jq * LDA + r) * lds_ld(s_b, jq), _zero())
+            acc = []
+            g_j = _lds_row(s_g, jq * LDG + seg * 32, 32, fx.Float32)
+            q_j = _lds_row(s_q, jq * LDQ + seg * 32, 32, fx.BFloat16)
+            k_j = _lds_row(s_k, jq * LDQ + seg * 32, 32, fx.BFloat16)
+            for e in range_constexpr(32):
+                ex = _decay(_sel(ok, g_j[e] - g_r[e], _zero()))
+                acc.append(st[e] + (aq * q_j[e] + ak * k_j[e]) * ex)
+            res = yield acc
+        dkt = _results(res, 32)
+
+        dg_row = row_in(dg, f32)
+        dk_row = row_in(dk, f32)
+        dk_out = []
+        for e in range_constexpr(32):
+            b_dg2[e] = b_dg2[e] + (b_dk2[e] - dkt[e]) * k_r[e] + dg_row[e]
+            dk_out.append(b_dk2[e] + dk_row[e] + dkt[e])
+        if const_expr(l2norm_qk):
+            dk_out = l2norm_bwd(row_in(k_raw, RKN), dk_out)
+        if rv:
+            row_out(dk2, dk_out, OKN)
+            row_out(dg2, b_dg2, f32)
+
+    @flyc.jit
+    def launch(
+        q: fx.Tensor,
+        k: fx.Tensor,
+        g: fx.Tensor,
+        beta: fx.Tensor,
+        dAqk: fx.Tensor,
+        dAkk: fx.Tensor,
+        dq: fx.Tensor,
+        dk: fx.Tensor,
+        dg: fx.Tensor,
+        db: fx.Tensor,
+        q_raw: fx.Tensor,
+        k_raw: fx.Tensor,
+        beta_raw: fx.Tensor,
+        dq2: fx.Tensor,
+        dk2: fx.Tensor,
+        dg2: fx.Tensor,
+        db2: fx.Tensor,
+        cu: fx.Tensor,
+        ci: fx.Tensor,
+        T: fx.Int32,
+        NT: fx.Int32,
+        NBH: fx.Int32,
+        stream: fx.Stream,
+    ):
+        kernel(
+            q,
+            k,
+            g,
+            beta,
+            dAqk,
+            dAkk,
+            dq,
+            dk,
+            dg,
+            db,
+            q_raw,
+            k_raw,
+            beta_raw,
+            dq2,
+            dk2,
+            dg2,
+            db2,
+            cu,
+            ci,
+            T,
+        ).launch(grid=(NT, NBH, 1), block=(NUM_THREADS, 1, 1), stream=stream)
+
+    return launch
