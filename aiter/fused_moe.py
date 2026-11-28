@@ -7,8 +7,10 @@ import os
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from typing import NamedTuple
 
 import torch
+from torch.utils._python_dispatch import is_in_torch_dispatch_mode
 
 import aiter
 
@@ -615,6 +617,34 @@ def _validate_flydsl_route_output_nbytes(route_output_nbytes: int) -> None:
         )
 
 
+def _plain_eager(x, *tensors):
+    """Whether host shortcuts preserve dispatch for these tensor arguments."""
+    return (
+        not torch.compiler.is_compiling()
+        and type(x) is torch.Tensor
+        and all(
+            t is None or type(t) in (torch.Tensor, torch.nn.Parameter) for t in tensors
+        )
+        and not torch.overrides.has_torch_function((x, *tensors))
+        and not is_in_torch_dispatch_mode()
+    )
+
+
+def _op_or_eager_body(op, x, *tensors):
+    """Keep the custom op where a tracer, mode or tensor subclass handles it."""
+    body = getattr(op, "_eager_body", op) if _plain_eager(x, *tensors) else op
+    if body is op or not torch.autograd._profiler_enabled():
+        return body
+
+    # The dispatcher supplies this event itself. Only the direct eager body
+    # needs a scope, and an unprofiled call creates neither a scope nor a wrapper.
+    def profiled(*args, **kwargs):
+        with torch.profiler.record_function("aiter::fused_moe_"):
+            return body(*args, **kwargs)
+
+    return profiled
+
+
 @drop_presort_after
 def fused_moe(
     hidden_states,
@@ -803,7 +833,26 @@ def fused_moe(
         block_size_M = -1
     enable_ep_scatter = stage2_scatter is not None
     scatter_source_map = stage2_scatter.source_token_map if enable_ep_scatter else None
-    return fused_moe_(
+    return _op_or_eager_body(
+        fused_moe_,
+        hidden_states,
+        w1,
+        w2,
+        topk_weight,
+        topk_ids,
+        expert_mask,
+        w1_scale,
+        w2_scale,
+        a1_scale,
+        a2_scale,
+        num_local_tokens,
+        bias1,
+        bias2,
+        scatter_source_map,
+        output,
+        w1_global_scale,
+        w2_global_scale,
+    )(
         hidden_states=hidden_states,
         w1=w1,
         w2=w2,
@@ -957,6 +1006,7 @@ def fused_moe_g1u1_bf16_small_m_direct(
     return output
 
 
+_BF16_G1U1_SMALL_M_DIRECT_GFX = "gfx1201"
 _BF16_G1U1_SMALL_M_DIRECT_SHUFFLE_LAYOUT = (16, 16)
 _BF16_G1U1_SMALL_M_DIRECT_ALLOWED_M = (1, 2, 3, 4, 8, 16)
 _BF16_G1U1_SMALL_M_DIRECT_MODEL_DIM = 2048
@@ -1009,7 +1059,7 @@ def _can_use_bf16_g1u1_small_m_direct(
     topk = topk_ids.shape[1]
     inter_dim = w2.shape[2]
     return (
-        get_gfx_runtime() == "gfx1201"
+        get_gfx_runtime() == _BF16_G1U1_SMALL_M_DIRECT_GFX
         and quant_type == QuantType.No
         and activation == ActivationType.Silu
         and dtype == dtypes.bf16
@@ -1241,11 +1291,89 @@ def fused_moe_(
     )
 
 
+class _MoePlan(NamedTuple):
+    """What _fused_moe_impl resolves before sorting: the get_2stage_cfgs call
+    it made, and the values the sort and the stages take."""
+
+    cfg_args: tuple
+    cfg_kwargs: dict
+    metadata: "MOEMetadata"
+    activation: ActivationType
+    quant_type: QuantType
+    gate_mode: GateMode
+    swiglu_limit: float | None
+    silu_limit: bool
+    M: int
+    topk: int
+    model_dim: int
+    global_E: int
+    dtype: torch.dtype
+    q_dtype_a: torch.dtype
+    q_dtype_w: torch.dtype
+    isG1U1: bool
+    block_size_M: int
+    asm_mode: AsmMoeMode
+    stage1_func: Callable
+    need_local_topk_ids: bool
+
+
+# _fused_moe_impl's plans by call signature (its plan_key).
+_MOE_PLANS: dict = {}
+_MOE_PLANS_MAX = 1024
+
+
+def _prepare_moe_input(
+    hidden_states, output=None, shape=None, dtype=None, *, validate=True, finalize=False
+):
+    """Per-call checks shared by resolution and cached plans.
+
+    Resolution validates first, then finalizes after inline-sort eligibility is
+    known. Cached plans exclude inline sort and do both in one call. Preserve
+    copy-before-overlap for non-row-major input, and overlap-before-final-copy
+    for row-major views.
+    """
+    if validate:
+        if not hidden_states.is_contiguous() and not _is_row_major_2d(hidden_states):
+            hidden_states = hidden_states.contiguous()
+        _validate_output_buffer_metadata(output, shape, dtype, hidden_states.device)
+        _validate_output_buffer_no_overlap(output, hidden_states)
+    if finalize and not hidden_states.is_contiguous():
+        hidden_states = hidden_states.contiguous()
+    return hidden_states
+
+
+def _check_moe_plan(plan_key, cached, fresh):
+    differing = [
+        name
+        for name in _MoePlan._fields
+        if (
+            getattr(cached, name) is not getattr(fresh, name)
+            if name in ("metadata", "stage1_func")
+            else getattr(cached, name) != getattr(fresh, name)
+        )
+    ]
+    if differing:
+        raise RuntimeError(
+            f"MoE plan mismatch for key {plan_key!r}: {', '.join(differing)}"
+        )
+
+
+def _check_moe_plan_route(plan_key, checked_plan, route):
+    if checked_plan is not None:
+        raise RuntimeError(f"MoE plan mismatch for key {plan_key!r}: route {route}")
+
+
 # NOTE: aiter.moev2 (under development, not graduated) keeps a copy of this logic: the
 # validation and derived values, the get_2stage_cfgs key and the launches, in
 # aiter/moev2/execute/executor.py (prologue, run_two_stage, run_whole_graph) and
 # aiter/moev2/api.py (dispatch_key). Mirror changes there or coordinate with the moev2
 # owners (@qli88), then run the tests/moe_dispatch checks in aiter/moev2/README.md.
+# When resolution changes, update plan_key, cache eligibility/store conditions,
+# and the hit path together. Keep the parameter partition in
+# tests/test_moe_plan_cache.py complete and run its signature/control-flow checks
+# plus MoE correctness with AITER_MOE_PLAN_CHECK=1. That mode resolves each valid
+# hit afresh and checks every plan field before execution. AITER_MOE_PLAN_CACHE=0
+# dynamically disables both cache reads and stores (including key construction).
 def _fused_moe_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -1296,6 +1424,119 @@ def _fused_moe_impl(
     # Consume a caller's presort first, so every path (including early returns
     # and errors) clears it.
     presorted_aux = pop_presorted_moe()
+    # Everything resolved below, up to the sort, follows from these, so a call
+    # can take the plan of an earlier one with the same key.
+    plan_key = None
+    checked_plan = None
+    if (
+        os.environ.get("AITER_MOE_PLAN_CACHE", "1") != "0"
+        and presorted_aux is None
+        and not deterministic
+        and not herd_topk
+        and not splitk
+        and stage2_scatter is None
+        and _q_dtype_a is None
+        and _metadata_transform is None
+        and _metadata_config_file is None
+        and _stage1_extra_args is None
+        and _stage2_extra_args is None
+        and _stage2_override is None
+        and not _enforce_metadata_block_size
+        and _config_shape is None
+        and w1_global_scale is None
+        and w2_global_scale is None
+        and _plain_eager(
+            hidden_states,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+            expert_mask,
+            w1_scale,
+            w2_scale,
+            a1_scale,
+            a2_scale,
+            num_local_tokens,
+            bias1,
+            bias2,
+            output,
+            w1_global_scale,
+            w2_global_scale,
+        )
+    ):
+        plan_key = (
+            topk_ids.shape,
+            w1.shape,
+            w2.shape,
+            w1.dtype,
+            hidden_states.dtype,
+            dtype,
+            activation,
+            quant_type,
+            doweight_stage1,
+            block_size_M,
+            hidden_pad,
+            intermediate_pad,
+            swiglu_limit,
+            beta,
+            linear_beta,
+            gate_mode,
+            quant_type_a,
+            quant_dtype_a,
+            quant_dtype_a2,
+            None if expert_mask is None else expert_mask.numel(),
+            bias1 is None,
+            bias2 is None,
+            a1_scale is None,
+            a2_scale is None,
+            num_local_tokens is None,
+            getattr(w1, "is_shuffled", False),
+            getattr(w2, "is_shuffled", False),
+            getattr(w1, "gate_up_interleave", None),
+        )
+        plan = _MOE_PLANS.get(plan_key)
+        # The tuned config is still looked up per call, through whatever
+        # get_2stage_cfgs is now (callers wrap it, tests clear its cache): the
+        # plan holds only while that returns the metadata it was resolved from.
+        if (
+            plan is not None
+            and get_2stage_cfgs(*plan.cfg_args, **plan.cfg_kwargs) is plan.metadata
+        ):
+            if os.environ.get("AITER_MOE_PLAN_CHECK", "0") == "1":
+                # Fall through with this call's untouched inputs. Do not prepare
+                # twice, recurse, or run a reference MoE to validate the plan.
+                checked_plan = plan
+            else:
+                hidden_states = _prepare_moe_input(
+                    hidden_states,
+                    output,
+                    (plan.M, plan.model_dim),
+                    plan.dtype,
+                    finalize=True,
+                )
+                return _fused_moe_run(
+                    plan,
+                    hidden_states,
+                    w1,
+                    w2,
+                    topk_weight,
+                    topk_ids,
+                    expert_mask,
+                    doweight_stage1,
+                    w1_scale,
+                    w2_scale,
+                    a1_scale,
+                    a2_scale,
+                    num_local_tokens,
+                    moe_sorting_dispatch_policy,
+                    hidden_pad,
+                    intermediate_pad,
+                    bias1,
+                    bias2,
+                    beta,
+                    linear_beta,
+                    output,
+                )
     # vLLM sends 0.0 for "no limit". Check floats and the raw int first:
     # pybind enum comparisons are much slower than int compares.
     silu_limit = (
@@ -1349,8 +1590,6 @@ def _fused_moe_impl(
         topk = herd_topk
     config_M, config_topk = (M, topk) if _config_shape is None else _config_shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
-    if not hidden_states.is_contiguous() and not _is_row_major_2d(hidden_states):
-        hidden_states = hidden_states.contiguous()
 
     assert w1.shape[1] in [
         inter_dim,
@@ -1383,10 +1622,7 @@ def _fused_moe_impl(
             "route-weighted results into the peers' combine buffers and returns an "
             "uninitialized placeholder"
         )
-    _validate_output_buffer_metadata(
-        output, (M, model_dim), dtype, hidden_states.device
-    )
-    _validate_output_buffer_no_overlap(output, hidden_states)
+    hidden_states = _prepare_moe_input(hidden_states, output, (M, model_dim), dtype)
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
     if (w1_global_scale is not None or w2_global_scale is not None) and (
@@ -1471,6 +1707,7 @@ def _fused_moe_impl(
     # so it is reachable exclusively from GateMode.INTERLEAVE. SEPARATED
     # weights fall through to the generic MoE below.
     if gate_mode == GateMode.INTERLEAVE:
+        _check_moe_plan_route(plan_key, checked_plan, "grouped_gemm_gfx1250_a8w4")
         grouped_a8w4_out = grouped_gemm_gfx1250_a8w4(
             hidden_states,
             w1,
@@ -1545,6 +1782,7 @@ def _fused_moe_impl(
         stage2_scatter=stage2_scatter,
         splitk=splitk,
     ):
+        _check_moe_plan_route(plan_key, checked_plan, "gfx1201_small_m_direct")
         return fused_moe_g1u1_bf16_small_m_direct(
             hidden_states,
             w1,
@@ -1611,8 +1849,13 @@ def _fused_moe_impl(
         activation, beta, linear_beta, swiglu_limit
     )
 
+    # The get_2stage_cfgs call behind `metadata`, and how many were made.
+    cfg_args = cfg_kwargs = None
+    cfg_lookups = 0
+
     def _resolve_metadata(disable_inline_sort=False, exclude_mxmoe=False):
-        metadata = get_2stage_cfgs(
+        nonlocal cfg_args, cfg_kwargs, cfg_lookups
+        cfg_args = (
             get_padded_M(config_M),
             model_dim,
             inter_dim,
@@ -1629,26 +1872,31 @@ def _fused_moe_impl(
             intermediate_pad,
             isShuffled,
             gate_mode,
-            is_ep=expert_mask is not None,
-            has_stage1_bias=bias1 is not None,
-            has_stage2_bias=bias2 is not None,
-            situ_beta=config_situ_beta,
-            situ_linear_beta=config_situ_linear_beta,
-            swiglu_limit=swiglu_limit,
-            opus_weights_shuffled=getattr(w1, "is_shuffled", False)
-            and getattr(w2, "is_shuffled", False),
-            gate_up_interleave=getattr(w1, "gate_up_interleave", None),
-            config_file=_metadata_config_file,
-            _disable_inline_sort=disable_inline_sort,
-            _exclude_mxmoe=exclude_mxmoe,
-            q_dtype_a2=quant_dtype_a2,
-            input_dtype=hidden_states.dtype,
-            has_stage2_scatter=stage2_scatter is not None,
-            has_activation_scales=a1_scale is not None or a2_scale is not None,
-            _has_input_activation_scales=a1_scale is not None,
-            has_num_local_tokens=num_local_tokens is not None,
-            has_global_scale=w1_global_scale is not None or w2_global_scale is not None,
         )
+        cfg_kwargs = {
+            "is_ep": expert_mask is not None,
+            "has_stage1_bias": bias1 is not None,
+            "has_stage2_bias": bias2 is not None,
+            "situ_beta": config_situ_beta,
+            "situ_linear_beta": config_situ_linear_beta,
+            "swiglu_limit": swiglu_limit,
+            "opus_weights_shuffled": getattr(w1, "is_shuffled", False)
+            and getattr(w2, "is_shuffled", False),
+            "gate_up_interleave": getattr(w1, "gate_up_interleave", None),
+            "config_file": _metadata_config_file,
+            "_disable_inline_sort": disable_inline_sort,
+            "_exclude_mxmoe": exclude_mxmoe,
+            "q_dtype_a2": quant_dtype_a2,
+            "input_dtype": hidden_states.dtype,
+            "has_stage2_scatter": stage2_scatter is not None,
+            "has_activation_scales": a1_scale is not None or a2_scale is not None,
+            "_has_input_activation_scales": a1_scale is not None,
+            "has_num_local_tokens": num_local_tokens is not None,
+            "has_global_scale": w1_global_scale is not None
+            or w2_global_scale is not None,
+        }
+        cfg_lookups += 1
+        metadata = get_2stage_cfgs(*cfg_args, **cfg_kwargs)
         return (
             metadata if _metadata_transform is None else _metadata_transform(metadata)
         )
@@ -1729,8 +1977,9 @@ def _fused_moe_impl(
             )
             metadata = _resolve_metadata(disable_inline_sort=True)
             use_inline_sort = False
-    if not use_inline_sort and not hidden_states.is_contiguous():
-        hidden_states = hidden_states.contiguous()
+    hidden_states = _prepare_moe_input(
+        hidden_states, validate=False, finalize=not use_inline_sort
+    )
 
     stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
     if (
@@ -1788,6 +2037,7 @@ def _fused_moe_impl(
         presorted_moe_ignored("the selected MoE pipeline takes no BM=16 aux sort")
     asm_mode = AsmMoeMode(metadata.flat)
     if metadata.full_impl is not None:
+        _check_moe_plan_route(plan_key, checked_plan, "metadata.full_impl")
         request = FusedMoeRequest(
             hidden_states=hidden_states,
             w1=w1,
@@ -1848,6 +2098,136 @@ def _fused_moe_impl(
         "gfx950",
     ), f"FLAT fmoe asm kernels are gfx942/gfx950-only; refusing to launch on {get_gfx()}. "
 
+    plan = _MoePlan(
+        cfg_args,
+        cfg_kwargs,
+        metadata,
+        activation,
+        quant_type,
+        gate_mode,
+        swiglu_limit,
+        silu_limit,
+        M,
+        topk,
+        model_dim,
+        global_E,
+        dtype,
+        q_dtype_a,
+        q_dtype_w,
+        isG1U1,
+        block_size_M,
+        asm_mode,
+        stage1_func,
+        need_local_topk_ids,
+    )
+    if checked_plan is not None:
+        _check_moe_plan(plan_key, checked_plan, plan)
+    # Kept only where the plan is a function of plan_key: one plain config
+    # lookup, and none of the paths that decide per call -- the gfx1201
+    # small-M direct path (on arguments the key leaves out), the gfx1250
+    # grouped path, the MXFP4 / gfx1250 activation dtype (read from the
+    # environment), and the MXMOE / inline-sort checks on the tensors.
+    if (
+        plan_key is not None
+        and cfg_lookups == 1
+        and gate_mode != GateMode.INTERLEAVE
+        and quant_type != QuantType.per_1x32
+        and get_gfx_runtime()
+        not in (_BF16_G1U1_SMALL_M_DIRECT_GFX, "gfx1250", "gfx1250-strict")
+        and not _is_mxmoe_opus_metadata(metadata)
+        and not _is_mxfp4_inline_sort(metadata)
+    ):
+        if len(_MOE_PLANS) >= _MOE_PLANS_MAX:
+            _MOE_PLANS.clear()
+        _MOE_PLANS[plan_key] = plan
+    return _fused_moe_run(
+        plan,
+        hidden_states,
+        w1,
+        w2,
+        topk_weight,
+        topk_ids,
+        expert_mask,
+        doweight_stage1,
+        w1_scale,
+        w2_scale,
+        a1_scale,
+        a2_scale,
+        num_local_tokens,
+        moe_sorting_dispatch_policy,
+        hidden_pad,
+        intermediate_pad,
+        bias1,
+        bias2,
+        beta,
+        linear_beta,
+        output,
+        herd_topk=herd_topk,
+        herd_routed_scaling_factor=herd_routed_scaling_factor,
+        herd_candidate_ids=herd_candidate_ids,
+        herd_candidate_weights=herd_candidate_weights,
+        presorted_aux=presorted_aux,
+        deterministic=deterministic,
+        _metadata_config_file=_metadata_config_file,
+        _stage1_extra_args=_stage1_extra_args,
+        _stage2_extra_args=_stage2_extra_args,
+        _stage2_override=_stage2_override,
+    )
+
+
+def _fused_moe_run(
+    plan,
+    hidden_states,
+    w1,
+    w2,
+    topk_weight,
+    topk_ids,
+    expert_mask,
+    doweight_stage1,
+    w1_scale,
+    w2_scale,
+    a1_scale,
+    a2_scale,
+    num_local_tokens,
+    moe_sorting_dispatch_policy,
+    hidden_pad,
+    intermediate_pad,
+    bias1,
+    bias2,
+    beta,
+    linear_beta,
+    output,
+    *,
+    herd_topk=0,
+    herd_routed_scaling_factor=1.0,
+    herd_candidate_ids=None,
+    herd_candidate_weights=None,
+    presorted_aux=None,
+    deterministic=False,
+    _metadata_config_file=None,
+    _stage1_extra_args=None,
+    _stage2_extra_args=None,
+    _stage2_override=None,
+):
+    """Sort the routes and run the stages of a fused_moe call resolved to `plan`."""
+    metadata = plan.metadata
+    activation = plan.activation
+    quant_type = plan.quant_type
+    gate_mode = plan.gate_mode
+    swiglu_limit = plan.swiglu_limit
+    silu_limit = plan.silu_limit
+    M = plan.M
+    topk = plan.topk
+    model_dim = plan.model_dim
+    global_E = plan.global_E
+    dtype = plan.dtype
+    q_dtype_a = plan.q_dtype_a
+    q_dtype_w = plan.q_dtype_w
+    isG1U1 = plan.isG1U1
+    block_size_M = plan.block_size_M
+    asm_mode = plan.asm_mode
+    stage1_func = plan.stage1_func
+    need_local_topk_ids = plan.need_local_topk_ids
     sort_m_indices = None
     sort_reverse_sorted = None
     runtime_stage2_reduce = _stage2_runtime_uses_route_reduce(
@@ -1983,7 +2363,7 @@ def _fused_moe_impl(
             # BM16's adaptive sort already emits routes and zeroes the output
             # without quantizing. Keep the Opus crossover for the configured aux
             # pipeline.
-            sorting_ret = moe_sorting(
+            sorting_ret = moev2_sort.moe_sorting(
                 topk_ids,
                 topk_weight,
                 global_E,
@@ -2035,7 +2415,7 @@ def _fused_moe_impl(
             # The reducer overwrites the final output, including masked rows.
             # An empty buffer also suppresses the sort's EP zero-fill.
             sort_output = torch.empty((0, 0), dtype=dtype, device=topk_ids.device)
-        sorting_ret = moe_sorting(
+        sorting_ret = moev2_sort.moe_sorting(
             topk_ids,
             topk_weight,
             global_E,

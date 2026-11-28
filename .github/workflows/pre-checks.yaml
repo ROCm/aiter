@@ -46,6 +46,8 @@ jobs:
         # is what makes this gate possible, so this job is also what protects
         # it -- a third-party import in aiter/plugin turns this red.
         run: python3 -m pytest -q tests/test_plugin.py tests/test_plugin_contracts.py tests/test_plugin_discovery.py tests/test_plugin_overhead.py
+      - name: Check MoE plan signature and host control flow without a GPU
+        run: python3 -m unittest discover -s tests -p test_moe_plan_cache.py -v
 
   black:
     name: Check Code Style with Black

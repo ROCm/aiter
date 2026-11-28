@@ -289,6 +289,13 @@ for file in "${sharded_files[@]}"; do
             fi
             ;;
     esac
+    # Validate cached plans against fresh resolution in MoE correctness runs.
+    # Keep existing timeout/launcher/profile arrays intact, including nested env.
+    case "$file" in
+        op_tests/test_moe*.py|op_tests/test_fhmoe.py|op_tests/test_flydsl_moe*.py|op_tests/flydsl_tests/test_*moe*.py|op_tests/multigpu_tests/test_*moe*.py|tests/test_moe*.py)
+            test_cmd=(env AITER_MOE_PLAN_CHECK=1 "${test_cmd[@]}")
+            ;;
+    esac
     tee_targets=("latest_test.log")
     if [[ "$file" == "op_tests/test_moe_2stage.py" && "${AITER_MOE_2STAGE_FULL_MATRIX:-false}" == "true" ]]; then
         : > full_matrix.log

@@ -19,7 +19,8 @@ TESTS = [
         "test_type": "Accuracy",
         "timeout_minutes": 130,
         "extra_exec_args": "",
-        "test_command": "python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4 --nightly --timeout-per-file 7200",
+        # AITER's explicit PR coverage is independent of upstream nightly rotation.
+        "test_command": "timeout --kill-after=30s 7200s python3 registered/amd/accuracy/mi35x/test_deepseek_r1_mxfp4_eval_mi35x.py TestDeepSeekR1MXFP4EvalMI35x.test_deepseek_r1_mxfp4_accuracy -v",
         "run_on_pr": True,
         "run_on_schedule": True,
     },
@@ -87,7 +88,7 @@ TESTS = [
         "test_type": "Accuracy",
         "timeout_minutes": 150,
         "extra_exec_args": "",
-        "test_command": "python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v32 --nightly --timeout-per-file 7200",
+        "test_command": "timeout --kill-after=30s 7200s python3 registered/amd/accuracy/mi35x/test_deepseek_v32_eval_mi35x.py TestDeepSeekV32EvalMI35x.test_deepseek_v32_accuracy -v",
         "run_on_pr": True,
         "run_on_schedule": True,
     },
@@ -125,6 +126,11 @@ SGLANG_CI_PATCHES = [
         "new": 'HOSTNAME_VALUE="${SGLANG_CI_HOSTNAME_OVERRIDE:-$(hostname)}"',
     },
     {
+        "path": "scripts/ci/amd/amd_ci_exec.sh",
+        "old": 'if [[ "$FIRST_EXIT_CODE" -eq 1 || "$FIRST_EXIT_CODE" -eq 137 || "$FIRST_EXIT_CODE" -eq 255 ]]; then',
+        "new": '# Exit 124: the test exceeded its time budget; offline mode cannot fix it.\nif [[ "$FIRST_EXIT_CODE" -eq 1 || "$FIRST_EXIT_CODE" -eq 124 || "$FIRST_EXIT_CODE" -eq 137 || "$FIRST_EXIT_CODE" -eq 255 ]]; then',
+    },
+    {
         "path": "scripts/ci/amd/amd_ci_install_dependency.sh",
         "old": 'docker cp human-eval "$CI_CONTAINER_NAME":/',
         "new": 'docker cp human-eval "$CI_CONTAINER_NAME":/\n  docker exec "$CI_CONTAINER_NAME" git config --global --add safe.directory /human-eval',
@@ -148,6 +154,11 @@ SGLANG_CI_PATCHES = [
         "path": "test/registered/amd/accuracy/mi35x/test_qwen35_eval_mi35x.py",
         "old": 'QWEN35_MODEL_PATH = "Qwen/Qwen3.5-397B-A17B"',
         "new": 'QWEN35_MODEL_PATH = os.environ.get("QWEN35_MODEL_PATH", "Qwen/Qwen3.5-397B-A17B")',
+    },
+    {
+        "path": "test/registered/amd/accuracy/mi35x/test_deepseek_r1_mxfp4_eval_mi35x.py",
+        "old": 'model_path="amd/DeepSeek-R1-MXFP4-Preview",',
+        "new": 'model_path=os.environ.get("DEEPSEEK_R1_MXFP4_MODEL_PATH", "amd/DeepSeek-R1-MXFP4-Preview"),',
     },
     {
         "path": "test/registered/amd/accuracy/mi35x/test_deepseek_v32_eval_mi35x.py",

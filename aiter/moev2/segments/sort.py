@@ -208,6 +208,15 @@ def _mxfp4_aux_instance_supported(experts, topk, hidden, block_m, zero_init):
     )
 
 
+@functools.lru_cache(maxsize=1024)
+def _moe_sorting_opus_workspace_size(tokens, num_experts, topk, policy, device_id):
+    """`moe_sorting_opus_get_workspace_size`, which is host arithmetic on its
+    arguments (and the device's arch) but costs a full op call per sort."""
+    return aiter.moe_sorting_opus_get_workspace_size(
+        tokens, num_experts, topk, policy, device_id
+    )
+
+
 def _moe_sorting_impl(
     topk_ids,
     topk_weights,
@@ -299,7 +308,7 @@ def _moe_sorting_impl(
         aux_reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
 
     if use_opus:
-        ws_size = aiter.moe_sorting_opus_get_workspace_size(
+        ws_size = _moe_sorting_opus_workspace_size(
             M, num_experts, topk, dispatch_policy, topk_ids.get_device()
         )
         workspace = (
