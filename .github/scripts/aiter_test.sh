@@ -126,7 +126,7 @@ for file in "${sharded_files[@]}"; do
             # have no script entry point; direct execution would only import them.
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
             ;;
-        op_tests/test_moe_cktile_stage1_splitk.py)
+        op_tests/test_moe_cktile_stage1_splitk.py|op_tests/test_moe_quant_shared_mxfp8.py)
             # The standalone benchmark omits selector and expected-error tests.
             # Use pytest to run these alongside the numerical regression cases.
             test_cmd=(timeout 60m python3 -m pytest -q "$file")

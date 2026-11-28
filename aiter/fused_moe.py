@@ -667,6 +667,12 @@ def fused_moe(
     # NVFP4 weights: fp32 1 / weight_global_scale, [E, 2] (gate, up) and [E]
     w1_global_scale: torch.Tensor | None = None,
     w2_global_scale: torch.Tensor | None = None,
+    # (payload, scale): also write hidden_states as MXFP8 for a consumer of the
+    # unrouted rows (e.g. a shared expert run outside this call): row-major
+    # (M, model_dim) E4M3 and (M, model_dim // 32) E8M0, the bytes of
+    # per_1x32_mx_quant_hip(quant_dtype=fp8, scale_type=fp8_e8m0). The gfx1250
+    # grouped path folds it into its A1 quant; elsewhere it is its own launch.
+    mxfp8_copy_out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ):
     """Run fused MoE, dispatching to FHMoE when shared-expert tensors are present.
 
@@ -767,6 +773,10 @@ def fused_moe(
             )
         from aiter.fhmoe import _fhmoe
 
+        if mxfp8_copy_out is not None:
+            from aiter.ops.flydsl.moe_kernels import mxfp8_row_copy
+
+            mxfp8_row_copy(hidden_states, mxfp8_copy_out)
         return _fhmoe(
             hidden_states=hidden_states,
             w1=w1,
@@ -854,6 +864,8 @@ def fused_moe(
         deterministic=deterministic,
         w1_global_scale=w1_global_scale,
         w2_global_scale=w2_global_scale,
+        mxfp8_copy_payload=None if mxfp8_copy_out is None else mxfp8_copy_out[0],
+        mxfp8_copy_scale=None if mxfp8_copy_out is None else mxfp8_copy_out[1],
     )
 
 
@@ -902,6 +914,8 @@ def fused_moe_fake(
     deterministic: bool = False,
     w1_global_scale: torch.Tensor | None = None,
     w2_global_scale: torch.Tensor | None = None,
+    mxfp8_copy_payload: torch.Tensor | None = None,
+    mxfp8_copy_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -1071,8 +1085,10 @@ def _can_use_bf16_g1u1_small_m_direct(
 # `w2_global_scale`, which turn fp4x2 weights from MXFP4 into NVFP4. A v1
 # provider built for 40 arguments cannot bind 42, and a forwarder that binds
 # them would serve an NVFP4 call as MXFP4, so v1 is not superseded.
+# Version 3 adds `mxfp8_copy_payload` / `mxfp8_copy_scale`, two outputs a v2
+# provider would leave unwritten, so v2 is not superseded either.
 @torch_compile_guard(gen_fake=fused_moe_fake)
-@_route(op="fused_moe", version=2)
+@_route(op="fused_moe", version=3)
 def fused_moe_(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -1118,6 +1134,8 @@ def fused_moe_(
     deterministic: bool = False,
     w1_global_scale: torch.Tensor | None = None,
     w2_global_scale: torch.Tensor | None = None,
+    mxfp8_copy_payload: torch.Tensor | None = None,
+    mxfp8_copy_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Route each token to its top-k experts, run both expert projections and
     combine them, weighted by ``topk_weight``.
@@ -1127,7 +1145,10 @@ def fused_moe_(
     Given ``output`` -- contiguous, of exactly that shape, dtype and device, not
     overlapping ``hidden_states`` -- the result is written into it and
     ``output`` itself is returned. Nothing else is written through the
-    arguments, except under the stage-2 scatter below.
+    arguments, except under the stage-2 scatter below and into
+    ``mxfp8_copy_payload`` / ``mxfp8_copy_scale`` when given: ``hidden_states``
+    as MXFP8, the bytes of ``per_1x32_mx_quant_hip(fp8, e8m0)``, which a
+    provider must write too or decline the call.
 
     This is the layer beneath the public ``fused_moe``, whose signature stays
     as callers know it. That function sends a call with shared experts (any
@@ -1238,7 +1259,18 @@ def fused_moe_(
         deterministic=deterministic,
         w1_global_scale=w1_global_scale,
         w2_global_scale=w2_global_scale,
+        mxfp8_copy_out=(
+            None
+            if mxfp8_copy_payload is None and mxfp8_copy_scale is None
+            else _mxfp8_copy_pair(mxfp8_copy_payload, mxfp8_copy_scale)
+        ),
     )
+
+
+def _mxfp8_copy_pair(payload, scale):
+    if payload is None or scale is None:
+        raise ValueError("mxfp8_copy_payload and mxfp8_copy_scale go together")
+    return payload, scale
 
 
 # NOTE: aiter.moev2 (under development, not graduated) keeps a copy of this logic: the
@@ -1283,6 +1315,7 @@ def _fused_moe_impl(
     deterministic: bool = False,
     w1_global_scale: torch.Tensor | None = None,
     w2_global_scale: torch.Tensor | None = None,
+    mxfp8_copy_out: tuple[torch.Tensor, torch.Tensor] | None = None,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -1507,10 +1540,16 @@ def _fused_moe_impl(
             herd_topk=herd_topk,
             herd_routed_scaling_factor=herd_routed_scaling_factor,
             output=output,
+            mxfp8_copy_out=mxfp8_copy_out,
         )
 
     if grouped_a8w4_out is not None:
         return _return_output(grouped_a8w4_out, output)
+    if mxfp8_copy_out is not None:
+        # No grouped A1 quant ran to fold it into.
+        from aiter.ops.flydsl.moe_kernels import mxfp8_row_copy
+
+        mxfp8_row_copy(hidden_states, mxfp8_copy_out)
     if herd_topk and get_gfx() == "gfx1250":
         raise ValueError(
             "gfx1250 HERD needs the grouped MoE path (per_1x32 MXFP4 weights, "

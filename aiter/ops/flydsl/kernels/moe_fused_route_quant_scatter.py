@@ -209,6 +209,70 @@ def _emit_pk8_lane_amax(bf16x8, c):
     return acc
 
 
+# The MXFP8 copy of the source rows (``mxfp8_copy``) seeds each block's amax
+# with aiter::kAmaxFloor (csrc/include/quant_amax_floor.h), so its bytes are
+# per_1x32_mx_quant_hip(quant_dtype=fp8, scale_type=fp8_e8m0)'s.
+_MXFP8_COPY_AMAX_FLOOR = 1e-10
+
+
+def mxfp8_copy_dest(payload_ptr, scale_ptr, row, live, feat_dim: int):
+    """Buffer descriptors for one row of the MXFP8 copy of the source rows.
+
+    The copy is row-major: ``feat_dim`` E4M3 bytes and ``feat_dim // 32`` E8M0
+    bytes per source row. A row that is not ``live`` gets zero-length
+    descriptors, so its stores are dropped by the bounds check, not a branch.
+    """
+    row = fx.Uint64(row)
+    return SimpleNamespace(
+        payload_rsrc=buffer_ops.create_buffer_resource_from_addr(
+            fx.Int64(ptrtoint(payload_ptr)) + row * feat_dim,
+            num_records_bytes=live.select(fx.Int32(feat_dim), fx.Int32(0)),
+        ),
+        scale_rsrc=buffer_ops.create_buffer_resource_from_addr(
+            fx.Int64(ptrtoint(scale_ptr)) + row * (feat_dim // 32),
+            num_records_bytes=live.select(fx.Int32(feat_dim // 32), fx.Int32(0)),
+        ),
+    )
+
+
+def _emit_mxfp8_copy_quant(c, bf16x8, block_amax):
+    """This lane's 8 E4M3 bytes of the MXFP8 copy, and its block's E8M0 code.
+
+    The block amax is the one the routed quant already reduced; only the
+    exponent rule (max 448 instead of 6, floored amax) and the convert differ.
+    """
+    e8m0 = fx.Int32(
+        emit_mx_e8m0_scale(
+            fx.max(block_amax, fx.Float32(_MXFP8_COPY_AMAX_FLOOR)),
+            mode=_ROUND_MODE,
+            dtype=_MxDtype.FP8_E4M3,
+        )
+    )
+    payload = _cvt_scalef32_pk8_fp8_bf16(
+        bf16x8, (e8m0 << c.c23_i32).bitcast(fx.Float32), v2i32_ty=T.vec(2, c.i32)
+    )
+    return payload, e8m0
+
+
+def _emit_mxfp8_copy_stores(c, mx_block, payload, e8m0):
+    """Write one MX block of the MXFP8 copy: 8 B per lane, the E8M0 byte from
+    the block's lead lane (the others' offsets are pushed out of range)."""
+    dst = c.mxfp8_copy
+    buffer_ops.buffer_store(
+        payload,
+        dst.payload_rsrc,
+        mx_block * fx.Int32(32) + c.lane_in_block * c.c_elems_per_lane,
+        offset_is_bytes=True,
+    )
+    buffer_ops.buffer_store(
+        fx.Uint8(e8m0),
+        dst.scale_rsrc,
+        mx_block,
+        mask=c.lane_in_block == c.c0_i32,
+        offset_is_bytes=True,
+    )
+
+
 def _arch_has_native_scaled_cvt(arch: str) -> bool:
     return arch.startswith(_NATIVE_SCALED_CVT_ARCHS)
 
@@ -354,6 +418,9 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
     separate e8m0 row (``c.src_scale_base`` / ``c.src_scale_bytes_per_row``, and
     ``c.feat_bytes_per_row`` sized for the payload, not for bf16): the first pass
     loads what it would otherwise have computed, and the store pass is unchanged.
+
+    ``c.mxfp8_copy`` (from :func:`mxfp8_copy_dest`) also writes the source row
+    as MXFP8 from the same block amax; pk8 quant only.
     """
     i32 = c.i32
     f32 = c.f32
@@ -450,6 +517,16 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
             dtype=i32,
         )
 
+    # The MXFP8 copy's stores go out with the convert when nothing global is
+    # loaded after them (LDS-staged rows): a buffer store the backend cannot
+    # tell apart from the hidden row would hold the next load back. Otherwise
+    # they wait for the store pass with the routed results.
+    mxfp8_copy = getattr(c, "mxfp8_copy", None)
+    mxfp8_copy_inline = mxfp8_copy is not None and hidden_lds_load is not None
+    if const_expr(mxfp8_copy is not None):
+        assert c.use_pk8 and not prequantized, "MXFP8 copy needs the pk8 quant"
+    mxfp8_copy_results = []
+
     quant_results = []
     for it in range_constexpr(c.block_iters):
         if const_expr(chunk_prefetch is not None and it % iters_per_chunk == 0):
@@ -497,6 +574,13 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
             for dist in c.amax_shuffle_dists:
                 peer_amax = block_amax.shuffle_xor(fx.Int32(dist), c.c_wave)
                 block_amax = fx.max(block_amax, peer_amax)
+
+            if const_expr(mxfp8_copy is not None):
+                copy_payload, copy_e8m0 = _emit_mxfp8_copy_quant(c, bf16x8, block_amax)
+                if const_expr(mxfp8_copy_inline):
+                    _emit_mxfp8_copy_stores(c, mx_block, copy_payload, copy_e8m0)
+                else:
+                    mxfp8_copy_results.append((mx_block, copy_payload, copy_e8m0))
 
             e8m0_scale = fx.Int32(
                 emit_mx_e8m0_scale(block_amax, mode=_ROUND_MODE, dtype=c.mx_dtype)
@@ -592,6 +676,8 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
     # row in ``c.dests``.
     for mx_block, payload_val, e8m0_scale in quant_results:
         _emit_quant_result_stores(c, dst_payload, mx_block, payload_val, e8m0_scale)
+    for mx_block, copy_payload, copy_e8m0 in mxfp8_copy_results:
+        _emit_mxfp8_copy_stores(c, mx_block, copy_payload, copy_e8m0)
 
 
 def _emit_quant_result_stores(c, dst_payload, mx_block, payload_val, e8m0_scale):
@@ -1678,6 +1764,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     fuse_ep_psum: bool = False,
     row_major_scale: bool = False,
     payload_preshuffled: bool = False,
+    mxfp8_copy: bool = False,
 ):
     """Route-indexed grouped quant+preshuffle.
 
@@ -1695,8 +1782,25 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     the scale preshuffle and drops only the quant -- the preshuffle cannot move
     to the sender, because its destination is a function of the grouped row THIS
     rank assigns, which no sender knows.
+
+    ``mxfp8_copy`` (bf16 source rows, ``source_topk`` > 0): the launch takes two
+    more pointers and each source row's first route also writes that row as
+    MXFP8, as in :func:`build_moe_token_multidest_quant_module` -- whether or
+    not the route itself has a grouped row.
     """
     L = _quant_layout(feat_dim, quant_mode, wmma_rep)
+    if mxfp8_copy and (
+        source_topk <= 0
+        or prequantized
+        or remap_rows
+        or fuse_ep_psum
+        or row_major_scale
+        or payload_preshuffled
+    ):
+        raise ValueError(
+            "mxfp8_copy quantizes bf16 source rows: it needs source_topk and "
+            "takes no prequantized, remap, EP psum, row-major or A-preshuffle mode"
+        )
     if payload_preshuffled and (quant_mode != "fp4" or feat_dim % 128):
         raise ValueError("preshuffled payload requires MXFP4 and K divisible by 128")
     if not L.use_pk8:
@@ -1759,10 +1863,12 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         f"moe_fused_quant_preshuffle_routeks_fd{feat_dim}_r{wmma_rep}"
         f"_{quant_mode}_{L.native_tag}_{source_tag}{remap_tag}{psum_tag}{ksplit_tag}"
         f"{prequant_tag}{rm_tag}{'_apre' if payload_preshuffled else ''}"
+        f"{'_mx8cp' if mxfp8_copy else ''}"
     )
 
-    @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
-    def fused_kernel(
+    # Shared by both kernel signatures below; inlined into the one built.
+    @flyc.jit
+    def routeks_body(
         grouped_in: fx.Pointer,  # flat grouped activations
         grouped_payload: fx.Pointer,
         grouped_scale: fx.Pointer,
@@ -1782,6 +1888,8 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         ep_topk: Int32,
         max_tok: Int32,
         slot_stride: Int32,
+        copy_payload: fx.Pointer = None,
+        copy_scale: fx.Pointer = None,
     ):
         """Write masked or contiguous ``(Mtile, K//128, wmma_rep, 16, 4)`` scales."""
         i32 = T.i32
@@ -1893,7 +2001,19 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
             # an SGPR is what makes the per-row destination descriptor uniform.
             row_raw = fx.Int32(buf_scalar_load(rows_t, route))
         row_is_mapped = row_raw >= 0
-        if row_is_mapped:
+        quant_route = row_is_mapped
+        if const_expr(mxfp8_copy):
+            # A source row's first route writes its MXFP8 copy, mapped or not.
+            if const_expr(source_topk_is_pow2):
+                copy_writer = route_in_range & (
+                    (fx.Uint32(route) & fx.Uint32(source_topk - 1)) == c0_i32
+                )
+            else:
+                copy_writer = route_in_range & (
+                    fx.Uint32(route) % fx.Uint32(c_source_topk) == c0_i32
+                )
+            quant_route = row_is_mapped | copy_writer
+        if quant_route:
             row = fx.Uint32(row_raw)
             if const_expr(fuse_ep_psum):
                 m = fx.Uint32(route_max_m)
@@ -2013,6 +2133,16 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                 wmma_rep=wmma_rep,
                 row_major_scale=row_major_scale,
             )
+            if const_expr(mxfp8_copy):
+                qc.mxfp8_copy = mxfp8_copy_dest(
+                    copy_payload, copy_scale, feat_row_i32, copy_writer, feat_dim
+                )
+                # An unmapped route is here only for the copy: its own row's
+                # payload and scale stores are switched off.
+                qc.payload_num_records = row_is_mapped.select(
+                    fx.Int32(payload_bytes_per_row), c0_i32
+                )
+                qc.is_block_lead = is_block_lead & row_is_mapped
             if const_expr(ksplit):
                 k_group_val = fx.Uint32(fx.block_idx.y)
                 _emit_quant_one_k_group(qc, k_group_val)
@@ -2023,57 +2153,205 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
 
     _grid_y_dim = block_iters if ksplit else 1
 
-    @flyc.jit
-    def launch_fused(
-        grouped_in: fx.Pointer,
-        grouped_payload: fx.Pointer,
-        grouped_scale: fx.Pointer,
-        topids_to_rows: fx.Pointer,
-        row_starts: fx.Pointer,
-        route_max_m: fx.Int32,
-        numel: fx.Int32,
-        num_valid_routes: fx.Pointer,
-        src_scale: fx.Pointer,
-        masked_m: fx.Pointer,
-        psum_out: fx.Pointer,
-        gather_w: fx.Pointer,
-        tis: fx.Pointer,
-        ep_rowmap: fx.Pointer,
-        experts: fx.Int32,
-        tile_m: fx.Int32,
-        ep_topk: fx.Int32,
-        max_tok: fx.Int32,
-        slot_stride: fx.Int32,
-        grid_route_blocks: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),  # noqa: B008
-    ):
-        grid_x = fx.Int64(grid_route_blocks)
-        grid_y = fx.Int64(_grid_y_dim)
-        fused_kernel(
-            grouped_in,
-            grouped_payload,
-            grouped_scale,
-            topids_to_rows,
-            row_starts,
-            route_max_m,
-            numel,
-            num_valid_routes,
-            src_scale,
-            masked_m,
-            psum_out,
-            gather_w,
-            tis,
-            ep_rowmap,
-            experts,
-            tile_m,
-            ep_topk,
-            max_tok,
-            slot_stride,
-        ).launch(
-            grid=(grid_x, grid_y, 1),
-            block=(BLOCK_THREADS, 1, 1),
-            stream=stream,
-        )
+    if mxfp8_copy:
+
+        @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
+        def fused_kernel(
+            grouped_in: fx.Pointer,
+            grouped_payload: fx.Pointer,
+            grouped_scale: fx.Pointer,
+            topids_to_rows: fx.Pointer,
+            row_starts: fx.Pointer,
+            route_max_m: Int32,
+            numel: Int32,
+            num_valid_routes: fx.Pointer,
+            src_scale: fx.Pointer,
+            masked_m: fx.Pointer,
+            psum_out: fx.Pointer,
+            gather_w: fx.Pointer,
+            tis: fx.Pointer,
+            ep_rowmap: fx.Pointer,
+            experts: Int32,
+            tile_m: Int32,
+            ep_topk: Int32,
+            max_tok: Int32,
+            slot_stride: Int32,
+            copy_payload: fx.Pointer,
+            copy_scale: fx.Pointer,
+        ):
+            routeks_body(
+                grouped_in,
+                grouped_payload,
+                grouped_scale,
+                topids_to_rows,
+                row_starts,
+                route_max_m,
+                numel,
+                num_valid_routes,
+                src_scale,
+                masked_m,
+                psum_out,
+                gather_w,
+                tis,
+                ep_rowmap,
+                experts,
+                tile_m,
+                ep_topk,
+                max_tok,
+                slot_stride,
+                copy_payload,
+                copy_scale,
+            )
+
+        @flyc.jit
+        def launch_fused(
+            grouped_in: fx.Pointer,
+            grouped_payload: fx.Pointer,
+            grouped_scale: fx.Pointer,
+            topids_to_rows: fx.Pointer,
+            row_starts: fx.Pointer,
+            route_max_m: fx.Int32,
+            numel: fx.Int32,
+            num_valid_routes: fx.Pointer,
+            src_scale: fx.Pointer,
+            masked_m: fx.Pointer,
+            psum_out: fx.Pointer,
+            gather_w: fx.Pointer,
+            tis: fx.Pointer,
+            ep_rowmap: fx.Pointer,
+            experts: fx.Int32,
+            tile_m: fx.Int32,
+            ep_topk: fx.Int32,
+            max_tok: fx.Int32,
+            slot_stride: fx.Int32,
+            grid_route_blocks: fx.Int32,
+            copy_payload: fx.Pointer,
+            copy_scale: fx.Pointer,
+            stream: fx.Stream = fx.Stream(None),  # noqa: B008
+        ):
+            fused_kernel(
+                grouped_in,
+                grouped_payload,
+                grouped_scale,
+                topids_to_rows,
+                row_starts,
+                route_max_m,
+                numel,
+                num_valid_routes,
+                src_scale,
+                masked_m,
+                psum_out,
+                gather_w,
+                tis,
+                ep_rowmap,
+                experts,
+                tile_m,
+                ep_topk,
+                max_tok,
+                slot_stride,
+                copy_payload,
+                copy_scale,
+            ).launch(
+                grid=(fx.Int64(grid_route_blocks), fx.Int64(_grid_y_dim), 1),
+                block=(BLOCK_THREADS, 1, 1),
+                stream=stream,
+            )
+
+    else:
+
+        @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
+        def fused_kernel(
+            grouped_in: fx.Pointer,
+            grouped_payload: fx.Pointer,
+            grouped_scale: fx.Pointer,
+            topids_to_rows: fx.Pointer,
+            row_starts: fx.Pointer,
+            route_max_m: Int32,
+            numel: Int32,
+            num_valid_routes: fx.Pointer,
+            src_scale: fx.Pointer,
+            masked_m: fx.Pointer,
+            psum_out: fx.Pointer,
+            gather_w: fx.Pointer,
+            tis: fx.Pointer,
+            ep_rowmap: fx.Pointer,
+            experts: Int32,
+            tile_m: Int32,
+            ep_topk: Int32,
+            max_tok: Int32,
+            slot_stride: Int32,
+        ):
+            routeks_body(
+                grouped_in,
+                grouped_payload,
+                grouped_scale,
+                topids_to_rows,
+                row_starts,
+                route_max_m,
+                numel,
+                num_valid_routes,
+                src_scale,
+                masked_m,
+                psum_out,
+                gather_w,
+                tis,
+                ep_rowmap,
+                experts,
+                tile_m,
+                ep_topk,
+                max_tok,
+                slot_stride,
+            )
+
+        @flyc.jit
+        def launch_fused(
+            grouped_in: fx.Pointer,
+            grouped_payload: fx.Pointer,
+            grouped_scale: fx.Pointer,
+            topids_to_rows: fx.Pointer,
+            row_starts: fx.Pointer,
+            route_max_m: fx.Int32,
+            numel: fx.Int32,
+            num_valid_routes: fx.Pointer,
+            src_scale: fx.Pointer,
+            masked_m: fx.Pointer,
+            psum_out: fx.Pointer,
+            gather_w: fx.Pointer,
+            tis: fx.Pointer,
+            ep_rowmap: fx.Pointer,
+            experts: fx.Int32,
+            tile_m: fx.Int32,
+            ep_topk: fx.Int32,
+            max_tok: fx.Int32,
+            slot_stride: fx.Int32,
+            grid_route_blocks: fx.Int32,
+            stream: fx.Stream = fx.Stream(None),  # noqa: B008
+        ):
+            fused_kernel(
+                grouped_in,
+                grouped_payload,
+                grouped_scale,
+                topids_to_rows,
+                row_starts,
+                route_max_m,
+                numel,
+                num_valid_routes,
+                src_scale,
+                masked_m,
+                psum_out,
+                gather_w,
+                tis,
+                ep_rowmap,
+                experts,
+                tile_m,
+                ep_topk,
+                max_tok,
+                slot_stride,
+            ).launch(
+                grid=(fx.Int64(grid_route_blocks), fx.Int64(_grid_y_dim), 1),
+                block=(BLOCK_THREADS, 1, 1),
+                stream=stream,
+            )
 
     launch_fused.compile_hints = {
         "llvm_options": {
@@ -2173,6 +2451,7 @@ def build_moe_token_multidest_quant_module(
     quant_mode: str = "fp4",
     tdm_hidden_chunks: int = _TOKEN_MULTIDEST_TDM_CHUNKS,
     ksplit: int = 1,
+    mxfp8_copy: bool = False,
 ):
     """Quantize each token once and scatter the result to its ``topk`` routed rows.
 
@@ -2181,6 +2460,12 @@ def build_moe_token_multidest_quant_module(
     every destination. What it saves therefore grows with ``topk``, while what
     it costs -- one buffer descriptor per destination held live across the store
     pass -- grows with it too.
+
+    ``mxfp8_copy``: the launch takes two more pointers and also writes every
+    token's row as MXFP8 (row-major E4M3 + E8M0, the bytes of
+    ``per_1x32_mx_quant_hip(quant_dtype=fp8, scale_type=fp8_e8m0)``) from the
+    block amax it already reduced, for a consumer of the unrouted rows such as
+    a shared expert. Without it the build is the one it always was.
     """
     L = _quant_layout(feat_dim, quant_mode, wmma_rep)
     if not L.use_pk8:
@@ -2231,15 +2516,20 @@ def build_moe_token_multidest_quant_module(
         f"{'_scpk' if scale_pack_dwords else ''}"
         f"{f'_hidtdm{tdm_hidden_chunks}' if tdm_hidden_chunks else ''}"
         f"{f'_ks{ksplit}' if ksplit > 1 else ''}"
+        f"{'_mx8cp' if mxfp8_copy else ''}"
     )
 
-    @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
-    def token_multidest_kernel(
+    # The body is shared by both kernel signatures below; it is inlined into
+    # whichever one is built.
+    @flyc.jit
+    def token_multidest_body(
         hidden: fx.Pointer,
         grouped_payload: fx.Pointer,
         grouped_scale: fx.Pointer,
         topids_to_rows: fx.Pointer,
         token_num: Int32,
+        copy_payload: fx.Pointer = None,
+        copy_scale: fx.Pointer = None,
     ):
         i32 = T.i32
         f32 = T.f32
@@ -2425,29 +2715,100 @@ def build_moe_token_multidest_quant_module(
                     else None
                 ),
             )
+            if const_expr(mxfp8_copy):
+                # Every valid token, live routes or not.
+                qc.mxfp8_copy = mxfp8_copy_dest(
+                    copy_payload, copy_scale, token_eff, valid, feat_dim
+                )
             _emit_quant_block_loop(qc)
 
-    @flyc.jit
-    def launch_token_multidest(
-        hidden: fx.Pointer,
-        grouped_payload: fx.Pointer,
-        grouped_scale: fx.Pointer,
-        topids_to_rows: fx.Pointer,
-        token_num: fx.Int32,
-        grid_blocks: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),  # noqa: B008
-    ):
-        token_multidest_kernel(
-            hidden, grouped_payload, grouped_scale, topids_to_rows, token_num
-        ).launch(
-            grid=(
-                fx.Int64(grid_blocks),
-                fx.Int64(ksplit),
-                1,
-            ),
-            block=(BLOCK_THREADS, 1, 1),
-            stream=stream,
-        )
+    if mxfp8_copy:
+
+        @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
+        def token_multidest_kernel(
+            hidden: fx.Pointer,
+            grouped_payload: fx.Pointer,
+            grouped_scale: fx.Pointer,
+            topids_to_rows: fx.Pointer,
+            token_num: Int32,
+            copy_payload: fx.Pointer,
+            copy_scale: fx.Pointer,
+        ):
+            token_multidest_body(
+                hidden,
+                grouped_payload,
+                grouped_scale,
+                topids_to_rows,
+                token_num,
+                copy_payload,
+                copy_scale,
+            )
+
+        @flyc.jit
+        def launch_token_multidest(
+            hidden: fx.Pointer,
+            grouped_payload: fx.Pointer,
+            grouped_scale: fx.Pointer,
+            topids_to_rows: fx.Pointer,
+            token_num: fx.Int32,
+            grid_blocks: fx.Int32,
+            copy_payload: fx.Pointer,
+            copy_scale: fx.Pointer,
+            stream: fx.Stream = fx.Stream(None),  # noqa: B008
+        ):
+            token_multidest_kernel(
+                hidden,
+                grouped_payload,
+                grouped_scale,
+                topids_to_rows,
+                token_num,
+                copy_payload,
+                copy_scale,
+            ).launch(
+                grid=(fx.Int64(grid_blocks), fx.Int64(ksplit), 1),
+                block=(BLOCK_THREADS, 1, 1),
+                stream=stream,
+            )
+
+    else:
+
+        @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
+        def token_multidest_kernel(
+            hidden: fx.Pointer,
+            grouped_payload: fx.Pointer,
+            grouped_scale: fx.Pointer,
+            topids_to_rows: fx.Pointer,
+            token_num: Int32,
+        ):
+            token_multidest_body(
+                hidden,
+                grouped_payload,
+                grouped_scale,
+                topids_to_rows,
+                token_num,
+            )
+
+        @flyc.jit
+        def launch_token_multidest(
+            hidden: fx.Pointer,
+            grouped_payload: fx.Pointer,
+            grouped_scale: fx.Pointer,
+            topids_to_rows: fx.Pointer,
+            token_num: fx.Int32,
+            grid_blocks: fx.Int32,
+            stream: fx.Stream = fx.Stream(None),  # noqa: B008
+        ):
+            token_multidest_kernel(
+                hidden,
+                grouped_payload,
+                grouped_scale,
+                topids_to_rows,
+                token_num,
+            ).launch(
+                grid=(fx.Int64(grid_blocks), fx.Int64(ksplit), 1),
+                block=(BLOCK_THREADS, 1, 1),
+                stream=stream,
+            )
 
     launch_token_multidest.compile_hints = {
         "llvm_options": {
@@ -2496,6 +2857,7 @@ def build_moe_token_multidest_compact_quant_module(
     topk: int,
     quant_mode: str = "fp4",
     tdm_hidden_chunks: int = _TOKEN_MULTIDEST_TDM_CHUNKS,
+    mxfp8_copy: bool = False,
 ):
     """Token-multidest quant writing a COMPACT per-token e8m0 scale.
 
@@ -2543,10 +2905,13 @@ def build_moe_token_multidest_compact_quant_module(
         f"_{quant_mode}_{L.native_tag}"
         f"{f'_hidtdm{tdm_hidden_chunks}' if tdm_hidden_chunks else ''}"
         "_quant"
+        f"{'_mx8cp' if mxfp8_copy else ''}"
     )
 
-    @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
-    def compact_quant_kernel(
+    # Shared by both kernel signatures below (``mxfp8_copy`` as in
+    # build_moe_token_multidest_quant_module); inlined into the one built.
+    @flyc.jit
+    def compact_quant_body(
         hidden: fx.Pointer,
         grouped_payload: fx.Pointer,
         compact_scale_buf: fx.Pointer,
@@ -2554,6 +2919,8 @@ def build_moe_token_multidest_compact_quant_module(
         row_to_token: fx.Pointer,
         token_num: Int32,
         grid_blocks: Int32,
+        copy_payload: fx.Pointer = None,
+        copy_scale: fx.Pointer = None,
     ):
         i32 = T.i32
         f32 = T.f32
@@ -2731,36 +3098,117 @@ def build_moe_token_multidest_compact_quant_module(
                 hidden_slot_bytes=hslot,
                 mx_group_base=None,
             )
+            if const_expr(mxfp8_copy):
+                qc.mxfp8_copy = mxfp8_copy_dest(
+                    copy_payload, copy_scale, token_eff, valid, feat_dim
+                )
             _emit_quant_block_loop(qc)
 
         step = fx.Uint32(grid_blocks) * c_wpb
         for token0 in range(bid * c_wpb, fx.Uint32(token_num), step):
             _quant_token_group(token0)
 
-    @flyc.jit
-    def launch_compact_quant(
-        hidden: fx.Pointer,
-        grouped_payload: fx.Pointer,
-        compact_scale_buf: fx.Pointer,
-        topids_to_rows: fx.Pointer,
-        row_to_token: fx.Pointer,
-        token_num: fx.Int32,
-        grid_blocks: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),  # noqa: B008
-    ):
-        compact_quant_kernel(
-            hidden,
-            grouped_payload,
-            compact_scale_buf,
-            topids_to_rows,
-            row_to_token,
-            token_num,
-            grid_blocks,
-        ).launch(
-            grid=(fx.Int64(grid_blocks), 1, 1),
-            block=(BLOCK_THREADS, 1, 1),
-            stream=stream,
-        )
+    if mxfp8_copy:
+
+        @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
+        def compact_quant_kernel(
+            hidden: fx.Pointer,
+            grouped_payload: fx.Pointer,
+            compact_scale_buf: fx.Pointer,
+            topids_to_rows: fx.Pointer,
+            row_to_token: fx.Pointer,
+            token_num: Int32,
+            grid_blocks: Int32,
+            copy_payload: fx.Pointer,
+            copy_scale: fx.Pointer,
+        ):
+            compact_quant_body(
+                hidden,
+                grouped_payload,
+                compact_scale_buf,
+                topids_to_rows,
+                row_to_token,
+                token_num,
+                grid_blocks,
+                copy_payload,
+                copy_scale,
+            )
+
+        @flyc.jit
+        def launch_compact_quant(
+            hidden: fx.Pointer,
+            grouped_payload: fx.Pointer,
+            compact_scale_buf: fx.Pointer,
+            topids_to_rows: fx.Pointer,
+            row_to_token: fx.Pointer,
+            token_num: fx.Int32,
+            grid_blocks: fx.Int32,
+            copy_payload: fx.Pointer,
+            copy_scale: fx.Pointer,
+            stream: fx.Stream = fx.Stream(None),  # noqa: B008
+        ):
+            compact_quant_kernel(
+                hidden,
+                grouped_payload,
+                compact_scale_buf,
+                topids_to_rows,
+                row_to_token,
+                token_num,
+                grid_blocks,
+                copy_payload,
+                copy_scale,
+            ).launch(
+                grid=(fx.Int64(grid_blocks), 1, 1),
+                block=(BLOCK_THREADS, 1, 1),
+                stream=stream,
+            )
+
+    else:
+
+        @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
+        def compact_quant_kernel(
+            hidden: fx.Pointer,
+            grouped_payload: fx.Pointer,
+            compact_scale_buf: fx.Pointer,
+            topids_to_rows: fx.Pointer,
+            row_to_token: fx.Pointer,
+            token_num: Int32,
+            grid_blocks: Int32,
+        ):
+            compact_quant_body(
+                hidden,
+                grouped_payload,
+                compact_scale_buf,
+                topids_to_rows,
+                row_to_token,
+                token_num,
+                grid_blocks,
+            )
+
+        @flyc.jit
+        def launch_compact_quant(
+            hidden: fx.Pointer,
+            grouped_payload: fx.Pointer,
+            compact_scale_buf: fx.Pointer,
+            topids_to_rows: fx.Pointer,
+            row_to_token: fx.Pointer,
+            token_num: fx.Int32,
+            grid_blocks: fx.Int32,
+            stream: fx.Stream = fx.Stream(None),  # noqa: B008
+        ):
+            compact_quant_kernel(
+                hidden,
+                grouped_payload,
+                compact_scale_buf,
+                topids_to_rows,
+                row_to_token,
+                token_num,
+                grid_blocks,
+            ).launch(
+                grid=(fx.Int64(grid_blocks), 1, 1),
+                block=(BLOCK_THREADS, 1, 1),
+                stream=stream,
+            )
 
     launch_compact_quant.compile_hints = {
         "llvm_options": {

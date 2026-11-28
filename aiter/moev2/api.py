@@ -140,6 +140,7 @@ def op_call(call) -> dict | None:
     scatter = call["stage2_scatter"]
     enable_ep_scatter = scatter is not None
     quant_type_a = call["quant_type_a"]
+    copy_out = call["mxfp8_copy_out"]
     return {
         "hidden_states": call["hidden_states"],
         "w1": call["w1"],
@@ -189,6 +190,8 @@ def op_call(call) -> dict | None:
         "deterministic": call["deterministic"],
         "w1_global_scale": call["w1_global_scale"],
         "w2_global_scale": call["w2_global_scale"],
+        "mxfp8_copy_payload": None if copy_out is None else copy_out[0],
+        "mxfp8_copy_scale": None if copy_out is None else copy_out[1],
     }
 
 
@@ -236,6 +239,7 @@ def fused_moe(
     deterministic: bool = False,
     w1_global_scale: torch.Tensor | None = None,
     w2_global_scale: torch.Tensor | None = None,
+    mxfp8_copy_out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ):
     """Same contract as `aiter.fused_moe.fused_moe`, served by aiter.moev2."""
     call = dict(locals())

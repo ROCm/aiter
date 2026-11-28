@@ -829,6 +829,7 @@ def _grouped_a8w4_tdm_moe(
     herd_topk=0,
     herd_routed_scaling_factor=1.0,
     output=None,
+    mxfp8_copy_out=None,
 ):
     import functools
 
@@ -1335,6 +1336,10 @@ def _grouped_a8w4_tdm_moe(
     _a1_wire_stride = (
         int(stage2_scatter.compact_wire_row_stride) if _compact and _prequantized else 0
     )
+    if mxfp8_copy_out is not None and (
+        (_compact and _prequantized) or _fuse_ep_route_quant
+    ):
+        raise ValueError("mxfp8_copy_out quantizes bf16 rows, not a payload")
     if _compact and _prequantized:
         a1_payload = hidden_states[:contiguous_m].reshape(1, contiguous_m, _src_width)
         a1_scale = src_a1_scale
@@ -1399,6 +1404,7 @@ def _grouped_a8w4_tdm_moe(
             clear_counter=(
                 _g2l_counter if _apre_route_fold and _direct_ep_mask else None
             ),
+            mxfp8_copy_out=mxfp8_copy_out,
         )
         if _compact_ascale:
             a1_scale = flydsl_moe_scatter_preshuffle_scale(
@@ -1842,6 +1848,7 @@ def grouped_gemm_gfx1250_a8w4(
     herd_topk: int = 0,
     herd_routed_scaling_factor: float = 1.0,
     output: torch.Tensor | None = None,
+    mxfp8_copy_out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ):
     """Grouped a8w4/a4w4 MoE on the TDM batched GEMM (gfx1250).
 
@@ -1852,7 +1859,9 @@ def grouped_gemm_gfx1250_a8w4(
 
     Returns ``None`` when the shape/dtype/arch is not served here, so the caller
     can fall back to the generic MoE. ``output``, a [token_num, model_dim]
-    buffer, receives the result in place of a fresh tensor.
+    buffer, receives the result in place of a fresh tensor. ``mxfp8_copy_out``
+    is filled as in ``flydsl_moe_fused_quant_preshuffle`` when this path runs;
+    on ``None`` it is the caller's.
     """
 
     # Read once per call (still honours a runtime change of the variable): when
@@ -2212,6 +2221,7 @@ def grouped_gemm_gfx1250_a8w4(
             herd_topk=herd_topk,
             herd_routed_scaling_factor=herd_routed_scaling_factor,
             output=output,
+            mxfp8_copy_out=mxfp8_copy_out,
             **_tdm_kw,
         )
 
