@@ -9,6 +9,7 @@ Returns (N, K, Do, Ho, Wo) bf16. Layouts NCDHW/NDHWC are independent.
 """
 
 import functools
+import itertools
 import math
 import os
 import weakref
@@ -484,12 +485,13 @@ def _tuned_rows_by_layer():
     return by_layer
 
 
-def _borrow_tuned_tile(dev, key):
+def _borrow_tuned_tile(dev, key, cu_num=None):
     """Nearest same-layer tuned tile by npq, or None. Does not borrow splitK.
 
     Two bars, both of which drop back to ``_pick_tile``: the row has to be
     within ``_BORROW_NPQ_RATIO`` of the npq being served, and its tile has to
-    still fill the device there (``_tile_fills_device``).
+    still fill the device there (``_tile_fills_device``). cu_num is the CU
+    count of the device and defaults to the CU count of dev.
     """
     rows = _tuned_rows_by_layer().get(dev + _layer_key(key))
     if not rows:
@@ -501,28 +503,45 @@ def _borrow_tuned_tile(dev, key):
     if not npq or not 1 / _BORROW_NPQ_RATIO <= want / npq <= _BORROW_NPQ_RATIO:
         return None
     f = dict(zip(TUNED_KEY_COLUMNS, key))
-    if not _tile_fills_device(want, f["K"], f["groups"], hit[0], dev[1]):
+    cu_num = dev[1] if cu_num is None else cu_num
+    if not _tile_fills_device(want, f["K"], f["groups"], hit[0], cu_num):
         return None
     return (hit[0], hit[1], None, *hit[3:])
 
 
 def _lookup_tuned_tile(key, device):
-    """Tuned (tile, wgm, splitk, block_rows, pipeline) for this device, or a borrowed same-layer row."""
-    del device
+    """Tuned (tile, wgm, splitk, block_rows, pipeline) for this device, or a borrowed same-layer row.
+
+    The exact rows of the CU counts of get_tuned_cu_nums() of device come
+    first, then the borrowed rows of these CU counts.
+    """
     if key is None:
         return None
     try:
-        from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+        from aiter.jit.utils.chip_info import (
+            get_gfx,
+            get_tuned_cu_nums,
+            log_tuned_cu_fallback,
+        )
 
-        dev = (get_gfx(), get_cu_num())
+        cu_nums = get_tuned_cu_nums(device=getattr(device, "index", None))
+        dev = (get_gfx(), cu_nums[0])
     except Exception:  # noqa: BLE001  same: degrade to the heuristic
         return None
     table = _load_tuned_table()
-    hit = table.get((*dev, *key))
-    borrowed = hit is None
-    if borrowed:
-        hit = _borrow_tuned_tile(dev, key)
-    _log_tuned_lookup(table, dev, key, hit, borrowed=borrowed)
+    for borrowed, tuned_cu in itertools.product((False, True), cu_nums):
+        tuned_dev = (dev[0], tuned_cu)
+        if borrowed:
+            hit = _borrow_tuned_tile(tuned_dev, key, dev[1])
+        else:
+            hit = table.get((*tuned_dev, *key))
+        if hit is not None:
+            if tuned_cu != dev[1]:
+                log_tuned_cu_fallback("conv3d_implicit", *dev, tuned_cu)
+            break
+    _log_tuned_lookup(
+        table, dev if hit is None else tuned_dev, key, hit, borrowed=borrowed
+    )
     return hit
 
 
