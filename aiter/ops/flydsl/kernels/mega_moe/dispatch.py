@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 FlyDSL Project Contributors
+# Copyright (C) 2025-2026 FlyDSL Project Contributors
 # ruff: noqa: B023, SIM102
 """Compact dispatch path for MegaMoE v2 stage1."""
 
@@ -68,6 +68,15 @@ class DispatchSlot(IntEnum):
     P2P_TILE_EXPECTED = 50
     FANOUT_PAIR_CONFIG = 51
     BLOCK_HIST = 52
+    # Fused fixed-slot GEMM2 (Stage1Config.fused_g2): Stage1's
+    # output and its scales, the local route weights, the peers' combine
+    # inputs, and the GEMM2 state (fused_stage2_state_index).  W2 changes per
+    # layer and is a launch argument.
+    S1_OUT = 53
+    S1_OUT_SCALE = 54
+    WEIGHT = 55
+    P2P_COMB_INP = 56
+    G2_STATE = 57
 
 
 DISPATCH_TABLE_SIZE = max(DispatchSlot) + 1
@@ -431,9 +440,24 @@ def emit_direct_fixed_slot_payload(
     *, num_waves, fz_npes, fz_epr, fz_k, fz_cap, fz_mtpr, fz_rank, fz_total_experts, fz_nbytes, fz_n_i32,
     fz_scale_n_i32, fz_enable_scales, addr_disp, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc,
     i32_cur_tok, dispatch_blocks, producer_slot, parity, expected,
+    early_tiles=False, tile_state_stride=0, ready_lds_addr=None, ready_lds_bytes=0,
+    light_release=False,
 ):
 # fmt: on
-    """Allocate and publish routes directly into destination fixed slots."""
+    """Allocate and publish routes directly into destination fixed slots.
+
+    With ``early_tiles`` every published row is also counted into its
+    destination's TILE_READY[parity][local_expert * npes + source] entry.  The
+    rows are listed in LDS at ``ready_lds_addr`` and counted after the CTA's
+    closing release, so the counts cost one fence per CTA as before.  Keying by
+    source keeps each counter at a few atomics; a per-tile counter would take
+    one from every source's rows, as deep a chain as RUNNING's.
+
+    With ``light_release`` (mori's uncached heap) the CTA's rows, scales,
+    weights and srcmap entries are performed in the destination's memory once
+    vmcnt drains, so the counts and done flags follow that drain without a
+    system release, whose L2 writeback would stall the GEMM running beside it.
+    """
     dispatch_table = ptr_buf_tensor(addr_disp, fx.Int64)
 
     def dp(i):
@@ -467,6 +491,17 @@ def emit_direct_fixed_slot_payload(
     srcmap_table = ptr_buf_tensor(p_sm, fx.Int64)
     running_table = ptr_buf_tensor(p_running, fx.Int64)
     source_done_table = ptr_buf_tensor(p_source_done, fx.Int64)
+
+    if const_expr(early_tiles):
+        assert tile_state_stride >= fz_epr * fz_npes and fz_npes <= 128
+        routes_per_wave = -(-(fz_mtpr * fz_k) // (producers_per_group * num_waves))
+        assert (1 + num_waves * routes_per_wave) * 4 <= ready_lds_bytes
+        tile_ready_table = ptr_buf_tensor(dp(DispatchSlot.P2P_TILE_READY), fx.Int64)
+        tile_ready_offset = fx.Int64(parity) * fx.Int64(tile_state_stride * 4)
+        ready_rows_addr = ready_lds_addr + fx.Int64(4)
+        if tid == fx.Int32(0):
+            comm_ops.store_i32_lds(ready_lds_addr, fx.Int32(0))
+        fx.barrier()
 
     for wk in range(route, route_limit, route_stride):
         source_token = wk // fx.Int32(fz_k)
@@ -532,10 +567,38 @@ def emit_direct_fixed_slot_payload(
                 ptr_buf_tensor(remote_weights, fx.Int32)[payload_row] = weight_bits
                 ptr_buf_tensor(remote_srcmap, fx.Int32)[payload_row] = source_encoding
 
+            if const_expr(early_tiles):
+                if lane == fx.Int32(0):
+                    ready_row = fx.Int32(
+                        comm_ops.atomic_add_lds(ready_lds_addr, fx.Int32(1))
+                    )
+                    comm_ops.store_i32_lds(
+                        ready_rows_addr + fx.Int64(ready_row) * 4,
+                        (destination << fx.Int32(24)) | local_expert,
+                    )
+
     fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
     fx.barrier()
+    if const_expr(early_tiles):
+        # The destination runs a tile once its count reaches the planned row
+        # count, so every listed row must be visible before its count moves.
+        if const_expr(not light_release):
+            comm_ops.fence_system_release()
+        ready_rows = fx.Int32(comm_ops.load_i32_lds(ready_lds_addr))
+        for row_index in range(tid, ready_rows, num_waves * 64):
+            entry = fx.Int32(
+                comm_ops.load_i32_lds(ready_rows_addr + fx.Int64(row_index) * 4)
+            )
+            comm_ops.atomic_add_system(
+                tile_ready_table[entry >> fx.Int32(24)]
+                + tile_ready_offset
+                + fx.Int64((entry & fx.Int32(0xFFFFFF)) * fx.Int32(fz_npes) + fx.Int32(fz_rank))
+                * 4,
+                fx.Int32(1),
+            )
     if tid == fx.Int32(0):
-        comm_ops.fence_system_release()
+        if const_expr(not light_release):
+            comm_ops.fence_system_release()
         done = fx.Int32(
             comm_ops.atomic_add_agent(
                 a_producer_done + fx.Int64(producer_group) * 4, fx.Int32(1)
@@ -547,14 +610,116 @@ def emit_direct_fixed_slot_payload(
             for destination in range_constexpr(fz_npes):
                 if producer_group == fx.Int32(destination % destination_groups):
                     remote_done = source_done_table[fx.Int32(destination)]
-                    comm_ops.store_i32_system(remote_done, done_index, expected)
+                    if const_expr(light_release):
+                        comm_ops.store_i32_global_system_monotonic(
+                            remote_done + fx.Int64(done_index) * 4, expected
+                        )
+                    else:
+                        comm_ops.store_i32_system(remote_done, done_index, expected)
+
+
+# G2_STATE: the GEMM2 tile claim counter, the count of consumer CTAs done
+# (a cache line apart), then from FUSED_STAGE2_HEAD_INTS each Stage1 M tile's
+# count of finished GEMM1 work items.  The last CTA done zeroes it all, so any
+# launch, fused or not, leaves it zero for the next fused one.
+FUSED_STAGE2_HEAD_INTS = 64
+FUSED_STAGE2_CLAIM = 0
+FUSED_STAGE2_DONE = 16
+
+
+def fused_stage2_state_ints(tile_state_stride):
+    return tile_state_stride + FUSED_STAGE2_HEAD_INTS
+
+
+def fixed_slot_count_flag_index(fz_npes, fz_epr):
+    """COUNT_MATRIX holds [parity][source][local expert] counts, then the flags."""
+    return 2 * fz_npes * fz_epr
+
+
+# fmt: off
+@flyc.jit
+def emit_direct_fixed_slot_counts(
+    *, fz_npes, fz_epr, fz_k, fz_rank, fz_total_experts, addr_disp, addr_in_idx, i32_cur_tok, hist_lds_addr,
+    parity, expected,
+):
+# fmt: on
+    """Send this source's per-expert route counts to every destination (one wave).
+
+    Uses ``fz_total_experts`` int32 of LDS at ``hist_lds_addr``.  The counts only depend on local routes,
+    so the owner sends them while it waits for the launch handshake; a
+    destination's COUNT_MATRIX parity slot is last read by the launch two back,
+    which every source has finished by the time it can start this one.
+    """
+    assert 0 < fz_epr <= 64, "fixed-slot counts send one destination row per wave"
+    dispatch_table = ptr_buf_tensor(addr_disp, fx.Int64)
+    count_table = ptr_buf_tensor(
+        dispatch_table[fx.Int32(int(DispatchSlot.P2P_COUNT_MATRIX))], fx.Int64
+    )
+    route_limit = i32_cur_tok * fx.Int32(fz_k)
+    # dwordx4 loads, several in flight per lane: one load per lane per pass
+    # leaves this wave on the plan's critical path for a dozen load latencies.
+    idx_units = ptr_buf_tensor(
+        addr_in_idx, fx.Int32, unit_elems=4, num_records_bytes=route_limit * fx.Int32(4)
+    )
+    lane = fx.thread_idx.x & fx.Int32(63)
+    for expert in range(lane, fz_total_experts, 64):
+        comm_ops.store_i32_lds(hist_lds_addr + fx.Int64(expert) * 4, fx.Int32(0))
+    comm_ops.wait_lds_wave()
+    units_in_flight = 4
+    for first_unit in range(
+        lane, (route_limit + fx.Int32(3)) // fx.Int32(4), 64 * units_in_flight
+    ):
+        unit_values = [
+            buf_copy_load(
+                idx_units, first_unit + fx.Int32(64 * step), fx.Int32, unit_elems=4
+            )
+            for step in range_constexpr(units_in_flight)
+        ]
+        for step in range_constexpr(units_in_flight):
+            for element in range_constexpr(4):
+                route = (first_unit + fx.Int32(64 * step)) * fx.Int32(4) + fx.Int32(element)
+                global_expert = unit_values[step][element]
+                valid = (global_expert >= fx.Int32(0)) & (global_expert < fx.Int32(fz_total_experts))
+                if (route < route_limit) & valid:
+                    comm_ops.atomic_add_lds(
+                        hist_lds_addr + fx.Int64(global_expert) * 4, fx.Int32(1)
+                    )
+    comm_ops.wait_lds_wave()
+    count_row = parity * fx.Int32(fz_npes * fz_epr) + fx.Int32(fz_rank * fz_epr)
+    for destination in range_constexpr(fz_npes):
+        if lane < fx.Int32(fz_epr):
+            count = fx.Int32(
+                comm_ops.load_i32_lds(
+                    hist_lds_addr + fx.Int64(destination * fz_epr) * 4 + fx.Int64(lane) * 4
+                )
+            )
+            ptr_buf_tensor(count_table[fx.Int32(destination)], fx.Int32)[
+                count_row + lane
+            ] = count
+    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+    comm_ops.fence_system_release()
+    flag_index = (
+        fx.Int32(fixed_slot_count_flag_index(fz_npes, fz_epr))
+        + parity * fx.Int32(fz_npes)
+        + fx.Int32(fz_rank)
+    )
+    for destination in range(lane, fz_npes, 64):
+        comm_ops.store_i32_system(count_table[destination], flag_index, expected)
 
 
 @flyc.jit
 def emit_direct_fixed_slot_finalize(
-    *, fz_npes, fz_epr, fz_cap, fz_mtpr, fz_rank, fz_tile_m, n_tiles, addr_disp, parity, expected
+    *, fz_npes, fz_epr, fz_cap, fz_mtpr, fz_rank, fz_tile_m, n_tiles, addr_disp, parity, expected,
+    early_tiles=False, tile_state_stride=0, num_waves=0,
 ):
-    """Finalize local fixed slots as soon as every source publishes this destination."""
+    """Finalize local fixed slots as soon as every source publishes this destination.
+
+    With ``early_tiles`` the plan is built from the counts every source sent
+    ahead of its payload; a GEMM consumer runs an expert's tiles once every
+    source's TILE_READY count for it matches its COUNT_MATRIX count.  RUNNING
+    is still reset only after every source finishes, and the other parity's
+    ready counters are cleared for the next launch.
+    """
     assert 0 < fz_epr <= 64, "direct fixed-slot finalize requires 1..64 experts per rank"
     dispatch_table = ptr_buf_tensor(addr_disp, fx.Int64)
 
@@ -582,19 +747,39 @@ def emit_direct_fixed_slot_finalize(
     work_tail = ptr_buf_tensor(a_work_tail, fx.Int32)
     expert_tile_end = ptr_buf_tensor(a_expert_tile_end, fx.Int32)
     max_expert_tiles_buffer = ptr_buf_tensor(a_max_expert_tiles, fx.Int32)
+    if const_expr(early_tiles):
+        assert tile_state_stride > fz_epr * fz_npes and num_waves > 0
+        a_counts = dp(DispatchSlot.COUNT_MATRIX)
+        counts = ptr_buf_tensor(a_counts, fx.Int32)
 
     tid = fx.thread_idx.x
     lane = tid & fx.Int32(63)
     warp = tid >> fx.Int32(6)
     if warp == fx.Int32(0):
-        for source in range(lane, fz_npes, 64):
-            done_index = parity * fx.Int32(fz_npes) + source
-            comm_ops.wait_i32_until_equals(a_source_done + fx.Int64(done_index) * 4, expected)
+        if const_expr(early_tiles):
+            flag_base = parity * fx.Int32(fz_npes) + fx.Int32(
+                fixed_slot_count_flag_index(fz_npes, fz_epr)
+            )
+            for source in range(lane, fz_npes, 64):
+                comm_ops.wait_i32_until_equals(
+                    a_counts + fx.Int64(flag_base + source) * 4, expected
+                )
+        else:
+            for source in range(lane, fz_npes, 64):
+                done_index = parity * fx.Int32(fz_npes) + source
+                comm_ops.wait_i32_until_equals(a_source_done + fx.Int64(done_index) * 4, expected)
         comm_ops.fence_system_acquire()
 
         valid_expert = lane < fx.Int32(fz_epr)
         safe_expert = valid_expert.select(lane, fx.Int32(0))
-        count = running[safe_expert]
+        if const_expr(early_tiles):
+            count = fx.Int32(0)
+            for source in range_constexpr(fz_npes):
+                count = count + counts[
+                    parity * fx.Int32(fz_npes * fz_epr) + fx.Int32(source * fz_epr) + safe_expert
+                ]
+        else:
+            count = running[safe_expert]
         count = valid_expert.select(count, fx.Int32(0))
         overflow_flag = (count > fx.Int32(fz_cap)).select(fx.Int32(1), fx.Int32(0))
         overflow_prefix = _wave_inclusive_scan_i32(overflow_flag, lane)
@@ -628,7 +813,8 @@ def emit_direct_fixed_slot_finalize(
                 expert_tile_end[safe_expert] = metadata_base + num_expert_tiles
             else:
                 expert_tile_end[safe_expert] = fx.Int32(0)
-            running[safe_expert] = fx.Int32(0)
+            if const_expr(not early_tiles):
+                running[safe_expert] = fx.Int32(0)
 
         if lane == fx.Int32(0):
             num_valid = no_overflow.select(total_tiles * fx.Int32(fz_tile_m), fx.Int32(0))
@@ -645,6 +831,26 @@ def emit_direct_fixed_slot_finalize(
             remote_ready = plan_ready_table[source]
             ready_index = parity * fx.Int32(fz_npes) + fx.Int32(fz_rank)
             comm_ops.store_i32_system(remote_ready, ready_index, expected)
+
+        if const_expr(early_tiles):
+            for source in range(lane, fz_npes, 64):
+                done_index = parity * fx.Int32(fz_npes) + source
+                comm_ops.wait_i32_until_equals(a_source_done + fx.Int64(done_index) * 4, expected)
+            comm_ops.fence_system_acquire()
+            if valid_expert:
+                running[safe_expert] = fx.Int32(0)
+    if const_expr(early_tiles):
+        # The other parity was last counted by the previous launch, which every
+        # source finished before this one's handshake, and is next counted
+        # after the next handshake, so it can be cleared now.  Producers count
+        # with system atomics; clear in the same coherence domain.
+        a_other_ready = dp(DispatchSlot.TILE_READY) + fx.Int64(
+            parity ^ fx.Int32(1)
+        ) * fx.Int64(tile_state_stride * 4)
+        for entry in range(tid, fz_epr * fz_npes, num_waves * 64):
+            comm_ops.store_i32_global_system_monotonic(
+                a_other_ready + fx.Int64(entry) * 4, fx.Int32(0)
+            )
     fx.barrier()
 
 

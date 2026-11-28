@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 FlyDSL Project Contributors
+# Copyright (C) 2025-2026 FlyDSL Project Contributors
 """GEMM1 compute shared by fused MegaMoE v2 stage1 and its standalone interface."""
 
 import functools
@@ -39,7 +39,7 @@ class _LdsF32View:
 def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
     a_scale_lds, a_lds_i32, K_ITERS, M_REPEAT, NUM_ACC_N, A_K_STEP_BYTES, pipe_weights,
     mfma_amajor, async_a_copy, trb_rsrc, tib_rsrc, indirect_input, pair_k, narrow_final_a, tile_zero=False,
-    row_map=None):
+    row_map=None, unroll_k=False):
 # fmt: on
     N_ACC = M_REPEAT * NUM_ACC_N
     NUM_B_SCALE = NUM_ACC_N // _PACK
@@ -181,7 +181,13 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
                 yv += sa_next
             return yv
 
-        if const_expr(pair_k):
+        if const_expr(unroll_k):
+            # Unrolled K: no loop-carried B copy, so each step's B prefetch
+            # stays in flight under the next step's MFMAs.
+            state = init
+            for sp_c in range_constexpr(K_ITERS - 1):
+                state = _kstep(sp_c, state)
+        elif const_expr(pair_k):
             # Two K steps per iteration (ping-pong B registers): the rolled loop
             # copies the prefetched B tile into loop-carried registers, which
             # forces a vmcnt drain of the prefetch every step.
@@ -439,7 +445,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     source_rows=0, a_dtype="fp8", out_dtype="fp8", swiglu_limit=0.0, pair_k=False, evec,
     act="silu", situ_beta=1.0, situ_linear_beta=1.0, narrow_final_a=False, rows_rsrc=None, lookahead=0,
     out_cache_modifier=0, tile_zero=False, fused_v8=False, epi_lean=0, row_map=None, short_rows=0, fold_rows=0,
-    a_async_lds=False, ascale_packed=False, plan_lookup=None, a_ahead=1):
+    a_async_lds=False, ascale_packed=False, plan_lookup=None, a_ahead=1, unroll_k=False):
     # fmt: on
     """Build the GEMM1 atoms and return its expert resolver and tile runner.
 
@@ -535,7 +541,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
             a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
             a_scale_lds, a_lds_i32, k_iters, m_repeat, num_acc_n,
             a_k_step_bytes, pipe_weights, mfma_amajor, async_a_copy,
-            trb_rsrc, tib_rsrc, indirect_input, pair_k, narrow_final_a, tile_zero, row_map)
+            trb_rsrc, tib_rsrc, indirect_input, pair_k, narrow_final_a, tile_zero, row_map, unroll_k)
         # fmt: on
 
     if const_expr(not short_rows):

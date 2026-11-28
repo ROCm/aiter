@@ -17,6 +17,9 @@ rows, CUDA graph replay against eager, and paired timing against the staged rout
 The fused routes need an a8w4 layout of FUSED_LAYOUTS (mega_moe_config.py) on an
 8-XCD gfx950: DeepSeek-V4-Pro (--network v4_pro) on 8 ranks, or DeepSeek-V4.1-Flash
 (--network v41_flash) on the rank counts listed there (EP8: 8 ranks, EP4: 4 ranks, EP2: 2 ranks).
+With --quant a4w4 the routed instance has the staged route only; the suite runs the
+same checks on it (default --mtpr 512, the V4.1-Flash EP8 decode capacity, which is
+fixed-slot with AITER_MEGA_FIXED_SLOT_MAX_MTPR=1023), skipping the small-input epoch wrap.
 
     torchrun --nproc-per-node 8 test_mega_moe_v2.py --bs-list 1,64,128
     torchrun --nproc-per-node 8 test_mega_moe_v2.py --max-tok-per-rank 8192 \
@@ -28,6 +31,9 @@ The fused routes need an a8w4 layout of FUSED_LAYOUTS (mega_moe_config.py) on an
     # against a same-MTPR staged route, timing only:
     torchrun --nproc-per-node 8 test_mega_moe_v2.py --suite routes \
         --mtpr 256 --small-m-mtprs 256 --time-only --time-bs 140,168,196,224,252
+    # routed A4W4 V4.1-Flash EP8 decode with the MXFP4 combine (Stage1 runs GEMM2):
+    AITER_MEGA_FIXED_SLOT_MAX_MTPR=1023 torchrun --nproc-per-node 8 test_mega_moe_v2.py \
+        --suite routes --network v41_flash --quant a4w4 --stage2-p2p-quant fp4_blockwise_1x32
 
 The routes suite takes the flags of the former test_mega_moe_small_m.py; its
 --mtpr and --slots are aliases of --max-tok-per-rank and --large-m-state-slots.
@@ -1242,25 +1248,33 @@ def _routes_instance(args, rank, world, device):
     moe = MegaMoEV2(
         rank=rank,
         world_size=world,
-        quant="a8w4",
+        quant=args.quant,
         w1=packs[0][0],
         w1_scale=packs[0][1],
         w2=packs[0][2],
         w2_scale=packs[0][3],
         max_tok_per_rank=args.max_tok_per_rank,
+        stage2_p2p_quant=args.stage2_p2p_quant,
         large_m_state_slots=args.large_m_state_slots,
         small_m_mtprs=tuple(args.small_m_mtprs),
         routed=True,
         **net,
     )
-    if moe.small_m_mtpr != max(args.small_m_mtprs):
+    if args.quant == "a4w4":
+        # The fused routes are A8W4 only (fused_layout_supported): every call takes the staged route.
+        if moe.small_m_mtpr or moe.large_m_available:
+            raise AssertionError("a routed a4w4 instance built a fused route")
+    elif moe.small_m_mtpr != max(args.small_m_mtprs):
         raise AssertionError(
             f"small-input route not built (small_m_mtpr={moe.small_m_mtpr}); it needs a fused "
             "a8w4 layout of FUSED_LAYOUTS (DeepSeek-V4-Pro on 8 ranks, DeepSeek-V4.1-Flash on 8, 4 or 2 ranks) "
             "on an 8-XCD gfx950"
         )
+    # The route the small calls below take, and its capacity.
+    fast_route = ROUTE_SMALL_M if moe.small_m_mtpr else ROUTE_STAGED
+    fast_mtpr = moe.small_m_mtpr or moe.mtpr
     x, w, ids = _make_inputs(
-        moe.small_m_mtpr,
+        fast_mtpr,
         net["model_dim"],
         net["experts"],
         net["topk"],
@@ -1288,12 +1302,14 @@ def _routes_instance(args, rank, world, device):
         refw=[p[4:] for p in packs],
         bind=bind,
         large_m=moe._large_m is not None,
+        fast_route=fast_route,
+        fast_mtpr=fast_mtpr,
         failures=[],
     )
 
 
 def _routes_accuracy(ctx, args):
-    """Small-input route against the fp32 reference and the staged route, both layers.
+    """Small-input route (a4w4: the staged route) against the fp32 reference and the staged route, both layers.
 
     Returns {(case, layer): (x, w, ids, output, real rows, max_tokens)}.
     """
@@ -1325,7 +1341,7 @@ def _routes_accuracy(ctx, args):
         ("c384_padded", [448] * world, 160),
         ("c384_idle", [448, 0, 7, 0, 364, 1, 0, 280][:world], 0),
     ]
-    cases = [c for c in cases if max(c[1]) <= moe.small_m_mtpr]
+    cases = [c for c in cases if max(c[1]) <= ctx.fast_mtpr]
     outputs = {}
     for name, tpr, pad in cases:
         for which in range(2):
@@ -1334,7 +1350,7 @@ def _routes_accuracy(ctx, args):
                 tpr, rank, ctx.x, ctx.w, ctx.ids, experts, pad
             )
             max_tokens = max(max(tpr), 1)
-            out_g = _routed(moe, xi, wi, ii, max_tokens, ROUTE_SMALL_M).clone()
+            out_g = _routed(moe, xi, wi, ii, max_tokens, ctx.fast_route).clone()
             _barrier()
             out_m = _staged_forward(moe, xi, wi, ii).clone()
             _barrier()
@@ -1375,8 +1391,12 @@ def _routes_edges(ctx, args):
         # The combine input still holds the rows of the calls above: a -1 slot must not read them.
         gen = torch.Generator(device=device).manual_seed(args.seed + rank)
         ii[torch.rand(ii.shape, generator=gen, device=device) < 1 / 3] = -1
-    # forward_small_m: the wrapper existing callers use (forward with mask_invalid_slots=True).
-    out = moe.forward_small_m(xi, wi, ii, max_tokens=max(tpr))[:n].clone()
+    if moe.small_m_mtpr:
+        # forward_small_m: the wrapper existing callers use (forward with mask_invalid_slots=True).
+        out = moe.forward_small_m(xi, wi, ii, max_tokens=max(tpr))
+    else:
+        out = moe.forward(xi, wi, ii, max_tokens=max(tpr), mask_invalid_slots=True)
+    out = out[:n].clone()
     _barrier()
     rel_ref = _rel_l2(out, _moe_reference(moe, xi, wi, ii, ctx.refw[0]))
     ok = rel_ref < args.rtol and _all_ranks(torch.isfinite(out).all(), device)
@@ -1392,11 +1412,11 @@ def _routes_edges(ctx, args):
     # keep BF16 rows, so the combine reads both formats.
     hot = torch.arange(moe.topk, dtype=ids.dtype, device=device)
     for name, n, share in (("hot60", 128, 3), ("one_rank", 64, 5), ("hot60", 448, 3)):
-        if n > moe.small_m_mtpr:
+        if n > ctx.fast_mtpr:
             continue
         xi, wi, ii = x[:n].clone(), w[:n].clone(), ids[:n].clone()
         ii[(torch.arange(n, device=device) % 5) < share] = hot
-        out = _routed(moe, xi, wi, ii, n, ROUTE_SMALL_M).clone()
+        out = _routed(moe, xi, wi, ii, n, ctx.fast_route).clone()
         _barrier()
         rel_ref = _rel_l2(out, _moe_reference(moe, xi, wi, ii, ctx.refw[0]))
         ok = rel_ref < args.rtol and _all_ranks(torch.isfinite(out).all(), device)
@@ -1613,19 +1633,20 @@ def _run_routes(args, rank, world, device):
         outputs = _routes_accuracy(ctx, args)
         _routes_edges(ctx, args)
         keys = _routes_alternation(ctx, args, outputs)
-        # Zero rows on every rank; 32-bit epochs wrapping.
-        case = outputs[(keys[0][0], 0)]
-        wrap_mism = _check_epoch_wrap_and_zero_rows(
-            moe, ctx.bind, case, case if ctx.large_m else None, device
-        )
-        if rank == 0:
-            print(
-                f"[WRAP] zero_rows+epoch_wrap mismatched_rows={wrap_mism} "
-                f"large_m={ctx.large_m} {'PASS' if wrap_mism == 0 else 'FAIL'}",
-                flush=True,
+        if moe.small_m_mtpr:
+            # Zero rows on every rank; 32-bit epochs wrapping.
+            case = outputs[(keys[0][0], 0)]
+            wrap_mism = _check_epoch_wrap_and_zero_rows(
+                moe, ctx.bind, case, case if ctx.large_m else None, device
             )
-        if wrap_mism:
-            ctx.failures.append("epoch wrap")
+            if rank == 0:
+                print(
+                    f"[WRAP] zero_rows+epoch_wrap mismatched_rows={wrap_mism} "
+                    f"large_m={ctx.large_m} {'PASS' if wrap_mism == 0 else 'FAIL'}",
+                    flush=True,
+                )
+            if wrap_mism:
+                ctx.failures.append("epoch wrap")
         _routes_graph(ctx, args)
     _routes_timing(ctx, args)
     _barrier()
@@ -1780,14 +1801,14 @@ def main():
     parser.add_argument(
         "--rtol",
         type=float,
-        help="relL2 gate; default 0.10 (0.25 for a4w4) in the size suite, 0.08 in the routes suite",
+        help="relL2 gate; default 0.25 for a4w4, else 0.10 in the size suite and 0.08 in the routes suite",
     )
     parser.add_argument(
         "--max-tok-per-rank",
         "--mtpr",
         type=int,
         help="instance capacity; size suite default: one instance per batch size, "
-        "routes suite default: 8192",
+        "routes suite default: 8192 (a4w4: 512)",
     )
     parser.add_argument(
         "--large-m-state-slots",
@@ -1796,12 +1817,12 @@ def main():
         help="large-input layer state slots; default 2 (size suite, so the edge checks "
         "can bind another slot), 61 (routes suite, a DeepSeek model's layers)",
     )
-    size = parser.add_argument_group("size suite")
-    size.add_argument(
+    parser.add_argument(
         "--stage2-p2p-quant",
-        choices=("auto", "none", "fp8_blockwise_1x32"),
+        choices=("auto", "none", "fp8_blockwise_1x32", "fp4_blockwise_1x32"),
         default="auto",
     )
+    size = parser.add_argument_group("size suite")
     size.add_argument("--bs-list", default="128")
     size.add_argument("--iters", type=int, default=30)
     size.add_argument("--accuracy-max-bs", type=int, default=128)
@@ -1858,14 +1879,17 @@ def main():
                 f"[SKIP] the small- and large-input routes need gfx950, got {get_gfx()}"
             )
             return
-        if args.network not in ("v4_pro", "v41_flash") or args.quant != "a8w4":
+        if args.network not in ("v4_pro", "v41_flash") or (
+            args.quant == "a4w4" and args.network != "v41_flash"
+        ):
             raise ValueError(
-                "--suite routes needs --network v4_pro or v41_flash and --quant a8w4"
+                "--suite routes needs --network v4_pro or v41_flash (a4w4: v41_flash)"
             )
         args.seed = 7 if args.seed is None else args.seed
-        args.rtol = 0.08 if args.rtol is None else args.rtol
+        if args.rtol is None:
+            args.rtol = 0.25 if args.quant == "a4w4" else 0.08
         if args.max_tok_per_rank is None:
-            args.max_tok_per_rank = 8192
+            args.max_tok_per_rank = 512 if args.quant == "a4w4" else 8192
         if args.large_m_state_slots is None:
             args.large_m_state_slots = 61
         run = _run_routes

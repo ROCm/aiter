@@ -16,23 +16,32 @@ pytest.importorskip("flydsl", reason="MegaMoE is built with FlyDSL")
 pytest.importorskip("mori.shmem", reason="MegaMoE's runtime imports mori")
 
 import hashlib
-from dataclasses import astuple, fields
+from dataclasses import fields, replace
 
+from aiter.ops.flydsl.kernels.mega_moe import mega_moe_config
 from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
+    ACTIVATION_FP4,
+    ACTIVATION_FP8,
     DEFAULT_SMALL_M_MTPRS,
     FUSED_TOKEN_BUCKETS,
     LARGE_M_MIN_TOKENS,
     LARGE_M_MTPRS,
+    P2P_QUANT_AUTO,
+    P2P_QUANT_FP4_BLOCKWISE,
+    P2P_QUANT_FP8_BLOCKWISE,
+    P2P_QUANT_NONE,
     ROUTE_LARGE_M,
     ROUTE_SMALL_M,
     ROUTE_STAGED,
     TOKEN_BUCKETS,
+    V41_FLASH_DRAFT_EXPERTS_PER_RANK,
     FusedStage1Knobs,
     FusedStage2Knobs,
     build_mega_moe_bundle_plan,
     fused_layout_supported,
     large_m_mtprs_for,
     select_fused_config,
+    select_mega_moe_config,
     small_m_cu_supported,
     small_m_mtprs_for,
 )
@@ -72,6 +81,27 @@ V41_FLASH_EP8_SHAPE = {
     "inter_dim": 2304,
 }
 MTPRS = tuple(b for b in TOKEN_BUCKETS if b >= 16)
+# Staged fixed-slot knobs added with the A4W4 EP8 V4.1-Flash tune: the fused kernels never read them, so they enter
+# the fused config tables below only when set and the digests pinned before them hold.
+_STAGED_KNOBS = frozenset(
+    (
+        "early_tiles",
+        "light_release",
+        "resident_grid",
+        "unroll_k",
+        "g1_split_tail",
+        "fused_g2",
+        "wide_scatter",
+    )
+)
+
+
+def _astuple(config):
+    return tuple(
+        getattr(config, f.name)
+        for f in fields(config)
+        if f.name not in _STAGED_KNOBS or getattr(config, f.name) != f.default
+    )
 
 
 def _plan(mtpr, *, small=DEFAULT_SMALL_M_MTPRS, large=None):
@@ -367,8 +397,8 @@ def test_fused_configs_unchanged():
     for mtpr, tokens in _FUSED_CASES:
         config = select_fused_config(tokens, mtpr)
         table[(mtpr, tokens)] = (
-            astuple(config.stage1),
-            astuple(config.stage2),
+            _astuple(config.stage1),
+            _astuple(config.stage2),
             config.p2p_quant,
         )
     digest = hashlib.sha256(repr(sorted(table.items())).encode()).hexdigest()
@@ -418,8 +448,8 @@ _EP2_KNOBS = ("stream_w",)
 
 def _knob_table(config):
     return (
-        astuple(config.stage1),
-        astuple(config.stage2),
+        _astuple(config.stage1),
+        _astuple(config.stage2),
         config.p2p_quant,
         tuple(
             (f.name, getattr(config.fused_stage1, f.name))
@@ -763,3 +793,120 @@ def test_ep2_fused_configs_unchanged():
         )
     digest = hashlib.sha256(repr(sorted(table.items())).encode()).hexdigest()
     assert digest == _EP2_FUSED_DIGEST, table
+
+
+# Routed A4W4: the fused routes are A8W4 only, so the routed instance serves every call on the staged route, whose
+# V4.1-Flash EP8 decode instance (MTPR 512, fixed-slot) takes the staged knobs with the MXFP4 combine.
+
+
+@pytest.fixture
+def fixed_slot_mtpr512(monkeypatch):
+    """AITER_MEGA_FIXED_SLOT_MAX_MTPR=1023, as the decode instance runs: MTPR 512 dispatches fixed-slot."""
+    monkeypatch.setattr(mega_moe_config, "FIXED_SLOT_MAX_MTPR", 1023)
+    build_mega_moe_bundle_plan.cache_clear()
+    yield
+    build_mega_moe_bundle_plan.cache_clear()
+
+
+def _staged_configs(p2p_quant, *, a_dtype=ACTIVATION_FP4, mtpr=512, **shape):
+    shape = {**V41_FLASH_EP8_SHAPE, **shape}
+    return {
+        bucket: select_mega_moe_config(
+            bucket, mtpr, a_dtype=a_dtype, p2p_quant=p2p_quant, **shape
+        )
+        for bucket in TOKEN_BUCKETS
+        if bucket <= mtpr
+    }
+
+
+def _staged_knobs(config):
+    return {
+        name: getattr(stage, name)
+        for stage in (config.stage1, config.stage2)
+        for name in _STAGED_KNOBS
+        if hasattr(stage, name)
+    }
+
+
+def test_v41ep8_a4w4_routed_is_staged_only(fixed_slot_mtpr512):
+    assert not fused_layout_supported(**{**V41_FLASH_EP8, "quant": "a4w4"})
+    plan = build_mega_moe_bundle_plan(
+        512,
+        a_dtype=ACTIVATION_FP4,
+        p2p_quant=P2P_QUANT_FP4_BLOCKWISE,
+        **V41_FLASH_EP8_SHAPE,
+    )
+    assert plan.fixed_slot_dispatch
+    assert not plan.small_m_mtprs and not plan.large_m
+    for max_tokens in (0, 1, 160, 192, 224, 511, 512):
+        assert plan.route_for(max_tokens) == (ROUTE_STAGED, 512), max_tokens
+
+
+def test_v41ep8_a4w4_fp4_combine_buckets_share_one_protocol(fixed_slot_mtpr512):
+    """early_tiles and light_release change what the ranks exchange: every bucket of the instance agrees on them.
+    Every bucket runs GEMM2 in the Stage1 launch (Stage2's 256-thread tile needs 4-wave Stage1 CTAs).
+    """
+    configs = _staged_configs(P2P_QUANT_FP4_BLOCKWISE)
+    protocols = {
+        (c.stage1.early_tiles, c.stage1.light_release) for c in configs.values()
+    }
+    assert protocols == {(True, True)}
+    for bucket, config in configs.items():
+        s1 = config.stage1
+        assert s1.fused_g2 and s1.num_waves == 4, bucket
+        assert s1.resident_grid and config.stage2.wide_scatter, bucket
+        assert s1.unroll_k == (s1.async_a_copy and s1.tile_n == 256), bucket
+        assert s1.g1_split_tail == (s1.tile_n == 256), bucket
+    # The decode graph sizes 160-224 (buckets 128 and 256) take the 64 x 256 GEMM1 tile and the 64-row GEMM2.
+    for bucket in (128, 256):
+        s1, s2 = configs[bucket].stage1, configs[bucket].stage2
+        assert (s1.sort_block_m, s1.tile_n, s1.unroll_k, s1.g1_split_tail) == (
+            64,
+            256,
+            True,
+            True,
+        )
+        assert (s2.block_m, s2.block_n) == (64, 128)
+
+
+@pytest.mark.parametrize(
+    "p2p_quant", (P2P_QUANT_AUTO, P2P_QUANT_NONE, P2P_QUANT_FP8_BLOCKWISE)
+)
+def test_v41ep8_a4w4_staged_knobs_need_fp4_combine(fixed_slot_mtpr512, p2p_quant):
+    for bucket, config in _staged_configs(p2p_quant).items():
+        assert not any(_staged_knobs(config).values()), (bucket, config)
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        {"a_dtype": ACTIVATION_FP8},
+        {"experts_per_rank": V41_FLASH_DRAFT_EXPERTS_PER_RANK},
+        {"mtpr": 256},
+    ),
+    ids=("a8w4", "draft_epr16", "mtpr256"),
+)
+def test_v41ep8_fp4_combine_elsewhere_keeps_staged_knobs_off(fixed_slot_mtpr512, case):
+    for bucket, config in _staged_configs(P2P_QUANT_FP4_BLOCKWISE, **case).items():
+        assert not any(_staged_knobs(config).values()), (bucket, config)
+
+
+def test_v41ep8_a4w4_mtpr512_without_fixed_slot_keeps_staged_knobs_off():
+    """Without AITER_MEGA_FIXED_SLOT_MAX_MTPR the MTPR 512 instance uses the bounded dispatch."""
+    assert mega_moe_config.FIXED_SLOT_MAX_MTPR < 512
+    for bucket, config in _staged_configs(P2P_QUANT_FP4_BLOCKWISE).items():
+        assert not any(_staged_knobs(config).values()), (bucket, config)
+
+
+def test_fused_g2_requires_fp4_combine(fixed_slot_mtpr512):
+    config = select_mega_moe_config(
+        192,
+        512,
+        a_dtype=ACTIVATION_FP4,
+        p2p_quant=P2P_QUANT_FP4_BLOCKWISE,
+        **V41_FLASH_EP8_SHAPE,
+    )
+    assert config.stage1.fused_g2
+    for p2p_quant in (P2P_QUANT_NONE, P2P_QUANT_FP8_BLOCKWISE):
+        with pytest.raises(ValueError, match="fused_g2"):
+            replace(config, p2p_quant=p2p_quant)

@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 FlyDSL Project Contributors
+# Copyright (C) 2025-2026 FlyDSL Project Contributors
 """Fused Stage1 dispatch with FP8/FP4 activation and FP4-weight GEMM1."""
 
 import dataclasses
 import functools
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -24,21 +25,33 @@ from ..tensor_shim import (
     ptr_buf_tensor,
 )
 from .dispatch import (
+    FUSED_STAGE2_CLAIM,
+    FUSED_STAGE2_DONE,
+    FUSED_STAGE2_HEAD_INTS,
     DispatchSlot,
+    emit_direct_fixed_slot_counts,
     emit_direct_fixed_slot_finalize,
     emit_direct_fixed_slot_payload,
     emit_dispatch_payload,
+    fused_stage2_state_ints,
 )
 from .gemm1 import _LdsF32View, build_fused_gemm1
 from .mega_moe_config import (
     FIXED_GRID_MULT_VALUES,
+    FIXED_SLOT_EXPERTS_PER_RANK,
     INDEXED_PAYLOAD_MIN_MTPR,
+    REFERENCE_EXPERTS_PER_RANK,
     Stage1Config,
     fixed_stage1_epoch_slot,
 )
+from .mega_moe_stage2 import Stage2Unit
 
 _SC0_CACHE = 1
 _BUFFER_OFFSET_ABI_BYTES = 1 << 32
+# MoRI's symmetric heap type, fixed for the process once MoRI initializes.
+_UNCACHED_HEAP = (
+    os.environ.get("MORI_SHMEM_HEAP_TYPE", "uncached").lower() == "uncached"
+)
 
 
 class _Stage1KernelSpec:
@@ -57,8 +70,15 @@ def _validate_fixed_slot_geometry(
     if tile_m <= 0 or max_tokens_per_rank <= 0:
         raise ValueError("fixed-slot requires positive tile and token capacities")
     required_cap = ((npes * max_tokens_per_rank + tile_m - 1) // tile_m) * tile_m
-    if npes != 8 or experts_per_rank != 48 or cap != required_cap:
-        raise ValueError("fixed-slot dispatch requires the direct EP8/EPR48 layout")
+    if (
+        npes != 8
+        or experts_per_rank not in FIXED_SLOT_EXPERTS_PER_RANK
+        or cap != required_cap
+    ):
+        raise ValueError(
+            "fixed-slot dispatch requires the direct EP8 layout with "
+            f"{FIXED_SLOT_EXPERTS_PER_RANK} experts per rank"
+        )
 
 
 def stage1_output_nbytes(rows, inter_dim, a_dtype="fp8"):
@@ -126,6 +146,8 @@ def compile_mega_moe_stage1(
     tile_state_stride: int = 0, a_dtype: str = "fp8", out_dtype: str = "fp8",
     swiglu_limit: float = 0.0,
     act: str = "silu", situ_beta: float = 1.0, situ_linear_beta: float = 1.0,
+    early_tiles: bool = False, light_release: bool = False, resident_grid: bool = False,
+    unroll_k: bool = False, g1_split_tail: bool = False, fused_stage2: tuple | None = None,
     _return_kernel_spec: bool = False,
 ):
     arch = str(get_rocm_arch() or "")
@@ -160,7 +182,14 @@ def compile_mega_moe_stage1(
     # CTAs may wait for tile readiness without preventing any producer from
     # becoming resident.  Fixed-slot retains arrival tickets until its owner
     # epoch protocol is converted to the same bounded-grid scheme.
-    consumer_ticket_base = 0 if compact_dispatch else dispatch_blocks + 1
+    # Fixed-slot with a resident grid launches only the consumer cohort; the
+    # arrival-ticket owner and producers are its first resident CTAs and take
+    # GEMM work once their role is done, so no consumer queues behind them.
+    # The fixed-slot Stage1 options below are validated for the V4/V4.1 target layout (48 experts per rank)
+    # only; other fixed-slot layouts (the V4.1-Flash DSpark draft MoE's 16 per rank) keep the base kernel.
+    TARGET_FIXED = fixed_slot_dispatch and int(experts_per_rank) == REFERENCE_EXPERTS_PER_RANK
+    RESIDENT_GRID = TARGET_FIXED and resident_grid
+    consumer_ticket_base = 0 if compact_dispatch or RESIDENT_GRID else dispatch_blocks + 1
     # Compact external-counting overwrites every source-owned histogram row
     # and publishes COUNT_DONE with the invocation generation.  That exchange
     # already provides the cross-rank release/acquire edge, so a separate
@@ -244,6 +273,38 @@ def compile_mega_moe_stage1(
         fz_mtpr, fz_npes, fz_epr, fz_k, fz_tile_m, fz_nbytes, inter_dim // out_pack, use_tile_resource
     )
 
+    # Fused GEMM2: once GEMM1 has no work left, consumers run Stage2's output
+    # tiles in this kernel, each once its Stage1 M tile's GEMM1 work items are
+    # done, instead of a separate Stage2 launch.  ``fused_stage2`` holds the
+    # Stage2Unit settings as sorted (name, value) pairs; the unit runs from the
+    # base of ``pool``.
+    FUSE_G2 = TARGET_FIXED and fused_stage2 is not None
+    if FUSE_G2:
+        assert TOTAL_THREADS == 256, "fused GEMM2 runs Stage2's 256-thread tile"
+        G2_UNIT = Stage2Unit(model_dim=model_dim, inter_dim=inter_dim, experts=fz_epr, topk=fz_k, rank=fz_rank,
+            npes=fz_npes, max_tok=fz_mtpr, SBM=sort_block_m, a_dtype=out_dtype, has_pad=False,
+            **dict(fused_stage2))
+        assert sort_block_m % G2_UNIT.BM == 0 and model_dim % G2_UNIT.BN == 0
+        G2_N_BLOCKS = model_dim // G2_UNIT.BN
+        lds_pool_bytes = max(lds_pool_bytes, G2_UNIT.lds_bytes)
+        u = G2_UNIT
+        G2_TAG = (
+            f"_fg2t{u.BM}x{u.BN}x{u.BK}nt{int(u.use_nt)}bh{int(u.g2_bhoist)}b2{int(u.g2_b2stage)}"
+            f"apf{int(u.g2_ascale_pf)}da{int(u.g2_deep_a_pipeline)}_{u.p2p_quant_type}_sv{u.scatter_vec}"
+            f"{'_ws' if u.wide_scatter else ''}"
+        )
+    # GEMM1 v2: when the work items overflow one round of consumer CTAs, the last
+    # G1_V2_TAIL_ITEMS (192) of them (at most the overflow) run as two 128-column items
+    # each, so the partial last round is spread over every CTA. M-tile done counts
+    # are in 128-column units (a whole item counts 2).
+    GEMM1_V2 = FUSE_G2 and g1_split_tail and tile_n == 256
+    TAIL_N = tile_n // 2
+    N_TILES_TAIL = 2 * N_TILES
+    G1_M_TARGET = N_TILES_TAIL if GEMM1_V2 else N_TILES
+    G1_V2_TAIL_ITEMS = 192
+    if GEMM1_V2:
+        G2_TAG += "_g1v2"
+
     @fx.struct
     class SharedStorage:
         pool: fx.Array[fx.Int8, lds_pool_bytes, 16]
@@ -259,6 +320,24 @@ def compile_mega_moe_stage1(
     # Paired GEMM1 K loop for fixed-slot tiles with LDS-DMA A copies; compact
     # prefill is slower with it (its 8-wave tiles already hide the latency).
     PAIR_K = fixed_slot_dispatch and async_a_copy
+    # Fully unrolled fixed-slot GEMM1 K loop for the wide tuned tile.
+    UNROLL_K = TARGET_FIXED and async_a_copy and tile_n == 256 and unroll_k
+    # Fixed-slot GEMM tiles wait for their expert's rows rather than for the
+    # whole dispatch: TILE_READY[parity][local_expert * npes + source] counts
+    # published rows against COUNT_MATRIX[parity][source][local_expert].
+    EARLY_TILES = TARGET_FIXED and early_tiles
+    # A system acquire per tile invalidates L2 under the running GEMM, so on
+    # mori's uncached heap a tile drops only its CU's L1 lines.
+    EARLY_L1_ONLY = EARLY_TILES and _UNCACHED_HEAP
+    LIGHT_RELEASE = TARGET_FIXED and light_release and _UNCACHED_HEAP
+    if EARLY_TILES:
+        assert tile_state_stride > fz_epr * fz_npes and fz_npes <= 64
+        assert NUM_WAVES >= 2, "early tiles send counts from wave 1 during the handshake"
+        assert lds_pool_bytes >= (fz_total_experts + 2) * 4
+    # Count wave LDS: histogram, then the parity/expected broadcast.
+    EPOCH_LDS_OFFSET = fz_total_experts * 4
+    if EARLY_TILES:
+        assert lds_pool_bytes >= EPOCH_LDS_OFFSET + 8
     # GEMM1 quant epilogue columns per lane (SiluQuantEpilogue; FP4 output uses 2).
     EPI_EVEC = 8
     dispatch_path = "fixedslot" if fixed_slot_dispatch else "compact"
@@ -291,7 +370,11 @@ def compile_mega_moe_stage1(
         f"_ev{EPI_EVEC}b"
         f"{'_fc' if compact_dispatch else ''}"
         f"{'_kp2' if PAIR_K else ''}"
+        f"{'_et' if EARLY_TILES else ''}{'' if EARLY_L1_ONLY or not EARLY_TILES else 'a'}"
+        f"{'_lr' if LIGHT_RELEASE else ''}"
+        f"{'_rg' if RESIDENT_GRID else ''}{'_uk' if UNROLL_K else ''}"
         f"{'_ac32' if NARROW_FINAL_A else ''}"
+        f"{G2_TAG if FUSE_G2 else ''}"
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[TOTAL_THREADS, 1, 1])
@@ -300,7 +383,7 @@ def compile_mega_moe_stage1(
         sorted_token_ids: fx.Tensor, expert_ids: fx.Tensor, num_valid_ids: fx.Tensor, out_scale: fx.Tensor,
         tokens: fx.Int32, addr_disp: fx.Int64, i32_cur_tok: fx.Int32, addr_in_tok: fx.Int64,
         addr_in_idx: fx.Int64, addr_in_wts: fx.Int64, addr_in_sc: fx.Int64, addr_parity: fx.Int64,
-        addr_expected: fx.Int64,
+        addr_expected: fx.Int64, addr_w2: fx.Int64, addr_w2_scale: fx.Int64,
     ):
         tid = fx.thread_idx.x
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
@@ -313,6 +396,13 @@ def compile_mega_moe_stage1(
 
         def _disp_ptr(slot):
             return disp_rsrc[fx.Int32(int(slot))]
+
+        if const_expr(EARLY_TILES):
+            # The owner's count histogram and its parity/expected broadcast
+            # live in pool, which the owner CTA does not use until GEMM.
+            hist_lds_addr = fx.Int64(fx.ptrtoint(lds.pool.ptr))
+            epoch_lds_addr = hist_lds_addr + fx.Int64(EPOCH_LDS_OFFSET)
+            warp_id = tid // fx.Int32(64)
 
         a_entry_count = _disp_ptr(DispatchSlot.ENTRY_COUNT)
         a_epoch_gate = _disp_ptr(DispatchSlot.EPOCH_GATE)
@@ -380,6 +470,19 @@ def compile_mega_moe_stage1(
                         (next_expected // fx.Int32(fz_npes)) * fx.Int32(2)
                         - next_parity_lane
                     )
+                    if const_expr(EARLY_TILES):
+                        comm_ops.store_i32_lds(epoch_lds_addr, next_parity_lane)
+                        comm_ops.store_i32_lds(epoch_lds_addr + fx.Int64(4), next_expected)
+                if const_expr(EARLY_TILES):
+                    fx.barrier()
+                    if warp_id == fx.Int32(1):
+                        emit_direct_fixed_slot_counts(
+                            fz_npes=fz_npes, fz_epr=fz_epr, fz_k=fz_k, fz_rank=fz_rank,
+                            fz_total_experts=fz_total_experts, addr_disp=addr_disp, addr_in_idx=addr_in_idx,
+                            i32_cur_tok=i32_cur_tok, hist_lds_addr=hist_lds_addr,
+                            parity=fx.Int32(comm_ops.load_i32_lds(epoch_lds_addr)),
+                            expected=fx.Int32(comm_ops.load_i32_lds(epoch_lds_addr + fx.Int64(4))),
+                        )
                 next_parity = fx.Int32(fx.rocdl.readfirstlane(T.i32, next_parity_lane))
                 launch_epoch = fx.Int32(
                     fx.rocdl.readfirstlane(T.i32, launch_epoch_lane)
@@ -452,6 +555,9 @@ def compile_mega_moe_stage1(
                     addr_in_tok=addr_in_tok, addr_in_idx=addr_in_idx, addr_in_wts=addr_in_wts, addr_in_sc=addr_in_sc,
                     i32_cur_tok=i32_cur_tok, dispatch_blocks=dispatch_blocks, producer_slot=producer_slot,
                     parity=payload_parity, expected=payload_expected,
+                    early_tiles=EARLY_TILES, tile_state_stride=tile_state_stride,
+                    ready_lds_addr=hist_lds_addr if EARLY_TILES else None, ready_lds_bytes=lds_pool_bytes,
+                    light_release=LIGHT_RELEASE,
                 )
             else:
                 if tid == fx.Int32(0):
@@ -490,6 +596,7 @@ def compile_mega_moe_stage1(
                     fz_npes=fz_npes, fz_epr=fz_epr, fz_cap=fz_cap, fz_mtpr=fz_mtpr, fz_rank=fz_rank,
                     fz_tile_m=fz_tile_m, n_tiles=N_TILES, addr_disp=addr_disp, parity=payload_parity,
                     expected=payload_expected,
+                    early_tiles=EARLY_TILES, tile_state_stride=tile_state_stride, num_waves=NUM_WAVES,
                 )
         else:
             addr_tile_ready = _disp_ptr(DispatchSlot.TILE_READY)
@@ -540,7 +647,7 @@ def compile_mega_moe_stage1(
             n_tiles=N_TILES, expert_offset=fz_rank * fz_epr, b_cache_modifier=b_cache_modifier,
             swizzle_a=swizzle_a, pipe_weights=pipe_weights, mfma_amajor=mfma_amajor,
             async_a_copy=async_a_copy, use_tile_resource=use_tile_resource,
-            pair_k=PAIR_K, evec=EPI_EVEC,
+            pair_k=PAIR_K, evec=EPI_EVEC, unroll_k=UNROLL_K,
             indirect_input=compact_dispatch and not indexed_payload,
             indexed_input=indexed_payload,
             row_map_rsrc=srcmap_rsrc,
@@ -550,6 +657,33 @@ def compile_mega_moe_stage1(
             swiglu_limit=swiglu_limit,
             act=act, situ_beta=situ_beta, situ_linear_beta=situ_linear_beta,
         )
+
+        def _do_tail_tile(flat):
+            # Built at the call so its per-thread setup is not live through the
+            # kernel, and with the rolled K loop: a second unrolled one spills.
+            _, run_tail = build_fused_gemm1(
+                x_tensor=x, w_rsrc=w_rsrc,
+                sw_rsrc=sw_rsrc, sx_rsrc=sx_rsrc, out_rsrc=out_rsrc, os_rsrc=os_rsrc,
+                trb_rsrc=trb_rsrc, expert_rsrc=expert_rsrc, out_tensor=out,
+                tib_rsrc=tib_rsrc,
+                a_buf=a_buf, a_scale_lds=a_scale_lds, c_tile=c_tile,
+                model_dim=model_dim, inter_dim=inter_dim, sort_block_m=sort_block_m,
+                tile_n=TAIL_N, num_waves=NUM_WAVES, n_per_wave=TAIL_N // NUM_WAVES, wave_id=wave_id,
+                m_repeat=M_REPEAT, num_acc_n=(TAIL_N // NUM_WAVES) // 16, a_k_step_bytes=A_K_STEP_BYTES,
+                total_threads=TOTAL_THREADS, k_iters=K_ITERS, a_lds_i32=a_lds_i32,
+                n_tiles=N_TILES_TAIL, expert_offset=fz_rank * fz_epr, b_cache_modifier=b_cache_modifier,
+                swizzle_a=swizzle_a, pipe_weights=pipe_weights, mfma_amajor=mfma_amajor,
+                async_a_copy=async_a_copy, use_tile_resource=use_tile_resource,
+                pair_k=PAIR_K, evec=EPI_EVEC, unroll_k=False,
+                indirect_input=False, indexed_input=indexed_payload,
+                row_map_rsrc=srcmap_rsrc,
+                source_rows=source_rows,
+                a_dtype=a_dtype, out_dtype=out_dtype,
+                narrow_final_a=NARROW_FINAL_A,
+                swiglu_limit=swiglu_limit,
+                act=act, situ_beta=situ_beta, situ_linear_beta=situ_linear_beta,
+            )
+            run_tail(flat)
 
         if tid == fx.Int32(0):
             local_plan_ready = disp_rsrc[fx.Int32(int(DispatchSlot.PLAN_READY))]
@@ -569,12 +703,41 @@ def compile_mega_moe_stage1(
         num_valid = nv_rsrc[fx.Int32(0)]
         num_m_tiles = ceildiv(num_valid, fx.Int32(sort_block_m))
         total_work = num_m_tiles * fx.Int32(N_TILES)
+        if const_expr(GEMM1_V2):
+            g1_items = total_work
+            g1_over = g1_items - fx.Int32(launch_grid_x - consumer_ticket_base)
+            g1_over = (g1_over > fx.Int32(0)).select(g1_over, fx.Int32(0))
+            g1_tail = (g1_over < fx.Int32(G1_V2_TAIL_ITEMS)).select(g1_over, fx.Int32(G1_V2_TAIL_ITEMS))
+            g1_big = g1_items - g1_tail
+            total_work = g1_big + g1_tail * fx.Int32(2)
         use_ready_order = fx.Int32(0) == 1
         if const_expr(compact_dispatch):
             max_expert_tiles = ptr_buf_tensor(a_max_expert_tiles, fx.Int32)[
                 fx.Int32(0)
             ]
             use_ready_order = max_expert_tiles * fx.Int32(4) >= num_m_tiles
+
+        if const_expr(EARLY_TILES):
+            a_fixed_rows_ready = _disp_ptr(DispatchSlot.TILE_READY) + fx.Int64(
+                payload_parity
+            ) * fx.Int64(tile_state_stride * 4)
+            fixed_source_counts = ptr_buf_tensor(
+                _disp_ptr(DispatchSlot.COUNT_MATRIX), fx.Int32
+            )
+
+        def _wait_fixed_tile_rows(flat, source):
+            # Lane ``source`` waits until that source has published all of its
+            # rows for the tile's expert.
+            local_expert = trb_rsrc[flat // fx.Int32(N_TILES)] // fx.Int32(fz_cap)
+            comm_ops.wait_i32_until_equals(
+                a_fixed_rows_ready
+                + fx.Int64(local_expert * fx.Int32(fz_npes) + source) * 4,
+                fixed_source_counts[
+                    payload_parity * fx.Int32(fz_npes * fz_epr)
+                    + source * fx.Int32(fz_epr)
+                    + local_expert
+                ],
+            )
 
         def _wait_tile_payload(flat):
             tile_index = flat // fx.Int32(N_TILES)
@@ -596,6 +759,9 @@ def compile_mega_moe_stage1(
         consumer_active = (consumer_ticket >= consumer_base) & (
             consumer_id < total_work
         )
+        if const_expr(FUSE_G2):
+            # Every consumer reaches the GEMM2 phase, with or without GEMM1 work.
+            consumer_active = consumer_ticket >= consumer_base
         work_scratch = fx.recast_iter(fx.Int32, lds.bc_work.ptr)
         work_scratch_view = fx.make_view(work_scratch, fx.make_layout(1, 1))
         # scheduled_first gets its own slot: tid 0 writes it while other waves
@@ -605,6 +771,88 @@ def compile_mega_moe_stage1(
         work_shard = consumer_id & fx.Int32(WORK_SHARDS - 1)
         work_batch = WORK_BATCH
         assert N_TILES % work_batch == 0
+
+
+        if const_expr(FUSE_G2):
+            a_g2_state = _disp_ptr(DispatchSlot.G2_STATE)
+            G2_CONSUMERS = launch_grid_x - consumer_ticket_base
+
+            def _g2_state_addr(entry):
+                return a_g2_state + fx.Int64(entry) * 4
+
+            def _g2_m_done_addr(m_tile):
+                return _g2_state_addr(fx.Int32(FUSED_STAGE2_HEAD_INTS) + m_tile)
+
+            def _run_fused_stage2():
+                g2_scratch = fx.recast_iter(fx.Int32, lds.bc_work.ptr)
+                g2_scratch_view = fx.make_view(g2_scratch, fx.make_layout(1, 1))
+                # Every wave has read its last GEMM1 claim from the same slot.
+                fx.barrier()
+                if consumer_ticket >= consumer_base:
+                    lds_base = fx.Int32(fx.ptrtoint(lds.pool.ptr))
+                    G2_UNIT.load_peers(lds_base, _disp_ptr(DispatchSlot.P2P_COMB_INP), tid)
+                    g2_total = ceildiv(num_valid, fx.Int32(G2_UNIT.BM)) * fx.Int32(G2_N_BLOCKS)
+                    # Rebuilt here rather than reusing GEMM1's srcmap view, which
+                    # would stay live through the whole GEMM1 loop.
+                    g2_srcmap = ptr_buf_tensor(_disp_ptr(DispatchSlot.SRCMAP), fx.Int32)
+                    g2_weights = ptr_buf_tensor(_disp_ptr(DispatchSlot.WEIGHT), fx.Float32)
+                    g2_lane = tid % fx.Int32(64)
+                    g2_wave = fx.Int32(fx.rocdl.readfirstlane(T.i32, tid // fx.Int32(64)))
+                    g2_active = fx.Int32(1) == 1
+                    while g2_active:
+                        if tid == fx.Int32(0):
+                            claimed = fx.Int32(comm_ops.atomic_add_agent(
+                                _g2_state_addr(fx.Int32(FUSED_STAGE2_CLAIM)), fx.Int32(1)
+                            ))
+                            fx.ptr_store(Vec.from_elements([claimed], fx.Int32), g2_scratch)
+                        fx.barrier()
+                        g2_unit = Vec(g2_scratch_view.load())[0]
+                        if g2_unit < g2_total:
+                            m_block = g2_unit // fx.Int32(G2_N_BLOCKS)
+                            if tid == fx.Int32(0):
+                                comm_ops.wait_i32_until_equals(
+                                    _g2_m_done_addr(
+                                        m_block * fx.Int32(G2_UNIT.BM) // fx.Int32(sort_block_m)
+                                    ),
+                                    fx.Int32(G1_M_TARGET),
+                                )
+                                comm_ops.invalidate_l1()
+                            fx.barrier()
+                            G2_UNIT.run(
+                                lds_base, g2_unit, m_block,
+                                arg_aq=_disp_ptr(DispatchSlot.S1_OUT),
+                                arg_ascale=_disp_ptr(DispatchSlot.S1_OUT_SCALE),
+                                arg_bq=addr_w2,
+                                arg_bscale=addr_w2_scale,
+                                arg_eids=_disp_ptr(DispatchSlot.SORTED_EXPERT),
+                                i32_max_m_blocks=tokens // fx.Int32(G2_UNIT.BM),
+                                i32_inter=fx.Int32(inter_dim), i32_hidden=fx.Int32(model_dim),
+                                i32_kpad=fx.Int32(0), i32_npad=fx.Int32(0),
+                                k_bytes=fx.Int32(inter_dim // (1 if out_dtype == "fp8" else 2)),
+                                trb_buf=trb_rsrc, stids_buf=g2_srcmap, sweights_buf=g2_weights,
+                                tx_i32=tid, lane=g2_lane, wave=g2_wave,
+                            )
+                        # The next tile's A stages reuse this one's CShuffle LDS.
+                        fx.barrier()
+                        g2_active = g2_unit < g2_total
+                    # Thread 0 made all of this CTA's GEMM1 counts and claims;
+                    # on the uncached heap they are performed in memory once
+                    # vmcnt drains, so the last CTA done clears a state no one
+                    # touches again in this launch.
+                    if tid == fx.Int32(0):
+                        fx.rocdl.s_waitcnt(vmcnt=0)
+                        done = fx.Int32(comm_ops.atomic_add_agent(
+                            _g2_state_addr(fx.Int32(FUSED_STAGE2_DONE)), fx.Int32(1)
+                        ))
+                        fx.ptr_store(Vec.from_elements([done], fx.Int32), g2_scratch)
+                    fx.barrier()
+                    if Vec(g2_scratch_view.load())[0] == fx.Int32(G2_CONSUMERS - 1):
+                        for entry in range(
+                            tid, fx.Int32(fused_stage2_state_ints(tile_state_stride)), TOTAL_THREADS
+                        ):
+                            comm_ops.store_i32_global_system_monotonic(
+                                _g2_state_addr(entry), fx.Int32(0)
+                            )
 
         def _run_work_batch(first_work, scheduled_first):
             for batch_offset in range_constexpr(work_batch):
@@ -616,15 +864,56 @@ def compile_mega_moe_stage1(
                     work = first_work + fx.Int32(batch_offset * WORK_SHARDS)
                 if work < total_work:
                     if const_expr(fixed_slot_dispatch):
-                        fx.barrier()
+                        if const_expr(EARLY_TILES):
+                            if tid < fx.Int32(fz_npes):
+                                if const_expr(GEMM1_V2):
+                                    # A 64 x 128 item waits for the rows of the 64 x 256 item it is half of.
+                                    _wait_fixed_tile_rows(
+                                        (work < g1_big).select(work, (g1_big * fx.Int32(2) + (work - g1_big)) // fx.Int32(2)),
+                                        tid,
+                                    )
+                                else:
+                                    _wait_fixed_tile_rows(work, tid)
+                                if const_expr(EARLY_L1_ONLY):
+                                    comm_ops.invalidate_l1()
+                                else:
+                                    comm_ops.fence_system_acquire()
+                            fx.barrier()
+                        else:
+                            fx.barrier()
                     elif not use_ready_order:
                         # Ready-order waits for the tile in the scheduler block.
                         if tid == fx.Int32(0):
                             _wait_tile_payload(work)
                         fx.barrier()
                         comm_ops.fence_system_acquire()
-                    _do_scheduled_tile(work)
+                    if const_expr(GEMM1_V2):
+                        if work < g1_big:
+                            _do_scheduled_tile(work)
+                        else:
+                            _do_tail_tile(g1_big * fx.Int32(2) + (work - g1_big))
+                    else:
+                        _do_scheduled_tile(work)
+                    # Recomputed after the tile so nothing extra stays live through it.
+                    if const_expr(GEMM1_V2):
+                        g1_whole = work < g1_big
+                        g1_m = g1_whole.select(
+                            work // fx.Int32(N_TILES),
+                            (g1_big * fx.Int32(2) + (work - g1_big)) // fx.Int32(N_TILES_TAIL),
+                        )
+                        g1_inc = g1_whole.select(fx.Int32(2), fx.Int32(1))
+                    else:
+                        g1_m = work // fx.Int32(N_TILES)
+                        g1_inc = fx.Int32(1)
+                    if const_expr(FUSE_G2):
+                        # The GEMM2 tiles of this M tile read its output once
+                        # every work item's stores have landed (uncached heap).
+                        fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+                        fx.barrier()
+                        if tid == fx.Int32(0):
+                            comm_ops.atomic_add_agent(_g2_m_done_addr(g1_m), g1_inc)
 
+        steal = fx.Int32(0)
         while consumer_active:
             if tid == fx.Int32(0):
                 first_work = fx.Int32(0)
@@ -649,15 +938,18 @@ def compile_mega_moe_stage1(
                             + local_work * fx.Int32(WORK_SHARDS)
                         )
                 else:
+                    claim_shard = work_shard
+                    if const_expr(FUSE_G2):
+                        claim_shard = (work_shard + steal) & fx.Int32(WORK_SHARDS - 1)
                     local_work = fx.Int32(
                         comm_ops.atomic_add_agent(
                             a_work_head
-                            + fx.Int64(work_shard) * 64,
+                            + fx.Int64(claim_shard) * 64,
                             fx.Int32(work_batch),
                         )
                     )
                     first_work = (
-                        work_shard + local_work * fx.Int32(WORK_SHARDS)
+                        claim_shard + local_work * fx.Int32(WORK_SHARDS)
                     )
                 fx.ptr_store(
                     Vec.from_elements([first_work], fx.Int32), work_scratch
@@ -698,7 +990,18 @@ def compile_mega_moe_stage1(
                 if use_ready_order:
                     comm_ops.fence_system_acquire()
             _run_work_batch(first_work, scheduled_first)
-            consumer_active = first_work < total_work
+            if const_expr(FUSE_G2):
+                # A CTA leaves for GEMM2 only once every shard is drained, so
+                # each GEMM1 work item a GEMM2 tile waits for is already held
+                # by a running CTA, whatever the residency order.
+                steal = steal + (first_work >= total_work).select(fx.Int32(1), fx.Int32(0))
+                consumer_active = steal < fx.Int32(WORK_SHARDS)
+            else:
+                consumer_active = first_work < total_work
+
+        if const_expr(FUSE_G2):
+            _run_fused_stage2()
+
 
     spec = _Stage1KernelSpec(
         kernel, launch_grid_x, TOTAL_THREADS, waves_per_eu_hint
@@ -715,11 +1018,12 @@ def compile_mega_moe_stage1(
         sorted_token_ids: fx.Tensor, expert_ids: fx.Tensor, num_valid_ids: fx.Tensor, out_scale: fx.Tensor,
         tokens: fx.Int32, addr_disp: fx.Int64, i32_cur_tok: fx.Int32, addr_in_tok: fx.Int64,
         addr_in_idx: fx.Int64, addr_in_wts: fx.Int64, addr_in_sc: fx.Int64, addr_parity: fx.Int64,
-        addr_expected: fx.Int64, stream: fx.Stream,
+        addr_expected: fx.Int64, addr_w2: fx.Int64, addr_w2_scale: fx.Int64, stream: fx.Stream,
     ):
         kernel(
             out, x, w, scale_x, scale_w, sorted_token_ids, expert_ids, num_valid_ids, out_scale, tokens,
             addr_disp, i32_cur_tok, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc, addr_parity, addr_expected,
+            addr_w2, addr_w2_scale,
             value_attrs={
                 "rocdl.waves_per_eu": waves_per_eu_hint,
                 "rocdl.flat_work_group_size": f"{TOTAL_THREADS},{TOTAL_THREADS}",
@@ -794,6 +1098,10 @@ def compile_mega_moe_stage1_bundle(
             situ_linear_beta=situ_linear_beta,
             a_dtype=a_dtype,
             out_dtype=out_dtype,
+            early_tiles=config.early_tiles,
+            light_release=config.light_release,
+            resident_grid=config.resident_grid,
+            unroll_k=config.unroll_k,
             _return_kernel_spec=True,
         )
         for config in variants
@@ -847,6 +1155,8 @@ def compile_mega_moe_stage1_bundle(
                     addr_in_sc,
                     addr_parity,
                     addr_expected,
+                    fx.Int64(0),
+                    fx.Int64(0),
                     value_attrs={
                         "rocdl.waves_per_eu": waves_per_eu[index],
                         "rocdl.flat_work_group_size": (
@@ -889,7 +1199,8 @@ def _stage1_bundle_lazy(compile_kw: dict):
 
 def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_ids, num_valid_ids, out_scale,
     tokens, addr_disp, i32_cur_tok, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc,
-    addr_parity, addr_expected, stream, *, model_dim, inter_dim, rank, experts_per_rank, fuse_npes,
+    addr_parity, addr_expected, addr_w2, addr_w2_scale, stream, *, model_dim, inter_dim, rank, experts_per_rank,
+    fuse_npes,
     fuse_topk, fuse_cap, fuse_mtpr, fuse_scale_dim, fixed_slot_dispatch, num_cu,
     sort_block_m=32, tile_n=256, tile_k=256, num_waves=4, grid_mult=4, pipe_weights=True,
     mfma_amajor=False, swizzle_a=True, async_a_copy=False, num_dispatch_cu=32,
@@ -897,7 +1208,9 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
     b_nt=-1, work_shards=None,
     payload_chunk_rows=0, tile_state_stride=0,
     a_dtype="fp8", out_dtype="fp8",
-    swiglu_limit=0.0, act="silu", situ_beta=1.0, situ_linear_beta=1.0):
+    swiglu_limit=0.0, act="silu", situ_beta=1.0, situ_linear_beta=1.0,
+    early_tiles=False, light_release=False, resident_grid=False, unroll_k=False, g1_split_tail=False,
+    fused_stage2=None):
     launch = compile_mega_moe_stage1(
         model_dim=model_dim, inter_dim=inter_dim, rank=rank, experts_per_rank=experts_per_rank,
         fuse_npes=fuse_npes, fuse_topk=fuse_topk, fuse_cap=fuse_cap, fuse_mtpr=fuse_mtpr,
@@ -909,11 +1222,13 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
         b_nt=b_nt, work_shards=work_shards, payload_chunk_rows=payload_chunk_rows,
         tile_state_stride=tile_state_stride, a_dtype=a_dtype, out_dtype=out_dtype,
         swiglu_limit=swiglu_limit, act=act, situ_beta=situ_beta, situ_linear_beta=situ_linear_beta,
+        early_tiles=early_tiles, light_release=light_release, resident_grid=resident_grid,
+        unroll_k=unroll_k, g1_split_tail=g1_split_tail, fused_stage2=fused_stage2,
     )
     _run_compiled(
         launch, out, x, w, scale_x, scale_w, sorted_token_ids, expert_ids, num_valid_ids, out_scale,
         tokens, addr_disp, i32_cur_tok, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc,
-        addr_parity, addr_expected, stream,
+        addr_parity, addr_expected, addr_w2, addr_w2_scale, stream,
     )
 
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 FlyDSL Project Contributors
+# Copyright (C) 2025-2026 FlyDSL Project Contributors
 """Static MegaMoEV2 configuration rules for MI355X."""
 
 import os
@@ -42,6 +42,14 @@ MAX_MTPR_CLASS = 32768
 # regardless of sort_block_m; smaller MTPR classes keep the route-major layout.
 INDEXED_PAYLOAD_MIN_MTPR = MAX_MTPR_CLASS
 REFERENCE_EXPERTS_PER_RANK = 48
+# Direct fixed-slot layouts validated at EP8: V4 (48 experts per rank) and the
+# V4.1-Flash DSpark draft MoE (128 experts, 16 per rank). Fixed-slot reserves
+# world_size * MTPR rows per local expert, so other widths stay compact.
+V41_FLASH_DRAFT_EXPERTS_PER_RANK = 16
+FIXED_SLOT_EXPERTS_PER_RANK = (
+    REFERENCE_EXPERTS_PER_RANK,
+    V41_FLASH_DRAFT_EXPERTS_PER_RANK,
+)
 R1_EXPERTS_PER_RANK = 32
 KIMI_K3_EXPERTS_PER_RANK = 112
 # Per-network tuning is keyed by the full (experts_per_rank, model_dim,
@@ -119,7 +127,14 @@ FUSED_TOKEN_BUCKETS = tuple(b for b in TOKEN_BUCKETS if b != 2)
 LARGE_M_MIN_TOKENS = SMALL_M_MAX_MTPR + 1
 P2P_QUANT_NONE = "none"
 P2P_QUANT_FP8_BLOCKWISE = "fp8_blockwise_1x32"
-SUPPORTED_P2P_QUANT_MODES = (P2P_QUANT_NONE, P2P_QUANT_FP8_BLOCKWISE)
+# MXFP4 combine rows: E2M1 pairs with one E8M0 scale per 32 values, a quarter of
+# the BF16 row bytes. Selected explicitly; "auto" never picks it.
+P2P_QUANT_FP4_BLOCKWISE = "fp4_blockwise_1x32"
+SUPPORTED_P2P_QUANT_MODES = (
+    P2P_QUANT_NONE,
+    P2P_QUANT_FP8_BLOCKWISE,
+    P2P_QUANT_FP4_BLOCKWISE,
+)
 
 ACTIVATION_FP4 = "fp4"
 ACTIVATION_FP8 = "fp8"
@@ -159,6 +174,21 @@ class Stage1Config:
     work_shards: int = 8
     payload_chunk_rows: int = 0
     prepare_quant_cu: int = 64
+    # Fixed-slot staged-path knobs, read only for the 48-expert target layout (mega_moe_stage1 TARGET_FIXED).
+    # early_tiles and light_release change the dispatch protocol between ranks, so every bucket of an
+    # instance must agree on them; the others are per-launch.
+    # early_tiles: a GEMM tile waits for its expert's rows (TILE_READY counts) rather than for the whole dispatch.
+    early_tiles: bool = False
+    # light_release: on MoRI's uncached heap, producers skip the system release fences.
+    light_release: bool = False
+    # resident_grid: launch only the consumer cohort; the owner and producers take GEMM work after their role.
+    resident_grid: bool = False
+    # unroll_k: fully unrolled GEMM1 K loop (async_a_copy, tile_n 256).
+    unroll_k: bool = False
+    # g1_split_tail (fused_g2, tile_n 256): the last GEMM1 work items run as two half-width items each.
+    g1_split_tail: bool = False
+    # fused_g2: consumers run GEMM2 and the combine scatter in this launch instead of a Stage2 launch.
+    fused_g2: bool = False
 
 
 def stage1_bundle_identity(config: Stage1Config) -> Stage1Config:
@@ -186,6 +216,8 @@ class Stage2Config:
     pair_block_m: int = 32
     pair_block_n: int = 256
     deep_a_pipeline: bool = False
+    # MXFP4 combine scatter with every lane busy (Stage1's fused GEMM2 only).
+    wide_scatter: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -379,12 +411,14 @@ class MegaMoEConfig:
             raise ValueError(
                 f"Stage2 block_m={bm} must divide Stage1 sort_block_m={sbm}"
             )
-        if self.p2p_quant not in ("none", "fp8_blockwise_1x32"):
+        if self.p2p_quant not in SUPPORTED_P2P_QUANT_MODES:
             raise ValueError(f"unsupported p2p_quant={self.p2p_quant!r}")
         if self.p2p_quant != "none" and self.stage2.bf16_lds:
-            raise ValueError("FP8 P2P requires Stage2 bf16_lds=False")
+            raise ValueError("FP8/FP4 P2P requires Stage2 bf16_lds=False")
         if self.stage2.deep_a_pipeline and not self.stage2.b2stage:
             raise ValueError("Stage2 deep_a_pipeline requires b2stage=True")
+        if self.stage1.fused_g2 and self.p2p_quant != P2P_QUANT_FP4_BLOCKWISE:
+            raise ValueError("Stage1 fused_g2 requires the fp4_blockwise_1x32 combine")
 
 
 @dataclass(frozen=True, slots=True)
@@ -400,7 +434,7 @@ class Stage2BundleKey:
             raise ValueError(
                 f"Stage2 block_m={self.config.block_m} must divide bundle SBM={self.sbm}"
             )
-        if self.p2p_quant not in ("none", "fp8_blockwise_1x32"):
+        if self.p2p_quant not in SUPPORTED_P2P_QUANT_MODES:
             raise ValueError(f"unsupported p2p_quant={self.p2p_quant!r}")
 
 
@@ -1109,8 +1143,153 @@ def _tune_v41_flash_ep2(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoECo
     return config
 
 
+def _v41_flash_ep8_fp4_combine(
+    config: MegaMoEConfig, ctx: _TuningContext
+) -> MegaMoEConfig:
+    """A4W4 fixed-slot decode at MTPR 512 (AITER_MEGA_FIXED_SLOT_MAX_MTPR=1023) with the MXFP4 combine.
+
+    Searched on 8x MI355X over the DP-padded decode graph sizes 128/160 (bucket 128) and 192/224
+    (bucket 256); outputs match the base config bitwise. Every bucket runs GEMM2 in the Stage1 launch
+    (fused_g2, where select_mega_moe_config allows it) on the early-tile, light-release protocol, which
+    every bucket of the instance shares.
+    """
+    if ctx.bucket in (128, 256):
+        # 64 x 256 GEMM1 tiles with 4 waves and async A copies: at 160-224 tokens a rank most experts get
+        # under 64 rows, so one 64-row tile streams each expert's W1 once where 32-row tiles stream it
+        # twice, and 864 items of 64 x 256 on 512 CTAs take ~62 us a round at full load against ~45 us
+        # per 64 x 128 item on 768 CTAs, which leaves a 25%-full third round. GEMM2 takes the same 64-row
+        # blocks (32-row ones run about half padding and read W2 twice), bn128 bk256 nt with bhoist, apf
+        # and spart 4x2; the FP4 combine needs Stage2's f32 CShuffle, so bf16_lds stays off. Without
+        # fused_g2, Stage2 runs on a persistent grid of 240 CUs: the one-shot grid takes ~117 us at
+        # 160-224 tokens a rank, a persistent one ~75 us.
+        config = _replace_config(
+            config,
+            stage1={
+                "sort_block_m": 64,
+                "tile_n": 256,
+                "tile_k": 256,
+                "num_waves": 4,
+                "async_a_copy": True,
+                "grid_mult": 2,
+                "waves_per_eu_hint": 2,
+                "b_nt": 2,
+            },
+            stage2={
+                "block_m": 64,
+                "block_n": 128,
+                "block_k": 256,
+                "use_nt": True,
+                "persist": True,
+                "persist_cu": 240,
+                "persist_strided": False,
+                "b_hoist": True,
+                "ascale_prefetch": True,
+                "spatial_partition": 402,
+                "b2stage": False,
+                "deep_a_pipeline": False,
+                "bf16_lds": False,
+            },
+        )
+    wide_gemm1 = config.stage1.async_a_copy and config.stage1.tile_n == 256
+    return _replace_config(
+        config,
+        stage1={
+            "early_tiles": True,
+            "light_release": True,
+            "resident_grid": True,
+            "unroll_k": wide_gemm1,
+            "g1_split_tail": config.stage1.tile_n == 256,
+            "fused_g2": True,
+        },
+        stage2={"wide_scatter": True},
+    )
+
+
 def _tune_v41_flash_ep8(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
-    if ctx.apply_fp4 or ctx.world_size != 8:
+    if ctx.world_size != 8:
+        return config
+    if ctx.apply_fp4:
+        if (
+            ctx.fixed_slot
+            and ctx.mtpr == 512
+            and config.p2p_quant == P2P_QUANT_FP4_BLOCKWISE
+        ):
+            return _v41_flash_ep8_fp4_combine(config, ctx)
+        if ctx.fixed_slot and ctx.mtpr == 512:
+            if ctx.bucket == 128:
+                return _replace_config(
+                    config,
+                    stage1={
+                        "tile_n": 512,
+                        "num_waves": 8,
+                        "async_a_copy": True,
+                        "grid_mult": 1,
+                        "num_dispatch_cu": 240,
+                        "waves_per_eu_hint": 1,
+                        "work_shards": 1,
+                    },
+                    stage2={"block_n": 256, "persist_cu": 128, "spatial_partition": 0},
+                )
+            if ctx.bucket == 256:
+                return _replace_config(
+                    config,
+                    stage1={
+                        "sort_block_m": 64,
+                        "tile_n": 512,
+                        "num_waves": 8,
+                        "async_a_copy": True,
+                        "grid_mult": 1,
+                        "num_dispatch_cu": 168,
+                        "work_shards": 1,
+                    },
+                    stage2={
+                        "block_m": 64,
+                        "block_n": 256,
+                        "persist_cu": 256,
+                        "b2stage": True,
+                        "deep_a_pipeline": True,
+                        "spatial_partition": 201,
+                    },
+                )
+        # A4W4 compact runtime at MTPR 4096 (max_num_batched_tokens) on steps that carry a prefill chunk.
+        # Searched like the decode rules at 768/1024, 1536/2048 and 3072/4096 tokens per rank; outputs match
+        # the base config bitwise. Bucket 4096 keeps 32 dispatch CUs: 40 and up deadlocked at 3072 and 4096
+        # tokens in the search.
+        if not ctx.fixed_slot and ctx.mtpr == 4096:
+            if ctx.bucket == 1024:
+                return _replace_config(
+                    config,
+                    stage1={
+                        "grid_mult": 2,
+                        "num_dispatch_cu": 144,
+                        "prepare_quant_cu": 32,
+                        "work_shards": 2,
+                    },
+                    stage2={"b2stage": True, "deep_a_pipeline": True, "skew_cu": 128},
+                )
+            if ctx.bucket == 2048:
+                return _replace_config(
+                    config,
+                    stage1={
+                        "sort_block_m": 128,
+                        "grid_mult": 2,
+                        "num_dispatch_cu": 40,
+                        "prepare_quant_cu": 32,
+                        "work_shards": 2,
+                    },
+                    stage2={"block_m": 64, "b2stage": True, "deep_a_pipeline": True},
+                )
+            if ctx.bucket == 4096:
+                return _replace_config(
+                    config,
+                    stage1={"prepare_quant_cu": 32, "work_shards": 2},
+                    stage2={
+                        "block_m": 128,
+                        "persist_cu": 256,
+                        "skew_cu": 32,
+                        "spatial_partition": 201,
+                    },
+                )
         return config
     if ctx.fixed_slot:
         if ctx.bucket in (16, 32):
@@ -1140,6 +1319,54 @@ def _tune_v41_flash_ep8(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoECo
             "skew_cu": 240 if ctx.bucket == 32768 else config.stage2.skew_cu,
         },
     )
+
+
+def _tune_v41_flash_draft_ep8(
+    config: MegaMoEConfig, ctx: _TuningContext
+) -> MegaMoEConfig:
+    # DSpark draft MoE (16 experts per rank), A4W4 fixed-slot decode at MTPR 512 with the MXFP4 combine.
+    # Searched like v41_flash_ep8; outputs match the base config bitwise.
+    if (
+        ctx.world_size != 8
+        or not ctx.apply_fp4
+        or not ctx.fixed_slot
+        or ctx.mtpr != 512
+    ):
+        return config
+    if ctx.bucket == 128:
+        return _replace_config(
+            config,
+            stage1={
+                "sort_block_m": 64,
+                "tile_n": 512,
+                "num_waves": 8,
+                "async_a_copy": True,
+                "grid_mult": 2,
+                "num_dispatch_cu": 240,
+                "mfma_amajor": True,
+                "b_nt": 0,
+            },
+            stage2={"persist_cu": 160, "use_nt": False, "spatial_partition": 804},
+        )
+    if ctx.bucket == 256:
+        return _replace_config(
+            config,
+            stage1={
+                "tile_n": 512,
+                "num_waves": 8,
+                "async_a_copy": True,
+                "grid_mult": 2,
+                "num_dispatch_cu": 208,
+                "b_nt": 0,
+            },
+            stage2={
+                "persist_cu": 192,
+                "persist_strided": True,
+                "skew_cu": 64,
+                "use_nt": False,
+            },
+        )
+    return config
 
 
 @dataclass(frozen=True, slots=True)
@@ -1195,6 +1422,13 @@ _NETWORKS = (
         fp4_prelude=True,
     ),
     NetworkProfile("v41_flash_ep8", 48, 5120, 2304, _tune_v41_flash_ep8),
+    NetworkProfile(
+        "v41_flash_draft_ep8",
+        V41_FLASH_DRAFT_EXPERTS_PER_RANK,
+        5120,
+        2304,
+        _tune_v41_flash_draft_ep8,
+    ),
 )
 
 
@@ -1254,7 +1488,7 @@ def select_mega_moe_config(
     fixed_slot_dispatch = (
         mtpr_class <= FIXED_SLOT_MAX_MTPR
         and world_size == 8
-        and experts_per_rank == REFERENCE_EXPERTS_PER_RANK
+        and experts_per_rank in FIXED_SLOT_EXPERTS_PER_RANK
     )
     if fixed_slot_dispatch and bucket > FIXED_SLOT_MAX_MTPR:
         raise ValueError(f"fixed-slot does not support token bucket {bucket}")
@@ -1349,10 +1583,21 @@ def select_mega_moe_config(
         # and it reclaims the small-bucket cost that forcing sync would add.
         config = _replace_config(config, stage1={"async_a_copy": True})
     if config.stage2.aligned_pair and config.p2p_quant != P2P_QUANT_FP8_BLOCKWISE:
-        # The aligned-pair Stage2 kernel only emits the FP8 P2P row layout, so
-        # reject the combination here instead of at launch.
-        raise ValueError(
-            f"p2p_quant={config.p2p_quant!r} conflicts with aligned-pair Stage2"
+        # The aligned-pair kernel writes FP8 rows only; an explicitly requested
+        # BF16 or FP4 combine keeps the plain Stage2.
+        config = _replace_config(config, stage2={"aligned_pair": False, "pair_cu": 0})
+    if config.stage1.fused_g2 and not (
+        fixed_slot_dispatch
+        and a_dtype == ACTIVATION_FP4
+        and experts_per_rank == REFERENCE_EXPERTS_PER_RANK
+        and config.p2p_quant == P2P_QUANT_FP4_BLOCKWISE
+        and config.stage1.num_waves == 4
+        and not config.stage2.aligned_pair
+    ):
+        # Stage1's fused GEMM2 runs Stage2's 256-thread tile, is validated with the MXFP4 combine on the
+        # 48-expert target layout only, and has no aligned-pair variant.
+        config = _replace_config(
+            config, stage1={"fused_g2": False, "g1_split_tail": False}
         )
     return config
 
@@ -1388,7 +1633,7 @@ def build_mega_moe_bundle_plan(
     fixed_slot_dispatch = (
         mtpr <= FIXED_SLOT_MAX_MTPR
         and world_size == 8
-        and experts_per_rank == REFERENCE_EXPERTS_PER_RANK
+        and experts_per_rank in FIXED_SLOT_EXPERTS_PER_RANK
     )
     stage1_variants: list[Stage1Config] = []
     stage2_variants: list[Stage2BundleKey] = []

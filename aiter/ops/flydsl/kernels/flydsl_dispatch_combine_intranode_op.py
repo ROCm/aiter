@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 FlyDSL Project Contributors
+# Copyright (C) 2025-2026 FlyDSL Project Contributors
 
 from __future__ import annotations
 
@@ -41,7 +41,8 @@ _SUPPORTED_TOK_DTYPES = (
 _SUPPORTED_QUANT_TYPES = ("none", "fp8_direct_cast")
 # "fp8_blockwise_1x32" is what the gfx1250 path calls combine_quant="mxfp8"
 # (mega_moe_gfx1250/recipe.py).
-_SUPPORTED_STAGE2_P2P_QUANT_TYPES = ("none", "fp8_blockwise_1x32")
+# "fp4_blockwise_1x32" carries packed E2M1 rows with the same E8M0 1x32 scales.
+_SUPPORTED_STAGE2_P2P_QUANT_TYPES = ("none", "fp8_blockwise_1x32", "fp4_blockwise_1x32")
 
 _MAX_INTRANODE_NPES = 8
 
@@ -1461,6 +1462,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 f"Supported: {_SUPPORTED_STAGE2_P2P_QUANT_TYPES}"
             )
         blockwise_fp8 = skip_stage1 and p2p_quant == "fp8_blockwise_1x32"
+        blockwise_fp4 = skip_stage1 and p2p_quant == "fp4_blockwise_1x32"
         # Fused-upstream combine: top-k ids mask never-dispatched (-1) slots.
         mask_topk_ids = skip_stage1 and indices is not None and not cfg.zero_copy
         if mask_topk_ids and (
@@ -1524,6 +1526,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
             bool(enable_weights),
             bool(fp8_dc),
             bool(blockwise_fp8),
+            bool(blockwise_fp4),
             bn,
             wpb,
             bool(skip_stage1),
@@ -1546,6 +1549,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 skip_stage1=bool(skip_stage1),
                 fp8_direct_cast=bool(fp8_dc),
                 blockwise_fp8_transport=bool(blockwise_fp8),
+                blockwise_fp4_transport=bool(blockwise_fp4),
                 # Must match dispatch's encoding stride so tok_map decode lines up.
                 max_recv=self._effective_max_recv,
                 mask_topk_ids=bool(mask_topk_ids),
@@ -1655,6 +1659,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
             and input.dtype == torch.bfloat16
         )
         blockwise_fp8 = p2p_quant == "fp8_blockwise_1x32"
+        blockwise_fp4 = p2p_quant == "fp4_blockwise_1x32"
         c_dtype = torch.float8_e4m3fn if fp8_dc else input.dtype
         _cur_tok = self._resolve_cur_tok(cur_tok, "preload_combine_no_stage1()")
         block_num, warp_num = _resolve_launch_geometry(
@@ -1673,6 +1678,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
             bool(enable_weights),
             bool(fp8_dc),
             bool(blockwise_fp8),
+            bool(blockwise_fp4),
             block_num,
             warp_num,
             True,
@@ -1695,6 +1701,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 skip_stage1=True,
                 fp8_direct_cast=bool(fp8_dc),
                 blockwise_fp8_transport=bool(blockwise_fp8),
+                blockwise_fp4_transport=bool(blockwise_fp4),
                 max_recv=self._effective_max_recv,
                 mask_topk_ids=bool(mask_topk_ids),
             )
