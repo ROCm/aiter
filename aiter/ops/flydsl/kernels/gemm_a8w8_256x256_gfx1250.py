@@ -475,10 +475,26 @@ def launch_gemm_a8w8_256x256(
         mn_oob = i32_m - blk_m  # valid M rows (A / C)
         a_oob = (mn_oob + 1) >> 1 if const_expr(a_preshuffle) else mn_oob
         # Workgroups past N pad the last cluster column: they still multicast
-        # their real A to the column's peers, but read zero B and store nothing.
+        # their real A to the column's peers and store nothing. Their own B is
+        # discarded; unless M is padded too, they load the real tile one
+        # cluster column back (else the last tile), as all-out-of-bounds B
+        # loads stall the cluster for several us when B is cold. With padded
+        # M the mirror loads cost more than they save.
         n_oob = i32_n - blk_n
-        b_oob = n_oob // 16
-        sb_oob = n_oob // (32 if const_expr(mx32) else 128)
+        blk_n_ld, n_oob_ld = blk_n, n_oob
+        if const_expr(cluster_n > 1 and persistent_n_tiles == 1):
+            mirror_n = blk_n - cluster_n * tile_n
+            last_n = (i32_n > tile_n).select(i32_n - tile_n, fx.Int32(0))
+            mirror_n = (mirror_n >= 0).select(mirror_n, last_n)
+            pad_ld = n_oob <= 0
+            if const_expr(cluster_m > 1):
+                m_tiles = (i32_m + (tile_m - 1)) // tile_m
+                pad_ld = pad_ld & ((m_tiles % fx.Int32(cluster_m)) == 0)
+            blk_n_ld = pad_ld.select(mirror_n, blk_n)
+            n_oob_ld = i32_n - blk_n_ld
+        blk_n64_ld = fx.Int64(blk_n_ld)
+        b_oob = n_oob_ld // 16
+        sb_oob = n_oob_ld // (32 if const_expr(mx32) else 128)
         c_rows = (n_oob > 0).select(mn_oob, fx.Int32(0))
         sa_oob = (
             (
@@ -515,7 +531,7 @@ def launch_gemm_a8w8_256x256(
 
         k_elem0 = kt_base * tile_k
         a_off0 = blk_m64 * lda64 + k_elem0 * A_PAIR
-        b_off0 = (blk_n64 // 16) * Kp16 + k_elem0 * 16
+        b_off0 = (blk_n64_ld // 16) * Kp16 + k_elem0 * 16
         if const_expr(mx32):
             sa_row64 = (
                 fx.Int64(i32_stride_ascale_k) if const_expr(batched) else k64 // 32
@@ -526,13 +542,13 @@ def launch_gemm_a8w8_256x256(
                 else blk_m64 * sa_row64 + k_elem0 // 32
             )
             sb_k64 = k64 // 32 if const_expr(b_scale_32x32) else k64
-            sb_off0 = (blk_n64 // 32) * sb_k64 + (
+            sb_off0 = (blk_n64_ld // 32) * sb_k64 + (
                 k_elem0 // 32 if const_expr(b_scale_32x32) else k_elem0
             )
         else:
             scale_k0 = kt_base * K_WS
             sa_off0 = blk_m64 + scale_k0 * fx.Int64(i32_stride_ascale_k)
-            sb_off0 = (blk_n64 // 128) * (k64 // 128) + scale_k0
+            sb_off0 = (blk_n64_ld // 128) * (k64 // 128) + scale_k0
         if const_expr(batched):
             bat = fx.Int64(bid_z)
             n64 = fx.Int64(i32_n)
