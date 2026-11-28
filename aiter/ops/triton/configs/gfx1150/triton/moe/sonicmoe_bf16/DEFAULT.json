@@ -56,8 +56,8 @@
       "_note": "N<=256, K<=256, E<=8"
     },
     "medium_NK": {
-      "BLOCK_M": 128,
-      "BLOCK_N": 128,
+      "BLOCK_M": 256,
+      "BLOCK_N": 32,
       "BLOCK_K": 64,
       "GROUP_SIZE_M": 8,
       "num_warps": 8,
@@ -65,11 +65,11 @@
       "_note": "N<=2048, K<=2048, E<=32"
     },
     "large_NK": {
-      "BLOCK_M": 128,
+      "BLOCK_M": 512,
       "BLOCK_N": 128,
-      "BLOCK_K": 64,
-      "GROUP_SIZE_M": 8,
-      "num_warps": 4,
+      "BLOCK_K": 32,
+      "GROUP_SIZE_M": 16,
+      "num_warps": 16,
       "num_stages": 2,
       "_note": "N>=4096 or K>=4096, E>=64"
     }
