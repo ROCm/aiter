@@ -1,6 +1,7 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.common.rmsnorm import _inverse_rms
 from aiter.ops.triton._triton_kernels.kv_cache import _store_mla_kv_cache
 from aiter.ops.triton._triton_kernels.quant.quant import _nvfp4_quant_op
 from aiter.ops.triton.rope.rope import (
@@ -10,6 +11,21 @@ from aiter.ops.triton.rope.rope import (
     _get_neox_rotated_x_1D,
 )
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
+
+
+def _get_config(key: str) -> dict | None:
+    """Launch options of fused_qk_rope_reshape_and_cache under ``key``. ``qk_norm``:
+    ``BLOCK_H_MAX``, the most q heads one program of the QK-norm path takes. None
+    on arches that ship no table."""
+    table = load_config_json(
+        resolve_config_dir("fusions", "FUSED_QK_ROPE_RESHAPE_AND_CACHE")
+        + "/DEFAULT.json",
+        required=False,
+    )
+    if table is None:
+        return None
+    return dict(table[key])
 
 
 @triton.jit
@@ -758,6 +774,52 @@ def _unit_rope_2d(
     return x_pe * cos + x_pe_rotated * sin
 
 
+@triton.jit
+def _norm_rope(
+    x_ptrs,
+    x_rot_ptrs,
+    w,
+    w_rot,
+    cos,
+    sin,
+    rot_neg,
+    eps,
+    BLOCK_D: tl.constexpr,
+):
+    """RMSNorm, then RoPE, of one head row [BLOCK_D]. The norm is fp32, rounded
+    to x's dtype; RoPE is fp32. The rotated row is loaded at its permuted
+    offsets (x_rot_ptrs, w_rot, negated where rot_neg), not shuffled."""
+    x = tl.load(x_ptrs)
+    x_f32 = x.to(tl.float32)
+    inv_rms = _inverse_rms(x_f32, BLOCK_D, eps, False)
+    n = (x_f32 * inv_rms * w).to(x.dtype).to(tl.float32)
+    n_rot = (tl.load(x_rot_ptrs).to(tl.float32) * inv_rms * w_rot).to(x.dtype)
+    n_rot = n_rot.to(tl.float32)
+    return n * cos + tl.where(rot_neg, -n_rot, n_rot) * sin
+
+
+@triton.jit
+def _norm_rope_2d(
+    x_ptrs,
+    x_rot_ptrs,
+    w,
+    w_rot,
+    cos,
+    sin,
+    rot_neg,
+    eps,
+    BLOCK_D: tl.constexpr,
+):
+    """`_norm_rope` on each row of [BLOCK_H, BLOCK_D]."""
+    x = tl.load(x_ptrs)
+    x_f32 = x.to(tl.float32)
+    inv_rms = _inverse_rms(x_f32, BLOCK_D, eps, False)[:, None]
+    n = (x_f32 * inv_rms * w).to(x.dtype).to(tl.float32)
+    n_rot = (tl.load(x_rot_ptrs).to(tl.float32) * inv_rms * w_rot).to(x.dtype)
+    n_rot = n_rot.to(tl.float32)
+    return n * cos + tl.where(rot_neg, -n_rot, n_rot) * sin
+
+
 _fused_qk_rope_reshape_and_cache_kernel_repr = make_kernel_repr(
     "_fused_qk_rope_reshape_and_cache_kernel",
     [
@@ -781,6 +843,9 @@ _fused_qk_rope_reshape_and_cache_kernel_repr = make_kernel_repr(
         "HAVE_V_SCALE",
         "HAVE_ZEROS",
         "UPCAST_OPERAND",
+        "HAVE_Q",
+        "HAVE_QK_NORM",
+        "SATURATE_FP8",
     ],
 )
 
@@ -856,6 +921,13 @@ def _fused_qk_rope_reshape_and_cache_kernel(
     BLOCK_H: tl.constexpr = 1,
     KH_BLOCK: tl.constexpr = 1,
     SCALE_PRESHUFFLE: tl.constexpr = 128,
+    q_norm_weight_ptr=None,
+    k_norm_weight_ptr=None,
+    norm_eps=None,
+    HAVE_Q: tl.constexpr = True,
+    HAVE_QK_NORM: tl.constexpr = False,
+    SATURATE_FP8: tl.constexpr = False,
+    FP8_MAX: tl.constexpr = 0.0,
 ):
 
     tl.assume(q_stride_t >= 0)
@@ -923,40 +995,64 @@ def _fused_qk_rope_reshape_and_cache_kernel(
         if UPCAST_OPERAND:
             cos = cos.to(tl.float32)
             sin = sin.to(tl.float32)
+        if HAVE_QK_NORM:
+            # The rotated half's offsets and the lanes RoPE negates.
+            if IS_NEOX:
+                d_rot_offs = (d_pe_offs + BLOCK_D_HALF_pe) % BLOCK_D_pe
+                rot_neg = d_pe_offs < BLOCK_D_HALF_pe
+            else:
+                d_rot_offs = d_pe_offs ^ 1
+                rot_neg = d_pe_offs % 2 == 0
 
-        q_ptrs = (
-            q_ptr
-            + pid_t * q_stride_t
-            + pid_hq[:, None] * q_stride_h
-            + d_pe_offs[None, :] * q_stride_d
-        )
-        q_pe = _unit_rope_2d(
-            q_ptrs,
-            cos[None, :],
-            sin[None, :],
-            d_pe_offs[None, :],
-            IS_NEOX,
-            BLOCK_H,
-            BLOCK_D_pe,
-            BLOCK_D_HALF_pe,
-        )
-        q_out_ptrs = (
-            q_out_ptr
-            + pid_t * q_out_stride_t
-            + pid_hq[:, None] * q_out_stride_h
-            + d_pe_offs[None, :] * q_out_stride_d
-        )
-        tl.store(q_out_ptrs, q_pe.to(q_out_ptr.dtype.element_ty))
-
-        if HAVE_ZEROS:
-            z = tl.zeros((BLOCK_H, BLOCK_D_pe), dtype=zeros_out_ptr.dtype.element_ty)
-            zeros_out_ptrs = (
-                zeros_out_ptr
-                + pid_t * zeros_out_stride_t
-                + pid_hq[:, None] * zeros_out_stride_h
-                + d_pe_offs[None, :] * zeros_out_stride_d
+        if HAVE_Q:
+            q_ptrs = (
+                q_ptr
+                + pid_t * q_stride_t
+                + pid_hq[:, None] * q_stride_h
+                + d_pe_offs[None, :] * q_stride_d
             )
-            tl.store(zeros_out_ptrs, z)
+            if HAVE_QK_NORM:
+                q_pe = _norm_rope_2d(
+                    q_ptrs,
+                    q_ptrs + (d_rot_offs - d_pe_offs)[None, :] * q_stride_d,
+                    tl.load(q_norm_weight_ptr + d_pe_offs).to(tl.float32)[None, :],
+                    tl.load(q_norm_weight_ptr + d_rot_offs).to(tl.float32)[None, :],
+                    cos[None, :],
+                    sin[None, :],
+                    rot_neg[None, :],
+                    norm_eps,
+                    BLOCK_D_pe,
+                )
+            else:
+                q_pe = _unit_rope_2d(
+                    q_ptrs,
+                    cos[None, :],
+                    sin[None, :],
+                    d_pe_offs[None, :],
+                    IS_NEOX,
+                    BLOCK_H,
+                    BLOCK_D_pe,
+                    BLOCK_D_HALF_pe,
+                )
+            q_out_ptrs = (
+                q_out_ptr
+                + pid_t * q_out_stride_t
+                + pid_hq[:, None] * q_out_stride_h
+                + d_pe_offs[None, :] * q_out_stride_d
+            )
+            tl.store(q_out_ptrs, q_pe.to(q_out_ptr.dtype.element_ty))
+
+            if HAVE_ZEROS:
+                z = tl.zeros(
+                    (BLOCK_H, BLOCK_D_pe), dtype=zeros_out_ptr.dtype.element_ty
+                )
+                zeros_out_ptrs = (
+                    zeros_out_ptr
+                    + pid_t * zeros_out_stride_t
+                    + pid_hq[:, None] * zeros_out_stride_h
+                    + d_pe_offs[None, :] * zeros_out_stride_d
+                )
+                tl.store(zeros_out_ptrs, z)
 
         if pid_hq_base % QH_PER_KH == 0:
             pid_slot = tl.load(slot_mapping_ptr + pid_t).to(tl.int64)
@@ -971,6 +1067,11 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                     v_scale = tl.load(v_scale_ptr)
                 else:
                     v_scale = 1
+                if HAVE_QK_NORM:
+                    k_norm_w = tl.load(k_norm_weight_ptr + d_pe_offs).to(tl.float32)
+                    k_norm_w_rot = tl.load(k_norm_weight_ptr + d_rot_offs).to(
+                        tl.float32
+                    )
                 for i in tl.static_range(KH_BLOCK):
                     pid_hk = pid_hq_base // QH_PER_KH + i
                     k_ptrs = (
@@ -979,15 +1080,31 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                         + pid_hk * k_stride_h
                         + d_pe_offs * k_stride_d
                     )
-                    k_pe = _unit_rope(
-                        k_ptrs,
-                        cos,
-                        sin,
-                        d_pe_offs,
-                        IS_NEOX,
-                        BLOCK_D_pe,
-                        BLOCK_D_HALF_pe,
-                    )
+                    if HAVE_QK_NORM:
+                        k_pe = _norm_rope(
+                            k_ptrs,
+                            k_ptrs + (d_rot_offs - d_pe_offs) * k_stride_d,
+                            k_norm_w,
+                            k_norm_w_rot,
+                            cos,
+                            sin,
+                            rot_neg,
+                            norm_eps,
+                            BLOCK_D_pe,
+                        )
+                        # The cache takes the rounded k_out, as a separate
+                        # norm -> rope -> cache-write chain does.
+                        k_pe = k_pe.to(k_out_ptr.dtype.element_ty)
+                    else:
+                        k_pe = _unit_rope(
+                            k_ptrs,
+                            cos,
+                            sin,
+                            d_pe_offs,
+                            IS_NEOX,
+                            BLOCK_D_pe,
+                            BLOCK_D_HALF_pe,
+                        )
 
                     k_out_ptrs = (
                         k_out_ptr
@@ -1008,6 +1125,9 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                     )
                     v_scale_rcprl = 1 / v_scale
                     v = tl.load(v_ptrs) * v_scale_rcprl
+                    if SATURATE_FP8:
+                        k_pe = tl.clamp(k_pe, -FP8_MAX, FP8_MAX)
+                        v = tl.clamp(v, -FP8_MAX, FP8_MAX)
 
                     _store_kv_cache_kernel(
                         key_cache_ptr,
@@ -1082,6 +1202,9 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                     v_scale = 1
                 v_scale_rcprl = 1 / v_scale
                 v = tl.load(v_ptrs) * v_scale_rcprl
+                if SATURATE_FP8:
+                    k_pe = tl.clamp(k_pe, -FP8_MAX, FP8_MAX)
+                    v = tl.clamp(v, -FP8_MAX, FP8_MAX)
 
                 _store_kv_cache_kernel(
                     key_cache_ptr,

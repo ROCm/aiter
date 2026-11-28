@@ -761,6 +761,223 @@ def test_fused_qk_rope_reshape_and_cache(
         )
 
 
+def _ref_head_rmsnorm(x, w, eps):
+    x_f32 = x.to(torch.float32)
+    inv_rms = torch.rsqrt(x_f32.pow(2).mean(-1, keepdim=True) + eps)
+    return (x_f32 * inv_rms * w.to(torch.float32)).to(x.dtype)
+
+
+@pytest.mark.parametrize("T", [1, 8, 130])
+@pytest.mark.parametrize("QH_per_KH", [1, 4])
+@pytest.mark.parametrize("KH", [2])
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, e4m3_dtype])
+@pytest.mark.parametrize("with_q", [True, False])
+def test_fused_qk_rope_reshape_and_cache_qk_norm(
+    T: int, QH_per_KH: int, KH: int, cache_dtype: torch.dtype, with_q: bool
+):
+    """The q/k RMSNorm prologue, with the FLASH layout and a NEOX RoPE: q and k
+    match norm -> RoPE in fp32, and the cache holds k_out and v, quantized with
+    saturation on an FP8 cache. with_q=False ropes and caches k only."""
+    if cache_dtype == e4m3_dtype and DEVICE_ARCH not in ("gfx1250", "gfx950"):
+        pytest.skip("FP8 cases only supported on gfx1250 and gfx950")
+    D, block_size, num_blocks, eps = 64, 16, 32, 1e-6
+    torch.manual_seed(0)
+    q, k, _, _, freqs, positions, _, cos, sin = generate_rope_inputs(
+        1,
+        T,
+        KH,
+        QH_per_KH,
+        D,
+        cached=True,
+        reuse_freqs_front_part=True,
+        nope=False,
+        pos=True,
+        offs=False,
+        two_inputs=True,
+        layout="thd",
+        dtype=torch.bfloat16,
+    )
+    v = torch.randn_like(k)
+    fp8 = cache_dtype == e4m3_dtype
+    if fp8:
+        # Out of the FP8 range: stored saturated, not as NaN.
+        v[0, 0, :4] = torch.tensor(
+            [1e4, -1e4, 500.0, -500.0], dtype=torch.bfloat16, device="cuda"
+        )
+    q_w = torch.rand(D, dtype=torch.bfloat16, device="cuda") + 0.5
+    k_w = torch.rand(D, dtype=torch.bfloat16, device="cuda") + 0.5
+    k_scale = torch.rand(1, dtype=torch.float32, device="cuda") + 0.5
+    v_scale = torch.rand(1, dtype=torch.float32, device="cuda") + 0.5
+    slot_mapping = torch.randperm(num_blocks * block_size, device="cuda")[:T]
+    if T > 1:
+        slot_mapping[T // 2] = -1
+
+    key_cache = torch.zeros(
+        (num_blocks, block_size, KH, D), dtype=cache_dtype, device="cuda"
+    )
+    value_cache = torch.zeros_like(key_cache)
+    q_in = q.clone() if with_q else None
+    k_in = k.clone()
+    q_out, k_out, key_cache, value_cache = fused_qk_rope_reshape_and_cache(
+        q_in,
+        k_in,
+        v,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        positions,
+        cos,
+        sin,
+        k_scale,
+        v_scale,
+        True,
+        flash_layout=True,
+        apply_scale=fp8,
+        q_out=q_in,
+        k_out=k_in,
+        output_zeros=False,
+        upcast_operand=True,
+        q_norm_weight=q_w if with_q else None,
+        k_norm_weight=k_w,
+        norm_eps=eps,
+        saturate_fp8=True,
+    )
+
+    def ref_norm_rope(x, w):
+        return ref_rope_sbhd_fwd(
+            _ref_head_rmsnorm(x, w, eps).unsqueeze(0),
+            freqs[positions].squeeze(-2),
+            rotate_style=RotateStyle.NEOX,
+            reuse_freqs_front_part=True,
+            nope_first=False,
+            simulate_cached=True,
+            comp_with_fp32=True,
+        ).squeeze(0)
+
+    # The fp32 sum of squares may round otherwise than torch's: a normed value
+    # one bf16 ulp off, which RoPE can carry to a few ulps of a small output.
+    tol = {"atol": 1e-1, "rtol": 1.6e-2}
+    written = slot_mapping >= 0
+    if with_q:
+        torch.testing.assert_close(q_out, ref_norm_rope(q, q_w), **tol)
+    else:
+        assert q_out is None
+    torch.testing.assert_close(k_out[written], ref_norm_rope(k, k_w)[written], **tol)
+
+    # The cache is exactly k_out and v at the written slots, quantized as a
+    # separate cache write does.
+    slots = slot_mapping[written]
+    got_k = key_cache[slots // block_size, slots % block_size]
+    got_v = value_cache[slots // block_size, slots % block_size]
+    if fp8:
+        fp8_max = torch.finfo(cache_dtype).max
+        exp_k = (k_out[written].to(torch.float32) * (1 / k_scale)).clamp(
+            -fp8_max, fp8_max
+        )
+        exp_v = (v[written].to(torch.float32) * (1 / v_scale)).clamp(-fp8_max, fp8_max)
+        exp_k, exp_v = exp_k.to(cache_dtype), exp_v.to(cache_dtype)
+        if written[0]:
+            assert got_v[0, 0, 0].item() == fp8_max
+            assert got_v[0, 0, 1].item() == -fp8_max
+    else:
+        exp_k, exp_v = k_out[written], v[written]
+    torch.testing.assert_close(
+        got_k.to(torch.float32), exp_k.to(torch.float32), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        got_v.to(torch.float32), exp_v.to(torch.float32), atol=0, rtol=0
+    )
+    # Nothing else is written: a -1 slot is skipped.
+    filled = key_cache.to(torch.float32).ne(0).flatten(2).any(-1)
+    assert int(filled.sum()) == int(written.sum())
+
+
+@pytest.mark.parametrize("T", [8, 130])
+def test_fused_qk_rope_reshape_and_cache_qk_norm_strided_weights(T: int):
+    """Strided norm weights, a [::2] view and an expanded scalar, give the result
+    of their contiguous copies."""
+    QH, KH, D, block_size, num_blocks = 8, 2, 64, 16, 32
+    torch.manual_seed(0)
+    q, k, _, _, _, positions, _, cos, sin = generate_rope_inputs(
+        1,
+        T,
+        KH,
+        QH // KH,
+        D,
+        cached=True,
+        reuse_freqs_front_part=True,
+        nope=False,
+        pos=True,
+        offs=False,
+        two_inputs=True,
+        layout="thd",
+        dtype=torch.bfloat16,
+    )
+    v = torch.randn_like(k)
+    q_w = (torch.rand(2 * D, dtype=torch.bfloat16, device="cuda") + 0.5)[::2]
+    k_w = torch.full((1,), 1.25, dtype=torch.bfloat16, device="cuda").expand(D)
+    scale = torch.ones(1, dtype=torch.float32, device="cuda")
+    slot_mapping = torch.randperm(num_blocks * block_size, device="cuda")[:T]
+
+    def run(q_w, k_w):
+        key_cache = torch.zeros(
+            (num_blocks, block_size, KH, D), dtype=torch.bfloat16, device="cuda"
+        )
+        return fused_qk_rope_reshape_and_cache(
+            q,
+            k,
+            v,
+            key_cache,
+            torch.zeros_like(key_cache),
+            slot_mapping,
+            positions,
+            cos,
+            sin,
+            scale,
+            scale,
+            True,
+            flash_layout=True,
+            apply_scale=False,
+            output_zeros=False,
+            upcast_operand=True,
+            q_norm_weight=q_w,
+            k_norm_weight=k_w,
+        )
+
+    for got, want in zip(run(q_w, k_w), run(q_w.contiguous(), k_w.contiguous())):
+        assert torch.equal(got, want)
+
+
+def test_fused_qk_rope_reshape_and_cache_saturate_fp8_refuses_a8k4v8():
+    """saturate_fp8 is refused on the A8K4V8 cache, not ignored."""
+    T, KH, D, block_size, num_blocks = 4, 2, 64, 64, 2
+    k = torch.randn((T, KH, D), dtype=torch.bfloat16, device="cuda")
+    cos = torch.randn((T, 1, 1, D // 2), dtype=torch.bfloat16, device="cuda")
+    key_cache = torch.zeros(
+        (num_blocks, KH, block_size, D // 2 + D // 16), dtype=torch.uint8, device="cuda"
+    )
+    value_cache = torch.zeros(
+        (num_blocks, KH, block_size // 16, D, 16), dtype=e4m3_dtype, device="cuda"
+    )
+    with pytest.raises(ValueError, match="saturate_fp8"):
+        fused_qk_rope_reshape_and_cache(
+            k.clone(),
+            k,
+            torch.randn_like(k),
+            key_cache,
+            value_cache,
+            torch.arange(T, device="cuda"),
+            torch.arange(T, device="cuda"),
+            cos,
+            cos,
+            None,
+            torch.ones(1, dtype=torch.float32, device="cuda"),
+            True,
+            flash_layout=False,
+            saturate_fp8=True,
+        )
+
+
 # gpt-oss-120b config: hidden_size=2880, num_attention_heads=64, num_key_value_heads=8, head_dim=64
 GPT_OSS_120B_HEAD_DIM = 64
 GPT_OSS_120B_NUM_ATTENTION_HEADS = 64

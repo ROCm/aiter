@@ -11,6 +11,7 @@ from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
 )
 from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
     _fused_qk_rope_cosine_cache_llama_kernel,
+    _get_config,
 )
 from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
     _fused_qk_rope_reshape_and_cache_kernel as triton_fused_qk_rope_reshape_and_cache_kernel,
@@ -635,12 +636,16 @@ def fused_qk_rope_reshape_and_cache(
     output_zeros: bool = True,
     zeros_out: torch.Tensor = None,
     upcast_operand: bool = False,
+    q_norm_weight: torch.Tensor = None,
+    k_norm_weight: torch.Tensor = None,
+    norm_eps: float = 1e-6,
+    saturate_fp8: bool = False,
 ):
     """
     Perform RoPE on q and k and along the last dimension and copy k and v into key_cache and value_cache inplace
 
     Key parameters:
-    - q: shape (T, QH, D).
+    - q: shape (T, QH, D), or None to rope and cache k only (no q_out, no zeros_out).
     - k: shape (T, KH, D).
     - v: shape (T, KH, D).
     - if flash_layout:
@@ -658,6 +663,15 @@ def fused_qk_rope_reshape_and_cache(
     -     v_scale and cast to FP8, so the attention side reads it with v_descale = v_scale
     -     and k_descale = 1 (pass k_scale=None or 1).
     - slot_mapping: shape (T_slot, ).
+    - k_norm_weight: shape (D,). If set, q and k get a per-head RMSNorm before RoPE:
+    -     x * rsqrt(mean(x**2) + norm_eps) * weight in fp32, rounded to the dtype of x.
+    -     The RoPE after it runs in fp32. q_norm_weight (D,) is then needed when q
+    -     is set. The cache takes k_out after its rounding, so the result is that
+    -     of separate norm, RoPE and cache-write kernels. Needs T_slot == T. Not on
+    -     the NVFP4 cache.
+    - saturate_fp8: clamp the scaled k and v to the FP8 cache dtype's range before
+    -     the FP8 cast, so an out-of-range value is stored as +-max and not as NaN.
+    -     It has no effect on a BF16 or NVFP4 cache. Not on the A8K4V8 cache (ValueError).
 
     T is the number of decode tokens, T_cache * block_size is the max number of tokens of kv_cache
     QH must be multiple of KH
@@ -671,7 +685,7 @@ def fused_qk_rope_reshape_and_cache(
     """
     _LOGGER.info(
         "FUSED_QK_ROPE_RESHAPE_AND_CACHE: q=%s k=%s pos=%s cos=%s sin=%s key_cache=%s value_cache=%s slot_mapping=%s",
-        tuple(q.shape),
+        None if q is None else tuple(q.shape),
         tuple(k.shape),
         tuple(pos.shape),
         tuple(cos.shape),
@@ -681,9 +695,18 @@ def fused_qk_rope_reshape_and_cache(
         tuple(slot_mapping.shape),
     )
 
-    t, qh, d = q.shape
+    have_q = q is not None
+    have_qk_norm = k_norm_weight is not None
     tk, kh, dk = k.shape
     tv, vh, dv = v.shape
+    if have_q:
+        t, qh, d = q.shape
+    else:
+        # k-only: one program per k head, the q-head grid with QH == KH.
+        q = k
+        t, qh, d = k.shape
+        assert q_out is None and zeros_out is None
+        output_zeros = False
     kv_cache_dtype = key_cache.dtype
     assert kv_cache_dtype in [
         torch.bfloat16,
@@ -787,8 +810,27 @@ def fused_qk_rope_reshape_and_cache(
         d_freq == d
     ), "cos/sin last dim should be the same or half of the qk last dim"
     reuse_freqs_front_part = d_freq == d // 2
+    if have_qk_norm:
+        assert (
+            kv_cache_dtype != torch.uint8
+        ), "QK norm is not supported on NVFP4 KV cache"
+        assert t == t_slot, "QK norm needs one slot for each token"
+        assert k_norm_weight.shape == (d,)
+        assert (q_norm_weight is not None) == have_q, "q_norm_weight is needed with q"
+        assert q_norm_weight is None or q_norm_weight.shape == (d,)
+        # The kernel reads the weights with unit stride.
+        k_norm_weight = k_norm_weight.contiguous()
+        if q_norm_weight is not None:
+            q_norm_weight = q_norm_weight.contiguous()
+    else:
+        assert q_norm_weight is None, "q_norm_weight needs k_norm_weight"
+    if saturate_fp8 and k4v8:
+        raise ValueError(
+            "saturate_fp8 is not supported on the A8K4V8 cache (NVFP4 K, FP8 V)"
+        )
+    saturate_fp8 = saturate_fp8 and kv_cache_dtype == e4m3_dtype
 
-    if q_out is None:
+    if q_out is None and have_q:
         q_out = torch.empty((t, qh, d), dtype=q.dtype, device=q.device)
 
     if k_out is None:
@@ -869,7 +911,13 @@ def fused_qk_rope_reshape_and_cache(
     # On gfx1250 the gluon 2D kernel handles all bf16/fp8 cache layouts in
     # one path (BLOCK_T > 1). uint8/NVFP4 still falls back to the Triton
     # kernel (no NVFP4 support in the 2D gluon kernel yet).
-    if DEVICE_ARCH in ("gfx1250", "gfx1250-strict") and kv_cache_dtype != torch.uint8:
+    if (
+        DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
+        and kv_cache_dtype != torch.uint8
+        and have_q
+        and not have_qk_norm
+        and not saturate_fp8
+    ):
         if t < 1024:
             BLOCK_T = 1
         elif t < 2048:
@@ -884,7 +932,15 @@ def fused_qk_rope_reshape_and_cache(
         BLOCK_H = 1
         if t >= _BLOCK_H_MIN_TOKENS:
             qh_per_kh = qh // kh
-            for cand in (16, 8, 4, 2):
+            cands = (16, 8, 4, 2)
+            if have_qk_norm:
+                # A QK-norm program also loads the rotated row of each head; on
+                # gfx950 and gfx942 more than 4 heads a program measured slower.
+                # Arches with a table cap the tile at its BLOCK_H_MAX.
+                norm_config = _get_config("qk_norm")
+                if norm_config is not None:
+                    cands = tuple(c for c in cands if c <= norm_config["BLOCK_H_MAX"])
+            for cand in cands:
                 if qh % cand == 0 and (cand % qh_per_kh == 0 or qh_per_kh % cand == 0):
                     BLOCK_H = cand
                     break
@@ -896,6 +952,19 @@ def fused_qk_rope_reshape_and_cache(
             # NVFP4 scale preshuffle group (rows), as the attention kernels unshuffle it
             "SCALE_PRESHUFFLE": min(128, block_size),
         }
+        if not have_q:
+            _extra_args["HAVE_Q"] = False
+        if have_qk_norm:
+            _extra_args.update(
+                q_norm_weight_ptr=q_norm_weight,
+                k_norm_weight_ptr=k_norm_weight,
+                norm_eps=norm_eps,
+                HAVE_QK_NORM=True,
+            )
+        if saturate_fp8:
+            _extra_args.update(
+                SATURATE_FP8=True, FP8_MAX=torch.finfo(kv_cache_dtype).max
+            )
     grid = (n_pid, 1, 1)
     _kernel[grid](
         q,
@@ -919,7 +988,7 @@ def fused_qk_rope_reshape_and_cache(
         *v.stride(),
         cos.stride(0),
         cos.stride(-1),
-        *q_out.stride(),
+        *(q_out if have_q else k_out).stride(),
         *k_out.stride(),
         key_cache_stride_t,
         key_cache_stride_h,
