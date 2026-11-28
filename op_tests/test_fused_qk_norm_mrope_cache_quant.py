@@ -438,6 +438,7 @@ def test_mrope_3d_rms_set_kv_shuffle(
     max_positions=10000,
     rotary_dim=0,  # Partial rotary dim (0 = full rotary = head_size)
     gemma_norm: bool = False,
+    positions_view: bool = False,  # MRoPE positions = rows 0-2 of a (4, T) buffer
 ):
     rotary_dim_ = rotary_dim if rotary_dim > 0 else head_size
     cos_sin_dim = rotary_dim_
@@ -456,6 +457,13 @@ def test_mrope_3d_rms_set_kv_shuffle(
     positions = torch.randint(
         0, max_positions, pos_shape, dtype=torch.int64, device="cuda"
     )
+    if positions_view:
+        assert is_mrope, "positions_view applies to MRoPE positions only"
+        # Row 3 holds an index far outside cos_sin, so a kernel that reads
+        # past the three position rows faults instead of passing by chance.
+        buf = torch.full((4, num_tokens), 1 << 40, dtype=torch.int64, device="cuda")
+        buf[:3] = positions
+        positions = buf[:3]
 
     q_out_ref = torch.empty(
         num_tokens, num_heads_q, head_size, dtype=dtype, device="cuda"
@@ -934,6 +942,25 @@ def _default_cases():
         _case(fp8, 127, 24, 4, 256, [11, 11, 10], rotary_dim=64, gemma_norm=True),
         _case(fp8, 127, 8, 2, 128, [4, 6, 6], rotary_dim=32, gemma_norm=True),
     ]
+    # MRoPE positions as a view of a larger buffer (e.g. vLLM's persistent
+    # positions buffer): the kernel must not read past the three rows.
+    for head_size, neox, interleaved in itertools.product(
+        [64, 128, 256], [True, False], [True, False]
+    ):
+        cases.append(
+            _case(
+                bf16,
+                3,
+                8,
+                1,
+                head_size,
+                mrope_sections_dict[head_size],
+                neox=neox,
+                interleaved=interleaved,
+                return_kv=False,
+                positions_view=True,
+            )
+        )
     return cases
 
 

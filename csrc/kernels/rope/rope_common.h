@@ -7653,7 +7653,9 @@ warp_rms_norm_no_weight_(vec_t<T, VEC_SIZE>& input, float rms_dim, float rms_eps
     }
 }
 
-template <typename T, int VEC_SIZE, int HEAD_SIZE, bool IS_INTERLEAVED, int M>
+// NUM: number of leading elements to fill. GPT-J consumes only VEC_SIZE / 2 cos/sin
+// values per lane; loading more runs past sum(mrope_section) and indexes positions OOB.
+template <typename T, int VEC_SIZE, int HEAD_SIZE, bool IS_INTERLEAVED, int M, int NUM = VEC_SIZE>
 __device__ __forceinline__ void mrope_load_cos_sin_vec(vec_t<T, VEC_SIZE>& out,
                                                        const T* cos_sin,
                                                        const int64_t* positions,
@@ -7669,7 +7671,7 @@ __device__ __forceinline__ void mrope_load_cos_sin_vec(vec_t<T, VEC_SIZE>& out,
     const int half = rd / 2;
     if constexpr(IS_INTERLEAVED)
     {
-        for(int i = 0; i < VEC_SIZE; ++i)
+        for(int i = 0; i < NUM; ++i)
         {
             auto id   = access_id_in_head + i;
             auto id_  = (access_id_in_head < half) ? id : id - half;
@@ -7687,7 +7689,7 @@ __device__ __forceinline__ void mrope_load_cos_sin_vec(vec_t<T, VEC_SIZE>& out,
     }
     else
     {
-        for(int i = 0; i < VEC_SIZE; ++i)
+        for(int i = 0; i < NUM; ++i)
         {
             auto id  = access_id_in_head + i;
             auto id_ = (access_id_in_head < half) ? id : id - half;
@@ -8006,7 +8008,7 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
             {
                 if(in_rotary)
                 {
-                    mrope_load_cos_sin_vec<T, VEC_SIZE, HEAD_SIZE, IS_INTERLEAVED, M>(
+                    mrope_load_cos_sin_vec<T, VEC_SIZE, HEAD_SIZE, IS_INTERLEAVED, M, VEC_SIZE / 2>(
                         cos_vec,
                         cos_sin,
                         positions,
@@ -8017,7 +8019,7 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                         access_id_in_head / 2,
                         mrope_section,
                         rotary_dim_);
-                    mrope_load_cos_sin_vec<T, VEC_SIZE, HEAD_SIZE, IS_INTERLEAVED, M>(
+                    mrope_load_cos_sin_vec<T, VEC_SIZE, HEAD_SIZE, IS_INTERLEAVED, M, VEC_SIZE / 2>(
                         sin_vec,
                         cos_sin,
                         positions,
