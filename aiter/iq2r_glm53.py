@@ -32,7 +32,7 @@ from torch import Tensor
 from aiter import logger
 
 from .jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
-from .jit.utils.chip_info import get_cu_num
+from .jit.utils.chip_info import get_cu_num, get_tuned_cu_nums, log_tuned_cu_fallback
 from .jit.utils.chip_info import get_gfx_runtime as get_gfx
 from .ops.iq2r import (
     iq2r_glm53_down_out,
@@ -324,14 +324,29 @@ def iq2r_glm53_config(tokens: int, intermediate_size: int) -> IQ2RGlm53Config:
     """Config of the smallest tuned M >= ``tokens`` that can run ``tokens``.
 
     Tuned rows are powers of two; rounding up skips rows that cannot run the
-    real M (M3 skips the route9 M4 row).
+    real M (M3 skips the route9 M4 row). The rows of all CU counts of
+    get_tuned_cu_nums() take part; at the same M, the row of the device CU
+    count wins.
     """
     tuned_file = AITER_CONFIGS.AITER_CONFIG_IQ2R_GLM53_FILE
-    rows = _tuned_table(tuned_file).get((get_gfx(), get_cu_num(), intermediate_size))
-    for tuned_tokens, config in rows or ():
+    table = _tuned_table(tuned_file)
+    gfx, cu_num = get_gfx(), get_cu_num()
+    rows = sorted(
+        (
+            (tuned_tokens, rank, tuned_cu, config)
+            for rank, tuned_cu in enumerate(get_tuned_cu_nums(cu_num))
+            for tuned_tokens, config in table.get(
+                (gfx, tuned_cu, intermediate_size), ()
+            )
+        ),
+        key=lambda row: row[:2],
+    )
+    for tuned_tokens, _, tuned_cu, config in rows:
         if tuned_tokens >= tokens and not _config_problem(
             config, tokens, intermediate_size
         ):
+            if tuned_cu != cu_num:
+                log_tuned_cu_fallback(tuned_file, gfx, cu_num, tuned_cu)
             if AITER_LOG_TUNED_CONFIG:
                 logger.info(
                     f"IQ2R GLM-5.3 M={tokens} I={intermediate_size}: tuned "
