@@ -1255,6 +1255,18 @@ def _check_fused_moe_inline_sort_pad_rows(tokens=32, valid=29):
     assert (out[valid:] == 0).all()
 
 
+def _check_output_overlap_sees_strided_span():
+    """An output past a strided input's nbytes but inside its span overlaps it."""
+    from aiter.presorted_moe import bytes_overlap
+
+    buf = torch.empty((4, 64), dtype=dtypes.bf16, device="cpu")
+    x = buf[:, 32:48]
+    assert bytes_overlap(buf.view(-1)[100:110], x)
+    assert not bytes_overlap(buf.view(-1)[:32], x)
+
+
+_check_output_overlap_sees_strided_span()
+
 if _running_on_gfx950():
     _check_aux_sort_pad_rows_and_num_local_tokens()
     _check_aux_sort_pad_rows_and_num_local_tokens(tokens=4, valid=3)
