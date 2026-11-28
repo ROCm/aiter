@@ -27,6 +27,10 @@ The fused routes need an a8w4 layout of FUSED_LAYOUTS (mega_moe_config.py) on an
     torchrun --nproc-per-node 2 test_mega_moe_v2.py --suite routes --network v41_flash --check-time-acc
     # EP8 DeepSeek-V4.1-Flash: the per-bucket small-input knobs leave every output bit for bit:
     torchrun --nproc-per-node 8 test_mega_moe_v2.py --suite routes --network v41_flash --compare-untuned
+    # its DSpark draft MoE (16 experts a rank, topk 3) returns BF16 rows on every route, as the staged route:
+    torchrun --nproc-per-node 8 test_mega_moe_v2.py --suite routes --network v41_flash_draft --staged-rtol 0.005
+    # on 4 or 2 ranks (the staged route only), at the draft instance's capacity:
+    torchrun --nproc-per-node 4 test_mega_moe_v2.py --suite routes --network v41_flash_draft --mtpr 16384         --staged-rtol 0.005
     # against a same-MTPR staged route, timing only:
     torchrun --nproc-per-node 8 test_mega_moe_v2.py --suite routes \
         --mtpr 256 --small-m-mtprs 256 --time-only --time-bs 140,168,196,224,252
@@ -86,6 +90,16 @@ NETWORKS = {
         "inter_dim": 2304,
         "experts": 384,
         "topk": 6,
+        "swiglu_limit": 10.0,
+    },
+    # DeepSeek-V4.1-Flash's DSpark draft MoE with the shared expert computed apart: 128 experts, topk 3. On 8
+    # ranks (16 experts a rank) it has the small-input route; on 4 or 2 ranks the staged route only. Every route
+    # returns BF16 rows (BF16_RETURN_LAYOUTS).
+    "v41_flash_draft": {
+        "model_dim": 5120,
+        "inter_dim": 2304,
+        "experts": 128,
+        "topk": 3,
         "swiglu_limit": 10.0,
     },
     "r1_v3": {
@@ -1127,6 +1141,11 @@ def _routed(moe, x, weights, ids, max_tokens, expect=None):
     return moe.forward(x, weights, ids, max_tokens=max_tokens)[: x.shape[0]]
 
 
+def _layout_key(moe):
+    """(world_size, experts_per_rank, model_dim, inter_dim) of an instance."""
+    return (moe.world_size, moe.epr, moe.model_dim, moe.inter_dim)
+
+
 def _staged_forward(moe, x, weights, ids):
     """The staged route of the instance (the accuracy and timing reference)."""
     return moe._forward_route((ROUTE_STAGED, moe.mtpr), x, weights, ids)[: x.shape[0]]
@@ -1255,14 +1274,18 @@ def _routes_instance(args, rank, world, device):
         routed=True,
         **net,
     )
-    if moe.small_m_mtpr != max(args.small_m_mtprs):
+    staged_only = (
+        moe.small_m_mtpr == 0
+        and _layout_key(moe) in mega_moe_config.BF16_RETURN_LAYOUTS
+    )
+    if not staged_only and moe.small_m_mtpr != max(args.small_m_mtprs):
         raise AssertionError(
             f"small-input route not built (small_m_mtpr={moe.small_m_mtpr}); it needs a fused "
             "a8w4 layout of FUSED_LAYOUTS (DeepSeek-V4-Pro on 8 ranks, DeepSeek-V4.1-Flash on 8, 4 or 2 ranks) "
             "on an 8-XCD gfx950"
         )
     x, w, ids = _make_inputs(
-        moe.small_m_mtpr,
+        moe.small_m_mtpr or max(args.small_m_mtprs),
         net["model_dim"],
         net["experts"],
         net["topk"],
@@ -1290,6 +1313,8 @@ def _routes_instance(args, rank, world, device):
         refw=[p[4:] for p in packs],
         bind=bind,
         large_m=moe._large_m is not None,
+        staged_only=staged_only,
+        packs=packs,
         failures=[],
     )
 
@@ -1352,7 +1377,8 @@ def _routes_accuracy(ctx, args):
             pad_ok = _all_ranks(torch.isfinite(out_g).all(), device)
             pad_zero = _all_ranks((out_g[real:] == 0).all(), device) if pad else True
             outputs[(name, which)] = (xi, wi, ii, out_g, real, max_tokens)
-            ok = rel_ref < args.rtol and rel_staged < args.rtol and pad_ok
+            staged_rtol = args.rtol if args.staged_rtol is None else args.staged_rtol
+            ok = rel_ref < args.rtol and rel_staged < staged_rtol and pad_ok
             if rank == 0:
                 print(
                     f"[ACC] {name:10s} w{which} tpr={tpr} pad={pad} relL2_vs_ref={rel_ref:.6f} "
@@ -1409,6 +1435,168 @@ def _routes_edges(ctx, args):
             )
         if not ok:
             ctx.failures.append(f"skewed {name} {n}")
+
+
+def _routes_bf16_return(ctx, args):
+    """A BF16_RETURN_LAYOUTS layout (v41_flash_draft): every route returns BF16 rows.
+
+    The staged route's buckets resolve to p2p_quant "none" at the instance's capacity, every small-input config
+    sends BF16 rows on every rank, and the outputs say so: skewed routes, whose hot rank would pick FP8 rows by
+    the rows received, agree with the staged route within --staged-rtol (an FP8 return is about 0.027 away), and
+    staged calls above the small-input capacity (the MTPR class whose "auto" return is FP8 elsewhere) stay within
+    --rtol of the fp32 reference.
+    """
+    moe, rank, world, device = ctx.moe, ctx.rank, ctx.world, ctx.device
+    x, w, ids = ctx.x, ctx.w, ctx.ids
+    staged_quant = {e.config.p2p_quant for e in moe._bundle_plan.entries}
+    small_rows = {
+        c.fused_stage1.bf16_rows_always
+        for runtime in moe._small_m_runtimes
+        for c in runtime._configs.values()
+    }
+    ok = staged_quant == {"none"} and small_rows == {True}
+    if rank == 0:
+        print(
+            f"[BF16RET] mtpr={moe.mtpr} staged_p2p_quant={sorted(staged_quant)} "
+            f"small_m_bf16_rows_always={sorted(small_rows)} {'PASS' if ok else 'FAIL'}",
+            flush=True,
+        )
+    if not ok:
+        ctx.failures.append("bf16 return configs")
+    staged_rtol = args.rtol if args.staged_rtol is None else args.staged_rtol
+    ctx.bind(0, 0)
+    hot = torch.arange(moe.topk, dtype=ids.dtype, device=device)
+    for name, n, share in (("hot60", 128, 3), ("one_rank", 64, 5), ("hot60", 448, 3), ("hot100", 512, 5)):
+        if n > moe.small_m_mtpr:
+            continue
+        xi, wi, ii = x[:n].clone(), w[:n].clone(), ids[:n].clone()
+        ii[(torch.arange(n, device=device) % 5) < share] = hot
+        out = _routed(moe, xi, wi, ii, n, ROUTE_SMALL_M).clone()
+        _barrier()
+        out_m = _staged_forward(moe, xi, wi, ii).clone()
+        _barrier()
+        rel_staged = _rel_l2(out, out_m)
+        rel_ref = _rel_l2(out, _moe_reference(moe, xi, wi, ii, ctx.refw[0]))
+        ok = (
+            rel_staged < staged_rtol
+            and rel_ref < args.rtol
+            and _all_ranks(torch.isfinite(out).all(), device)
+        )
+        if rank == 0:
+            print(
+                f"[BF16RET] {name} tpr={n} relL2_vs_staged={rel_staged:.6f} relL2_vs_ref={rel_ref:.6f} "
+                f"{'PASS' if ok else 'FAIL'}",
+                flush=True,
+            )
+        if not ok:
+            ctx.failures.append(f"bf16 return {name} {n}")
+    gen = torch.Generator(device=device).manual_seed(args.seed + 101 + rank)
+    for n in (640, 2048, 4096):
+        if n > moe.mtpr:
+            continue
+        xm = torch.randn((n, ctx.net["model_dim"]), dtype=torch.bfloat16, device=device, generator=gen)
+        wm = w[:1].expand(n, -1).contiguous()
+        scores = torch.rand((n, ctx.net["experts"]), device=device, generator=gen)
+        im = scores.argsort(dim=1)[:, : moe.topk].to(ids.dtype).contiguous()
+        out = _routed(moe, xm, wm, im, n, ROUTE_STAGED).clone()
+        _barrier()
+        rel_ref = _rel_l2(out, _moe_reference(moe, xm, wm, im, ctx.refw[0]))
+        ok = rel_ref < args.rtol and _all_ranks(torch.isfinite(out).all(), device)
+        if rank == 0:
+            print(
+                f"[BF16RET] staged tpr={n} relL2_vs_ref={rel_ref:.6f} {'PASS' if ok else 'FAIL'}",
+                flush=True,
+            )
+        if not ok:
+            ctx.failures.append(f"bf16 return staged {n}")
+
+
+def _routes_bf16_return_staged(ctx, args):
+    """A BF16_RETURN_LAYOUTS layout without a fused route (v41_flash_draft on 4 or 2 ranks): the staged route,
+    the only one it has, returns BF16 rows at the instance's capacity.
+
+    Every bucket resolves to p2p_quant "none" (the config of an explicit "none"), and the outputs stay within
+    --rtol of the fp32 reference. An instance of the same weights built with the FP8 return
+    (stage2_p2p_quant="fp8_blockwise_1x32", what "auto" picked from P2P_FP8_MIN_MTPR on before) must differ from
+    them by more than --staged-rtol (about 0.027 relL2), so the check tells the two returns apart.
+    """
+    moe, rank, device, net = ctx.moe, ctx.rank, ctx.device, ctx.net
+    entries = moe._bundle_plan.entries
+    staged_quant = {e.config.p2p_quant for e in entries}
+    explicit = all(
+        e.config
+        == mega_moe_config.select_mega_moe_config(
+            e.token_bucket,
+            moe.mtpr,
+            p2p_quant="none",
+            experts_per_rank=moe.epr,
+            model_dim=moe.model_dim,
+            inter_dim=moe.inter_dim,
+            world_size=moe.world_size,
+        )
+        for e in entries
+    )
+    aligned = any(e.config.stage2.aligned_pair for e in entries)
+    ok = staged_quant == {"none"} and explicit and not aligned
+    if rank == 0:
+        print(
+            f"[BF16RET] staged-only mtpr={moe.mtpr} staged_p2p_quant={sorted(staged_quant)} "
+            f"configs_eq_explicit_none={explicit} aligned_pair={aligned} {'PASS' if ok else 'FAIL'}",
+            flush=True,
+        )
+    if not ok:
+        ctx.failures.append("bf16 return configs")
+    staged_rtol = args.rtol if args.staged_rtol is None else args.staged_rtol
+    ctx.bind(0, 0)
+    gen = torch.Generator(device=device).manual_seed(args.seed + 101 + rank)
+    cases = []
+    for n in (1, 10, 64, 256, 640, 2048, 4096):
+        if n > moe.mtpr:
+            continue
+        xm = torch.randn((n, net["model_dim"]), dtype=torch.bfloat16, device=device, generator=gen)
+        wm = torch.rand((n, moe.topk), dtype=torch.float32, device=device, generator=gen)
+        wm = (wm / wm.sum(dim=1, keepdim=True)).contiguous()
+        scores = torch.rand((n, net["experts"]), device=device, generator=gen)
+        im = scores.argsort(dim=1)[:, : moe.topk].to(ctx.ids.dtype).contiguous()
+        out = _routed(moe, xm, wm, im, n, ROUTE_STAGED).clone()
+        _barrier()
+        cases.append((n, xm, wm, im, out))
+    fp8 = MegaMoEV2(
+        rank=rank,
+        world_size=moe.world_size,
+        quant="a8w4",
+        w1=ctx.packs[0][0],
+        w1_scale=ctx.packs[0][1],
+        w2=ctx.packs[0][2],
+        w2_scale=ctx.packs[0][3],
+        max_tok_per_rank=moe.mtpr,
+        large_m_state_slots=1,
+        stage2_p2p_quant="fp8_blockwise_1x32",
+        routed=True,
+        **net,
+    )
+    for n, xm, wm, im, out in cases:
+        out_fp8 = _routed(fp8, xm, wm, im, n, ROUTE_STAGED).clone()
+        _barrier()
+        ref = _moe_reference(moe, xm, wm, im, ctx.refw[0])
+        rel_ref = _rel_l2(out, ref)
+        rel_fp8_ref = _rel_l2(out_fp8, ref)
+        rel_vs_fp8 = _rel_l2(out, out_fp8)
+        ok = (
+            rel_ref < args.rtol
+            and rel_vs_fp8 > staged_rtol
+            and _all_ranks(torch.isfinite(out).all(), device)
+        )
+        if rank == 0:
+            print(
+                f"[BF16RET] staged tpr={n} relL2_vs_ref={rel_ref:.6f} fp8_return_relL2_vs_ref={rel_fp8_ref:.6f} "
+                f"relL2_vs_fp8_return={rel_vs_fp8:.6f} {'PASS' if ok else 'FAIL'}",
+                flush=True,
+            )
+        if not ok:
+            ctx.failures.append(f"bf16 return staged-only {n}")
+    del fp8
+    _barrier()
 
 
 def _routes_alternation(ctx, args, outputs):
@@ -1661,11 +1849,24 @@ def _run_routes(args, rank, world, device):
             f"large_m={ctx.large_m} world={world}",
             flush=True,
         )
+    if ctx.staged_only:
+        # No fused route to check: the BF16 return of the staged route is the whole suite.
+        if args.compare_untuned and rank == 0:
+            print("[UNTUNED] SKIP (no small-input route)", flush=True)
+        _routes_bf16_return_staged(ctx, args)
+        _barrier()
+        if ctx.failures:
+            raise AssertionError("FAILED: " + ", ".join(ctx.failures))
+        if rank == 0:
+            print("[RESULT] ALL PASS", flush=True)
+        return
     if not args.time_only:
         outputs = _routes_accuracy(ctx, args)
         if args.compare_untuned:
             _routes_compare_untuned(ctx, outputs)
         _routes_edges(ctx, args)
+        if _layout_key(ctx.moe) in mega_moe_config.BF16_RETURN_LAYOUTS:
+            _routes_bf16_return(ctx, args)
         keys = _routes_alternation(ctx, args, outputs)
         # Zero rows on every rank; 32-bit epochs wrapping.
         case = outputs[(keys[0][0], 0)]
@@ -1903,6 +2104,12 @@ def main():
         help="check every timed route against the fp32 reference",
     )
     routes.add_argument(
+        "--staged-rtol",
+        type=float,
+        help="relL2 gate of the small-input route against the staged route (default: --rtol); "
+        "routes that return the same rows (v41_flash_draft: BF16 on both) stay far below 0.005",
+    )
+    routes.add_argument(
         "--compare-untuned",
         action="store_true",
         help="check the small-input outputs bit for bit against the configs selected "
@@ -1918,9 +2125,12 @@ def main():
                 f"[SKIP] the small- and large-input routes need gfx950, got {get_gfx()}"
             )
             return
-        if args.network not in ("v4_pro", "v41_flash") or args.quant != "a8w4":
+        if (
+            args.network not in ("v4_pro", "v41_flash", "v41_flash_draft")
+            or args.quant != "a8w4"
+        ):
             raise ValueError(
-                "--suite routes needs --network v4_pro or v41_flash and --quant a8w4"
+                "--suite routes needs --network v4_pro, v41_flash or v41_flash_draft and --quant a8w4"
             )
         args.seed = 7 if args.seed is None else args.seed
         args.rtol = 0.08 if args.rtol is None else args.rtol

@@ -999,7 +999,9 @@ def _use_direct_fixed_slot(npes, experts_per_rank, max_tokens_per_rank, cap, til
     if tile_m <= 0 or max_tokens_per_rank <= 0:
         return False
     required_cap = ((npes * max_tokens_per_rank + tile_m - 1) // tile_m) * tile_m
-    return (npes, experts_per_rank) in ((8, 48), (4, 96), (2, 192)) and cap == required_cap
+    return (npes, experts_per_rank) in (
+        (8, 48), (8, 16), (4, 96), (2, 192)
+    ) and cap == required_cap
 
 
 # fmt: off
@@ -1017,6 +1019,7 @@ def compile_mega_moe_stage1(
     g2_epi_lean: int = 0, g1_lookahead: int = 1, g1_a_ahead: int = 1, direct_done: int = 0, tok_done: bool = False,
     tok_counters: bool = False, bf16_head_tokens: int = 0, epi_evec: int = 2, epi_lean: int = 0,
     ascale_packed: bool = False, stream_w: bool = False, pair_tiles: bool = False, en_order: int = 0,
+    bf16_rows_always: bool = False,
 ):
     arch = get_gfx_runtime()
     if arch != "gfx950":
@@ -1222,6 +1225,7 @@ def compile_mega_moe_stage1(
         f"{'_stw' if stream_w else ''}"
         f"{'_pt' if pair_tiles else ''}"
         f"{f'_en{en_order}' if en_order else ''}"
+        f"{'_b16ra' if bf16_rows_always else ''}"
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[TOTAL_THREADS, 1, 1])
@@ -1782,7 +1786,9 @@ def compile_mega_moe_stage1(
         # A rank that receives many rows sends its GEMM2 rows as FP8: they halve the traffic it would otherwise
         # spend most of its GEMM2 sending; the other ranks keep BF16 rows.
         fp8_rows = (plan_low >> fx.Int32(_PLAN_FP8_ROWS_BIT)) & fx.Int32(1)
-        if const_expr(tok_done):
+        if const_expr(tok_done or bf16_rows_always):
+            # bf16_rows_always: every rank returns BF16 rows (the layout's staged route's return); the flag's low
+            # bit says so.
             fp8_rows = fx.Int32(0)
         tok_off = tok_reset = fx.Int64(0)
         if const_expr(tok_counters):
@@ -1900,6 +1906,7 @@ def _kernel_knobs(config: MegaMoEConfig) -> dict:
         g1_a_ahead=k1.g1_a_ahead, direct_done=k1.direct_done, tok_done=k1.tok_done, tok_counters=k1.tok_counters,
         bf16_head_tokens=k1.bf16_head_tokens, epi_evec=k1.epi_evec, epi_lean=k1.epi_lean,
         ascale_packed=k1.ascale_packed, stream_w=k1.stream_w, pair_tiles=k1.pair_tiles, en_order=k1.en_order,
+        bf16_rows_always=k1.bf16_rows_always,
     )
     # fmt: on
 
