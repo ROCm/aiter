@@ -125,6 +125,22 @@
       "TILE_SIZE_MIN": 64,
       "TILE_SIZE_MAX": 64
     },
+    "D_GEQ_513.Q_GEQ_1024.DT_bf16_bf16": {
+      "BLOCK_M": 16,
+      "num_warps": 4,
+      "num_stages": 2,
+      "waves_per_eu": 2,
+      "TILE_SIZE_MIN": 16,
+      "TILE_SIZE_MAX": 16
+    },
+    "D_GEQ_512.Q_GEQ_1024.DT_bf16_bf16": {
+      "BLOCK_M": 64,
+      "num_warps": 4,
+      "num_stages": 2,
+      "waves_per_eu": 1,
+      "TILE_SIZE_MIN": 32,
+      "TILE_SIZE_MAX": 32
+    },
     "D_LEQ_128.Q_GEQ_256.SW.DT_fp8_fp8": {
       "BLOCK_M": 128,
       "num_warps": 4,
