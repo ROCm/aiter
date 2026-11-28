@@ -7,6 +7,14 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton._triton_kernels.common.pid_preprocessing import remap_xcd_aid
+from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+# remap_xcd_aid reads the pipe and queue of the wave from a gfx1250 hardware register, so
+# the kernel does not build for another target.
+pytestmark = pytest.mark.skipif(
+    "gfx1250" not in (get_arch() or ""),
+    reason="remap_xcd_aid is for gfx1250 only",
+)
 
 
 @triton.jit
