@@ -8,10 +8,11 @@ prefill chunks and decode tokens over a paged KV cache and writes ``out``.
 Three kernels, all FlyDSL. Sequences with more than ``16 / (heads per KV
 head)`` queries run on the paged prefill kernel (128-row query blocks, many
 waves per workgroup); the shorter ones (decode, speculative decode) on the
-decode kernel, one wave per (sequence, KV head, KV segment) with the KV head's
-query heads packed into the WMMA rows; when the keys are split into segments,
-the merge kernel combines them and writes those rows, leaving the prefill
-kernel's rows alone. The two attention kernels never touch the same row.
+decode kernel, one workgroup per (sequence, KV head, KV segment) with the KV
+head's query heads packed into the WMMA rows and the head dim split over its
+waves; when the keys are split into segments, the merge kernel combines them
+and writes those rows, leaving the prefill kernel's rows alone. The two
+attention kernels never touch the same row.
 """
 
 import functools
@@ -33,16 +34,20 @@ from aiter.ops.flydsl.kernels.flash_attn_paged_reduce_gfx11 import (
 __all__ = ["flydsl_unified_attention_gfx11", "gfx11_paged_supported"]
 
 _DTYPE_STR = {torch.bfloat16: "bf16", torch.float16: "f16"}
-_LDS_BYTES = 65536
 # The decode side's tile and grid choices (the prefill tile comes from the
 # varlen rule). One place, so a sweep can set them.
 _TUNE = {
     "decode_block_n": 16,  # keys per decode tile (16 or 32)
-    "decode_vt_rows": 2,  # keys per LDS write in the V^T staging (2, 4, 8)
-    "target_wgs": 160,  # one-wave decode workgroups the segments aim for
+    "decode_vt_rows": 8,  # keys per LDS write in the V^T staging (2, 4, 8)
+    # waves per decode workgroup, each with head_dim / d_split columns; 0 picks
+    # by head dim (2 at head_dim > 128: 16 x 256 fp32 of O alone fill half of
+    # a wave's registers)
+    "decode_d_split": 0,
+    "decode_q_reload": False,  # Q operand re-read per tile instead of in VGPRs
+    "target_wgs": 160,  # decode workgroups the segments aim for
     "max_segments": 32,  # KV segments per sequence at most
     # decode rows of a mixed batch: KV segments + merge (True) or one segment
-    # with several waves per workgroup writing the rows themselves (False)
+    # per sequence writing the rows itself (False)
     "mixed_segments": True,
 }
 
@@ -79,7 +84,18 @@ def _prefill_kernel(
 
 @functools.lru_cache(maxsize=64)
 def _decode_kernel(
-    device_index, H, HKV, D, page, dtype_str, scale, block_n, vt_rows, num_waves, direct
+    device_index,
+    H,
+    HKV,
+    D,
+    page,
+    dtype_str,
+    scale,
+    block_n,
+    vt_rows,
+    d_split,
+    q_reload,
+    direct,
 ):
     return build_flash_attn_paged_decode_module_gfx11(
         num_heads=H,
@@ -89,7 +105,8 @@ def _decode_kernel(
         sm_scale=scale,
         block_n=block_n,
         vt_rows=vt_rows,
-        num_waves=num_waves,
+        d_split=d_split,
+        q_reload=q_reload,
         direct=direct,
         num_kv_heads=HKV,
     )
@@ -110,25 +127,22 @@ def _short_limit(H, HKV):
     return 16 // group if group <= 16 and 16 % group == 0 else 0
 
 
-def _decode_waves(D, block_n):
-    """Waves per decode workgroup when it runs without segments: as many as
-    fit their V^T tiles in LDS, up to 8 (4 at head_dim 256, 8 at head_dim 128)."""
-    dp = -(-D // 16) * 16
-    tile_bytes = dp * (block_n + 8) * 2
-    nw = 8
-    while nw > 1 and nw * tile_bytes > _LDS_BYTES:
-        nw //= 2
-    return nw
+def _d_split(D):
+    """Waves a decode workgroup splits the head dim over: the tuned value, or
+    by head dim; 1 when the head dim does not divide into 16-column slices."""
+    n = int(_TUNE["decode_d_split"]) or (2 if D > 128 else 1)
+    while n > 1 and D % (16 * n):
+        n //= 2
+    return n
 
 
 def _num_segments(batch, HKV, max_seqlen_k, block_n):
     """KV segments for the decode kernel: enough one-wave workgroups to reach
-    ``target_wgs`` (gfx1151: 20 WGPs x 8), at least one tile per segment, a
-    power of two, at most ``max_segments``."""
+    ``target_wgs`` (gfx1151: 20 WGPs x 8), at least one tile per segment, at
+    most ``max_segments``."""
     want = -(-int(_TUNE["target_wgs"]) // max(1, batch * HKV))
     tiles = -(-max_seqlen_k // block_n)
-    n = int(max(1, min(want, tiles, int(_TUNE["max_segments"]))))
-    return 1 << (n.bit_length() - 1)
+    return int(max(1, min(want, tiles, int(_TUNE["max_segments"]))))
 
 
 def gfx11_paged_supported(
@@ -233,6 +247,8 @@ def flydsl_unified_attention_gfx11(
     max_q, max_k = int(max_seqlen_q), int(max_seqlen_k)
     bn = int(_TUNE["decode_block_n"])
     vt = int(_TUNE["decode_vt_rows"])
+    ds = _d_split(D)
+    qr = bool(_TUNE["decode_q_reload"])
 
     if max_q > short:
         # The long sequences (prefill chunks): the kernel skips the short ones.
@@ -275,10 +291,10 @@ def flydsl_unified_attention_gfx11(
     if max_q > short and not _TUNE["mixed_segments"]:
         nseg = 1
     if nseg == 1:
-        # Enough workgroups without splitting; several waves per workgroup
-        # split the tiles instead.
-        nw = _decode_waves(D, bn) if max_q > short else 1
-        dec = _decode_kernel(dev, H, HKV, D, page, dtype_str, scale, bn, vt, nw, True)
+        # Enough workgroups without splitting: the rows are written directly.
+        dec = _decode_kernel(
+            dev, H, HKV, D, page, dtype_str, scale, bn, vt, ds, qr, True
+        )
         dec(
             q,
             k,
@@ -296,7 +312,7 @@ def flydsl_unified_attention_gfx11(
             stream=stream,
         )
         return out
-    dec = _decode_kernel(dev, H, HKV, D, page, dtype_str, scale, bn, vt, 1, False)
+    dec = _decode_kernel(dev, H, HKV, D, page, dtype_str, scale, bn, vt, ds, qr, False)
     dpad = dec.dpad2
     # Partials per (sequence, token slot): the long sequences' slots stay
     # unused, so the buffers do not grow with the prefill tokens.

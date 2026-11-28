@@ -5,17 +5,22 @@
 half of the ``unified_attention`` form, for sequences of a few queries (decode,
 speculative decode). ``flash_attn_paged_gfx11.py`` takes the long ones.
 
-One wave per workgroup. The 16 rows of the WMMA tile are the ``GROUP`` query
-heads of one KV head x ``16 / GROUP`` query tokens of one sequence, so a decode
-token's heads share every K / V byte the wave reads. The workgroup walks one
-segment of the sequence's keys (grid y = segment): K rows go straight from the
-paged cache into the WMMA A operand (lane L%16 holds key L%16 of the tile), V
-rows are transposed through LDS as in the varlen kernel. It writes either the
-normalized output (one segment) or the segment's unnormalized O, running max
-and exp-sum in the layout of aiter's Triton ``reduce_segments``, which then
-merges the segments: segment s of a sequence with ``n`` keys covers tiles
+The 16 rows of the WMMA tile are the ``GROUP`` query heads of one KV head x
+``16 / GROUP`` query tokens of one sequence, so a decode token's heads share
+every K / V byte the workgroup reads. The workgroup walks one segment of the
+sequence's keys (grid y = segment): K rows go straight from the paged cache
+into the WMMA A operand (lane L%16 holds key L%16 of the tile), V rows are
+transposed through LDS as in the varlen kernel. It writes either the normalized
+output (one segment) or the segment's unnormalized O, running max and exp-sum
+for the merge kernel: segment s of a sequence with ``n`` keys covers tiles
 ``[s * t, (s + 1) * t)`` of ``BLOCK_N`` keys, ``t = ceil(n / (segments *
-BLOCK_N))``; a segment past the keys writes nothing and the reduce masks it.
+BLOCK_N))``; a segment past the keys writes (-inf, 0) and the merge skips it.
+
+The head dim is split over ``d_split`` waves (1, 2 or 4): wave w loads and
+multiplies its ``head_dim / d_split`` columns of K, Q and V and holds that slice
+of O^T, which keeps a wave's registers at head_dim 256 (16 x 256 fp32 of O alone
+fill half of them). The waves add up their partial S^T through LDS once per tile
+(one barrier), then run the same softmax on the same numbers.
 
 Same transposed core as the other gfx11 kernels:
 
@@ -60,7 +65,8 @@ def build_flash_attn_paged_decode_module_gfx11(
     sm_scale=None,
     block_n=16,
     vt_rows=2,
-    num_waves=1,
+    d_split=1,
+    q_reload=False,
     direct=False,
     waves_per_eu=None,
     num_kv_heads=None,
@@ -77,20 +83,21 @@ def build_flash_attn_paged_decode_module_gfx11(
     num_heads, num_segments, next_pow2(head_dim)]``, ``segm_max`` /
     ``segm_expsum`` fp32 ``[batch * max_seqlen_q, num_heads, num_segments]``,
     row ``b * max_seqlen_q + t`` for token ``t`` of sequence ``b`` (unused with
-    ``direct``, pass ``out``); ``cu_seqlens_q`` ``batch + 1`` int32 entries, ``seqused_k``
-    ``batch`` entries, ``block_table`` int32 ``[batch, max_blocks]``.
-    Sequences with more than ``max_seqlen_q`` queries are left alone (the
-    prefill kernel's); ``max_seqlen_q`` is at most ``16 / GROUP`` x the number
-    of query tiles the grid covers.
+    ``direct``, pass ``out``); ``cu_seqlens_q`` ``batch + 1`` int32 entries,
+    ``seqused_k`` ``batch`` entries, ``block_table`` int32 ``[batch,
+    max_blocks]``. Sequences with more than ``max_seqlen_q`` queries are left
+    alone (the prefill kernel's); ``max_seqlen_q`` is at most ``16 / GROUP`` x
+    the number of query tiles the grid covers.
 
     Args:
         num_heads, head_dim: compile-time head geometry (``head_dim % 8 == 0``).
         page_size: cache rows per block (a multiple of 8).
         block_n: keys per tile (16 or 32).
         vt_rows: keys packed per LDS write in the V -> V^T transpose (2, 4, 8).
-        num_waves: waves per workgroup (1, 2, 4, 8). They split the segment's
-            tiles round-robin, each with its own V^T tile in LDS, and merge
-            their (m, l, O) through LDS at the end; wave 0 writes the result.
+        d_split: waves per workgroup, each with ``head_dim / d_split`` columns
+            (1, 2 or 4; ``head_dim`` a multiple of ``16 * d_split`` when > 1).
+        q_reload: read the Q operand from the (cached) global tensor on every
+            tile instead of keeping it in VGPRs.
         direct: one segment: normalize and write ``out`` (bf16 / f16) instead
             of the segment partials.
         num_kv_heads: K / V heads; ``num_heads / num_kv_heads`` must divide 16.
@@ -116,13 +123,15 @@ def build_flash_attn_paged_decode_module_gfx11(
     TQ = 16 // GROUP  # query tokens per WMMA tile
     DP = -(-D // WMMA_MNK) * WMMA_MNK
     ND = DP // WMMA_MNK
-    DPAD2 = 1 << (D - 1).bit_length()  # the reduce's V_HEAD_SIZE_PADDED
+    DPAD2 = 1 << (D - 1).bit_length()  # the merge's padded row length
+    NWD = int(d_split)
+    if NWD not in (1, 2, 4) or (NWD > 1 and D % (WMMA_MNK * NWD) != 0):
+        raise ValueError(f"d_split={d_split} does not divide head_dim={D} into 16s")
+    NDW = ND // NWD  # 16-column chunks per wave
+    DW = NDW * WMMA_MNK  # columns per wave
     BLOCK_N = block_n
     NK = BLOCK_N // WMMA_MNK
-    NW = int(num_waves)
-    if NW not in (1, 2, 4, 8):
-        raise ValueError(f"num_waves must be 1, 2, 4 or 8, got {num_waves}")
-    THREADS = WAVE_SIZE * NW
+    THREADS = WAVE_SIZE * NWD
     TOK = H * D  # elements between consecutive Q / O tokens (THD)
     TOK_KV = HKV * D  # elements of one K / V cache row
     PAGE_ELEMS = PAGE * TOK_KV
@@ -130,18 +139,20 @@ def build_flash_attn_paged_decode_module_gfx11(
     elem = fx.BFloat16 if is_bf16 else fx.Float16
 
     V_ROW = BLOCK_N + LDS_PAD
-    VT_SIZE = DP * V_ROW  # elements of one wave's V^T tile in LDS
-    DBLKS = D // 8
+    VT_SIZE = DW * V_ROW  # elements of one wave's V^T slice in LDS
+    DBLKS = DW // 8  # 8-column blocks of a wave's slice
     V_BLOCKS = (BLOCK_N // vt_rows) * DBLKS  # vt_rows keys x 8 d per block
-    V_PER_THR = -(-V_BLOCKS // WAVE_SIZE)  # each wave stages its own tile
-    # Merge scratch (NW > 1), reusing the dead V^T tiles: per lane its O^T
-    # registers (ND x 8 fp32), m and l, padded to a 32-byte multiple.
-    SCR_ROW = ND * 8 + 8  # fp32 per lane
-    SCR_ELEMS = SCR_ROW * WAVE_SIZE * 2 if NW > 1 else 0  # in `elem` units
-    LDS_ELEMS = max(NW * VT_SIZE, SCR_ELEMS)
+    V_PER_THR = -(-V_BLOCKS // WAVE_SIZE)  # each wave stages its own slice
+    # Partial S^T exchange (NWD > 1): two parity slots x NWD waves x the
+    # lane's NK x 8 fp32, in `elem` units.
+    S_LANE = NK * 8  # fp32 per lane
+    S_SLOT = S_LANE * WAVE_SIZE  # fp32 per wave slot
+    S_ELEMS = 2 * NWD * S_SLOT * 2 if NWD > 1 else 0
+    S_BASE = NWD * VT_SIZE  # elem offset of the exchange area (even)
+    LDS_ELEMS = S_BASE + S_ELEMS
     if LDS_ELEMS * 2 > LDS_LIMIT_BYTES:
         raise ValueError(
-            f"head_dim={D}, block_n={BLOCK_N}, num_waves={NW} exceeds "
+            f"head_dim={D}, block_n={BLOCK_N}, d_split={NWD} exceeds "
             f"{LDS_LIMIT_BYTES} B of LDS"
         )
 
@@ -173,7 +184,7 @@ def build_flash_attn_paged_decode_module_gfx11(
         )
 
     def _barrier():
-        # Across the waves (merge phase): LDS traffic done, then meet.
+        # Across the waves: LDS traffic done, then meet.
         _llvm.inline_asm(
             res=None,
             operands_=[],
@@ -222,7 +233,8 @@ def build_flash_attn_paged_decode_module_gfx11(
         hh = lane // 16
         is_h0 = hh == 0
         is_w0 = wave == 0
-        vt_base = wave * VT_SIZE  # this wave's V^T tile in LDS
+        vt_base = wave * VT_SIZE  # this wave's V^T slice in LDS
+        col0 = wave * DW  # this wave's first head-dim column
         bat = fx.block_idx.z
         seg = fx.block_idx.y
         kvh = fx.block_idx.x % HKV
@@ -244,7 +256,7 @@ def build_flash_attn_paged_decode_module_gfx11(
         seq_kv = table_scalar(SEQUSED_K, bat, batch_size)
         diag = seq_kv - seq_q
         n_kv_tiles = (seq_kv + (BLOCK_N - 1)) // BLOCK_N
-        # This segment's tiles, the reduce's partition; capped by the causal
+        # This segment's tiles, the merge's partition; capped by the causal
         # limit of the tile's last row.
         tiles_per_seg = (seq_kv + (num_segments * BLOCK_N - 1)) // (
             num_segments * BLOCK_N
@@ -320,31 +332,37 @@ def build_flash_attn_paged_decode_module_gfx11(
         def g_load8(buf, off):
             return buf_copy_load(buf, off, elem=elem, unit_elems=8)
 
-        # ---- Q -> VGPRs as WMMA B operands (zero past seq_q / past head_dim) ----
+        # ---- Q -> WMMA B operands (zero past seq_q / past head_dim) ----
         zero_e8 = Vec.filled(8, 0.0, elem)
-        q_off = tok * TOK + head * D
-        q_vecs = []
-        for c in range_constexpr(ND):
-            lo = zero_e8
-            hi = zero_e8
-            if const_expr(16 * c < D):
-                lo = g_load8(q_buf, q_off + 16 * c)
-            if const_expr(16 * c + 8 < D):
-                hi = g_load8(q_buf, q_off + 16 * c + 8)
-            q_vecs.append(Vec(lo).shuffle(Vec(hi), CONCAT16))
+        q_off = tok * TOK + head * D + col0
+
+        def load_q():
+            vecs = []
+            for c in range_constexpr(NDW):
+                lo = zero_e8
+                hi = zero_e8
+                if const_expr(16 * c < D):  # a partial last chunk only at NWD 1
+                    lo = g_load8(q_buf, q_off + 16 * c)
+                if const_expr(16 * c + 8 < D):
+                    hi = g_load8(q_buf, q_off + 16 * c + 8)
+                vecs.append(Vec(lo).shuffle(Vec(hi), CONCAT16))
+            return vecs
+
+        if const_expr(not q_reload):
+            q_vecs = load_q()
 
         # ---- K rows straight into the A operand: lane L%16 holds key L%16 ----
         def k_vec(addr, c):
-            """Columns 16c .. 16c + 15 of the K row at `addr`."""
+            """Columns col0 + 16c .. col0 + 16c + 15 of the K row at `addr`."""
             lo = zero_e8
             hi = zero_e8
             if const_expr(16 * c < D):
-                lo = load8_at(addr, 16 * c)
+                lo = load8_at(addr, col0 + 16 * c)
             if const_expr(16 * c + 8 < D):
-                hi = load8_at(addr, 16 * c + 8)
+                hi = load8_at(addr, col0 + 16 * c + 8)
             return Vec(lo).shuffle(Vec(hi), CONCAT16)
 
-        # ---- V tile staging: global (gathered) -> VGPRs -> LDS as V^T ----
+        # ---- V slice staging: global (gathered) -> VGPRs -> LDS as V^T ----
         def v_block(i):
             blk = lane + i * WAVE_SIZE
             if const_expr(V_PER_THR * WAVE_SIZE > V_BLOCKS):
@@ -363,7 +381,7 @@ def build_flash_attn_paged_decode_module_gfx11(
                 addr0 = kv_row(v_base, kb0, vt_rows)
                 rows = []
                 for r in range_constexpr(vt_rows):
-                    v = Vec(load8_at(addr0, r * TOK_KV + d0))
+                    v = Vec(load8_at(addr0, r * TOK_KV + col0 + d0))
                     # A row past the keys would multiply P = 0 by whatever the
                     # clamped page holds (NaN * 0 = NaN): zero it.
                     rows.append((kb0 + r < seq_kv).select(v, zero_e8))
@@ -392,6 +410,19 @@ def build_flash_attn_paged_decode_module_gfx11(
                             Vec.from_elements(ws, fx.Int32).bitcast(elem)
                         )
 
+        # ---- partial S^T exchange between the d_split waves ----
+        if const_expr(NWD > 1):
+            s_ptr = fx.recast_iter(fx.Float32, lds_ptr)
+
+            def s_view(off_f32, n):
+                return fx.make_view(
+                    fx.add_offset(s_ptr, fx.make_int_tuple(fx.Int32(off_f32))),
+                    fx.make_layout(n, 1),
+                )
+
+            def s_slot(parity, w):
+                return S_BASE // 2 + (parity * NWD + w) * S_SLOT + lane * S_LANE
+
         # ---- P^T operand assembly ----
         def pack2(a, b):
             """Two f32 P values in [0, 1] -> one dword of elem, a in the low half."""
@@ -409,40 +440,67 @@ def build_flash_attn_paged_decode_module_gfx11(
         sel_odd = is_h0.select(fx.Int32(0x07060302), fx.Int32(0x03020706))
 
         zero8 = Vec.filled(8, 0.0, fx.Float32)
-        # The waves take the segment's tiles round-robin (wave w: tiles w, w + NW,
-        # ...). A row with no visible key from the wave's first tile on starts at
+        # A row with no visible key from the segment's first tile on starts at
         # +BIG: every p is exactly 0, l and O stay 0 (see the varlen kernel).
-        m0 = (q_lim < (tile_lo + wave) * BLOCK_N).select(
+        m0 = (q_lim < tile_lo * BLOCK_N).select(
             fx.Float32(POS_BIG), fx.Float32(NEG_BIG)
         )
-        init = [m0, fx.Float32(0.0)] + [zero8 for _ in range_constexpr(ND)]
+        init = [m0, fx.Float32(0.0)] + [zero8 for _ in range_constexpr(NDW)]
 
-        store_v(gload_v(tile_lo + wave))
+        store_v(gload_v(tile_lo))
         _lds_wait()
 
         def tile_step(j32, state):
             m_old = fx.Float32(state[0])
             l_old = fx.Float32(state[1])
-            o_acc = [Vec(state[2 + i]) for i in range_constexpr(ND)]
+            o_acc = [Vec(state[2 + i]) for i in range_constexpr(NDW)]
             tile = tile_lo + j32
             key0 = tile * BLOCK_N
 
-            nxt = j32 + NW
+            nxt = j32 + 1
             nxt = (nxt < n_tiles).select(nxt, j32)
             next_v = gload_v(tile_lo + nxt)
             fx.rocdl.sched_barrier(0)
+            if const_expr(q_reload):
+                qv = load_q()
+            else:
+                qv = q_vecs
 
-            # ---- S^T = K Q^T, K rows from the cache ----
-            s_vals = []
+            # ---- S^T = K Q^T over this wave's columns, K rows from the cache ----
+            s_acc = []
             for kb in range_constexpr(NK):
                 acc = zero8
                 k_addr = kv_row(k_base, key0 + kb * 16 + l16)
-                for c in range_constexpr(ND):
-                    acc = _wmma(k_vec(k_addr, c), q_vecs[c], acc)
-                acc = Vec(acc)
+                for c in range_constexpr(NDW):
+                    acc = _wmma(k_vec(k_addr, c), qv[c], acc)
+                s_acc.append(Vec(acc))
+
+            if const_expr(NWD > 1):
+                # Sum the waves' partial S^T: each writes its slot, all read.
+                parity = j32 % 2
+                mine = s_slot(parity, wave)
+                for kb in range_constexpr(NK):
+                    s_view(mine + kb * 8, 8).store(s_acc[kb])
+                _barrier()
+                for w in range_constexpr(NWD):
+                    if const_expr(w == 0):
+                        continue
+                    other = s_slot(parity, (wave + w) % NWD)
+                    for kb in range_constexpr(NK):
+                        o_s = Vec(s_view(other + kb * 8, 8).load())
+                        s_acc[kb] = Vec.from_elements(
+                            [
+                                fx.Float32(s_acc[kb][si]) + fx.Float32(o_s[si])
+                                for si in range_constexpr(8)
+                            ],
+                            fx.Float32,
+                        )
+
+            s_vals = []
+            for kb in range_constexpr(NK):
                 row = []
                 for si in range_constexpr(8):
-                    x = fx.Float32(acc[si])
+                    x = fx.Float32(s_acc[kb][si])
                     key = key0 + kb * 16 + 2 * si + hh
                     x = (key > q_lim).select(fx.Float32(NEG_BIG), x)
                     x = (key >= seq_kv).select(fx.Float32(NEG_BIG), x)
@@ -488,7 +546,7 @@ def build_flash_attn_paged_decode_module_gfx11(
                         fx.Int32(fx.rocdl.perm_b32(partp[j2], ownp[j2], sel_odd))
                     )
                 p_vec = Vec.from_elements(dwords, fx.Int32).bitcast(elem)
-                for dc in range_constexpr(ND):
+                for dc in range_constexpr(NDW):
                     a = lds_v16(vt_base + (dc * 16 + l16) * V_ROW + kb * 16)
                     o_acc[dc] = Vec(_wmma(a, p_vec, o_acc[dc]))
 
@@ -498,70 +556,10 @@ def build_flash_attn_paged_decode_module_gfx11(
             _lds_wait()
             return [m_new, l_new] + o_acc
 
-        for j, state in range(wave, n_tiles, NW, init=init):
+        for j, state in range(0, n_tiles, 1, init=init):
             results = yield tile_step(fx.Int32(j), state)
 
-        if const_expr(NW > 1):
-            # ---- merge the waves' states; wave 0 collects, one wave per round ----
-            # A row that saw no key in a wave has l = 0 (both lane halves) and an
-            # arbitrary m; such a state carries m = -BIG so its weight is 0.
-            def row_sum(l):
-                return l + l.shuffle_xor(16, WAVE_SIZE)
-
-            scr_ptr = fx.recast_iter(fx.Float32, lds_ptr)  # the V^T tiles are dead
-
-            def scr_view(off, n):
-                return fx.make_view(
-                    fx.add_offset(scr_ptr, fx.make_int_tuple(fx.Int32(off))),
-                    fx.make_layout(n, 1),
-                )
-
-            m_cur = fx.Float32(results[0])
-            l_cur = fx.Float32(results[1])
-            o_cur = [Vec(results[2 + i]) for i in range_constexpr(ND)]
-            m_cur = (row_sum(l_cur) > 0.0).select(m_cur, fx.Float32(NEG_BIG))
-            scr = lane * SCR_ROW
-            for w in range_constexpr(1, NW):
-                _barrier()  # the V^T tiles / the previous round's reads are done
-
-                def _spill():
-                    for dc in range_constexpr(ND):
-                        scr_view(scr + dc * 8, 8).store(o_cur[dc])
-                    scr_view(scr + ND * 8, 2).store(
-                        Vec.from_elements([m_cur, l_cur], fx.Float32)
-                    )
-
-                if wave == w:
-                    _spill()
-                _barrier()
-                # Every wave reads (cheap); only wave 0 keeps the merge.
-                o_w = [
-                    Vec(scr_view(scr + dc * 8, 8).load()) for dc in range_constexpr(ND)
-                ]
-                ml = Vec(scr_view(scr + ND * 8, 2).load())
-                m_w = fx.Float32(ml[0])
-                l_w = fx.Float32(ml[1])
-                m_n = fx.maxnumf(m_cur, m_w)
-                a_c = _exp2((m_cur - m_n) * SCALE_LOG2)
-                a_w = _exp2((m_w - m_n) * SCALE_LOG2)
-                l_m = l_cur * a_c + l_w * a_w
-                o_m = [
-                    Vec.from_elements(
-                        [
-                            fx.Float32(o_cur[dc][si]) * a_c
-                            + fx.Float32(o_w[dc][si]) * a_w
-                            for si in range_constexpr(8)
-                        ],
-                        fx.Float32,
-                    )
-                    for dc in range_constexpr(ND)
-                ]
-                m_cur = is_w0.select(m_n, m_cur)
-                l_cur = is_w0.select(l_m, l_cur)
-                o_cur = [is_w0.select(o_m[dc], o_cur[dc]) for dc in range_constexpr(ND)]
-            results = [m_cur, l_cur] + o_cur
-
-        # ---- epilogue (wave 0 only when NW > 1) ----
+        # ---- epilogue: every wave writes its columns, wave 0 the statistics ----
         l_fin = fx.Float32(results[1])
         l_fin = l_fin + l_fin.shuffle_xor(16, WAVE_SIZE)
         # An element offset past every descriptor, so the store is dropped. Its
@@ -571,11 +569,9 @@ def build_flash_attn_paged_decode_module_gfx11(
         OOB = fx.Int32(0x3FFFFFF0)
 
         def gated(off, lane_ok=None):
-            """off for wave 0's rows with keys and a token, OOB otherwise."""
+            """off for rows with keys and a token, OOB otherwise."""
             off = row_ok.select(off, OOB)
             off = has_keys.select(off, OOB)
-            if const_expr(NW > 1):
-                off = is_w0.select(off, OOB)
             if lane_ok is not None:
                 off = lane_ok.select(off, OOB)
             return off
@@ -584,7 +580,7 @@ def build_flash_attn_paged_decode_module_gfx11(
             # One segment: normalized output, as the varlen kernel's epilogue.
             inv = (l_fin > 0.0).select(fx.Float32(1.0) / l_fin, fx.Float32(0.0))
             o_buf = seq_buf(O, seq_q, fx.Int64(q_start) * TOK)
-            for dc in range_constexpr(ND):
+            for dc in range_constexpr(NDW):
                 if const_expr(dc * 16 < D):
                     o = Vec(results[2 + dc])
                     own = [fx.Float32(o[si]) * inv for si in range_constexpr(8)]
@@ -603,8 +599,6 @@ def build_flash_attn_paged_decode_module_gfx11(
                         off = is_h0.select(off, OOB)
                     # A row without keys in a one-segment launch has O = 0.
                     off = row_ok.select(off, OOB)
-                    if const_expr(NW > 1):
-                        off = is_w0.select(off, OOB)
                     buf_copy_store(
                         o_buf,
                         off,
@@ -646,13 +640,13 @@ def build_flash_attn_paged_decode_module_gfx11(
             m_out = has_keys.select(m_out, fx.Float32(NEG_INF))
             l_out = has_keys.select(l_fin, fx.Float32(0.0))
             stat_off = row_ok.select(row_seg, OOB)
-            if const_expr(NW > 1):
+            if const_expr(NWD > 1):
                 stat_off = is_w0.select(stat_off, OOB)
             stat_off = is_h0.select(stat_off, OOB)
             buf_copy_store(m_tab, stat_off, m_out, elem=fx.Float32, unit_elems=1)
             buf_copy_store(l_tab, stat_off, l_out, elem=fx.Float32, unit_elems=1)
-            o_row = row_seg * DPAD2
-            for dc in range_constexpr(ND):
+            o_row = row_seg * DPAD2 + col0
+            for dc in range_constexpr(NDW):
                 o = Vec(results[2 + dc])
                 own = [fx.Float32(o[si]) for si in range_constexpr(8)]
                 part = [own[si].shuffle_xor(16, WAVE_SIZE) for si in range_constexpr(8)]
@@ -768,7 +762,7 @@ def build_flash_attn_paged_decode_module_gfx11(
 
     _launch.tq = TQ
     _launch.block_n = BLOCK_N
-    _launch.num_waves = NW
+    _launch.d_split = NWD
     _launch.dpad2 = DPAD2
     _launch.direct = direct
     return _launch
