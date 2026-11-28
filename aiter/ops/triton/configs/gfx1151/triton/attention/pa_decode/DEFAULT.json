@@ -1,7 +1,24 @@
 {
+    "dispatch": {
+        "bf16": {
+            "v1_max_partitions": 1,
+            "split_target_programs": 128,
+            "split_sizes": [1024, 512, 256, 128],
+            "split_max_partitions": 64
+        },
+        "fp16": {
+            "v1_max_partitions": 1,
+            "split_target_programs": 128,
+            "split_sizes": [1024, 512, 256, 128],
+            "split_max_partitions": 64
+        }
+    },
     "launch": {
         "v1_w_dot": {
-            "any": {"num_stages": 1, "waves_per_eu": 3}
+            "any": {"num_warps": 1, "num_stages": 1, "waves_per_eu": 2}
+        },
+        "v2_w_dot": {
+            "any": {"num_warps": 1, "num_stages": 1, "waves_per_eu": 4}
         }
     }
 }
