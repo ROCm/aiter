@@ -37,6 +37,7 @@ def input_helper(
     num_blocks: int | None,
     varlen: bool,
     device: str = "cuda",
+    seq_lens_kv: list[int] | None = None,
 ):
     """Generates the paged-KV shapes/tensors shared by the decode and prefill
     tests. ``decode_qlen > 0`` fixes the query length (decode); ``0`` lets it
@@ -45,17 +46,25 @@ def input_helper(
     ``num_blocks`` is the size of the block pool to draw (possibly repeated)
     block indices from. Pass ``None`` to instead allocate exactly as many
     blocks as needed and assign each sequence a unique set of blocks (e.g. for
-    benchmarking realistic KV cache footprint/bandwidth)."""
+    benchmarking realistic KV cache footprint/bandwidth).
+
+    ``seq_lens_kv`` sets explicit per-sequence KV lengths; it overrides
+    ``ctx_lens``/``varlen`` for the KV side."""
     qk_head_dim = kv_lora_rank + qk_rope_head_dim
 
     cu_seqlens_q = torch.zeros(batch_size + 1, dtype=torch.int, device=device)
     seq_lens_qo = torch.empty(batch_size, dtype=torch.int, device=device)
-    seq_lens_kv = torch.empty(batch_size, dtype=torch.int, device=device)
-    if varlen:
+    if seq_lens_kv is not None:
+        assert len(seq_lens_kv) == batch_size
+        seq_lens_kv = torch.tensor(seq_lens_kv, dtype=torch.int, device=device)
+    elif varlen:
+        seq_lens_kv = torch.empty(batch_size, dtype=torch.int, device=device)
         for i in range(batch_size):
             seq_lens_kv[i] = max(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens)
     else:
-        seq_lens_kv.fill_(ctx_lens)
+        seq_lens_kv = torch.full(
+            (batch_size,), ctx_lens, dtype=torch.int, device=device
+        )
     if decode_qlen > 0:
         seq_lens_qo.fill_(decode_qlen)
     else:
@@ -1542,6 +1551,123 @@ def test_mla_decode_fwd_lds_pipeline_eligibility(
         assert isinstance(result, tuple) and len(result) == 3
     else:
         assert result is output
+
+
+def _strided_block_cache(blocks, row_stride, first_row=0):
+    n, block_size, num_kv_heads, head_dim = blocks.shape
+    num_rows = first_row + n
+    flat = torch.full(
+        (num_rows * row_stride,), 0xFF, dtype=torch.uint8, device=blocks.device
+    ).view(blocks.dtype)
+    cache = flat.as_strided(
+        (num_rows, block_size, num_kv_heads, head_dim),
+        (row_stride, num_kv_heads * head_dim, head_dim, 1),
+    )
+    cache[first_row:].copy_(blocks)
+    return cache
+
+
+def _paged_decode_inputs(ctx_lens, q_len, num_query_heads, block_size, page=64):
+    kv_lora_rank, qk_rope_head_dim = 512, 64
+    cu_seqlens_q, seq_lens, max_seqlen, blocks, kv, q, _, _ = input_helper(
+        batch_size=len(ctx_lens),
+        ctx_lens=max(ctx_lens),
+        decode_qlen=q_len,
+        num_query_heads=num_query_heads,
+        num_kv_heads=1,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        block_size=block_size,
+        num_blocks=None,
+        varlen=False,
+        seq_lens_kv=[c + q_len for c in ctx_lens],
+    )
+    # Expand each block id into the ids of the pages it holds.
+    pages_per_block = block_size // page
+    page_table = (
+        blocks[:, :, None] * pages_per_block
+        + torch.arange(pages_per_block, dtype=torch.int32, device=blocks.device)
+    ).view(blocks.shape[0], -1)
+    return {
+        "q": q.clamp_(-4, 4).to(e4m3_dtype),
+        "kv": kv.clamp_(-4, 4).to(e4m3_dtype),
+        "page_table": page_table,
+        "seq_lens": seq_lens,
+        "cu_seqlens_q": cu_seqlens_q,
+        "max_seqlen": max_seqlen,
+        "kv_lora_rank": kv_lora_rank,
+        "qk_rope_head_dim": qk_rope_head_dim,
+        "pages_per_block": pages_per_block,
+        "page": page,
+    }
+
+
+def _run_paged_decode(inp, kv_buffer, page_table, pages_per_block):
+    q = inp["q"]
+    out = torch.full(
+        (q.shape[0], q.shape[1], inp["kv_lora_rank"]),
+        float("nan"),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    mla_decode_fwd(
+        q,
+        kv_buffer,
+        out,
+        inp["cu_seqlens_q"],
+        inp["seq_lens"],
+        inp["max_seqlen"],
+        page_table,
+        1.0 / (q.shape[-1] ** 0.5),
+        inp["kv_lora_rank"],
+        inp["qk_rope_head_dim"],
+        True,
+        torch.tensor([0.05], dtype=torch.float32, device="cuda"),
+        torch.tensor([0.07], dtype=torch.float32, device="cuda"),
+        pages_per_block=pages_per_block,
+    )
+    return out
+
+
+def _check_strided_matches_contiguous(inp, row_stride, first_row=0):
+    kv, page, ppb = inp["kv"], inp["page"], inp["pages_per_block"]
+    ref = _run_paged_decode(
+        inp, kv.view(-1, page, 1, kv.shape[-1]), inp["page_table"], 1
+    )
+    assert torch.isfinite(ref.float()).all()
+    cache = _strided_block_cache(kv, row_stride, first_row)
+    out = _run_paged_decode(inp, cache, inp["page_table"] + first_row * ppb, ppb)
+    torch.testing.assert_close(out, ref, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("block_size", [2048, 1024])
+@pytest.mark.parametrize("q_len", [1, 8])
+@pytest.mark.parametrize("num_query_heads", [24, 96])
+@pytest.mark.parametrize("ctx_lens", [[1, 777, 4100, 131064], [2047, 2048, 2049]])
+@torch.inference_mode()
+def test_mla_decode_fwd_strided_blocks(block_size, q_len, num_query_heads, ctx_lens):
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("pages_per_block is gfx1250 only")
+    torch.manual_seed(0)
+    inp = _paged_decode_inputs(ctx_lens, q_len, num_query_heads, block_size)
+    _check_strided_matches_contiguous(inp, block_size * inp["kv"].shape[-1] + 8)
+
+
+@torch.inference_mode()
+def test_mla_decode_fwd_strided_blocks_over_4gb():
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("pages_per_block is gfx1250 only")
+    block_size, head_dim = 2048, 576
+    row_stride = 3 * block_size * head_dim + 5 * 576 + 64
+    num_rows = (2**32 + 2**30) // row_stride + 1
+    torch.cuda.empty_cache()
+    if torch.cuda.mem_get_info()[0] < num_rows * row_stride + 2**31:
+        pytest.skip("needs ~7 GiB free")
+    torch.manual_seed(0)
+    inp = _paged_decode_inputs([40 * 1024, 30 * 1024 + 17], 8, 96, block_size)
+    first_row = num_rows - inp["kv"].shape[0]
+    assert first_row * row_stride > 2**31
+    _check_strided_matches_contiguous(inp, row_stride, first_row)
 
 
 @pytest.mark.parametrize("query_stride", [1, 2])

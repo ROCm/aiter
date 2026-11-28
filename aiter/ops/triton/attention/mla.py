@@ -368,6 +368,7 @@ def mla_decode_fwd(
     out_scale=None,
     shuffled_kv_cache: bool = False,
     skip_reduce: bool = False,
+    pages_per_block: int = 1,
 ):
     assert causal, "Only causal attention is supported"
     q_dtype = q.dtype
@@ -420,6 +421,14 @@ def mla_decode_fwd(
     else:
         num_blocks, block_size, num_kv_heads, _ = kv_buffer.shape
         K_WIDTH = 16 if kv_buffer_dtype == e4m3_dtype else 8
+
+    page_kwargs = {}
+    if pages_per_block != 1:
+        assert IS_DEVICE_ARCH_GFX12 and not shuffled_kv_cache
+        assert pages_per_block > 1 and block_size % pages_per_block == 0
+        block_size //= pages_per_block
+        num_blocks *= pages_per_block
+        page_kwargs["PAGES_PER_BLOCK"] = pages_per_block
 
     num_seqs = len(seqused_k)
     num_tokens_per_seq = total_num_tokens // num_seqs
@@ -497,6 +506,8 @@ def mla_decode_fwd(
     use_pipelined_unshuffled = (
         IS_DEVICE_ARCH_GFX12
         and not shuffled_kv_cache
+        # Strided blocks (pages_per_block > 1) are read by the non-pipelined kernel only.
+        and pages_per_block == 1
         and ALL_DECODE
         and KV_CACHE_DTYPE in ("bf16", "fp8")
         and block_size in (64, 128)
@@ -673,6 +684,7 @@ def mla_decode_fwd(
             KV_CACHE_DTYPE=KV_CACHE_DTYPE,
             BLOCK_SCALES_SIZE=BLOCK_SCALES_SIZE,
             NUM_HEAD_BLOCKS=NUM_HEAD_BLOCKS,
+            **page_kwargs,
             **attn_config,
         )
     else:
