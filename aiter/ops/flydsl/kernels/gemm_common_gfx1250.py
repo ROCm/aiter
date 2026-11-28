@@ -4,6 +4,7 @@ import os
 from collections import namedtuple
 
 import flydsl.expr as fx
+from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl.expr import as_ir_value, gpu, range_constexpr, rocdl
 from flydsl.expr.rocdl import cluster, tdm_ops
@@ -11,6 +12,68 @@ from flydsl.expr.typing import T
 
 from .act import sigmoid_f32
 from .kernels_common import LOG2E
+
+
+def get_flush_lds_size(num_waves: int) -> int:
+    """Return scratch bytes for flush_lds_store, with a private dword per wave."""
+    FLUSH_LANES = 5
+    BANKS = 64
+    DWORD_BYTES = 4
+    STRIDE_BYTES = BANKS * DWORD_BYTES
+    ALIGNMENT = 16
+    assert 1 <= num_waves <= BANKS
+    size = (FLUSH_LANES - 1) * STRIDE_BYTES + num_waves * DWORD_BYTES
+    return (size + ALIGNMENT - 1) // ALIGNMENT * ALIGNMENT
+
+
+def flush_lds_store(flush_addr):
+    """Flush gfx1250 wave32 LDS stores before a subsequent TDM store.
+
+    Working hypothesis: DS loads may see pending stores through forwarding,
+    while TDM may not share that path and can observe stale LDS data. This is
+    not yet a confirmed hardware explanation for the concurrent replay failure.
+
+    Call convergently after the payload stores and before the workgroup barrier
+    handing LDS to TDM. This does not replace cross-wave synchronization.
+
+    Args:
+        flush_addr: Uniform LDS byte address, aligned to four bytes. The caller
+            must reserve five unused dwords at offsets 0, 256, 512, 768, 1024,
+            disjoint from live data and every other wave's scratch addresses.
+
+    """
+    # TODO: Record the first verified compiler fix version; none exists yet.
+    _FLYDSL_LDS_STORE_FIX_VERSION = None
+    FLUSH_LANES = 5
+    STRIDE_BYTES = 64 * 4
+    # No stable FlyDSL API expresses this hardware workaround: five deliberately
+    # bank-conflicting stores followed by a read and drain. Keep EXEC changes
+    # and the DS sequence in one asm, with memory ordering visible to LLVM.
+    # EXEC is restored inside the asm, so it is not an outgoing clobber.
+    # LLVM cannot insert waits within inline asm: address dependencies need
+    # explicit ALU waits, including in expert scheduling mode.
+    llvm_dialect.InlineAsmOp(
+        res=ir.Type.parse("!llvm.struct<(i32, i32, i32)>"),
+        operands_=[as_ir_value(fx.Int32(flush_addr))],
+        asm_string=(
+            "s_mov_b32 $0, exec_lo\n"
+            f"s_mov_b32 exec_lo, 0x{(1 << FLUSH_LANES) - 1:x}\n"
+            "v_mbcnt_lo_u32_b32 $1, -1, 0\n"
+            "s_wait_alu depctr_va_vdst(0)\n"
+            f"v_lshlrev_b32 $1, {STRIDE_BYTES.bit_length() - 1}, $1\n"
+            "s_wait_alu depctr_va_vdst(0)\n"
+            "v_add_nc_u32 $1, $3, $1\n"
+            "v_mov_b32 $2, 0\n"
+            "s_wait_alu depctr_va_vdst(0)\n"
+            "ds_store_b32 $1, $2\n"
+            "ds_load_b32 $2, $1\n"
+            "s_mov_b32 exec_lo, $0\n"
+            "s_wait_dscnt 0"
+        ),
+        constraints="=&s,=&v,=&v,s,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+    )
 
 
 def make_lds_copy_ops(bits):

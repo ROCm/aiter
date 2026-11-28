@@ -21,8 +21,10 @@ from .gemm_common_gfx1250 import (
     INST_PREFETCH,
     batched_silu_swiglu,
     batched_situv2,
+    flush_lds_store,
     fused_silu_swiglu_elem,
     fused_situv2_elem,
+    get_flush_lds_size,
     make_lds_copy_ops,
     pipeline_fence,
     prefetch_kernel_code,
@@ -286,8 +288,8 @@ def build_gemm_a8w4_tdm_task(
       wait``) instead of ``gpu.barrier``'s loadcnt/storecnt drain. They order
       only LDS and TDM traffic; nothing in that window hands data through
       global memory.
-    - ``defer_c_wait`` (fp4 stage-1 output, persistent): stage C in the last
-      pipeline stage and skip the waits after its TDM store and the e8m0
+    - ``defer_c_wait`` (fp4 stage-1 output, persistent): stage C at the arena's
+      tail and skip the waits after its TDM store and the e8m0
       scale stores. The next tile's first fence retires both (tensor ops
       retire in issue order and the prologue writes only its first
       ``prologue_stages`` stages; ``gpu.barrier`` waits storecnt). The caller
@@ -555,14 +557,18 @@ def build_gemm_a8w4_tdm_task(
     _lds_row_bytes = _lds_pitch(C_ROW_BYTES)
     c_lds_pad_elems = (_lds_row_bytes - C_ROW_BYTES) // 2 if enable_ep_scatter else 0
     store_pad = c_lds_pad_elems if enable_ep_scatter else 16
-    C_STORE_B = (
-        ((tile_m * _lds_row_bytes + 127) // 128) * 128
-        if ep_quant_bits
-        else ((tile_m * (tile_n + store_pad) * 2 + 127) // 128) * 128
+    C_LDS_ROW_BYTES = (
+        tile_n // (4 if a_is_fp4 else 2)
+        if stage1_act and stage1_quant_out
+        else (
+            tile_n
+            if stage1_act
+            else _lds_row_bytes if ep_quant_bits else (tile_n + store_pad) * 2
+        )
     )
+    C_STORE_B = ceildiv(tile_m * C_LDS_ROW_BYTES, 128) * 128
     AS_FULL_OFF = INPUT_LDS_B
     AS_FULL_B = ceildiv(AS_SUPERS * AS_FULL_INNER * 4, 128) * 128
-    ARENA_B = max(AS_FULL_OFF + (AS_FULL_B if tdm_as_in_prologue else 0), C_STORE_B)
     # Each k_waves group gets its own arena, which also holds its partial
     # accumulators (one f32 dword4 per lane per chunk) for the final reduction.
     K_PARTIAL_B = (
@@ -573,6 +579,22 @@ def build_gemm_a8w4_tdm_task(
         * num_waves
         * WAVE
     )
+    # After the epilogue's input fence, C occupies the tail and flush scratch
+    # reuses the head. Reserve both even when the input arena is smaller.
+    FLUSH_BYTES = get_flush_lds_size(num_waves)
+    ARENA_B = (
+        ceildiv(
+            max(
+                AS_FULL_OFF + (AS_FULL_B if tdm_as_in_prologue else 0),
+                K_PARTIAL_B if k_waves > 1 else 0,
+                FLUSH_BYTES + C_STORE_B,
+            ),
+            128,
+        )
+        * 128
+    )
+    C_OFF = ARENA_B - C_STORE_B
+    assert C_OFF >= FLUSH_BYTES
     GROUP_ARENA_B = ceildiv(max(ARENA_B, K_PARTIAL_B), 512) * 512
     # Stages the mainloop issues before its first fence (mirrors run_mainloop).
     _mid_compute = not (tile_m <= 32 or num_buffers <= 2)
@@ -581,12 +603,9 @@ def build_gemm_a8w4_tdm_task(
         if _mid_compute
         else num_buffers
     )
-    # With defer_c_wait the output is staged in the last pipeline stage, which
-    # the next tile's prologue does not write: tile_m x tile_n/4 B of fp4 for
-    # stage 1, the padded bf16 scatter rows for stage 2. A persistent bf16 EP
-    # scatter defers on its own whenever its rows fit there: the remote
-    # gather-store then retires under the next tile's prologue instead of
-    # stalling every wave (DSV4.1-Flash EP4 tpr 512: GEMM2 57.4 -> 54.9 us).
+    # Keep deferred output at the arena tail, clear of the next prologue and
+    # the flush scratch. A persistent bf16 EP scatter can then retire its
+    # gather-store under the next tile's prologue.
     if (
         _EP_DEFER_C_WAIT
         and enable_ep_scatter
@@ -600,14 +619,9 @@ def build_gemm_a8w4_tdm_task(
         and num_buffers * PITCH - PITCH + C_STORE_B <= ARENA_B
     ):
         defer_c_wait = 1
-    _defer_off = (num_buffers - 1) * PITCH if defer_c_wait else 0
-    C_EP_OFF = _defer_off if enable_ep_scatter else 0
-    C_Q_OFF = 0 if enable_ep_scatter else _defer_off
     if defer_c_wait:
         assert not planar_lds_on and not tdm_as_in_prologue and _mid_compute
-        assert _pro_stages * PITCH <= _defer_off, "C staging overlaps the prologue"
-        _c_bytes = C_STORE_B if enable_ep_scatter else tile_m * (tile_n // 4)
-        assert _defer_off + _c_bytes <= ARENA_B, "C staging past arena"
+        assert _pro_stages * PITCH <= C_OFF, "C staging overlaps the prologue"
 
     # Quant epilogue compile-time constants.
     QUANT_ROWS_PER_TILE = quant_wmma_rep * 16
@@ -907,12 +921,8 @@ def build_gemm_a8w4_tdm_task(
             return fx.Index(fx.ptrtoint(p))
 
         stC_idx = ptr_to_idx(base_ptr)
-        # EP-scatter C staging.
-        stC_ep_idx = (stC_idx + C_EP_OFF) if const_expr(C_EP_OFF) else stC_idx
-        c_ep_base_ptr = (base_ptr + C_EP_OFF) if const_expr(C_EP_OFF) else base_ptr
-        # Quantized stage-1 C staging (offset only with defer_c_wait).
-        stC_q_idx = (stC_idx + C_Q_OFF) if const_expr(C_Q_OFF) else stC_idx
-        c_q_base_ptr = (base_ptr + C_Q_OFF) if const_expr(C_Q_OFF) else base_ptr
+        c_lds_idx = stC_idx + C_OFF
+        c_base_ptr = base_ptr + C_OFF
 
         def global_view(base, off, shape, stride):
             return fx.Tensor(fx.make_view(base + off, fx.make_layout(shape, stride)))
@@ -2481,12 +2491,12 @@ def build_gemm_a8w4_tdm_task(
                                     col_fp4_0 = (wnb + wn0 * 16) // 4 + kgrp * 2
                                     col_fp4_1 = (wnb + wn1 * 16) // 4 + kgrp * 2
                                     lds_store_b16(
-                                        stC_q_idx,
+                                        c_lds_idx,
                                         quant_byte_offset(row_rel, col_fp4_0),
                                         packed_i32,
                                     )
                                     lds_store_b16(
-                                        stC_q_idx,
+                                        c_lds_idx,
                                         quant_byte_offset(row_rel, col_fp4_1),
                                         packed_i32 >> fx.Int32(16),
                                     )
@@ -2508,7 +2518,7 @@ def build_gemm_a8w4_tdm_task(
                                         packed_i32 = fx.Vector(packed_v2i32)[sub]
                                         col_fp8 = (wnb + wn * 16 + kgrp * 8) // 2
                                         lds_store_b32(
-                                            stC_q_idx,
+                                            c_lds_idx,
                                             row_rel * STORE_N + col_fp8,
                                             Vec.from_elements([packed_i32], fx.Int32),
                                         )
@@ -2580,7 +2590,7 @@ def build_gemm_a8w4_tdm_task(
                         address_space=fx.AddressSpace.Shared,
                         alignment=1,
                     )
-                    _scale_lds = fx.recast_iter(_p8_scale, base_ptr)
+                    _scale_lds = fx.recast_iter(_p8_scale, c_base_ptr)
                     for wm in range_constexpr(wmma_m_rep):
                         row_rel = wmb + wm * 16 + lane16
                         _wf = _wf_rows[wm]
@@ -2621,7 +2631,7 @@ def build_gemm_a8w4_tdm_task(
                                 # on the fp4 one.
                                 if const_expr(ep_quant_bits == 8):
                                     lds_store_b64(
-                                        stC_idx,
+                                        c_lds_idx,
                                         _row_byte + col_rel,
                                         emit_cvt_scalef32_pk8_fp8_f32(
                                             _src8,
@@ -2632,7 +2642,7 @@ def build_gemm_a8w4_tdm_task(
                                     )
                                 else:
                                     lds_store_b32(
-                                        stC_idx,
+                                        c_lds_idx,
                                         _row_byte + col_rel // 2,
                                         Vec.from_elements(
                                             [
@@ -2666,7 +2676,7 @@ def build_gemm_a8w4_tdm_task(
                                         _e8m0_blks[dw * 4 : dw * 4 + 4]
                                     )
                                     lds_store_b32(
-                                        stC_idx,
+                                        c_lds_idx,
                                         _sc_byte + dw * 4,
                                         Vec.from_elements([_packed], fx.Int32),
                                     )
@@ -2705,7 +2715,7 @@ def build_gemm_a8w4_tdm_task(
                                     ]
                                 hv = Vec.from_elements(act_vals, fx.Float32).to(oc)
                                 lds_store_b64(
-                                    stC_idx,
+                                    c_lds_idx,
                                     (row_rel * STORE_N + col_rel // 2) * 2,
                                     hv.bitcast(fx.Int32).ir_value(),
                                 )
@@ -2724,12 +2734,14 @@ def build_gemm_a8w4_tdm_task(
                                     ).to(oc)
                                 hv_i32 = hv.bitcast(fx.Int32).ir_value()
                                 lds_store_b128(
-                                    stC_ep_idx,
+                                    c_lds_idx,
                                     (row_rel * STORE_PITCH + col_rel) * 2,
                                     hv_i32,
                                 )
 
             # -- Shared LDS -> global --
+            # Unlike standalone GEMM, fused quant also uses a TDM output store.
+            flush_lds_store(fx.Int32(fx.ptrtoint(base_ptr)) + fx.Int32(wave) * 4)
             # dscnt-only barrier: the store reads LDS, not the e8m0 scales still
             # in flight, so their storecnt wait moves past the store below.
             if const_expr(stage1_quant_out and stage1_act):
@@ -2771,7 +2783,7 @@ def build_gemm_a8w4_tdm_task(
                     _comb_iter, (_oob, _row_elems), (_stride_elems, 1)
                 )
                 _lds_c = tensor_view(
-                    fx.recast_iter(fx.Int8 if ep_quant_bits else oc, c_ep_base_ptr),
+                    fx.recast_iter(fx.Int8 if ep_quant_bits else oc, c_base_ptr),
                     (tile_m, _lds_row_elems),
                     (_lds_row_elems, 1),
                 )
@@ -2881,7 +2893,7 @@ def build_gemm_a8w4_tdm_task(
                     store_tile(
                         gtC,
                         (tile_m // 16, STORE_N * 16),
-                        fx.recast_iter(oc_store, c_q_base_ptr),
+                        fx.recast_iter(oc_store, c_base_ptr),
                         STORE_N * 16,
                     )
                 else:
@@ -2891,13 +2903,10 @@ def build_gemm_a8w4_tdm_task(
                     )
                     # The LDS tile is (tile_m, STORE_PITCH) dense; gtC's inner
                     # extent is STORE_N, so the pad columns never reach global.
-                    # c_q_base_ptr is base_ptr unless defer_c_wait, and that
-                    # asserts stage1_act and not enable_ep_scatter -- the only
-                    # case it differs already has STORE_PAD == 0 (PITCH == N).
                     store_tile(
                         gtC,
                         (tile_m, STORE_PITCH),
-                        fx.recast_iter(oc_store, c_q_base_ptr),
+                        fx.recast_iter(oc_store, c_base_ptr),
                         STORE_PITCH,
                     )
                 if const_expr(tdm_snop):
@@ -2915,7 +2924,7 @@ def build_gemm_a8w4_tdm_task(
                 # LDS hand-off only (S1F: the next item's slot). The output
                 # store no longer reads what the next prologue writes: either
                 # every wave waited for it above, or (defer_c_wait) it reads
-                # the last stage, which the prologue does not touch.
+                # the arena tail, which the prologue does not touch.
                 rocdl.s_wait_dscnt(0)
                 rocdl.s_barrier_signal(-1)
                 rocdl.s_barrier_wait(-1)
@@ -2930,8 +2939,8 @@ def build_gemm_a8w4_tdm_task(
         "arena": ARENA_B,
         "pitch": PITCH,
         "prologue_stages": _pro_stages,
-        "c_ep_off": C_EP_OFF,
-        "c_q_off": C_Q_OFF,
+        "c_ep_off": C_OFF,
+        "c_q_off": C_OFF,
         "defer_c_wait": int(bool(defer_c_wait)),
     }
     return gemm_task, block, _kname, cluster_m, layout

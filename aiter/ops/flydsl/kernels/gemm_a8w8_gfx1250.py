@@ -15,6 +15,8 @@ from flydsl.runtime.device import get_rocm_arch
 
 from aiter.jit.utils.lds_capacity import get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
+    flush_lds_store,
+    get_flush_lds_size,
     make_lds_copy_ops,
     pipeline_fence,
     workgroup_barrier,
@@ -216,7 +218,13 @@ def launch_gemm_a8w8(
     C_PAD = 8 if tile_n >= 128 else 0
     C_LDS_ROW = tile_n + C_PAD
     C_STORE_B = (tile_m * C_LDS_ROW * c_bytes + 127) // 128 * 128
-    ARENA_B = max(PANEL_OFF + PANEL_A + PANEL_B, C_STORE_B)
+    # After the input fence, stage C at the tail and reuse the head for flush.
+    FLUSH_BYTES = get_flush_lds_size(num_waves) if not fuse_quant_out else 0
+    ARENA_B = (
+        (max(PANEL_OFF + PANEL_A + PANEL_B, FLUSH_BYTES + C_STORE_B) + 127) // 128 * 128
+    )
+    C_OFF = ARENA_B - C_STORE_B if not fuse_quant_out else 0
+    assert C_OFF >= FLUSH_BYTES
     # The compile target, not the host: AOT cross-compiles these gfx1250
     # kernels under FLYDSL_GPU_ARCH, which get_rocm_arch() honours.
     arch = get_rocm_arch().split(":", 1)[0]
@@ -958,6 +966,7 @@ def launch_gemm_a8w8(
         pipeline_fence(outstanding=0, use_cluster=use_cluster)
         if const_expr(not is_mxscale):
             accs = epilogue_apply_ptpc_scale(scale_regs)
+        c_base_ptr = base_ptr + C_OFF
         for wm in range_constexpr(wmma_m_rep):
             row_rel = wmb + wm * 16 + lane16
             for wn in range_constexpr(wmma_n_rep):
@@ -965,8 +974,11 @@ def launch_gemm_a8w8(
                 h = accs[wm * wmma_n_rep + wn].to(out_cls)
                 fx.ptr_store(
                     h.bitcast(fx.Int8),
-                    base_ptr + (row_rel * C_LDS_ROW + col_rel) * c_bytes,
+                    c_base_ptr + (row_rel * C_LDS_ROW + col_rel) * c_bytes,
                 )
+        if const_expr(not fuse_quant_out):
+            # Fused quant reads LDS via DS loads; only this path hands it to TDM.
+            flush_lds_store(fx.Int32(_bidx(base_ptr)) + fx.Int32(wave) * 4)
         workgroup_barrier(use_cluster=False)
         if const_expr(not fuse_quant_out):
             c_off_rt = blk_m64 * ldc64 + blk_n64
@@ -985,7 +997,7 @@ def launch_gemm_a8w8(
             )
             blkC = fx.zipped_divide(coordC, C_TILE)[None, (0, None)]
             sC = _lv(
-                fx.recast_iter(out_cls, base_ptr),
+                fx.recast_iter(out_cls, c_base_ptr),
                 (C_TILE, 1),
                 ((C_LDS_ROW, 1), tile_m * C_LDS_ROW),
             )
