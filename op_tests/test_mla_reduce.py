@@ -492,6 +492,27 @@ LAYOUT_CASES = [
     ("8 rows, max_seqlen_q 1", 16, 512, [200], 8, 1, True, {}),
     ("8 rows, max_seqlen_q 3", 16, 128, [32, 32, 32], 8, 3, True, {}),
     ("80 tiles", 16, 128, [16] * 80, 1, 1, True, {}),
+    # Few splits per tile (decode with a split KV): the wave-per-head kernel on
+    # wave32 GPUs, kn_mla_reduce_v1 elsewhere.
+    ("few splits, no final map", 96, 512, [4, 2, 7], 1, 1, False, {}),
+    ("few splits, -1 tile", 96, 512, [3, 1, 5], 1, 1, True, {"sentinel_tiles": (1,)}),
+    ("few splits, 30 padded", 96, 512, [2, 6], 1, 1, True, {"pad_tiles": 30}),
+    ("few splits, 4 rows, max_seqlen_q 2", 16, 512, [3, 5], 4, 2, True, {}),
+    # Multi-row tiles as the decode planner cuts a 64-head 4-token query (2 rows
+    # each): the wave-per-head kernel's multi-row instance on wave32 GPUs. The
+    # second case passes its 256-tile grid, so workgroups walk several tiles and
+    # stop at the padded (empty) tail.
+    ("2-row tiles, 64 heads", 64, 512, [5, 9, 3, 7] * 16, 2, 4, True, {}),
+    (
+        "2-row tiles past the grid, 64 heads",
+        64,
+        512,
+        [2, 3] * 150,
+        2,
+        4,
+        True,
+        {"pad_tiles": 40},
+    ),
 ]
 
 
