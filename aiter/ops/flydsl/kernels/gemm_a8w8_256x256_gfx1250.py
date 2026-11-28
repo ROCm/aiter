@@ -1649,11 +1649,12 @@ def launch_gemm_a8w8_256x256(
             # one cross-lane max, no bf16 staging. Values are first rounded to
             # the output dtype, as the bf16 store does, so the codes match
             # quantize_fp8 of that output (amax floored at 1e-10, e8m0 ceil).
+            # The per-group step and the scale-row store are shared with the
+            # batched kernel's accumulator quant (gemm_a8w8_gfx1250.py).
             from aiter.ops.flydsl.kernels.quant_utils import (
-                emit_cvt_scalef32_pk8_fp8_f32,
-                emit_mx_e8m0_scale,
+                emit_mxfp8_acc_pair_to_lds,
+                emit_mxfp8_scale_rows_store,
             )
-            from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
 
             s8 = fx.recast_iter(fx.Int8, arg_out)
             lds8 = fx.recast_iter(fx.Int8, base_ptr)
@@ -1662,7 +1663,6 @@ def launch_gemm_a8w8_256x256(
             )
             GN = tile_n // 32
             S8_OFF = tile_m * C8_ROW
-            v2i32_ty = T.vec(2, T.i32)
             srow = ldc64 // 32  # scale row stride: one byte per 32 C columns
             c8_off = blk_m64 * ldc64 + blk_n64
             sbase_blk = blk_n64 // 32
@@ -1672,62 +1672,38 @@ def launch_gemm_a8w8_256x256(
             for wm in range_constexpr(wmma_m_rep):
                 row_rel = wmb + wm * 16 + lane16
                 for wp in range_constexpr(wmma_n_rep // 2):
-                    h0 = accs[wm * wmma_n_rep + 2 * wp].to(oc).to(fx.Float32)
-                    h1 = accs[wm * wmma_n_rep + 2 * wp + 1].to(oc).to(fx.Float32)
-                    amax = abs(h0[0])
-                    for t in range_constexpr(1, 8):
-                        amax = fx.maxnumf(amax, abs(h0[t]))
-                    for t in range_constexpr(8):
-                        amax = fx.maxnumf(amax, abs(h1[t]))
-                    amax = fx.maxnumf(amax, fx.Float32(amax).shuffle_xor(16, WAVE))
-                    amax = fx.maxnumf(amax, fx.Float32(1e-10))
-                    e8 = emit_mx_e8m0_scale(
-                        amax,
-                        mode=MxScaleRoundModeInt.RoundUp,
-                        dtype=MxDtypeInt.FP8_E4M3,
-                    )
-                    scale_f32 = (fx.Int32(e8) << 23).bitcast(fx.Float32)
-                    p0 = emit_cvt_scalef32_pk8_fp8_f32(
-                        h0.ir_value(), scale_f32, v2i32_ty=v2i32_ty, rocdl=rocdl
-                    )
-                    p1 = emit_cvt_scalef32_pk8_fp8_f32(
-                        h1.ir_value(), scale_f32, v2i32_ty=v2i32_ty, rocdl=rocdl
-                    )
-                    gcol = fx.Int64(wnb + wp * 32)
                     # e4m3 bytes go through LDS so the global write is the
                     # tile's coalesced TDM store.
-                    l_off = fx.Int64(row_rel) * C8_ROW + gcol + fx.Int64(kgrp * 8)
-                    fx.ptr_store(
-                        fx.Vector(p0).bitcast(fx.Int8), fx.add_offset(lds8, l_off)
+                    emit_mxfp8_acc_pair_to_lds(
+                        accs[wm * wmma_n_rep + 2 * wp],
+                        accs[wm * wmma_n_rep + 2 * wp + 1],
+                        oc,
+                        lds8,
+                        row_rel,
+                        fx.Int64(wnb + wp * 32),
+                        kgrp,
+                        c8_row=C8_ROW,
+                        s8_off=S8_OFF,
+                        gn=GN,
+                        wave=WAVE,
                     )
-                    fx.ptr_store(
-                        fx.Vector(p1).bitcast(fx.Int8),
-                        fx.add_offset(lds8, l_off + 16),
-                    )
-                    if kgrp == 0:
-                        fx.ptr_store(
-                            Vec.from_elements([fx.Uint8(e8)], fx.Int8),
-                            fx.add_offset(
-                                lds8,
-                                fx.Int64(S8_OFF + row_rel * GN) + gcol // 32,
-                            ),
-                        )
             workgroup_barrier(use_cluster=False)
-            # One row's GN scale bytes per thread: contiguous in the row-major
-            # scale, so each row is a single small store.
-            for rr in range_constexpr((tile_m + block - 1) // block):
-                srow_rel = fx.Int32(tid) + rr * block
-                if (srow_rel < tile_m) and (srow_rel < mn_oob):
-                    sv = fx.ptr_load(
-                        fx.add_offset(lds8, fx.Int64(S8_OFF + srow_rel * GN)),
-                        result_type=T.vec(GN, T.i8),
-                    )
-                    fx.ptr_store(
-                        fx.Vector(sv),
-                        fx.add_offset(
-                            s8, (blk_m64 + fx.Int64(srow_rel)) * srow + sbase_blk
-                        ),
-                    )
+            # Each thread copies whole scale rows (rows tid, tid + block, ...);
+            # a row's GN bytes are contiguous in the row-major scale, so each
+            # row is one small store.
+            emit_mxfp8_scale_rows_store(
+                lds8,
+                s8,
+                tid,
+                mn_oob,
+                blk_m64,
+                srow,
+                sbase_blk,
+                s8_off=S8_OFF,
+                gn=GN,
+                tile_m=tile_m,
+                block=block,
+            )
             C8_TILE = (tile_m, C8_ROW)
             gtC8 = _gv(gC8_base, c8_off, (mn_oob, tile_n), (ldc64, 1))
             atomC8, coordC8 = fx.rocdl.cdna5.make_tiled_tdm_atom(
