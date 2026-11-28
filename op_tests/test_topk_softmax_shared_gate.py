@@ -32,15 +32,24 @@ torch.set_default_device("cuda")
 SUPPORTED_GFX = ["gfx942", "gfx950"]
 
 
-def sorted_pairs(ids, weights):
-    order = torch.argsort(ids, dim=-1)
-    return torch.gather(ids, -1, order), torch.gather(weights, -1, order)
+def invalid_id_rows(ids, num_experts):
+    s = ids.sort(dim=-1).values
+    dup = (s[:, 1:] == s[:, :-1]).any(dim=-1)
+    return dup | (s[:, 0] < 0) | (s[:, -1] >= num_experts)
+
+
+def ref_topk_ids(gating, topk):
+    # The kernels select on the fp32 gating logits and pick the lower expert id
+    # on an exact tie, so routing is deterministic. torch.topk leaves tie order
+    # unspecified; a stable descending sort keeps the lower id first.
+    return torch.argsort(gating.float(), dim=-1, descending=True, stable=True)[:, :topk]
 
 
 def run_torch(gating, hidden, gate_weight, topk, num_shared, base, scale, renorm):
     # Reference only: fp32 math. Not timed, not in the table.
     probs = torch.softmax(gating.float(), dim=-1)
-    routed_w, routed_i = torch.topk(probs, topk, dim=-1)
+    routed_i = ref_topk_ids(gating, topk)
+    routed_w = probs.gather(-1, routed_i)
     if renorm:
         routed_w = routed_w / routed_w.sum(dim=-1, keepdim=True)
     shared_w = torch.sigmoid(hidden.float() @ gate_weight.float().t()) * scale
@@ -70,11 +79,12 @@ def _fused_buffers(tokens, topk, num_shared):
     )
 
 
-def _check(wbuf, ibuf, topk, ref, name):
+def _check(wbuf, ibuf, topk, ref, num_experts, name):
     # Compare one candidate's output buffers against the torch reference and return
-    # the WORST of the four checks, so a mismatch in ANY of them (ids to the bit,
-    # weights within tol) shows up as a non-zero err in the table. checkAllclose
-    # also logs each check (red on mismatch), the way other aiter op_tests report.
+    # the WORST of the five checks, so a mismatch in ANY of them (ids to the bit,
+    # in selection order, weights within tol) shows up as a non-zero err in the
+    # table. checkAllclose also logs each check (red on mismatch), the way other
+    # aiter op_tests report.
     ref_rw, ref_ri, ref_sw, ref_si = ref
     got_rw, got_ri = wbuf[:, :topk], ibuf[:, :topk]
     got_sw, got_si = wbuf[:, topk:], ibuf[:, topk:]
@@ -92,23 +102,34 @@ def _check(wbuf, ibuf, topk, ref, name):
         atol=2e-2,
         msg=f"{name} shared weights",
     )
-    ref_ids, ref_w = sorted_pairs(ref_ri, ref_rw)
-    got_ids, got_w = sorted_pairs(got_ri.to(dtypes.i32), got_rw)
-    e_rid = checkAllclose(
-        got_ids.to(dtypes.fp32),
-        ref_ids.to(dtypes.fp32),
+    # One invalid row must print failed!. The default tol_err_ratio=0.05 only
+    # does that for T < 20, and at T=16384 it still warns with 819 bad rows.
+    invalid = invalid_id_rows(got_ri, num_experts).to(dtypes.fp32)
+    e_valid = checkAllclose(
+        invalid,
+        torch.zeros_like(invalid),
         rtol=0,
         atol=0,
+        tol_err_ratio=0,
+        msg=f"{name} routed ids unique and in range",
+    )
+    # The lower-id tie rule is part of the contract, so one wrong id fails too.
+    e_rid = checkAllclose(
+        got_ri.to(dtypes.fp32),
+        ref_ri.to(dtypes.fp32),
+        rtol=0,
+        atol=0,
+        tol_err_ratio=0,
         msg=f"{name} routed ids",
     )
     e_rw = checkAllclose(
-        got_w.to(dtypes.fp32),
-        ref_w.to(dtypes.fp32),
+        got_rw.to(dtypes.fp32),
+        ref_rw.to(dtypes.fp32),
         rtol=2e-2,
         atol=2e-2,
         msg=f"{name} routed weights",
     )
-    return max(e_sid, e_sw, e_rid, e_rw)
+    return max(e_sid, e_sw, e_valid, e_rid, e_rw)
 
 
 @benchmark()
@@ -181,7 +202,7 @@ def test_shared_gate(
     ret = {"gfx": get_gfx()}
     for name, (fn, wbuf, ibuf) in candidates.items():
         _, us = run_perftest(fn)
-        err = _check(wbuf, ibuf, topk, ref, name)
+        err = _check(wbuf, ibuf, topk, ref, num_experts, name)
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
@@ -269,6 +290,52 @@ def _run_guard_checks():
     )
 
 
+def _run_tie_checks():
+    """Both kernels must pick the lower expert id on an exact tie, so the same
+    gating row routes to the same experts on every run."""
+    tokens, num_experts, hidden, topk, num_shared = 64, 512, 4096, 10, 1
+    _, hs, gw = _make_inputs(tokens, num_experts, hidden, num_shared, dtypes.bf16)
+    # Four distinct values, so every row ties at the k-th score, both among the
+    # columns one thread reads and across threads.
+    gating = torch.randint(0, 4, (tokens, num_experts)).to(dtypes.bf16)
+    # Every expert tied: the lowest ids win.
+    gating[0] = 1.0
+    # Nine clear winners at the highest ids, then 503 experts tied at 0: the
+    # last pick is expert 0, the tied expert furthest from the winners.
+    gating[1] = 0.0
+    gating[1, num_experts - 9 :] = torch.arange(9, 0, -1).to(dtypes.bf16)
+    expected = ref_topk_ids(gating, topk).to(dtypes.i32)
+    assert expected[0].tolist() == list(range(topk))
+    assert expected[1].tolist() == list(range(num_experts - 9, num_experts)) + [0]
+
+    w = torch.empty(tokens, topk, dtype=dtypes.fp32)
+    ids = torch.empty(tokens, topk, dtype=dtypes.i32)
+    tei = torch.empty(tokens, topk, dtype=dtypes.i32)
+    topk_softmax(w, ids, tei, gating, True)
+    w_f, ids_f, tei_f = _fused_buffers(tokens, topk, num_shared)
+    topk_softmax_fused_shared_gate(
+        w_f,
+        ids_f,
+        tei_f,
+        gating,
+        True,
+        num_shared,
+        "sigmoid",
+        hs,
+        gw,
+        1.0,
+        num_experts,
+    )
+    for name, got in (("unfused", ids), ("fused", ids_f[:, :topk])):
+        bad = (got != expected).any(dim=-1)
+        assert not bad.any(), (
+            f"{name}: {int(bad.sum())} of {tokens} tied rows do not pick the "
+            "lower expert id"
+        )
+
+    aiter.logger.info("tie checks passed: both kernels pick the lower id on ties")
+
+
 def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning(
@@ -317,6 +384,7 @@ def main():
 
     # Negative/guard behaviors (raise or no-op) -- asserts, run in CI too.
     _run_guard_checks()
+    _run_tie_checks()
 
 
 if __name__ == "__main__":

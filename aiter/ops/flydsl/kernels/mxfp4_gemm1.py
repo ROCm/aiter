@@ -8,9 +8,10 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
 from ..mxfp4_gemm1_kernels import _assert_supported
-from . import dpp_utils
+from . import buffer_ops, dpp_utils
 from .mxfp4_gemm_common import (
     _activation_mul_batch,
+    _buffer_rsrc,
     _e8m0_from_amax,
     _fabs_f32,
     _global_f32_at,
@@ -66,6 +67,7 @@ def _gemm1_body(
     arg_aqout,
     arg_ascaleout,
     arg_hidden,
+    i32_hidden_row_stride_bytes,
     arg_bias,
     bx_i32,
     lane,
@@ -176,7 +178,9 @@ def _gemm1_body(
     ascale_dma_atom4 = fx.make_copy_atom(fx.rocdl.BufferCopyLDS32b(), fx.Int32)
 
     if const_expr(inline_quant):
-        hidden_num = fx.Int64(i32_ntok * fx.Int32(K * 2))
+        hidden_num = fx.Int64(
+            (i32_ntok - fx.Int32(1)) * i32_hidden_row_stride_bytes + fx.Int32(K * 2)
+        )
         hidden_tiles = _global_i32_buffer_tiles(arg_hidden, hidden_num, 4)
         hidden_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
 
@@ -695,7 +699,7 @@ def _gemm1_body(
 
     def inline_quant_load_kt(B128_IDX, kt, row_token):
         v_voff = (
-            row_token * fx.Int32(K * 2)
+            row_token * i32_hidden_row_stride_bytes
             + lane_shr2_and3 * fx.Int32(64)
             + lib * fx.Int32(16)
         )
@@ -1261,31 +1265,27 @@ def _gemm1_body(
     scales_per_mr = [None] * EPILOGUE_M_REPS
 
     def run_epilogue(split):
-        aqout_tiles = _global_scalar_tiles(arg_aqout, fx.Int32, 1 << 24)
+        # Sorted payloads can exceed 2 GiB. The buffer resource starts at this
+        # block's first sorted row in i64, so each lane's byte offset stays below
+        # BM * OUT_ROW_BYTES and fits the i32 buffer offset.
+        assert BM * OUT_ROW_BYTES < 1 << 31
+        aqout_rsrc = _buffer_rsrc(
+            arg_aqout + fx.Int64(m_row) * fx.Int64(OUT_ROW_BYTES), BM * OUT_ROW_BYTES
+        )
 
-        def store_payload(payload_row, packed0, packed1):
+        def store_payload(row_local, packed0, packed1):
+            row_off = row_local * fx.Int32(OUT_ROW_BYTES)
             if const_expr(out_dtype == "fp8"):
                 byte_pos = (
                     n_block_idx * fx.Int32(BN_INT)
                     + wave_grp * fx.Int32(32)
                     + kk * fx.Int32(8)
                 )
-                # Sorted payloads can exceed 2 GiB. Keep the byte offset in
-                # i64 through division so global stores cannot sign-wrap.
-                store_off = fx.Int64(payload_row) * fx.Int64(OUT_ROW_BYTES) + fx.Int64(
-                    byte_pos
-                )
-                _scalar_store(
-                    aqout_tiles,
-                    store_off // fx.Int64(4),
-                    packed0,
-                    fx.Int32,
-                )
-                _scalar_store(
-                    aqout_tiles,
-                    (store_off + fx.Int64(4)) // fx.Int64(4),
-                    packed1,
-                    fx.Int32,
+                buffer_ops.buffer_store(
+                    fx.Vector.from_elements([packed0, packed1], fx.Int32),
+                    aqout_rsrc,
+                    row_off + byte_pos,
+                    offset_is_bytes=True,
                 )
             else:
                 byte_pos = (
@@ -1293,14 +1293,8 @@ def _gemm1_body(
                     + wave_grp * fx.Int32(16)
                     + kk * fx.Int32(4)
                 )
-                store_off = fx.Int64(payload_row) * fx.Int64(OUT_ROW_BYTES) + fx.Int64(
-                    byte_pos
-                )
-                _scalar_store(
-                    aqout_tiles,
-                    store_off // fx.Int64(4),
-                    packed0,
-                    fx.Int32,
+                buffer_ops.buffer_store(
+                    packed0, aqout_rsrc, row_off + byte_pos, offset_is_bytes=True
                 )
 
         if const_expr(enable_bias):
@@ -1356,7 +1350,6 @@ def _gemm1_body(
             scales_per_mr[mr] = e8m0
 
             qscale_raw = as_ir_value(qscale)
-            sorted_out_row = m_row + row_local
             if const_expr(out_dtype == "fp8"):
                 i16x2 = fx.Vector.make_type(2, fx.Int16)
                 zero16 = fx.full(2, 0, fx.Int16)
@@ -1393,7 +1386,7 @@ def _gemm1_body(
                     1,
                 )
                 store_payload(
-                    sorted_out_row,
+                    row_local,
                     fx.Vector(packed0).bitcast(fx.Int32)[0],
                     fx.Vector(packed1).bitcast(fx.Int32)[0],
                 )
@@ -1409,7 +1402,7 @@ def _gemm1_body(
                         w,
                     )
                 store_payload(
-                    sorted_out_row,
+                    row_local,
                     fx.Int32(packed_i32),
                     fx.Int32(0),
                 )
@@ -1670,10 +1663,8 @@ def compile_gemm1_a4w4_port(
     #
     # situ_beta / situ_linear_beta / swiglu_limit are deliberately absent: they
     # are floats, so they would make ugly symbols, and they cannot collide.
-    # FlyDSL's disk cache is not keyed on this symbol name -- the key is a hash
-    # over the launcher source, its dependency sources, and every scalar closure
-    # value reachable from it (see jit_function._jit_function_cache_key /
-    # _collect_closure_scalar_vals), and gemm1_kernel closes over all three.
+    # FlyDSL's disk cache is not keyed on this symbol name but on the traced IR,
+    # where all three are constants.
     gu_tag = "il" if interleave else "sep"
     name_suffix = (
         f"{a_dtype}_h{D_HIDDEN}_i{D_INTER}_ne{NE}_bm{BM}_{variant_tag}_{gu_tag}"
@@ -1719,6 +1710,7 @@ def compile_gemm1_a4w4_port(
         arg_aqout: fx.Int64,
         arg_ascaleout: fx.Int64,
         arg_hidden: fx.Int64,
+        i32_hidden_row_stride_bytes: fx.Int32,
         arg_bias: fx.Int64,
     ):
         lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
@@ -1766,6 +1758,7 @@ def compile_gemm1_a4w4_port(
                 arg_aqout,
                 arg_ascaleout,
                 arg_hidden,
+                i32_hidden_row_stride_bytes,
                 arg_bias,
                 tile,
                 lane,
@@ -1810,6 +1803,7 @@ def compile_gemm1_a4w4_port(
         arg_aqout: fx.Int64,
         arg_ascaleout: fx.Int64,
         arg_hidden: fx.Int64,
+        i32_hidden_row_stride_bytes: fx.Int32,
         arg_bias: fx.Int64,
         stream: fx.Stream,
     ):
@@ -1826,6 +1820,7 @@ def compile_gemm1_a4w4_port(
             arg_aqout,
             arg_ascaleout,
             arg_hidden,
+            i32_hidden_row_stride_bytes,
             arg_bias,
         ).launch(
             grid=(grid_x, 1, 1),

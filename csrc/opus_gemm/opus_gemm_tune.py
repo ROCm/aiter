@@ -513,7 +513,7 @@ def candidate_splitK(M: int, N: int, K: int, batch: int, cu_num: int, k_inst):
     return sorted(candidates)
 
 
-def kid_rejects_shape(k_inst, M, N, K):
+def kid_rejects_shape(k_inst, M, N, K, cu_num):
     """Host-side prediction of whether a kid will produce wrong output or
     fail its runtime TORCH_CHECK for this (M, N, K).
 
@@ -718,8 +718,7 @@ def kid_rejects_shape(k_inst, M, N, K):
                 return True
         num_tiles_m = _ceil_div(M, k_inst.B_M)
         num_tiles_n = _ceil_div(N, k_inst.B_N)
-        NUM_CU = 256
-        split_m = max(1, _ceil_div(NUM_CU, num_tiles_n))
+        split_m = max(1, _ceil_div(cu_num, num_tiles_n))
         while split_m < num_tiles_m and num_tiles_m % split_m != 0:
             split_m += 1
         if split_m > num_tiles_m:
@@ -856,7 +855,7 @@ def candidate_kids_for_shape(M, N, K, bias, cu_num):
 _OPUS_PERMA_BAD_KIDS = frozenset()
 
 
-def _ensure_kids_compiled(candidate_kids):
+def _ensure_kids_compiled(candidate_kids, *, family="a16w16", gfx=None, cu_num=None):
     """Make sure every kid in ``candidate_kids`` is compiled into the
     current module_deepgemm_opus.so.
 
@@ -921,8 +920,12 @@ def _ensure_kids_compiled(candidate_kids):
     from aiter.jit.utils.jit_cache import compiled_kids_are_current
 
     candidate_kids = frozenset(int(k) for k in candidate_kids)
-    gfx, cu = _device_arch_and_cu(torch.cuda.current_device())
-    requests = {KernelKey("a16w16", gfx, cu, kid) for kid in candidate_kids}
+    if gfx is None or cu_num is None:
+        device_gfx, device_cu = _device_arch_and_cu(torch.cuda.current_device())
+        gfx = device_gfx if gfx is None else gfx
+        cu_num = device_cu if cu_num is None else cu_num
+    cu = int(cu_num)
+    requests = {KernelKey(family, gfx, cu, kid) for kid in candidate_kids}
     required = {key.encode() for key in requests | default_compiled_keys(gfx, cu)}
 
     def _read_sidecar(path):
@@ -966,7 +969,7 @@ def _ensure_kids_compiled(candidate_kids):
             return False
         # Peer's expand didn't cover us (rare: peer's `required` set was
         # disjoint from ours). Re-enter to extend further.
-        return _ensure_kids_compiled(candidate_kids)
+        return _ensure_kids_compiled(candidate_kids, family=family, gfx=gfx, cu_num=cu)
 
     try:
         compiled = _read_sidecar(sidecar)
@@ -2047,7 +2050,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                 k_inst = a16w16_all_kernels[kid]
 
                 # Pre-filter kids that can't produce correct output for this shape.
-                if _kid_rejects_shape(k_inst, M, N, K):
+                if _kid_rejects_shape(k_inst, M, N, K, cu_num):
                     if forced_kids is not None and kid in forced_kids:
                         logger.warning(
                             f"OpusGemmA16W16Tuner: --kid {kid} rejected "

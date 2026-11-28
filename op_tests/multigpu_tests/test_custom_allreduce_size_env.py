@@ -2,7 +2,9 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """Check how AITER_CUSTOM_{AR,AG,RS}_MAX_SIZE size the custom allreduce input
-pool and route each collective between the custom kernels and RCCL.
+pool and route each collective between the custom kernels and RCCL, and the
+gfx1250 plain all-reduce default that applies while AITER_CUSTOM_AR_MAX_SIZE is
+unset.
 
 Single process, no process group: the resolver is a pure function and the size
 gates only read attributes the constructor sets.
@@ -19,6 +21,7 @@ import torch
 from aiter.dist.device_communicators.custom_all_reduce import (
     CustomAllreduce,
     _resolve_custom_sizes,
+    _resolve_plain_ar_max_size,
 )
 
 MiB = 1 << 20
@@ -161,19 +164,141 @@ def test_bad_values_fall_back_to_defaults():
     assert s.pool == GiB, s
 
 
-def _stub(gfx1250=True, ws=4, min_size=0, **env):
-    """A CustomAllreduce with only what the size gates read."""
+def ll_ar_max_bytes(ws):
+    """kLLArMaxBytes, as the gfx1250 binding returns."""
+    return 4 * MiB
+
+
+def plain_max(gfx1250=True, ws=4, ll_max=ll_ar_max_bytes, **env):
+    s = resolve(gfx1250, ws=ws, **env)
+    return _resolve_plain_ar_max_size(gfx1250, ws, s, ll_max if gfx1250 else None)
+
+
+def test_gfx1250_plain_ar_default_only_when_env_unset():
+    # Unset: the measured RCCL crossover, at TP2, TP4 and TP8.
+    assert plain_max(ws=2) == 4 * MiB
+    assert plain_max(ws=4) == 4 * MiB
+    assert plain_max(ws=8) == 4 * MiB
+    assert plain_max(ws=6) == 64 * MiB
+    # A value that does not parse counts as unset.
+    assert plain_max(ws=8, AR_MAX="abc") == 4 * MiB
+    # Set: the value keeps its meaning, above or below the default.
+    for ws in (2, 4, 6, 8):
+        for v in (64 * MiB, 6 * MiB, MiB, 0):
+            assert plain_max(ws=ws, AR_MAX=v) == v, (ws, v)
+    # gfx9 keeps the AR cutoff.
+    assert plain_max(gfx1250=False, ws=8) == 64 * MiB
+    # Never above what the LL one-shot takes, nor above the AR cutoff.
+    assert plain_max(ws=8, ll_max=lambda ws: 2 * MiB) == 2 * MiB
+    assert plain_max(ws=8, max_size=4 * MiB) == 4 * MiB
+
+
+def test_gfx1250_plain_ar_gate():
+    def u8(n):
+        return torch.empty(n, dtype=torch.uint8)
+
+    for ws, cut in ((2, 4 * MiB), (4, 4 * MiB), (8, 4 * MiB)):
+        ca = _stub(ws=ws)
+        assert ca.should_custom_plain_ar(u8(cut)), ws
+        assert not ca.should_custom_plain_ar(u8(cut + 16)), ws
+        # The fused paths keep should_custom_ar and its 64 MiB default.
+        assert ca.should_custom_ar(u8(cut + 16)) and ca.should_custom_ar(u8(64 * MiB))
+        ca = _stub(ws=ws, AR_MAX=64 * MiB)
+        assert ca.should_custom_plain_ar(u8(64 * MiB)), ws
+    ca = _stub(ws=6)
+    assert ca.should_custom_plain_ar(u8(64 * MiB))
+
+
+def test_gfx1250_plain_ar_gate_lamport():
+    # Above the plain all-reduce cutoff, inputs the Lamport all-reduce takes
+    # (up to world_size x its cap; fp32 on the two-shot) stay on the custom
+    # path; everything else still goes to RCCL there.
+    def bf16(n):
+        return torch.empty(n // 2, dtype=torch.bfloat16)
+
+    def fp32(n):
+        return torch.empty(n // 4, dtype=torch.float32)
+
+    for ws, cap in ((2, 16 * MiB), (4, 8 * MiB), (8, 4 * MiB)):
+        ca = _stub(ws=ws, lamport_max_bytes=cap)
+        cut = ca._plain_ar_max_size
+        assert ca.should_custom_plain_ar(bf16(cut + 16)), ws
+        assert ca.should_custom_plain_ar(bf16(ws * cap)), ws
+        assert ca.should_custom_plain_ar(torch.empty(cut // 2 + 8, dtype=torch.half))
+        assert not ca.should_custom_plain_ar(bf16(ws * cap + 16)), ws
+        assert ca.should_custom_plain_ar(fp32(cut + 16)), ws  # the two-shot
+        assert ca.select_lamport_ar(fp32(cut + 16))[0], ws
+        assert not ca.should_custom_plain_ar(fp32(ws * cap + 16)), ws
+        assert not ca.should_custom_plain_ar(bf16(2 * cut + 32)[::2]), ws  # strided
+        # The Lamport cap at 0 (AITER_CUSTOM_AR_LAMPORT_RMS_MAX_SIZE=0) turns it off
+        assert not _stub(ws=ws).should_custom_plain_ar(bf16(cut + 16)), ws
+    # AITER_CUSTOM_AR_MAX_SIZE still bounds it.
+    ca = _stub(ws=4, lamport_max_bytes=8 * MiB, AR_MAX=6 * MiB)
+    assert ca.should_custom_plain_ar(bf16(6 * MiB))
+    assert not ca.should_custom_plain_ar(bf16(6 * MiB + 16))
+
+
+def test_gfx1250_lamport_ar_route():
+    # select_lamport_ar: (two_shot, split) by size and dtype, or None.
+    def t(n, dtype):
+        return torch.empty(
+            n // torch.tensor([], dtype=dtype).element_size(), dtype=dtype
+        )
+
+    bf16, fp32 = torch.bfloat16, torch.float32
+    ca = _stub(ws=8, lamport_max_bytes=4 * MiB)
+    route = ca.select_lamport_ar
+    assert route(t(768 * 1024, bf16)) == (False, False)  # the one-shot
+    assert route(t(768 * 1024 + 512, bf16)) == (True, True)  # split to 4 MiB
+    assert route(t(4 * MiB, bf16)) == (True, True)
+    assert route(t(4 * MiB + 512, bf16)) == (True, False)  # fused above
+    assert route(t(32 * MiB, bf16)) == (True, False)
+    assert route(t(32 * MiB + 512, bf16)) is None
+    assert route(t(512, fp32)) == (True, True)  # fp32: split from any size
+    assert route(t(4 * MiB, fp32)) == (True, True)
+    assert route(t(4 * MiB + 512, fp32)) == (True, False)
+    ca = _stub(ws=4, lamport_max_bytes=8 * MiB)
+    assert ca.select_lamport_ar(t(1280 * 1024, bf16)) == (False, False)
+    assert ca.select_lamport_ar(t(4 * MiB, bf16)) == (True, False)
+    assert ca.select_lamport_ar(t(4 * MiB + 512, bf16)) == (True, True)
+    assert ca.select_lamport_ar(t(8 * MiB + 512, bf16)) == (True, False)
+    assert ca.select_lamport_ar(t(512, fp32)) == (True, False)
+    assert ca.select_lamport_ar(t(4 * MiB + 512, fp32)) == (True, True)
+    ca = _stub(ws=2, lamport_max_bytes=16 * MiB)
+    assert ca.select_lamport_ar(t(9 * MiB, bf16)) == (False, False)
+    assert ca.select_lamport_ar(t(9 * MiB + 512, bf16)) == (True, False)
+    assert ca.select_lamport_ar(t(MiB, fp32)) is None  # the LL one-shot
+    assert ca.select_lamport_ar(t(MiB + 512, fp32)) == (True, False)
+    assert ca.select_lamport_ar(t(2 * MiB + 512, fp32)) == (True, True)  # to 4 MiB
+    assert ca.select_lamport_ar(t(4 * MiB + 512, fp32)) == (True, False)
+    # unmeasured world sizes: fp32 on the LL one-shot up to the one-shot's bound
+    ca = _stub(ws=6, lamport_max_bytes=2 * MiB)
+    assert ca.select_lamport_ar(t(2 * MiB, fp32)) is None
+    assert ca.select_lamport_ar(t(2 * MiB + 512, fp32)) == (True, False)
+    # every rank decides from the shape alone: no address, no strides past it
+    assert ca.select_lamport_ar(t(16 * MiB, bf16)[::2]) is None
+
+
+def _stub(gfx1250=True, ws=4, min_size=0, lamport_max_bytes=0, **env):
+    """A CustomAllreduce with only what the size gates read; the Lamport inbox
+    off unless lamport_max_bytes sets its cap."""
     ca = CustomAllreduce.__new__(CustomAllreduce)
     s = resolve(gfx1250, ws=ws, **env)
     ca.disabled = False
     ca._is_gfx1250 = gfx1250
+    ca._lamport_max_bytes = lamport_max_bytes
+    ca._lamport_ar_max_bytes = lamport_max_bytes
     ca.world_size = ws
     ca.fully_connected = True
     ca.max_size = s.pool
     ca._car_max_size = s.ar
     ca._car_prefill_max_size = s.ar_prefill
+    ca._plain_ar_max_size = _resolve_plain_ar_max_size(
+        gfx1250, ws, s, ll_ar_max_bytes if gfx1250 else None
+    )
     ca._cag_max_size = s.ag
     ca._crs_max_size = s.rs
+    ca._crs_first_dim_max_size = s.rs_first_dim
     ca._car_min_size = min_size
     return ca
 

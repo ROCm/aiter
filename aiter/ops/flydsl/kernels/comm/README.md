@@ -8,20 +8,34 @@ node.
 
 | File | Contents |
 |---|---|
-| `one_shot_allreduce.py` | The exact one-shot kernel. |
-| `quick_allreduce_int4.py` | The quantized two-shot **mesh** kernel. |
-| `quick_allreduce_int4_ring.py` | The quantized two-shot **ring** kernel. |
-| `quick_allreduce_codec.py` | The INT4, INT6 and FP16 wire codecs. The mesh and the ring use them. |
-| `allreduce_shared.py` | Tile geometry, the inbox cache policy, and the peer store and load primitives. All three kernels use them. |
+| `one_shot_allreduce.py` | The exact one-shot kernel, and its plain epilogue. |
+| `one_shot_allreduce_rmsnorm.py` | The one-shot's residual-add + RMSNorm epilogue, its row geometry (`fused_*`) and the split-row exchange. |
+| `quick_allreduce_mesh.py` | The quantized two-shot **mesh** kernel. |
+| `quick_allreduce_ring.py` | The quantized two-shot **ring** kernel. |
+| `quick_allreduce_epilogue.py` | The plain epilogue of the mesh and the ring, and the hooks every mesh or ring epilogue implements. |
+| `quick_allreduce_rmsnorm.py` | The residual-add + RMSNorm epilogues of the mesh and the ring. |
+| `quick_allreduce_codec.py` | The INT4, INT5, INT6 and FP16 wire codecs. The mesh and the ring use them. |
+| `quick_allreduce_pull.py` | The exact bf16 **pull** kernels of the fused Gemma all-reduce + RMSNorm on graph-registered inputs. |
+| `transport.py` | Tile geometry, the inbox cache policy, and the peer store and load primitives. All three kernels use them. |
+| `quick_allreduce_fusions.py` | The parts every fused epilogue shares: the RMSNorm arithmetic, the row-to-workgroup geometry, the per-wave reductions and the `RowIO` HBM row access. |
 
 The host classes are in `aiter/ops/flydsl/`:
 
 | File | Contents |
 |---|---|
-| `one_shot_allreduce.py` | `OneShotAllReduce`, the host class for the one-shot kernel. |
-| `quick_allreduce_int4.py` | `QuickAllReduceInt4`, the host class for the mesh and the ring. |
-| `allreduce_policy.py` | The payload-size boundaries between the three kernels, and the tuning ladders. |
-| `allreduce_host_shared.py` | IPC inbox setup, link detection and other host helpers. |
+| `one_shot_allreduce.py` | `OneShotAllReduce` and `OneShotAllReduceRMSNorm`, the host classes for the one-shot kernel. |
+| `quick_allreduce.py` | `FlyQuickAllReduce` and `FlyQuickAllReduceRMSNorm`, the host classes for the mesh and the ring (and, fused only, the pull). |
+| `pull_allreduce_rmsnorm.py` | `PullAllReduceRMSNorm`, the engine behind `FlyQuickAllReduceRMSNorm(algorithm="pull")`. |
+| `allreduce_policy.py` | The limits and the values each kernel can build, the policy records, and the tables: the payload-size boundaries between the three kernels and the tuning ladders, for the plain and the fused all-reduce. |
+| `comm_collectives_host_shared.py` | IPC inbox setup, link detection and other host helpers. |
+
+The dispatchers are in `aiter/dist/device_communicators/`:
+
+| File | Contents |
+|---|---|
+| `custom_all_reduce.py` | `CustomAllreduce`. It owns the exact one-shot, plain and fused. |
+| `quick_all_reduce.py` | `QuickAllReduce`. It owns the quantized mesh and ring, plain and fused. |
+| `flydsl_backends.py` | `FlyDSLAllReduceRMSNorm`, the fused backend. `CustomAllreduce` and `QuickAllReduce` each own one instance. |
 
 ## Kernels
 
@@ -30,8 +44,8 @@ The host classes are in `aiter/ops/flydsl/`:
 | Kernel | Hops | Wire bytes for each rank | Accuracy | Use |
 |---|---|---|---|---|
 | One-shot | 1 | `(N-1)*S` | Exact: fp32 accumulate, one bf16 rounding | Small payloads (decode) |
-| Mesh | 2 | `2(N-1)/N*S` | INT4 on the wire | Medium and large payloads |
-| Ring | `2(N-1)` | `2(N-1)/N*S` | INT4 or INT6 on the wire | Large payloads, mostly on PCIe |
+| Mesh | 2 | `2(N-1)/N*S` | INT4, INT5, INT6 or FP16 on the wire | Medium and large payloads |
+| Ring | `2(N-1)` | `2(N-1)/N*S` | INT4, INT6 or FP16 on the wire, per lap | Large payloads, mostly on PCIe |
 
 ### One-shot
 
@@ -43,9 +57,10 @@ sentinel until the data of a peer arrives. The reader polls its slot until no
 ### Mesh
 
 The mesh is a two-shot all-reduce: a reduce-scatter lap, then an all-gather
-lap. In each lap, each rank pushes to all `N-1` peers. The wire format is INT4
-with one E5M2 scale for each group of 16 values. FP16 is also available for
-tests.
+lap. In each lap, each rank pushes to all `N-1` peers. Both laps use the same
+wire format. The default is INT4 with one E5M2 scale for each group of 16
+values. INT5 and INT6 use the same scale and add more bits for each value. FP16
+sends the values without quantization and is used in testing.
 
 ### Ring
 
@@ -81,8 +96,7 @@ fp16, for every wire format.
 * The group scale is an E5M2 byte (bias 12) spanning `[2**-12, 1.75 * 2**19]`,
   so every fp16 extremum fits and no group clips below the fp16 limit above,
   including the ring's requantized partial sums. NaN and Inf become finite
-  values. `SCALE_CODEC_TAG` is part of every kernel's launch name: bump it when
-  the codec changes, or a warm FlyDSL cache keeps loading old binaries.
+  values.
 
 ## Inbox memory
 
@@ -99,7 +113,7 @@ selects the memory type of the inbox:
   topology cannot be read. At TP2, `auto` selects `uncached` on PCIe also, because
   there is only one remote peer.
 
-The cache policy for each mode is in `_INBOX_POLICY` in `allreduce_shared.py`.
+The cache policy for each mode is in `_INBOX_POLICY` in `transport.py`.
 
 ## Dispatch
 
@@ -125,22 +139,225 @@ levels:
    or RCCL. `FamilyPolicy.select()` gives the algorithm for a payload size.
 
    The mesh and the ring run only with the INT4 quantization regime, and their
-   windows do not overlap. The one-shot is exact and runs in both modes. With quantization on, the mesh/ring takes those payloads first.
+   windows do not overlap. The one-shot is exact and runs in both modes. With
+   quantization on, the mesh and the ring take the payloads of their windows
+   first.
 2. Which configuration of that algorithm runs. Each algorithm has a tuning
    ladder for each arch, link type and world size: `ONESHOT_LADDER`,
-   `MESH_ST_LADDER` and `RING_ST_LADDER`. The fused add+RMSNorm has its own ladder,
-   `MESH_NORM_LADDER`, because its epilogue wants a different grid than the
-   plain all-reduce. A platform without a row there uses its `MESH_ST_LADDER`.
-   Pass the row widths the fused call will use in the constructor's
-   `rmsnorm_hidden`. The constructor then builds the fused engines and compiles
-   and loads every fused binary of each width, so the first fused call can be
-   inside a HIP graph capture. The RMSNorm epsilon is a launch argument, so it 
-   does not select a binary.
-   `compile_rmsnorm(hidden)` does the same after construction, on every rank.
-   The fused epilogue reduces a row inside one workgroup, so a tile must hold
-   whole rows. A row that never divides the default 8-atom tile, such as
-   hidden 6144, runs on a 12-atom tile (`tile_atoms_for`). That tile splits
-   only across TP 2 and 4, and its engines have their own IPC inbox.
+   `MESH_ST_LADDER` and `RING_ST_LADDER`.
+
+## Fused all-reduce + RMSNorm
+
+The three kernels can also run with a residual add and an RMSNorm fused into
+the epilogue (`fusion="rmsnorm"`). For each token row:
+
+```text
+residual_out = allreduce(inp) + residual
+out          = rmsnorm(residual_out) * weight
+```
+
+Each kernel file holds the schedule. The schedule reaches HBM only through
+an epilogue object, which the factory picks from `fusion`: the plain one
+stores the reduced values, and the RMSNorm one in `*_rmsnorm.py` normalizes
+them first. The epilogue also fixes the block and the row geometry. Its hooks
+run inline in the kernel trace. They cannot hold a runtime `if` or loop,
+because the FlyDSL AST rewriter sees only the `@flyc.kernel` body and
+`@flyc.jit` functions. The one-shot's split-row exchange is a `@flyc.jit`
+helper for that reason.
+
+The quick-reduce RMSNorm epilogue has two extras, both used through
+`FlyQuickAllReduceRMSNorm` directly and not routed by the dispatcher:
+
+* `gemma_norm=True` scales by `1 + weight`. It is a runtime kernel operand
+  (`w_bias`), so it shares the engines of the usual build.
+* `allreduce_rmsnorm_mxfp4` also quantizes `out` to MXFP4 (gfx950, unpadded
+  hidden): packed fp4x2 values and shuffled e8m0 scales, bit for bit what
+  `per_1x32_f4_quant_hip(out, shuffle=True)` returns. It is a compile-time
+  variant (`mxfp4=True`) of the epilogue, so it gets its own engines, built on
+  first use or by `preload(hidden, mxfp4=True)`.
+
+The mesh also has a low-latency build (`low_latency=true` on a ladder rung, or the
+`low_latency=` argument of `FlyQuickAllReduceRMSNorm`): the epilogue loads the
+residual ahead of the exchanges (`prefetch`) and two workgroups per CU stay
+resident. It needs `super_tile=1` and the 256-thread block. It is currently
+enabled only on xGMI.
+
+A mesh row may span several ranks' reduce-scatter chunks (`wide_rows` in
+`quick_reduce_atoms_choices`): the mesh normalizes only once the all-gather has
+handed it the whole tile, so `atoms_per_row` may be any divisor of the tile's 8
+atoms. The ring normalizes chunk by chunk, so its row still has
+to fit one rank's `8 / world_size` atoms.
+
+A split row (one token row over several workgroups; opt-in with
+`AITER_FLY_AR_FUSED_SPLIT=1`) joins its sum of squares
+through an integer atomic in HBM, so that every rank decodes the same bits. The
+sum is therefore a fixed-point number, not an fp32 one:
+
+* Resolution is 2**-22 per wave partial. Rows with a tiny RMS (about 1e-3, where
+  `eps` dominates) can differ from the unsplit build in a bf16 ulp on a small
+  share of lanes (under 1%). Ranks still agree bit for bit.
+* A wave partial that is not finite, or too large for the fixed point, makes the
+  row's `out` NaN.
+* Range: a wave of `512 * atoms` elements poisons its row when its sum of
+  squares reaches the limit below. `out` of that row is then NaN on every
+  rank. `residual_out` and other rows are not affected, and the unsplit build
+  has no limit. The limit falls with the writer count `n = hidden / (512 *
+  atoms)`:
+
+  | `n` | wave sum of squares | single element | first bf16 that poisons |
+  |---:|---:|---:|---:|
+  | 2-3 | 2**29 | 23170.5 | 23296 |
+  | 4-7 | 2**28 | 16384 | 16384 |
+  | 8-15 | 2**27 | 11585.2 | 11648 |
+  | 16-31 | 2**26 | 8192 | 8192 |
+
+  The element is a value of `residual_out`. Other elements of the wave lower
+  its limit. Leave `AITER_FLY_AR_FUSED_SPLIT` off where a row can reach these
+  values. `test_one_shot_allreduce_rmsnorm_split_poison` checks each boundary
+  to the bf16 step.
+* A split row takes at most 31 writers (5-bit arrival and poison counts), so
+  hidden is limited to about 15.9k at `atoms=1` and 31.7k at `atoms=2`. A wider
+  one has no split build and runs unsplit.
+
+`CudaCommunicator.fused_allreduce_rmsnorm` uses the fused kernels with the
+same split as the plain all-reduce:
+
+* `QuickAllReduce` owns the quantized mesh and ring. It builds them only when
+  `AITER_QUICK_REDUCE_QUANTIZATION=INT4`.
+* `CustomAllreduce` owns the exact one-shot. It builds it in every regime.
+
+The communicator tries `QuickAllReduce` first, then `CustomAllreduce`, and
+both before the other fused kernels. If neither FlyDSL backend takes the call,
+the communicator uses the HIP quick-reduce fused kernel, the
+`CustomAllreduce` fused kernel, or an all-reduce and a separate RMSNorm.
+
+The fused path has its own policy tables in `allreduce_policy.py`:
+`FUSED_FAMILY_POLICIES` for the windows, and `FUSED_ONESHOT_LADDER`,
+`FUSED_MESH_ST_LADDER`, `FUSED_RING_ST_LADDER` and `FUSED_QR_ROW_ATOMS` for the
+configurations. Above the one-shot window, the exact path declines. A window
+may have no upper limit, as the one-shot's does on gfx950/PCIe. With
+quantization on, a payload in the mesh or the ring window runs quantized. Any
+other payload runs on the exact one-shot, because the quantized backend has no
+one-shot engine and declines it.
+
+The configuration ladders are read from
+`aiter/ops/flydsl/configs/comm/fused_allreduce_ladders.json` when
+`allreduce_policy.py` is imported. `AITER_FLY_AR_FUSED_LADDERS=<file>`
+names another file. Each platform has a default ladder per family and may have
+a ladder of its own for a hidden size. A width without its own ladder runs the
+default, and the default one-shot ladder never splits a row. Every rank must
+read the same ladders, or the fused path declines.
+
+### Pull: exact Gemma all-reduce + RMSNorm on registered graph inputs
+
+`FlyQuickAllReduceRMSNorm(algorithm="pull")` is the third entry of
+`ALGORITHMS`, and it keeps the one host interface (`allreduce_rmsnorm`,
+`gemma_norm=True`). It is fused-only and it does not quantize: its codec is
+the identity, named `bf16`, and it is the only value `rs_codec` and `ag_codec`
+take. The engine hands the call to `PullAllReduceRMSNorm`, which has no
+inbox, ladder or super-tile.
+
+* Each rank reads the peers' inputs in place. `capture()` (entered by
+  `CustomAllreduce.capture()` and so by `graph_capture()`) gives every captured
+  call a row of an address table, and exchanges the IPC handles of the inputs
+  when the capture ends. A call outside a registered capture is declined, and
+  the next backend serves it.
+* The reducer of a row sums the four partials in fp32 in the order of AITER's
+  two-stage all-reduce (the chunk owner first, denormals flushed, one bf16
+  rounding), publishes it, and the three other ranks pull it. The norm follows
+  `gemma_add_rmsnorm`: Triton's `tl.sum` order and `y = s * rstd * (1 + w)`.
+  `residual_out` therefore equals the two-stage kernel's, except a rare fp32
+  summation-order difference; `out` differs from an fp32 reference by at most
+  one bf16 ulp, at rounding ties.
+* Where it runs is table data like the other families': the `pull` window of
+  the fused policy row (`FUSED_FAMILY_POLICIES`, payload bytes; gfx950 / xGMI /
+  TP4: 1-1024 rows of 6144 bf16, moved with
+  `AITER_FLY_AR_FUSED_PULL_{MIN,MAX}_BYTES`) and the `pull` ladder of the width
+  in `configs/comm/fused_allreduce_ladders.json` (one rung per kernel,
+  `min_bytes` in ascending order, no default ladder: only a width with an entry
+  is served). For hidden 6144 at TP4 on gfx950 the rungs are 1-11 rows one-shot
+  with read acks, 12-256 one row per workgroup (wave hand-offs from 37 to 96),
+  257-512 streamed with the weight hoisted (2 rows per workgroup), 513-1024
+  streamed at 4 rows per workgroup. The one-row kernels hang above about 640
+  rows (every workgroup has to be resident), so the engine refuses a ladder
+  that reaches them there (`PULL_KERNEL_MAX_ROWS`). The measurements behind the
+  rungs are in `docs/flydsl_pull_ar_m31.md`
+  (`op_tests/multigpu_tests/bench_fused_ar_rms_gemma.py` reproduces them).
+* `CustomAllreduce` builds it when `AITER_FLY_AR=1`, and
+  `CudaCommunicator.fused_allreduce_rmsnorm` tries it first for `gemma_norm`
+  calls. `AITER_FLY_AR_PULL=0` switches it off and `=1` builds it without the
+  rest of the FlyDSL all-reduce: a kill switch, not a route. The ranks vote on
+  a digest of the window and the ladders before building, so ranks that
+  resolved different ones decline together. Every rank must set these alike.
+* `AITER_AR_ROUTE_TRACE=1` (or a path prefix) counts which backend served
+  each fused all-reduce call, by rows and width: graph captures count once per
+  recorded call site, eager calls every call.
+
+The fused path declines a call if:
+
+* a tensor is not bf16, not contiguous, or not 16-byte aligned,
+* the caller asks for gemma norm or a padded output (the quick-reduce
+  classes themselves accept `gemma_norm`; the dispatcher routes it only to the pull schedule above),
+* no build exists for the hidden size. One workgroup covers one row, so only
+  some widths are supported, some of them with padding.
+
+### Hidden sizes and graph capture
+
+The fused wire layout depends on the hidden size, so the engines are built for
+each hidden size. A build allocates an IPC inbox and exchanges handles, which
+is not possible inside a HIP graph capture. Build a width before capture in one
+of these ways:
+
+1. Set `AITER_FLY_AR_FUSED_HIDDENS`. The engines build the widths at startup.
+2. Call `FlyDSLAllReduceRMSNorm.prime(hidden)` on every rank.
+3. Make one call at that width before capture. A warmup pass does this.
+
+If a width is not built when a capture starts, the fused path declines it
+during the capture and logs a warning. The capture then records the unfused
+path. This is slower but correct.
+
+Step 3 compiles every rung that the family's payload window can select, not only
+the rung of the call itself. A capture at another payload size then finds every
+binary ready.
+
+Each of the three ways is a collective. It builds the engines, compiles and
+loads the binaries, and then ranks agree on success. In step 3, 
+`should_fly_fused_ar_rms` does this, before the dispatcher commits to
+the fused path.
+
+* Every rank must call `should_fly_fused_ar_rms` in the same order, with the
+  same shape, dtype and contiguity, so that it gives the same answer on every
+  rank.
+* If the compile or the module load fails on any rank, every rank marks the
+  width failed, and `should_fly_fused_ar_rms` declines it on every rank from
+  then on. The dispatcher then serves the call with its next backend.
+
+#### Memory per width
+
+Each (family, hidden size) builds one engine for each distinct config in its
+ladder. The mesh and the ring always also build the ST=1 engine, their fallback 
+for payloads with fewer tiles than the super-tile. Callers that use 
+`allreduce_rmsnorm_mxfp4` directly get a second set of engines for the MXFP4
+variant.
+
+Each engine owns its own IPC inbox and state, and nothing is freed until the
+backend closes. Memory therefore grows with the number of distinct widths a
+process uses. The `inbox_bytes` property of the backend and of each engine
+reports it. Measured on MI350P (PCIe), per GPU and per width:
+
+| TP | exact one-shot | quantized (mesh and ring) |
+|---|--:|--:|
+| 2 | 6 to 12 MiB | 2 to 8 MiB |
+| 4 | 21 to 42 MiB | 47 to 166 MiB |
+| 8 | 30 to 60 MiB | 10 to 20 MiB |
+
+The ranges cover hidden sizes 4096, 7168 and 8192. The quantized TP4 number at
+7168 is the largest.
+
+`AITER_FLY_AR_FUSED_HIDDENS` does not limit the widths. It only builds the
+listed widths at startup. Any other supported width is still built on its first
+call outside a graph capture, and declined during a capture.
+
 
 ## Environment variables
 
@@ -155,8 +372,8 @@ The code reads `AITER_FLY_AR` when it creates `CustomAllreduce` and
 
 `AITER_FLY_AR=1` does not enable a kernel on an unsupported system. The
 kernels need gfx942 or gfx950, a world size of 2, 4 or 8, and the `flydsl`
-package. These limits, and the other shared constants of the kernels, are in
-the "Limits" section of `aiter/ops/flydsl/kernels/comm/allreduce_shared.py`.
+package. These limits, and the values each kernel can build, are in the
+"Limits" section of `aiter/ops/flydsl/allreduce_policy.py`.
 
 ### Set the interconnect type
 
@@ -205,24 +422,42 @@ payloads first. To move the boundary between the one-shot and the mesh with
 quantization on, set `AITER_FLY_AR_MESH_MIN_BYTES`. To change the payloads that
 the one-shot serves without quantization, set `AITER_FLY_AR_ONESHOT_MAX_BYTES`.
 
+### Fused all-reduce + RMSNorm
+
+With `AITER_FLY_AR=1`, `CudaCommunicator.fused_allreduce_rmsnorm` tries the
+FlyDSL fused path before the HIP kernels. A call that FlyDSL serves is not
+subject to `AITER_AR_1STAGE`, `AITER_AR_1STAGE_MAX_KB` or `prefill_support`; the
+fused windows below decide. Calls it declines take the existing dispatch,
+overrides included.
+
+| Variable | Effect |
+|---|---|
+| `AITER_FLY_AR_FUSED_HIDDENS` | Comma-separated hidden sizes to build at startup, for example `4096,7168`. It does not limit the widths: other supported widths are still built on first use outside a graph capture. |
+| `AITER_FLY_AR_FUSED_SPLIT` | `1` lets the fused one-shot split a token row over several workgroups, where its ladder has a split rung. Not set (the default): every rung runs unsplit. Set it the same on every rank. |
+| `AITER_FLY_AR_FUSED_LADDERS` | Path to a ladder file to read instead of `aiter/ops/flydsl/configs/comm/fused_allreduce_ladders.json`. Read once at import; a malformed file raises `ValueError` naming the bad entry. Set it to the same file on every rank, or the fused path declines. |
+| `AITER_FLY_AR_FUSED_ONESHOT_MIN_BYTES` | The minimum of the fused one-shot window. |
+| `AITER_FLY_AR_FUSED_ONESHOT_MAX_BYTES` | The maximum of the fused one-shot window. |
+| `AITER_FLY_AR_FUSED_MESH_MIN_BYTES` | The minimum of the fused mesh window. |
+| `AITER_FLY_AR_FUSED_MESH_MAX_BYTES` | The maximum of the fused mesh window. |
+| `AITER_FLY_AR_FUSED_RING_MIN_BYTES` | The minimum of the fused ring window. |
+| `AITER_FLY_AR_FUSED_RING_MAX_BYTES` | The maximum of the fused ring window. |
+
+The window variables follow the rules of the plain ones above, but they change
+`FUSED_FAMILY_POLICIES`. The plain and the fused variables are independent.
+The `AITER_CUSTOM_AR_*` limits do not apply to the fused one-shot.
+
 ### Related aiter variables
 
 These variables are not new, but they change where the FlyDSL kernels run.
 
 | Variable | Effect on the FlyDSL kernels |
 |---|---|
-| `AITER_QUICK_REDUCE_QUANTIZATION` | Set to `INT4` to use the mesh and the ring. With other values, `QuickAllReduce` does not use them. |
-| `AITER_CUSTOM_AR_MIN_SIZE` | `CustomAllreduce` uses the one-shot only for payloads larger than this value. |
-| `AITER_CUSTOM_AR_MAX_SIZE` | `CustomAllreduce` uses the one-shot only for payloads up to this value. With `0`, the one-shot is not used. |
+| `AITER_QUICK_REDUCE_QUANTIZATION` | Set to `INT4` to use the mesh and the ring, plain and fused. With other values, `QuickAllReduce` does not use them. |
+| `AITER_CUSTOM_AR_MIN_SIZE` | `CustomAllreduce` uses the plain one-shot only for payloads larger than this value. |
+| `AITER_CUSTOM_AR_MAX_SIZE` | `CustomAllreduce` uses the plain one-shot only for payloads up to this value. With `0`, the plain one-shot is not used. |
 
 If the `AITER_CUSTOM_AR_*` window and the one-shot window do not overlap,
-`CustomAllreduce` does not build the one-shot.
-
-### Development variables
-
-| Variable | Effect |
-|---|---|
-| `FLYDSL_EXTRA_SOURCE_DIRS` | Adds directories to the FlyDSL JIT cache key. Refer to [The JIT cache does not see changes in shared modules](#the-jit-cache-does-not-see-changes-in-shared-modules). |
+`CustomAllreduce` does not build the plain one-shot.
 
 ## Tests and benchmarks
 
@@ -236,23 +471,28 @@ what a test does:
 | Test | FlyDSL kernels | Stock kernels in `bench` |
 |---|---|---|
 | `op_tests/multigpu_tests/test_flydsl_one_shot_allreduce.py` | One-shot | `cdr` and `cdr_naive`, the `CustomAllreduce` kernels with `use_new` on and off, and `rccl` |
-| `op_tests/multigpu_tests/test_flydsl_quick_allreduce_int4.py` | Mesh and ring | `hip`, the HIP `QuickAllReduce` kernel at the INT4 regime |
+| `op_tests/multigpu_tests/test_flydsl_quick_allreduce.py` | Mesh and ring | `hip`, the HIP `QuickAllReduce` kernel at the INT4 regime |
 
 A test fails if the arch is not supported, or if a world size that you name
 with `--tp` needs more GPUs than the node has. The default sweep skips the world
 sizes that do not fit, and fails if none of them does; name a size that fits with
 `--tp` instead.
 
-The `verify` scenario drives the engines directly with `AITER_FLY_AR=0`, but it
-also includes a production-dispatch check. That check drives payloads across the policy
-window boundaries through `CudaCommunicator.all_reduce`. It verifies that
-`_init_fly_backend` / `_init_fly_oneshot` built the slot, that dispatch routes
-the in-window payloads to FlyDSL, and that the result is correct.
+`--operation ar_rmsnorm` selects the fused kernels. Without it, `verify`
+runs the plain and the fused kernels, and `bench` runs the plain ones.
+
+The `verify` scenario drives the engines directly with `AITER_FLY_AR=0`. It
+also has production-dispatch checks, which drive payloads across the window
+boundaries through `CudaCommunicator.all_reduce` and
+`CudaCommunicator.fused_allreduce_rmsnorm`. They verify that the expected
+backends are built, that dispatch routes each payload to the expected backend,
+and that the result is correct. The fused check runs with
+`AITER_QUICK_REDUCE_QUANTIZATION` at `NONE` and at `INT4`.
 
 ```bash
 python3 op_tests/multigpu_tests/test_flydsl_one_shot_allreduce.py --scenario bench --tp 4
-python3 op_tests/multigpu_tests/test_flydsl_quick_allreduce_int4.py --scenario bench \
-    --tp 4 --report /tmp/int4.md
+python3 op_tests/multigpu_tests/test_flydsl_quick_allreduce.py --scenario bench \
+    --tp 4 --report /tmp/quick_allreduce.md
 ```
 
 The one-shot bench has two comparisons:
@@ -262,8 +502,9 @@ The one-shot bench has two comparisons:
 - `flydsl vs best` compares with the fastest stock kernel.
 
 The `variant` columns show which kernel each candidate ran. For `cdr` this is
-`ll`, `ll128_<block>`, `1stage` or `2stage`. The INT4 bench compares each
-schedule with `hip`. A ratio above 1.0 means that the FlyDSL kernel is faster.
+`ll`, `ll128_<block>`, `1stage` or `2stage`. The quick all-reduce bench
+compares each schedule with `hip`. A ratio above 1.0 means that the FlyDSL
+kernel is faster.
 
 All candidates are timed with the same method, on the same input, in the same
 process. Each candidate is a CUDA graph of 10 back-to-back calls. The test
@@ -273,22 +514,13 @@ and how it prevents bias in the comparison.
 
 ## Notes
 
-### The JIT cache does not see changes in shared modules
+### The JIT cache follows changes in shared modules
 
-The FlyDSL JIT cache key includes the source of the kernel function. It does
-not include helper functions from other modules, for example
-`allreduce_shared.py` or `quick_allreduce_codec.py`. If you change a helper,
-FlyDSL can run an old binary from the cache.
-
-To prevent this, set this variable at the repository root before you run a
-test:
-
-```bash
-export FLYDSL_EXTRA_SOURCE_DIRS=$PWD/aiter/ops/flydsl/kernels
-```
-
-FlyDSL then includes all the `.py` files in this directory tree in the cache
-key. The tree includes `kernels_common.py`, which the codec also uses.
+FlyDSL 0.5.0 and later key the JIT cache on the traced kernel IR. A change to a
+helper in another module, for example `transport.py`,
+`quick_allreduce_codec.py` or the epilogue modules (`*_epilogue.py`,
+`*_rmsnorm.py`), changes the IR of every kernel that uses it, so FlyDSL
+compiles a new binary.
 
 ### Each rank compiles its own binary
 
@@ -306,11 +538,14 @@ engines in the same order. If they do not, the processes deadlock.
 Each rank works out what to build on its own, from its environment
 (`AITER_FLY_AR*`, `AITER_CUSTOM_AR_{MIN,MAX}_SIZE`,
 `AITER_QUICK_REDUCE_QUANTIZATION`), its arch and its link, so ranks can
-disagree. Before any engine is built, `CustomAllreduce` and `QuickAllReduce`
-gather every rank's plan over the CPU group
-(`flydsl_utils.all_ranks_agree_on_plan`). They build only if all plans match,
-otherwise FlyDSL collectives are off on every rank. The vote runs even when 
-FlyDSL is off, because a rank that skipped it would leave its peers waiting.
+disagree. Before any engine is built, every rank votes over the CPU group on
+what it would build: `CustomAllreduce` gathers each rank's plan for the
+one-shot (`all_ranks_agree_on_plan`), and the backends in `flydsl_backends.py`
+compare a digest of the policy, arch, link and FlyDSL version
+(`vote_on_digest`). They build only if every rank agrees, otherwise FlyDSL
+collectives are off on every rank. The vote runs even when FlyDSL is off or
+declines on that rank, because a rank that skipped it would leave its peers
+waiting.
 
 ### The mesh and the ring are persistent kernels
 

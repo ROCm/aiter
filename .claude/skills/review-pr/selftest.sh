@@ -349,6 +349,19 @@ flydsl='diff --git a/aiter/ops/flydsl/kernels/moe_gemm.py b/aiter/ops/flydsl/ker
 # is_kernel() skips FlyDSL, so flydsl-kernel is the only family that can carry A4 there.
 t "a FlyDSL kernel edit selects A4" \
   "$(rules_of "$flydsl" flydsl-kernel | grep -ow A4)" "A4"
+# Raw-pointer launches live in the wrappers (aiter/ops/flydsl/*.py), which derive `flydsl` but
+# not `flydsl-kernel`, so D14 and D13 must reach a wrapper-only diff through `flydsl`.
+flydsl_wrapper='diff --git a/aiter/ops/flydsl/qsa_sparse_decode.py b/aiter/ops/flydsl/qsa_sparse_decode.py
+--- a/aiter/ops/flydsl/qsa_sparse_decode.py
++++ b/aiter/ops/flydsl/qsa_sparse_decode.py
+@@ -1 +1 @@
+-    _run_compiled(exe, ptr_arg(q), ptr_arg(out), stream)
++    _run_compiled(exe, ptr_arg(q), ptr_arg(kv_indices), ptr_arg(out), stream)
+'
+t "a FlyDSL wrapper-only edit selects D14" \
+  "$(rules_of "$flydsl_wrapper" flydsl | grep -ow D14)" "D14"
+t "a FlyDSL wrapper-only edit selects D13" \
+  "$(rules_of "$flydsl_wrapper" flydsl | grep -ow D13)" "D13"
 
 # derive -> verdict -> card: a submodule path has no extension, so unless audit_card counts it
 # as a citation, a card that reports HK20 without the rule code (as SKILL.md requires) fails
@@ -385,6 +398,29 @@ dispatch_host='diff --git a/aiter/fused_moe.py b/aiter/fused_moe.py
 '
 t "a host-side activation branch selects A4 via dispatch-change" \
   "$(rules_of "$dispatch_host" dispatch-change | grep -ow A4)" "A4"
+
+# Every rule id derive() can emit must be registered in ALL_RULES. It is read by the
+# derivation-failed, diff-too-large and underivable fallbacks -- the moments the full
+# catalogue matters most -- and by the rules=N/M denominator. B8 and D12 reached main
+# unregistered, and HK4-HK11 had been missing for longer, because nothing compared the
+# two lists. Ported from ROCm/ATOM, where this guard was added during the port.
+_rule_ids_consistent() {
+  python3 - "$S" <<'PYEOF'
+import inspect, re, sys
+sys.path.insert(0, sys.argv[1])
+import triage
+src = inspect.getsource(triage.derive)
+emitted = set()
+# hit("family-name", "A1 B2 ...") -- the rule list is the second argument, and rule ids
+# are an uppercase letter run followed by digits, so the fragments a looser pattern
+# picked up (IE, ule) cannot match.
+for m in re.finditer(r"hit\([^)]*?,\s*.((?:[A-Z]+[0-9]+[a-z]?(?: |(?=.)))+).\)", src):
+    emitted |= set(m.group(1).split())
+missing = sorted(emitted - set(triage.ALL_RULES.split()))
+print("ok" if emitted and not missing else ("empty" if not emitted else "missing:" + ",".join(missing)))
+PYEOF
+}
+t "every id derive() emits is in ALL_RULES" "$(_rule_ids_consistent)" "ok"
 
 echo "[mapping]"
 # MAPPING.md is generated; a family or rule added to derive() without regenerating it drifts.
@@ -448,6 +484,24 @@ _budget_pair() {  # <agent> <budget> -> rc of run_one's precondition
   ( AITER_AGENT_TIMEOUT=$1 AITER_RUN_BUDGET=$2 \
     timeout 20 bash "$S/run_one.sh" 0 x/y >/dev/null 2>&1; echo $? )
 }
+# A shared runner label is a nuisance, not an outage. run_one.sh treats any non-zero from
+# check_prompts.py as fatal, so making this one refuse stopped every review in the repo for
+# a day (2026-11-18, after a scheduled job adopted box308) while the thing it guards is one
+# notification that may be wrong. Pinned so it does not quietly become fatal again.
+_shared_label_rc() {  # -> check_prompts' exit code with another workflow on the same label
+  r=$(mktemp -d); d="$r/.claude/skills/review-pr"
+  mkdir -p "$d" "$r/.github/workflows"; cp -r "$S"/. "$d/" 2>/dev/null
+  cp "$S/../../../.github/workflows/"*.y*ml "$r/.github/workflows/" 2>/dev/null
+  printf 'name: squatter\njobs:\n  x:\n    runs-on: [self-hosted, box308]\n' \
+    > "$r/.github/workflows/zz-squatter.yml"
+  python3 "$d/check_prompts.py" >/dev/null 2>&1
+  rc=$?
+  rm -rf "$r"
+  echo $rc
+}
+t "another workflow on the review label warns, it does not stop the review" \
+  "$(_shared_label_rc)" "0"
+
 t "a per-agent timeout that starves the refuter is refused" "$(_budget_pair 5400 7200)" "2"
 
 echo "[watchdog]"

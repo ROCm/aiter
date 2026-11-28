@@ -20,18 +20,11 @@ from aiter import dtypes
 from aiter.benchmark_reporting import print_json_table
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.gemm_op_a8w8 import (
-    _get_mxfp8_bpreshuffle_config,
     gemm_a8w8_blockscale_ck,
     gemm_a8w8_blockscale_cktile,
     gemm_a8w8_blockscale_flydsl,
 )
-from aiter.jit.utils.build_targets import is_gfx1250_family
-from aiter.ops.shuffle import (
-    shuffle_mxfp8fp4_a,
-    shuffle_mxfp8fp4_b,
-    shuffle_mxfp8fp4_scale,
-    shuffle_weight,
-)
+from aiter.ops.shuffle import shuffle_mxfp8fp4_a, shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.utility import fp4_utils
 
@@ -81,20 +74,6 @@ def run_gemm_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16):
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
-def run_gemm_mxfp8_1x32(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16):
-    return aiter.gemm_a8w8_mxfp8_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype)
-
-
-@perftest(num_iters=TEST_NUM_ITERS)
-def run_asm_mxfp8_1x32(x, weight_b, x_scale, w_scale, dtype=dtypes.bf16):
-    # gfx1250 ASM MXFP8 GEMM (same op test_mxfp8fp4gemm.py times with --apre 0):
-    # A row-major, B and both e8m0 scales preshuffled.
-    return aiter.gemm_a8w8_mxfp8(
-        x, weight_b, x_scale, w_scale, dtype=dtype, a_preshuffle=False
-    )
-
-
-@perftest(num_iters=TEST_NUM_ITERS)
 def run_gemm_abpreshuffle(
     x_shuffled, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16
 ):
@@ -138,7 +117,7 @@ def test_gemm(
     w_scale_block="128x128",
 ):
     ret = {}
-    scale_shape = {"32x32": (32, 32), "1x32": (1, 32)}.get(w_scale_block, block_shape)
+    scale_shape = (32, 32) if w_scale_block == "32x32" else block_shape
     block_shape_n, block_shape_k = scale_shape
     scale_m = m
     scale_n = (n + block_shape_n - 1) // block_shape_n
@@ -167,9 +146,7 @@ def test_gemm(
         w_scale_raw = bench_init.fill_scale_e8m0(
             (scale_n, scale_k), scale_init, generator
         )
-    use_flydsl_fp8_scale = (
-        use_flydsl or w_scale_block in ("32x32", "1x32")
-    ) and ck_preshuffle
+    use_flydsl_fp8_scale = (use_flydsl or w_scale_block == "32x32") and ck_preshuffle
     if use_flydsl_fp8_scale:
         x_scale = x_scale_raw.view(dtypes.fp8_e8m0)
         w_scale = w_scale_raw.view(dtypes.fp8_e8m0)
@@ -182,18 +159,12 @@ def test_gemm(
     x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
     gemm_weight = shuffle_weight(weight, layout=(16, 16)) if ck_preshuffle else weight
     gemm_x_scale = x_scale_t if ck_preshuffle and block_shape_k == 128 else x_scale
-    if w_scale_block == "1x32":
-        # gfx1250 reads a 32x4-shuffled w_scale, gfx950 a row-major one; the
-        # reference keeps the raw one.
-        w_scale_k = (
-            w_scale if get_gfx() == "gfx950" else shuffle_mxfp8fp4_scale(w_scale)
-        )
-        b, avg_b = run_gemm_mxfp8_1x32(x, gemm_weight, x_scale, w_scale_k, dtype)
-    else:
-        run_func = run_gemm_bpreshuffle if ck_preshuffle else run_gemm
-        b, avg_b = run_func(x, gemm_weight, gemm_x_scale, w_scale, dtype)
+    run_func = run_gemm_bpreshuffle if ck_preshuffle else run_gemm
+    b, avg_b = run_func(x, gemm_weight, gemm_x_scale, w_scale, dtype)
 
     err_ck = checkAllclose(a, b, msg="ck", catastrophic_check=True)
+    if w_scale_block == "32x32":
+        assert err_ck <= 0.05, f"m={m} n={n} k={k}: 32x32 mismatch ratio {err_ck}"
     if ck_preshuffle and not use_flydsl_fp8_scale:
         x_scale_strided = x_scale.transpose(0, 1).contiguous().transpose(0, 1)
         b_strided = aiter.gemm_a8w8_blockscale_bpreshuffle(
@@ -210,23 +181,6 @@ def test_gemm(
     ret["ck TFLOPS"] = m * n * k * 2 / avg_b / 1e6
     ret["ck TB/s"] = (x.nbytes + weight.nbytes) / avg_b / 1e6
     ret["ck err"] = err_ck
-    if w_scale_block == "1x32":
-        ret["kernelName"] = _get_mxfp8_bpreshuffle_config(m, n, k)[1]
-        if is_gfx1250_family(get_gfx()):
-            # ASM baseline on the same operands. "ck us" above is the FlyDSL
-            # MXFP8 GEMM here, so asm/ck < 1 means ASM is faster than FlyDSL.
-            c, avg_c = run_asm_mxfp8_1x32(
-                x,
-                shuffle_mxfp8fp4_b(weight),
-                shuffle_mxfp8fp4_scale(x_scale),
-                shuffle_mxfp8fp4_scale(w_scale),
-                dtype,
-            )
-            ret["asm us"] = avg_c
-            ret["asm TFLOPS"] = m * n * k * 2 / avg_c / 1e6
-            ret["asm TB/s"] = (x.nbytes + weight.nbytes) / avg_c / 1e6
-            ret["asm err"] = checkAllclose(a, c, msg="asm", catastrophic_check=True)
-            ret["asm/ck"] = avg_c / avg_b
 
     if apre and use_flydsl_fp8_scale:
         # A-preshuffle packs adjacent A row pairs, so an odd M needs A -- and only
@@ -511,11 +465,10 @@ parser.add_argument(
 parser.add_argument(
     "--w-scale-block",
     dest="w_scale_block",
-    choices=["128x128", "32x32", "1x32"],
+    choices=["128x128", "32x32"],
     default="128x128",
     help="""Weight scale block. 32x32 runs native E8M0 group32 scales (1x32
-    row-major x_scale) on the preshuffled weight. 1x32 runs the MXFP8 GEMM
-    (gemm_a8w8_mxfp8_bpreshuffle) with 1x32 x_scale and w_scale.
+    row-major x_scale) on the preshuffled weight.
     e.g.: --w-scale-block 32x32""",
 )
 parser.add_argument(
@@ -564,37 +517,21 @@ init_pairs = list(zip(data_init_list, scale_init_list))
 
 if args.ck_preshuffle is None:
     args.ck_preshuffle = (
-        [True]
-        if args.flydsl or args.w_scale_block in ("32x32", "1x32")
-        else [True, False]
+        [True] if args.flydsl or args.w_scale_block == "32x32" else [True, False]
     )
 l_preshuffle = (
     args.ck_preshuffle if isinstance(args.ck_preshuffle, list) else [args.ck_preshuffle]
 )
 l_apre = args.apre if isinstance(args.apre, list) else [args.apre]
-mx_w_scale_block = args.w_scale_block in ("32x32", "1x32")
-if mx_w_scale_block and get_gfx() not in (
+if args.w_scale_block == "32x32" and (False in l_preshuffle or True in l_apre):
+    parser.error("--w-scale-block 32x32 needs --ck_preshuffle True and no --apre")
+if args.w_scale_block == "32x32" and get_gfx() not in (
     "gfx950",
     "gfx1250",
     "gfx1250-strict",
 ):
-    print(
-        f"skip: native {args.w_scale_block} E8M0 preshuffle is unsupported on {get_gfx()}"
-    )
+    print(f"skip: native 32x32 E8M0 preshuffle is unsupported on {get_gfx()}")
     sys.exit(0)
-if mx_w_scale_block and (False in l_preshuffle or True in l_apre):
-    parser.error(
-        f"--w-scale-block {args.w_scale_block} needs --ck_preshuffle True and no --apre"
-    )
-
-def _emit_row(m, n, k, ret):
-    """Print one finished shape right away so a later crash/hang keeps it."""
-    if not ret:
-        return
-    keys = ("ck us", "ck TFLOPS", "asm us", "asm TFLOPS", "asm/ck", "kernelName")
-    fields = " ".join(f"{key}={ret[key]}" for key in keys if key in ret)
-    print(f"ROW m={m} n={n} k={k} {fields}", flush=True)
-
 
 df = []
 if args.csv is not None:
@@ -621,7 +558,6 @@ if args.csv is not None:
                             w_scale_block=args.w_scale_block,
                         )
                         df.append(ret)
-                        _emit_row(int(row["M"]), int(row["N"]), int(row["K"]), ret)
 else:
     for dtype in args.dtype:
         for m in args.m:
@@ -643,7 +579,6 @@ else:
                                 w_scale_block=args.w_scale_block,
                             )
                             df.append(ret)
-                            _emit_row(m, n, k, ret)
 
 df = pd.DataFrame([row for row in df if row is not None])
 print_json_table("gemm_a8w8_blockscale summary", df)

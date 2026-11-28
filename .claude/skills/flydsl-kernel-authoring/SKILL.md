@@ -639,11 +639,24 @@ fx.rocdl.tdm_ops.tensor_wait(0)                                  # await async D
 ```
 
 The older `fx.rocdl.make_tdm_atom` + `fx.copy_atom_call` + `advance_tdm_atom`
-carried the descriptor as atom state and is being retired — do not write new
-kernels against it. It is still required where the tiled atom cannot reach: the
+carried the descriptor as atom state and is **retired**: no aiter kernel calls
+it any more, so do not write new ones against it and do not reintroduce it when
+editing an existing load. What replaced each of its parameters:
+`tensor_extents=` and `strides=` move into the global view's own layout,
+`imm_offset=` becomes the coordinate tensor's i32 tile index, `pad_interval` /
+`pad_amount` become row slack in the LDS box, and a hand-split of the tile
+across waves becomes `num_warps=` plus a matching `tdm_partition` warp layout.
+`early_timeout` has no equivalent and is dropped: on the tiled atom that
+descriptor bit comes from a runtime slot guarded by
+`assume(early == 0 || mask != 0)`, so writing it under a zero mask is
+undefined behaviour rather than a hint.
+
+What the tiled atom still cannot reach, and so stays on the old interface: the
 gather/scatter family (`make_tensor_gather_descriptor` / `tensor_load_gather`,
-for per-row addresses such as a KV page table), and a tile whose innermost
-dimension spans under 16 bytes per warp.
+for per-row addresses such as a KV page table). A tile whose innermost
+dimension spans under 16 bytes per warp is a FlyDSL check rather than an ISA
+rule; a tile one element wide along the tensor's contiguous mode used to fail
+here too, and stopped failing in flydsl 0.4.2 (ROCm/FlyDSL#1309).
 
 ---
 

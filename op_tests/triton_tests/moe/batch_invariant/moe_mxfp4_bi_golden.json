@@ -1,0 +1,8 @@
+{
+  "contract_version": 1,
+  "gfx950": {
+    "T1_E32": "8a1af748c443c089a0bbc02ded54cbb90d73efb5d5ba927f6e1eaa9cd8830acc",
+    "T64_E32": "c72ecdc788a664ff7505c7b597cabe1c32eb9ab7d441ac19eda8271512749800",
+    "T1024_E256": "572eecec22b5d3a7a584f562a34dd3dd8fbc307074bf977e45c11cafa492dfc3"
+  }
+}

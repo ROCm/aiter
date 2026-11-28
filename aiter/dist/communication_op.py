@@ -152,6 +152,22 @@ def tensor_model_parallel_all_reduce(
     return get_tp_group().all_reduce(input_, use_new, open_fp8_quant, prefill_support)
 
 
+def tensor_model_parallel_all_reduce_add(
+    input_: torch.Tensor,
+    other: torch.Tensor,
+    use_new: bool = True,
+    open_fp8_quant: bool = False,
+    prefill_support: bool = False,
+) -> torch.Tensor:
+    """All-reduce input_ + other across the model parallel group: the sum over
+    ranks of each rank's input_ + other, with the add fused into the all-reduce
+    where the device communicator can."""
+    _assert_no_custom_group("tensor_model_parallel_all_reduce_add")
+    return get_tp_group().all_reduce_add(
+        input_, other, use_new, open_fp8_quant, prefill_support
+    )
+
+
 def tensor_model_parallel_fused_allreduce_rmsnorm(
     input_: torch.Tensor,
     residual_inp_: torch.Tensor,
@@ -328,6 +344,24 @@ def tensor_model_parallel_all_gather(
     return get_tp_group().all_gather(input_, use_custom, dim)
 
 
+def tensor_model_parallel_all_to_all(
+    input_: torch.Tensor,
+    scatter_dim: int = 0,
+    gather_dim: int = -1,
+    scales: torch.Tensor | None = None,
+    use_custom: bool = True,
+    registered: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """All-to-all across the model parallel group: split `input_` into
+    world_size equal chunks along `scatter_dim`, send chunk j to rank j and
+    concatenate the chunks received from ranks 0..W-1 along `gather_dim`.
+    See `GroupCoordinator.all_to_all`."""
+    _assert_no_custom_group("tensor_model_parallel_all_to_all")
+    return get_tp_group().all_to_all(
+        input_, scatter_dim, gather_dim, scales, use_custom, registered
+    )
+
+
 def tensor_model_parallel_gather(
     input_: torch.Tensor, dst: int = 0, dim: int = -1
 ) -> torch.Tensor | None:
@@ -364,6 +398,22 @@ def expert_parallel_all_gather(
     """All-gather the input tensor across expert parallel group."""
     _assert_no_custom_group("expert_parallel_all_gather")
     return get_ep_group().all_gather(input_, use_custom, dim)
+
+
+def expert_parallel_all_to_all(
+    input_: torch.Tensor,
+    scatter_dim: int = 0,
+    gather_dim: int = -1,
+    scales: torch.Tensor | None = None,
+    use_custom: bool = True,
+    registered: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """All-to-all across the expert parallel group (tensor contract in
+    `GroupCoordinator.all_to_all`)."""
+    _assert_no_custom_group("expert_parallel_all_to_all")
+    return get_ep_group().all_to_all(
+        input_, scatter_dim, gather_dim, scales, use_custom, registered
+    )
 
 
 def expert_parallel_reduce_scatter(
@@ -558,3 +608,26 @@ def custom_reduce_scatter(
     """
     _assert_has_custom_group()
     return get_custom_group(group).reduce_scatter_tensor(input_, use_custom, dim)
+
+
+def custom_all_to_all(
+    input_: torch.Tensor,
+    scatter_dim: int = 0,
+    gather_dim: int = -1,
+    scales: torch.Tensor | None = None,
+    use_custom: bool = True,
+    registered: bool = False,
+    group: str | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """All-to-all across the user-specified custom group (tensor contract in
+    `GroupCoordinator.all_to_all`).
+
+    Args:
+        group: Name of the custom group. When only one custom group is
+            initialized this can be omitted. When multiple groups exist,
+            pass the group name to select which one to use.
+    """
+    _assert_has_custom_group()
+    return get_custom_group(group).all_to_all(
+        input_, scatter_dim, gather_dim, scales, use_custom, registered
+    )

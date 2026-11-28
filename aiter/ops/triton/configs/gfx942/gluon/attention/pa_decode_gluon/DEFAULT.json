@@ -1,0 +1,8 @@
+{
+  "ps_reduce": {
+    "num_warps": 4
+  },
+  "ps_reduce_output_gate": {
+    "num_warps": 4
+  }
+}

@@ -4,7 +4,9 @@
 import torch
 import torch.nn.functional as F
 
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.build_targets import is_gfx1250_family
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
+from aiter.ops.moe_nvfp4_common import scale_gs
 
 
 def _moe_tile_shuffle(
@@ -63,6 +65,25 @@ def shuffle_mxfp8fp4_scale(src: torch.Tensor) -> torch.Tensor:
         s = F.pad(s, (0, 0, 0, pad), value=0x7F)
     out = _moe_tile_shuffle(s, tile_minor=32, tile_major=4)
     return out.view(x_type)
+
+
+def shuffle_mxfp8_bpreshuffle_scale(w_scale: torch.Tensor) -> torch.Tensor:
+    """1x32 e8m0 weight scale ``[N, K/32]`` as this arch's mxfp8 bpreshuffle GEMM reads it.
+
+    The w_scale of ``gemm_a8w8_mxfp8_bpreshuffle`` (and of group32
+    ``gemm_a8w8_blockscale(isBpreshuffled=True)``): 32x4 shuffled on the gfx1250
+    family (``shuffle_mxfp8fp4_scale`` bytes, same shape and dtype). On every
+    other arch (e.g. gfx950) it is row-major and the input is returned unchanged.
+    The arch is the running GPU's (``get_gfx_runtime()``), as in the GEMM dispatch.
+    """
+    if not is_gfx1250_family(get_gfx_runtime()):
+        return w_scale
+    if w_scale.dim() != 2 or w_scale.shape[0] % 32 or w_scale.shape[1] % 4:
+        raise ValueError(
+            "gfx1250 1x32 w_scale must be [N, K/32] with N % 32 == 0 and "
+            f"K % 128 == 0, got {tuple(w_scale.shape)}"
+        )
+    return shuffle_mxfp8fp4_scale(w_scale.contiguous())
 
 
 def shuffle_blockscale_to_mxfp8_scale(scale: torch.Tensor, n: int) -> torch.Tensor:
@@ -191,6 +212,8 @@ def shuffle_weight(
             x_ = x_.permute(0, 1, 3, 4, 2, 5).contiguous()
         x_ = x_.view(*x.shape).contiguous().view(x_type)
         x_.is_shuffled = True
+        x_.aiter_shuffle_layout = tuple(layout)
+        x_.aiter_shuffle_is_guinterleave = True
         x_.gate_up_interleave = gate_up
         return x_
 
@@ -213,6 +236,8 @@ def shuffle_weight(
     x_ = x_.view(*x.shape)
     x_ = x_.view(x_type)
     x_.is_shuffled = True
+    x_.aiter_shuffle_layout = tuple(layout)
+    x_.aiter_shuffle_is_guinterleave = False
     if pad_k_to:
         x_.aiter_original_k = original_k
         x_.aiter_padded_k = x.shape[-1]
@@ -430,7 +455,10 @@ def shuffle_scale(
         # Permute to: [E, N1, K1, K_Lane, N_Lane, K_Pack, N_Pack]
         shfl_scale = shfl_scale.permute(0, 1, 4, 6, 3, 5, 2).contiguous()
     # print("shf_scale shape:", shfl_scale.shape)
-    return shfl_scale.view(*src.shape).contiguous()
+    out = shfl_scale.view(*src.shape).contiguous()
+    # Same tag as shuffle_weight, so a consumer can check the gate/up order of the scale.
+    out.gate_up_interleave = gate_up
+    return out
 
 
 def moe_shuffle_scale(
@@ -462,6 +490,25 @@ def shuffle_scale_a16w4(
     return shuffle_scale(
         src, experts_cnt=experts_cnt, is_guinterleave=True, gate_up=gate_up
     )
+
+
+def shuffle_scale_nvfp4_moe(src: torch.Tensor) -> torch.Tensor:
+    """gfx950 NVFP4 MoE (aiter.ops.moe_nvfp4) E4M3 block-scale preshuffle.
+
+    [E, N, K/16] -> [E][N/16][K/128/GS][64][GS/2][4] bytes, GS =
+    scale_gs(K / 128): per 16-row N tile and K-tile pair the 64 lanes x
+    4 bytes of one scale load, GS/2 pairs per group. An odd K-tile count gets zero
+    scales for the missing K-tile.
+    """
+    x_type = src.dtype
+    s = src.view(torch.uint8)
+    if s.shape[2] % 16:
+        s = F.pad(s, (0, 16 - s.shape[2] % 16))
+    E, N, KS = s.shape
+    s = s.view(E, N // 16, 16, KS // 16, 2, 4, 2).permute(0, 1, 3, 5, 2, 4, 6)
+    gps = scale_gs(KS // 8) // 2
+    s = s.reshape(E, N // 16, -1, gps, 64, 4).permute(0, 1, 2, 4, 3, 5)
+    return s.contiguous().view(x_type)
 
 
 def pack_int8_to_packed_int4(x_shuf_i8: torch.Tensor) -> torch.Tensor:
@@ -506,3 +553,63 @@ def shuffle_scale_for_int4(scale: torch.Tensor, group_size: int = 32) -> torch.T
         return scale.view(E, G // 2, 2, N).permute(0, 1, 3, 2).contiguous()
 
     return scale.contiguous()
+
+
+def _mark_a8w4_gfx942(out_u8, src):
+    """`out_u8` viewed as `src` (dtype, shape), tagged ``a8w4_gfx942_layout = True``.
+
+    The relayout keeps shape and dtype, so the tag is the only way to tell it from the
+    a16w4 preshuffle; fused_moe checks it against the stage-1 kernel (check_a8w4_gfx942_inputs). Like
+    ``is_shuffled`` (carried over from `src`) it is a Python attribute of this tensor
+    object: views, copies and ``nn.Parameter`` wrapping drop it, so a caller that wraps
+    the result must set it on the final tensor again.
+    """
+    out = out_u8.view(src.dtype).view(src.shape)
+    out.a8w4_gfx942_layout = True
+    out.is_shuffled = getattr(src, "is_shuffled", False)
+    return out
+
+
+def shuffle_weight_a8w4_gfx942(w_a16w4_u8):
+    """Relayout a16w4-preshuffled MXFP4 W (``shuffle_weight_a16w4(w, 16, False)``).
+
+    In each 1 KB chunk (16 N rows x 128 K) the a16w4 order is [klane j][nlane][dword g]
+    (klane j = MX block j, dword g = its K [g*8, +8)). This writes [g][nlane][j], so a
+    lane of group g loads part g of all four blocks with the same dwordx4 address.
+
+    Raises ``ValueError`` if ``w_a16w4_u8`` carries ``gate_up_interleave=True``
+    (GUGU layout): the kernel reads GGUU (separated gate/up) and a GUGU input would
+    place half the bytes in the wrong position without raising at runtime.
+    """
+    if getattr(w_a16w4_u8, "gate_up_interleave", False):
+        raise ValueError(
+            "shuffle_weight_a8w4_gfx942 requires GGUU (separated gate/up) layout "
+            "(shuffle_weight_a16w4(w, 16, False)), but the input has "
+            "gate_up_interleave=True (GUGU). Pass the GGUU-preshuffled weight."
+        )
+    w = w_a16w4_u8.view(torch.uint8)
+    assert w.numel() % 1024 == 0, "W bytes must be a multiple of 1 KB"
+    out = w.reshape(-1, 4, 16, 4, 4).permute(0, 3, 2, 1, 4).contiguous()
+    return _mark_a8w4_gfx942(out, w_a16w4_u8)
+
+
+def shuffle_scale_a8w4_gfx942(s_a16w4_u8):
+    """Relayout a16w4-preshuffled E8M0 W scales (``shuffle_scale_a16w4(s, E, False)``).
+
+    Per 256 B chunk (32 N x 256 K) a16w4 holds dwords [klane 4][nlane 16] with bytes
+    [kpack_sub 2][npack 2]; this writes dwords [kpack_sub][npack][nlane] with bytes
+    [klane], i.e. one dword = the 4 block scales of one column and one 128-wide K group.
+
+    Raises ``ValueError`` if ``s_a16w4_u8`` carries ``gate_up_interleave=True``:
+    the scale layout mirrors the weight layout and the same GGUU requirement applies.
+    """
+    if getattr(s_a16w4_u8, "gate_up_interleave", False):
+        raise ValueError(
+            "shuffle_scale_a8w4_gfx942 requires GGUU (separated gate/up) layout "
+            "(shuffle_scale_a16w4(s, E, False)), but the input has "
+            "gate_up_interleave=True (GUGU)."
+        )
+    s = s_a16w4_u8.view(torch.uint8)
+    assert s.numel() % 256 == 0, "scale bytes must be a multiple of 256"
+    out = s.reshape(-1, 4, 16, 2, 2).permute(0, 3, 4, 2, 1).contiguous()
+    return _mark_a8w4_gfx942(out, s_a16w4_u8)

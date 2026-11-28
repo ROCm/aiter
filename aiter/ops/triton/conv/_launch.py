@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
+import torch.nn.functional as F
 import triton
 
 from aiter.ops.triton._triton_kernels.conv.conv3d_1x1x1 import (
@@ -84,7 +85,13 @@ from aiter.ops.triton._triton_kernels.conv.ncx_to_cblocked import (
 from aiter.ops.triton._triton_kernels.conv.ncx_to_cblocked import (
     _ncx_to_cblocked_kernel,
 )
-from aiter.ops.triton.conv._utils import _winograd_transform_storage_dtype
+from aiter.ops.triton.conv._utils import (
+    _ensure_layout,
+    _normalize_tuple,
+    _padding_geometry,
+    _validate_padding_mode,
+    _winograd_transform_storage_dtype,
+)
 from aiter.ops.triton.utils.conv_config_utils import (
     format_prepack_shape_key,
     format_prepack_shape_key_3d,
@@ -141,6 +148,49 @@ def _make_wino_output_grid(T, K_out):
         return (T, triton.cdiv(K_out, meta["BLOCK_K"]))
 
     return grid
+
+
+def _prepare_conv_padding(
+    source: torch.Tensor,
+    padding,
+    padding_mode: str = "zeros",
+    *,
+    layout: str,
+    x_blocked: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, tuple[int, ...]]:
+    """Prepare Conv2D or Conv3D padding before routing and activation packing.
+
+    No-op paths return the input unchanged; callers handle their layout.
+    """
+    if layout in ("nchw", "nhwc"):
+        rank = 4
+    elif layout in ("ncdhw", "ndhwc"):
+        rank = 5
+    else:
+        raise ValueError(
+            "layout must be one of ('nchw', 'nhwc', 'ncdhw', 'ndhwc'), "
+            f"got {layout!r}"
+        )
+    if source.ndim != rank:
+        logical_layout = "NCHW" if rank == 4 else "NCDHW"
+        raise ValueError(
+            f"conv{rank - 2}d padding input must be {rank}-D {logical_layout}, "
+            f"got {source.ndim}-D"
+        )
+    padding = _normalize_tuple(padding, rank - 2, "padding", allow_zero=True)
+    spatial = tuple(source.shape[2:])
+    _validate_padding_mode(padding_mode, spatial, padding)
+    padded_spatial, conv_padding = _padding_geometry(spatial, padding, padding_mode)
+    if padded_spatial == spatial:
+        return source, conv_padding
+    if x_blocked is not None:
+        raise ValueError(
+            "x_blocked cannot be used with materialized padding; "
+            "omit it to pack the padded input"
+        )
+    pad = tuple(value for amount in reversed(padding) for value in (amount, amount))
+    output = F.pad(source, pad, mode=padding_mode)
+    return _ensure_layout(output, layout), conv_padding
 
 
 def _launch_nchw_to_cblocked(x, x_blocked, N, C, H, W, C_pad, block_c):

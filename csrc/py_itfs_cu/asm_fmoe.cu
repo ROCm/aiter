@@ -77,6 +77,15 @@ enum class AsmMoeMode : int
     POST_REDUCE = 3,
 };
 
+// FLAT (NO_SORT) and EMSORT grids cover the logical width rounded up to whole
+// sub_GU tiles. The columns past the logical width are zero pad, so the result
+// is exact as long as the rounded width stays within the stored one.
+static int flat_grid_inter_dim(int stored_inter_dim, int intermediate_pad, int sub_GU)
+{
+    const int logical = stored_inter_dim - intermediate_pad;
+    return (logical + sub_GU - 1) / sub_GU * sub_GU;
+}
+
 class FMoeKernel
 {
     private:
@@ -134,7 +143,8 @@ class FMoeKernel
                        aiter_tensor_t* w1_dqn        = nullptr,
                        aiter_tensor_t* w2_dqn        = nullptr,
                        aiter_tensor_t* w2_smooth_qnt = nullptr,
-                       hipStream_t stream         = nullptr)
+                       hipStream_t stream         = nullptr,
+                       int intermediate_pad       = 0)
     {
         int token_cnt       = out->size(0);
         int dim             = w2->size(1);
@@ -142,6 +152,31 @@ class FMoeKernel
         int eprt            = w1->size(0);
         int inter_dim       = w2->size(2) * (w2->size(1) / w1->size(2));
         uint32_t sub_GU     = this->sub_GU;
+        // FLAT (NO_SORT) and EMSORT take the gate->up half offset and the w1/w2
+        // strides from args.inter_dim, so they keep the stored width while their
+        // grid (and EMSORT's ps_deno slice count) covers the logical columns rounded
+        // up to whole tiles. A tile past the stored width would read the up half.
+        // POST_REDUCE and host-sorted kernels run over the stored width; the
+        // zero-filled pad adds 0.
+        const bool logical_grid = this->flat_mode == AsmMoeMode::NO_SORT ||
+                                  this->flat_mode == AsmMoeMode::EMSORT;
+        const int grid_inter_dim =
+            logical_grid ? flat_grid_inter_dim(inter_dim, intermediate_pad, sub_GU)
+                         : inter_dim;
+        if(logical_grid)
+        {
+            AITER_CHECK(grid_inter_dim > 0 && grid_inter_dim <= inter_dim,
+                        __func__,
+                        ": ",
+                        this->name,
+                        " needs inter_dim - intermediate_pad rounded up to sub_GU within "
+                        "inter_dim; got inter_dim=",
+                        inter_dim,
+                        ", intermediate_pad=",
+                        intermediate_pad,
+                        ", sub_GU=",
+                        sub_GU);
+        }
 
         int stride_X  = input->stride(0) * input->element_size();
         int stride_GU = dim * I_elemSize;
@@ -206,7 +241,7 @@ class FMoeKernel
         args.eDQs      = stride_expert_DDQN;
         args.eSMQs     = stride_expert_SMTDQN;
         args.topk      = topk;
-        args.ps_deno   = ((inter_dim + sub_GU - 1) / sub_GU);
+        args.ps_deno   = ((grid_inter_dim + sub_GU - 1) / sub_GU);
         // Kernels that remap workgroups across XCDs need total_tgs to also be a
         // multiple of tgs_align (the XCD count), or the remap skips work.
         const uint32_t tgs_unit = std::lcm(args.ps_deno, this->tgs_align);
@@ -223,7 +258,7 @@ class FMoeKernel
         if(this->flat_mode == AsmMoeMode::NO_SORT)
         {
             bdx = 256;
-            gdx = ((inter_dim + sub_GU - 1) / sub_GU);
+            gdx = grid_inter_dim / sub_GU;
             gdy = static_cast<int>(topk);
             gdz = static_cast<int>(token_cnt);
         }
@@ -270,23 +305,17 @@ class FMoeKernel
                         this->max_experts,
                         " experts; got ",
                         eprt);
-            AITER_CHECK(inter_dim % sub_GU == 0,
-                        __func__,
-                        ": EMSORT requires inter_dim divisible by sub_GU; got inter_dim=",
-                        inter_dim,
-                        ", sub_GU=",
-                        sub_GU);
             AITER_CHECK(this->num_persistent_tgs > 0 && args.total_tgs > 0,
                         __func__,
                         ": EMSORT requires the dispatcher resident grid; got total_tgs=",
                         args.total_tgs,
                         ", pool=",
                         this->num_persistent_tgs);
-            gdx = inter_dim / sub_GU;
+            gdx = grid_inter_dim / sub_GU;
             const int emsort_tgs = static_cast<int>(args.total_tgs);
             AITER_CHECK(gdx > 0 && (emsort_tgs % gdx) == 0,
                         __func__,
-                        ": EMSORT requires total_tgs divisible by inter_dim/sub_GU; got total_tgs=",
+                        ": EMSORT requires total_tgs divisible by the slice count; got total_tgs=",
                         emsort_tgs,
                         ", slices=",
                         gdx);
@@ -363,12 +392,28 @@ static bool ps_grid_fits(const CFG::mapped_type& cfg, int inter_dim)
                               cfg.tg_num_perCU * static_cast<int>(get_num_cu_func());
 }
 
+// Mirrors launch_kernel: FLAT and EMSORT rows launch over the rounded logical
+// width, POST_REDUCE keeps the stored width.
+static int grid_inter_dim(const CFG::mapped_type& cfg, int inter_dim, int intermediate_pad)
+{
+    if(cfg.flat == static_cast<int>(AsmMoeMode::NO_SORT) ||
+       cfg.flat == static_cast<int>(AsmMoeMode::EMSORT))
+        return flat_grid_inter_dim(inter_dim, intermediate_pad, cfg.subGU_n);
+    return inter_dim;
+}
+
 // model_dim must be a multiple of the kernel's dim_align and at least its dim_min
 // (0 = unconstrained).
-static bool kernel_fits(
-    const CFG::mapped_type& cfg, int vskip, int smf, int block_size_M, int inter_dim, int model_dim)
+static bool kernel_fits(const CFG::mapped_type& cfg,
+                        int vskip,
+                        int smf,
+                        int block_size_M,
+                        int stored_inter_dim,
+                        int model_dim,
+                        int intermediate_pad = 0)
 {
-    if(cfg.smf != smf || inter_dim % cfg.subGU_n != 0 ||
+    const int inter_dim = grid_inter_dim(cfg, stored_inter_dim, intermediate_pad);
+    if(cfg.smf != smf || inter_dim > stored_inter_dim || inter_dim % cfg.subGU_n != 0 ||
        model_dim % std::max(cfg.dim_align, 1) != 0 || model_dim < cfg.dim_min ||
        !ps_grid_fits(cfg, inter_dim))
         return false;
@@ -380,13 +425,36 @@ static bool kernel_fits(
            cfg.flat == static_cast<int>(AsmMoeMode::SORTED);
 }
 
+// The SwiGLU OAI MXFP4 FLAT kernels (16x32/16x128) are validated for inter_dim % 128 == 0
+// (Minimax M3 TP2/TP4/TP8: 1536/768/384). The FLAT grid is ceil(inter_dim / subGU_n)
+// with no partial-tile handling, so reject other sizes here rather than launch a kernel
+// that reads past the expert's weights.
+// Every row in this map is flat=1: it reads the raw top-k ids/weights, not the host
+// moe_sorting output. Only a tuned row (kernel_name set, flat=1 forwarded by fused_moe)
+// passes raw top-k, so an unnamed call must not reach the heuristic below.
+static void
+check_swiglu_oai_flat_launch(const CFG* cfgs, int inter_dim, const std::string& kernel_name)
+{
+    if(cfgs != &cfg_fmoe_bf16_pertokenMXfp4_g1u1_swiglu_oai)
+        return;
+    AITER_CHECK(!kernel_name.empty(),
+                __func__,
+                " SwiGLU OAI MXFP4 FLAT asm kernels need an explicit kernel name: they read "
+                "raw top-k routing, not host-sorted ids, so heuristic selection is not allowed");
+    AITER_CHECK(inter_dim % 128 == 0,
+                __func__,
+                " SwiGLU OAI MXFP4 FLAT asm kernels need inter_dim % 128 == 0, got " +
+                    std::to_string(inter_dim));
+}
+
 FMoeKernel* get_heuristic_kernel(int inter_dim,
                                  int sub_X_cnt,
                                  CFG* cfgs,
                                  int smf                 = 0,
                                  std::string kernel_name = "",
                                  int block_size_M        = 32,
-                                 int model_dim           = 0)
+                                 int model_dim           = 0,
+                                 int intermediate_pad    = 0)
 {
     FMoeKernel* impl_ptr        = nullptr;
     uint32_t num_cu             = get_num_cu_func();
@@ -407,9 +475,9 @@ FMoeKernel* get_heuristic_kernel(int inter_dim,
             if(el.first.find(arch_id) != 0)
                 continue;
             const auto& cfg = el.second;
-            if(kernel_fits(cfg, vskip, smf, block_size_M, inter_dim, model_dim))
+            if(kernel_fits(cfg, vskip, smf, block_size_M, inter_dim, model_dim, intermediate_pad))
             {
-                tg_num = inter_dim / cfg.subGU_n *
+                tg_num = grid_inter_dim(cfg, inter_dim, intermediate_pad) / cfg.subGU_n *
                          sub_X_cnt; // how many thread_groups are needed to handle inter_dim
                 uint32_t local_round = (tg_num + num_cu - 1) / num_cu;
                 const uint32_t empty = local_round * num_cu - tg_num;
@@ -460,14 +528,16 @@ FMoeKernel* get_heuristic_kernel(int inter_dim,
                     cfg.dim_min,
                     "; got model_dim=",
                     model_dim);
-        AITER_CHECK(ps_grid_fits(cfg, inter_dim),
+        AITER_CHECK(ps_grid_fits(cfg, grid_inter_dim(cfg, inter_dim, intermediate_pad)),
                     __func__,
                     ": ",
                     selectedKl,
                     " has too few persistent workgroups on ",
                     num_cu,
                     " CUs for inter_dim=",
-                    inter_dim);
+                    inter_dim,
+                    ", intermediate_pad=",
+                    intermediate_pad);
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
         if(cfg.ps == 1)
@@ -714,8 +784,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const char* kernel_name,
     aiter_tensor_t* fc2_smooth_scale,  // [expert, 1, inter_dim]
     int activation,
+    int intermediate_pad,              // zero-filled tail of each gate/up half and of w2's K
     hipStream_t stream),
-    (out, input, gate, down, sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids, topk, input_scale, fc1_scale, fc2_scale, kernel_name, fc2_smooth_scale, activation, stream))
+    (out, input, gate, down, sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids, topk, input_scale, fc1_scale, fc2_scale, kernel_name, fc2_smooth_scale, activation, intermediate_pad, stream))
 {
     const HipDeviceGuard device_guard(input->device_id);
     ActivationType act = static_cast<ActivationType>(activation);
@@ -736,6 +807,17 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     int sub_X_cnt = sorted_expert_ids->size(0);
     static SynchronizedCache<std::string_view, FMoeKernel> impl_ptr_map;
     std::string kernel_name_str = kernel_name ? kernel_name : "";
+    AITER_CHECK(intermediate_pad >= 0 && intermediate_pad < inter_dim,
+                __func__,
+                ": intermediate_pad must be in [0, inter_dim); got intermediate_pad=",
+                intermediate_pad,
+                ", inter_dim=",
+                inter_dim);
+    // Only the MXFP4 SiLU/GELU FLAT and EMSORT tiles are validated on the logical
+    // grid. Every other kernel runs over the stored width, which the zero-filled
+    // pad keeps exact.
+    const bool silu_or_gelu = act == ActivationType::Silu || act == ActivationType::Gelu;
+    int launch_pad          = 0;
 
     if(gate->dtype() == AITER_DTYPE_u32 || gate->dtype() == AITER_DTYPE_i32) // int4
     {
@@ -780,9 +862,14 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_gelu;
         else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Situv2)
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_situv2;
+        else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Swiglu)
+            config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_swiglu_oai;
         else
             AITER_CHECK(false, __func__, " Not find proper cfg in pertokenMXfp4_g1u1. ");
-        impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name_str);
+        check_swiglu_oai_flat_launch(config_map, inter_dim, kernel_name_str);
+        launch_pad = silu_or_gelu ? intermediate_pad : 0;
+        impl_ptr   = get_heuristic_kernel(
+            inter_dim, sub_X_cnt, config_map, smf, kernel_name_str, 32, model_dim, launch_pad);
         impl_ptr->set_4bit(true);
         is_mxfp4 = true;
     }
@@ -802,9 +889,14 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_gelu;
         else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Situv2)
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_situv2;
+        else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Swiglu)
+            config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_swiglu_oai;
         else
             AITER_CHECK(false, __func__, " Not find proper cfg in pertokenMXfp4_g1u1 (bf16 X). ");
-        impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name_str);
+        check_swiglu_oai_flat_launch(config_map, inter_dim, kernel_name_str);
+        launch_pad = silu_or_gelu ? intermediate_pad : 0;
+        impl_ptr   = get_heuristic_kernel(
+            inter_dim, sub_X_cnt, config_map, smf, kernel_name_str, 32, model_dim, launch_pad);
         impl_ptr->set_4bit(true);
         is_mxfp4 = true;
     }
@@ -823,6 +915,16 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         else
             AITER_CHECK(false, __func__, " Not find proper cfg in pertokenInt8_g1u1. ");
         impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name_str);
+    }
+    else if(input->dtype() == AITER_DTYPE_fp8 && gate->dtype() == AITER_DTYPE_fp4x2) // mxfp8 X + mxfp4 W
+    {
+        if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Situv2)
+            config_map = &cfg_fmoe_bf16_pertokenMXfp4Fp8_g1u1_situv2;
+        else
+            AITER_CHECK(false, __func__, " Not find proper cfg in pertokenMXfp4Fp8_g1u1. ");
+        impl_ptr = get_heuristic_kernel(
+            inter_dim, sub_X_cnt, config_map, smf, kernel_name_str, /*block_size_M=*/32, model_dim);
+        impl_ptr->set_4bit(true);
     }
     else if(input->dtype() == AITER_DTYPE_fp8) // fp8
     {
@@ -871,7 +973,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                                   fc1_scale,
                                   fc2_scale,
                                   fc2_smooth_scale,
-                                  stream);
+                                  stream,
+                                  launch_pad);
 }
 
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
