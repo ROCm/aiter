@@ -136,6 +136,11 @@ from aiter.ops.moe_mxfp4_aux import (
     _MissingMxfp4MoeAuxInstances,
     is_mxfp4_moe_scatter_supported,
 )
+from aiter.ops.moe_sort_mx_quant import (
+    MOE_SORT_MX_QUANT_COLS,
+    MOE_SORT_MX_QUANT_MAX_ROUTES_PER_BLOCK,
+    moe_sort_mx_quant,
+)
 from aiter.ops.opus import moe_stage2_a8w4 as _opus_a8w4
 from aiter.ops.opus.moe_stage1_a8w4 import (
     opus_a8w4_stage1_wrapper as _opus_a8w4_stage1_wrapper,
@@ -174,6 +179,9 @@ _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "
 # sync with AITER_MXFP4_SORT_QUANT_ROUTES in moe_sorting_opus_kernels.cu.
 _FUSED_DECODE_SORT_QUANT_ROUTES = {(512, 10), (513, 11)}
 _FUSED_DECODE_SORT_QUANT_MAX_M = 128
+# moe_sort_mx_quant_fwd (MXFP8 activations): every block rebuilds the full
+# expert histogram, and by ~2.5K tokens that costs what the saved launches do.
+_FUSED_SORT_MXFP8_QUANT_MAX_M = 2048
 
 # Internal benchmark/test hook (not a public switch): set True to force the
 # generic sort+quant path so base-vs-head latency can be measured from one
@@ -200,15 +208,21 @@ def _is_fused_decode_sort_quant_enabled(
     stage1_is_flydsl: bool,
     hidden_pad: int,
     ksplit: int,
+    prequant: bool = True,
+    num_local_tokens: torch.Tensor | None = None,
 ) -> bool:
-    """Gate the direct-scale HIP route-sort/quant kernel to supported decode.
+    """Gate the fused HIP route-sort/quant kernels to supported decode.
 
-    The shape bounds mirror the kernel's own contract (``model_dim=4096``,
-    ``block_m=32``, ``M`` in ``[1, 128]``, an instantiated ``(E, topk)``
-    route). The remaining conditions are integration requirements: they
-    describe the stage-1 path whose activation quantization this kernel
-    replaces. The fused path is selected automatically whenever every
-    condition matches; it falls back to the generic sort + quant otherwise.
+    Two kernels, selected by the activation dtype. MXFP4 is
+    ``mxfp4_moe_sort_quant_fwd`` (``model_dim=4096``, ``block_m=32``, ``M``
+    in ``[1, 128]``, an instantiated ``(E, topk)`` route). MXFP8 is
+    ``moe_sort_mx_quant_fwd`` (``model_dim`` in ``MOE_SORT_MX_QUANT_COLS``,
+    ``E <= model_dim / 4``, power-of-two ``block_m``, ``M`` up to
+    ``_FUSED_SORT_MXFP8_QUANT_MAX_M`` and within its per-block route limit).
+    The remaining conditions are integration requirements: they describe the
+    stage-1 path whose activation quantization these kernels replace. The
+    fused path is selected automatically whenever every condition matches; it
+    falls back to the generic sort + quant otherwise.
     """
     if _fused_decode_sort_quant_disabled:
         return False
@@ -218,21 +232,39 @@ def _is_fused_decode_sort_quant_enabled(
         return False
     tokens = hidden_states.shape[0] if hidden_states.ndim == 2 else 0
     topk = topk_ids.shape[1] if topk_ids.ndim == 2 else 0
+    model_dim = hidden_states.shape[-1]
+    mxfp4_shape = (
+        q_dtype_a == dtypes.fp4x2
+        and tokens <= _FUSED_DECODE_SORT_QUANT_MAX_M
+        and model_dim == 4096
+        and (global_experts, topk) in _FUSED_DECODE_SORT_QUANT_ROUTES
+        and block_m == 32
+    )
+    mxfp8_shape = (
+        q_dtype_a == dtypes.fp8
+        and tokens <= _FUSED_SORT_MXFP8_QUANT_MAX_M
+        and model_dim in MOE_SORT_MX_QUANT_COLS
+        and 1 <= topk <= global_experts <= model_dim // 4
+        and block_m is not None
+        and block_m > 0
+        and block_m & (block_m - 1) == 0
+        and -(-tokens // get_cu_num()) * topk <= MOE_SORT_MX_QUANT_MAX_ROUTES_PER_BLOCK
+        # Stage 1 reads raw BF16 unless it expects a quantized A.
+        and prequant
+        and num_local_tokens is None
+    )
     return (
         runtime_is_gfx950
         and hidden_states.dtype == dtypes.bf16
-        and 1 <= tokens <= _FUSED_DECODE_SORT_QUANT_MAX_M
-        and hidden_states.shape[1] == 4096
+        and tokens >= 1
+        and (mxfp4_shape or mxfp8_shape)
         and hidden_states.is_contiguous()
         and topk_ids.dtype == dtypes.i32
-        and (global_experts, topk) in _FUSED_DECODE_SORT_QUANT_ROUTES
         and topk_ids.shape[0] == tokens
         and topk_ids.is_contiguous()
         and topk_weights.dtype == dtypes.fp32
         and topk_weights.is_contiguous()
-        and block_m == 32
         and quant_type == QuantType.per_1x32
-        and q_dtype_a == dtypes.fp4x2
         and q_dtype_w == dtypes.fp4x2
         and activation == ActivationType.Silu
         and is_g1u1
@@ -260,10 +292,42 @@ def _fused_decode_sort_quant(
     accumulate: bool,
     compact_scale: bool = False,
     num_local_tokens: torch.Tensor | None = None,
+    q_dtype_a: torch.dtype = dtypes.fp4x2,
+    output: torch.Tensor | None = None,
 ):
     """Return standard sorted metadata plus the pre-quantized stage-1 input."""
     device = hidden_states.device
     tokens = hidden_states.shape[0]
+    if q_dtype_a == dtypes.fp8:
+        # As in moe_sorting, a caller output stands in for moe_buf and is
+        # zeroed in place.
+        if accumulate:
+            moe_buf = (
+                output
+                if output is not None
+                else torch.empty((tokens, model_dim), dtype=moebuf_dtype, device=device)
+            )
+        else:
+            moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
+        (
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            activation_quant,
+            activation_scale,
+        ) = moe_sort_mx_quant(
+            hidden_states, topk_ids, topk_weights, global_experts, block_m, moe_buf
+        )
+        return (
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            activation_quant,
+            activation_scale,
+        )
     route_count = topk_ids.numel()
     active_experts = min(global_experts, route_count)
     max_sorted = (
@@ -1890,6 +1954,8 @@ def _fused_moe_impl(
         stage1_is_flydsl=stage1_func is _flydsl_stage1_wrapper,
         hidden_pad=hidden_pad,
         ksplit=metadata.ksplit,
+        prequant=metadata.prequant,
+        num_local_tokens=num_local_tokens,
     )
     fused_sort_quant = fused_sort_quant and not herd_topk
     # compact-scale variant not ported (its stage-1 change targets the
@@ -2027,6 +2093,8 @@ def _fused_moe_impl(
             accumulate=not runtime_stage2_reduce,
             compact_scale=fused_compact_scale,
             num_local_tokens=num_local_tokens,
+            q_dtype_a=q_dtype_a,
+            output=output if asm_mode.requires_host_sort else None,
         )
         local_topk_ids = None
     else:
