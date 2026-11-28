@@ -165,8 +165,10 @@ and launches them; every FlyDSL launch is compiled into the cache instead.
   token-major and a dense and indexed initial state, and each of those layouts
   over batch sizes the table never measured, where the BV rule decides.
 - `gdn_fused_prefill.py` replays each head shape with and without
-  `track_state` and `has_initial_state` (compile-time flags), over batch
-  sizes from 1 sequence up, bisected where the wrapper's BV rule switches.
+  `track_state` and `has_initial_state` (compile-time flags) and with and
+  without `AITER_GDN_SPLIT_PREFILL=1` (the split path, replayed at no fewer
+  tokens than it needs), over batch sizes from 1 sequence up, bisected where
+  the wrapper's BV rule switches.
 - `fmha_fp8.py` replays a grid of batch sizes and sequence lengths per head
   shape, bisecting between grid points where the wrapper switches kernels.
   Between grid points of the batch and query length the wrapper can still

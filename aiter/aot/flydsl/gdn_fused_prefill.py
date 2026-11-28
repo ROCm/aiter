@@ -9,11 +9,16 @@
 HAS_INIT_FLAG, scale): BV follows the batch's sequence count and the CU count,
 and the two flags follow the optional ``track_state`` / ``has_initial_state``
 arguments, so a serving process would JIT each new combination on the request
-path. This module replays the wrapper itself on FakeTensors inside
+path. With ``AITER_GDN_SPLIT_PREFILL=1`` it runs batches of at least
+``_split_min_tokens`` tokens as the split kernels instead: one prep kernel per
+(H, Hg, scale) and a serial kernel per the same keys as the single kernel.
+This module replays the wrapper itself on FakeTensors inside
 :func:`aiter.aot.flydsl.dry_run.dry_run` (see ``replay.py``) for each head
-shape in ``DEFAULT_SHAPES``, with and without each optional argument, over
-batches of 1 to ``_MAX_SEQUENCES`` sequences, bisected where the BV rule
-switches. Only the default scale is covered.
+shape in ``DEFAULT_SHAPES``, with and without each optional argument and the
+split path, over batches of 1 to ``_MAX_SEQUENCES`` sequences, bisected where
+the BV rule switches. A split replay passes the split path's minimum token
+count wherever the operands still fit 32-bit offsets. Only the default scale
+is covered.
 
 Usage:
     python -m aiter.aot.flydsl.gdn_fused_prefill               # DEFAULT_SHAPES
@@ -25,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import os
 import sys
 
 from aiter.aot.flydsl import replay as _replay
@@ -63,20 +69,23 @@ def unsupported_reason(h: int, hg: int) -> str | None:
 
 
 def jobs_for_shape(h: int, hg: int) -> list[dict]:
-    """A job per optional argument pair, over the BV rule's range of batches."""
+    """A job per optional argument pair and path, over the BV rule's range of
+    batches."""
     return [
         {
-            "kernel_name": f"gdn_fused_prefill_h{h}_hg{hg}",
+            "kernel_name": f"gdn_fused_prefill_h{h}_hg{hg}"
+            + ("_split" if split else ""),
             "gfx": AOT_ARCH_DEFAULT,
             "cu_num": _CU_NUM,
             "H": h,
             "Hg": hg,
             "has_track": has_track,
             "has_init": has_init,
+            "split": split,
             "m": _MAX_SEQUENCES,
             "m_low": 1,
         }
-        for has_track, has_init in itertools.product((False, True), (False, True))
+        for has_track, has_init, split in itertools.product((False, True), repeat=3)
     ]
 
 
@@ -108,6 +117,13 @@ def replay(job: dict) -> None:
 
     h, hg, n = job["H"], job["Hg"], job["m"]
     t = n * _BT
+    if job["split"]:
+        # Where n sequences reach the split path's minimum token count only
+        # with operands past 32-bit offsets, no batch takes the split path, so
+        # the size replays the single kernel.
+        t_split = op._split_min_tokens(n, h)
+        if t_split * (2 * hg * _KD + h * _VD) * 2 < op._MAX_BYTES:
+            t = max(t, t_split)
     # q/k/v as views of one packed projection, as serving stacks pass them.
     mixed = empty(t, 2 * hg * _KD + h * _VD, dtype=torch.bfloat16)
     q, k, v = torch.split(mixed, [hg * _KD, hg * _KD, h * _VD], dim=-1)
@@ -117,21 +133,29 @@ def replay(job: dict) -> None:
         kwargs["track_chunk_idx"] = empty(n, dtype=torch.int32)
     if job["has_init"]:
         kwargs["has_initial_state"] = empty(n, dtype=torch.bool)
-    op.gdn_fused_prefill_fwd(
-        q.view(1, t, hg, _KD),
-        k.view(1, t, hg, _KD),
-        v.view(1, t, h, _VD),
-        empty(1, t, h, dtype=torch.float32),
-        empty(1, t, h, dtype=torch.float32),
-        ssm_states=empty(n, h, _VD, _KD, dtype=torch.bfloat16),
-        cache_indices=empty(n, dtype=torch.int32),
-        cu_seqlens=empty(n + 1, dtype=torch.int32),
-        **kwargs,
-    )
+    previous = os.environ.get(op._SPLIT_ENV)
+    os.environ[op._SPLIT_ENV] = "1" if job["split"] else "0"
+    try:
+        op.gdn_fused_prefill_fwd(
+            q.view(1, t, hg, _KD),
+            k.view(1, t, hg, _KD),
+            v.view(1, t, h, _VD),
+            empty(1, t, h, dtype=torch.float32),
+            empty(1, t, h, dtype=torch.float32),
+            ssm_states=empty(n, h, _VD, _KD, dtype=torch.bfloat16),
+            cache_indices=empty(n, dtype=torch.int32),
+            cu_seqlens=empty(n + 1, dtype=torch.int32),
+            **kwargs,
+        )
+    finally:
+        if previous is None:
+            os.environ.pop(op._SPLIT_ENV)
+        else:
+            os.environ[op._SPLIT_ENV] = previous
 
 
 def describe(job: dict) -> str:
-    flags = " ".join(name for name in ("has_track", "has_init") if job[name])
+    flags = " ".join(name for name in ("has_track", "has_init", "split") if job[name])
     return f"{job['kernel_name']} {job['m']} sequences {flags}".rstrip()
 
 

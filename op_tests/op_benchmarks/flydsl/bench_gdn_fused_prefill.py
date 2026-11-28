@@ -6,6 +6,8 @@
 Per shape, one GDN prefill layer on the same GPU and operands:
 
   fused    ``gdn_fused_prefill_fwd`` (one launch)
+  split    the same call on its split path (``AITER_GDN_SPLIT_PREFILL=1``,
+           forced at any batch size): prep + serial kernels
   opt_vk   ``chunk_gated_delta_rule_opt_vk`` with the FlyDSL prepare stage and
            each hidden-state backend in ``--backends``; the table reports the
            fastest one
@@ -24,6 +26,7 @@ Shapes default to the (H, Hg) x (T, N) grid of the Qwen3.5 tables in
            recurrence (checked against the token-by-token reference of
            op_tests/test_gdn_fused_prefill.py at startup)
   gate     ``gdn_fused_prefill_supported(..., max_seqlen=T / N)``
+  split equal  split o and pool ``torch.equal`` to fused
 
 Usage, from the repo root (the ``op_tests`` import needs it on sys.path):
 
@@ -50,6 +53,7 @@ from op_tests.test_gdn_fused_prefill import (
     _rel_l2,
     _seq_errors,
     run_torch_reference,
+    split_path,
 )
 
 BT = 64
@@ -174,26 +178,31 @@ def bench_shape(h, hg, t, n, backends):
             q, k, v, g, beta, ssm_states=pool, cache_indices=idx, cu_seqlens=cu
         )
 
-    candidates = {"fused": fused}
+    # "split" is the fused call with the split path forced on.
+    candidates = {"fused": fused, "split": fused}
     for backend in backends:
         candidates[backend] = _opt_vk_candidate(
             q, k, v, g, beta, cu, seq_lens, idx, backend
         )
 
-    res = {}
+    res, outs = {}, {}
     for name, fn in candidates.items():
-        pool = pool0.clone()
-        o_errs, s_errs, _ = _seq_errors(
-            fn(pool), o_ref, pool, final_ref, cu, idx, range(n)
-        )
-        _, us = run_perftest(fn, pool0.clone(), num_iters=20, num_warmup=3)
-        _, wall = run_perftest(
-            fn, pool0.clone(), num_iters=20, num_warmup=3, use_cuda_event=True
-        )
+        with split_path(name == "split", force=True):
+            pool = pool0.clone()
+            o = fn(pool)
+            # Rows past cu[-1] (T % N of them) are left uninitialized.
+            outs[name] = (o[:, : int(cu[-1])], pool)
+            o_errs, s_errs, _ = _seq_errors(
+                o, o_ref, pool, final_ref, cu, idx, range(n)
+            )
+            _, us = run_perftest(fn, pool0.clone(), num_iters=20, num_warmup=3)
+            _, wall = run_perftest(
+                fn, pool0.clone(), num_iters=20, num_warmup=3, use_cuda_event=True
+            )
         res[name] = (us, wall, max(o_errs.values()), max(s_errs.values()))
 
     best = min(backends, key=lambda b: res[b][0])
-    fu, bu = res["fused"], res[best]
+    fu, bu, su = res["fused"], res[best], res["split"]
     row = {
         "H": h,
         "Hg": hg,
@@ -212,6 +221,11 @@ def bench_shape(h, hg, t, n, backends):
         "fused state rel_l2": fu[3],
         "opt_vk o rel_l2": bu[2],
         "opt_vk state rel_l2": bu[3],
+        "split us": su[0],
+        "split speedup": fu[0] / su[0],
+        "split wall us": su[1],
+        "split wall speedup": fu[1] / su[1],
+        "split equal": all(map(torch.equal, outs["split"], outs["fused"])),
     }
     for backend in backends:
         row[f"{backend} us"] = res[backend][0]

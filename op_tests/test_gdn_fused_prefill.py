@@ -8,12 +8,15 @@ one packed projection (the layout serving stacks pass) and compares the
 output, the updated pool slots and the tracked chunk-boundary states against
 an fp32 token-by-token recurrence. Rows with has_initial_state False start from
 zero whatever their slot holds. Padding rows (slot -1) must write no pool slot
-or track row, and slots outside the batch must stay untouched.
+or track row, and slots outside the batch must stay untouched. The split path
+(``AITER_GDN_SPLIT_PREFILL=1``) must reproduce the single kernel bit for bit.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import pandas as pd
@@ -60,6 +63,11 @@ SHAPES = {
     "qwen35_tp2_varlen": FusedShape((128, 172, 300), 8, 16),
     "qwen35_tp2_long_mixed": FusedShape((8192, 512, 256), 8, 16),
 }
+# Split-path cases beyond SHAPES: a chunk edge and a zero-length sequence.
+SPLIT_SHAPES = {
+    "t65": FusedShape((65,), 16, 48),
+    "zero_length": FusedShape((300, 0, 64), 16, 48),
+}
 
 
 def _load():
@@ -69,6 +77,46 @@ def _load():
     )
 
     return gdn_fused_prefill_fwd, gdn_fused_prefill_supported
+
+
+@contextmanager
+def split_path(enabled: bool, force: bool = False):
+    """Run ``gdn_fused_prefill_fwd`` on the split path (at any batch size when
+    ``force``) or on the single kernel."""
+    from aiter.ops.flydsl import gdn_fused_prefill as op
+
+    env, rule = os.environ.get(op._SPLIT_ENV), op._split_min_tokens
+    os.environ[op._SPLIT_ENV] = "1" if enabled else "0"
+    if force:
+        op._split_min_tokens = lambda N, H: 0
+    try:
+        yield
+    finally:
+        op._split_min_tokens = rule
+        if env is None:
+            os.environ.pop(op._SPLIT_ENV)
+        else:
+            os.environ[op._SPLIT_ENV] = env
+
+
+@contextmanager
+def _nan_handoff():
+    """NaN-fill the split path's hand-off, so that an element the serial kernel
+    reads but the prep kernel leaves unwritten reaches o. Yields the list of
+    hand-off allocations."""
+    from aiter.ops.flydsl import gdn_fused_prefill as op
+
+    alloc, calls = op._handoff_buffer, []
+
+    def nan_buffer(numel, dtype, device):
+        calls.append(numel)
+        return alloc(numel, dtype, device).fill_(float("nan"))
+
+    op._handoff_buffer = nan_buffer
+    try:
+        yield calls
+    finally:
+        op._handoff_buffer = alloc
 
 
 def _opt_vk_candidate(q, k, v, g, beta, cu, seq_lens, idx, backend):
@@ -348,6 +396,58 @@ def test_gdn_fused_prefill(name, seq_lens, hg, h):
     return ret
 
 
+def test_split_matches_fused(name, seq_lens, hg, h):
+    """The split path, forced at any batch size here, reproduces the single
+    kernel's o (live rows), pool and track rows bit for bit, with fresh
+    (has_initial_state False, NaN) slots and with padding rows."""
+    fwd, _ = _load()
+    q, k, v, g, beta, cu, pool0, idx, track_idx = _make_inputs(
+        FusedShape(tuple(seq_lens), hg, h)
+    )
+    n = len(seq_lens)
+    has_init = torch.arange(n) % 2 == 1
+    fresh = pool0.clone()
+    fresh[idx[~has_init].long()] = float("nan")
+    idx_pad = idx.clone()
+    idx_pad[0::2] = -1
+    for cache, pool_in, kwargs in (
+        (idx, fresh, {"has_initial_state": has_init}),
+        (idx_pad, pool0, {}),
+    ):
+        live = torch.zeros(q.shape[1], dtype=torch.bool)
+        for i in range(n):
+            if cache[i] >= 0:
+                live[int(cu[i]) : int(cu[i + 1])] = True
+        runs = []
+        for split in (False, True):
+            pool = pool_in.clone()
+            track = torch.full((n, h, V, K), 7.0, dtype=torch.float32)
+            with split_path(split, force=True), _nan_handoff() as calls:
+                o = fwd(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    ssm_states=pool,
+                    cache_indices=cache,
+                    cu_seqlens=cu,
+                    track_state=track,
+                    track_chunk_idx=track_idx,
+                    **kwargs,
+                )
+                torch.cuda.synchronize()
+            assert len(calls) == (
+                2 if split else 0
+            ), f"{name}: {len(calls)} hand-off allocations, split={split}"
+            runs.append((o[0, live], pool, track))
+        (o_ref, pool_ref, track_ref), (o_split, pool_split, track_split) = runs
+        tag = f"{name}{' padded' if not kwargs else ''}"
+        assert torch.equal(o_split, o_ref), f"{tag}: split o differs"
+        assert torch.equal(pool_split, pool_ref), f"{tag}: split pool differs"
+        assert torch.equal(track_split, track_ref), f"{tag}: split track differs"
+
+
 def _run_contract_checks():
     fwd, supported = _load()
     q, k, v, g, beta, cu, pool, idx, _ = _make_inputs(SHAPES["qwen35_tp8_tail"])
@@ -370,6 +470,23 @@ def _run_contract_checks():
         assert supported(q, k, v, g, beta, pool), f"{shape}: operands rejected"
         got = supported(q, k, v, g, beta, pool, max_seqlen=q.shape[1])
         assert got == expect, f"{shape}: perf gate returned {got}"
+
+    # With the env var set, the split path takes a batch from _SPLIT_MIN_TOKENS
+    # tokens; below _SPLIT_MIN_HEADS value heads, only if its sequences average
+    # that many.
+    from aiter.ops.flydsl import gdn_fused_prefill as op
+
+    m, many_heads = op._SPLIT_MIN_TOKENS, op._SPLIT_MIN_HEADS
+    for seq_lens, hg, h, allocations in (
+        ((m - 1,), 2, 8, 0),
+        ((m,), 2, 8, 2),
+        ((m, m - 2), 2, 8, 0),
+        ((m // 2, m // 2), 8, many_heads, 2),
+    ):
+        q, k, v, g, beta, cu, pool, idx, _ = _make_inputs(FusedShape(seq_lens, hg, h))
+        with split_path(True), _nan_handoff() as calls:
+            fwd(q, k, v, g, beta, ssm_states=pool, cache_indices=idx, cu_seqlens=cu)
+        assert len(calls) == allocations, f"{seq_lens}, H={h}: {len(calls)} hand-offs"
 
 
 def main():
@@ -401,6 +518,10 @@ def main():
     aiter.logger.info(
         "gdn_fused_prefill summary:\n%s", pd.DataFrame(rows).to_markdown()
     )
+    split_shapes = {name: SHAPES[name] for name in args.shapes} | SPLIT_SHAPES
+    for name, shape in split_shapes.items():
+        test_split_matches_fused(name, list(shape.seq_lens), shape.hg, shape.h)
+    aiter.logger.info("split path matches fused on %d shapes", len(split_shapes))
 
 
 if __name__ == "__main__":
