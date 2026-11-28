@@ -245,8 +245,34 @@ def test_loader_opens_by_name_when_nothing_is_loaded(fresh_loader, monkeypatch):
     assert hip_runtime.load_hip_runtime() == "opened:libamdhip64.so"
 
 
-def test_loader_does_not_probe_loaded_runtimes_on_windows(fresh_loader, monkeypatch):
+@pytest.mark.parametrize(
+    "torch_hip, dll, handle",
+    [("7.2.53211", "amdhip64_7.dll", 0x7000), ("6.4.43482", "amdhip64_6.dll", 0x6000)],
+)
+def test_loader_binds_to_torch_runtime_on_windows(
+    fresh_loader, monkeypatch, torch_hip, dll, handle
+):
     monkeypatch.setattr(hip_runtime.sys, "platform", "win32")
+    torch = SimpleNamespace(version=SimpleNamespace(hip=torch_hip))
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    loaded = {"amdhip64_6.dll": 0x6000, "amdhip64_7.dll": 0x7000}
+    monkeypatch.setattr(
+        hip_runtime, "_windows_loaded_module", lambda n: loaded.get(n, 0)
+    )
+    library_names = mock.Mock(return_value=("amdhip64.dll",))
+    monkeypatch.setattr(hip_runtime, "_library_names", library_names)
+    cdll = mock.Mock(return_value="dll")
+    monkeypatch.setattr(hip_runtime.ctypes, "CDLL", cdll)
+    assert hip_runtime.load_hip_runtime() == "dll"
+    cdll.assert_called_once_with(dll, handle=handle)
+    library_names.assert_not_called()
+
+
+def test_loader_opens_by_name_on_windows_when_nothing_is_loaded(
+    fresh_loader, monkeypatch
+):
+    monkeypatch.setattr(hip_runtime.sys, "platform", "win32")
+    monkeypatch.setattr(hip_runtime, "_windows_loaded_module", lambda name: 0)
     monkeypatch.setattr(hip_runtime, "_library_names", lambda: ("amdhip64_7.dll",))
     cdll = mock.Mock(return_value="dll")
     monkeypatch.setattr(hip_runtime.ctypes, "CDLL", cdll)
