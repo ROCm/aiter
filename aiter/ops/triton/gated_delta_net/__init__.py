@@ -12,6 +12,9 @@ from aiter.ops.triton._triton_kernels.gated_delta_net.utils import (
     GatedDeltaRulePrefillMetadata,
     build_gated_delta_rule_prefill_metadata,
 )
+from aiter.ops.triton.gated_delta_net.causal_conv1d_bwd import (
+    causal_conv1d_split_qkv_bwd_triton_fn,
+)
 from aiter.ops.triton.gated_delta_net.causal_conv1d_decode import (
     causal_conv1d_update_split_qkv,
 )
@@ -40,6 +43,7 @@ from aiter.ops.triton.gated_delta_net.gated_delta_rule import (
 __all__ = [
     "GatedDeltaRulePrefillMetadata",
     "build_gated_delta_rule_prefill_metadata",
+    "causal_conv1d_split_qkv_bwd_triton_fn",
     "causal_conv1d_split_qkv_triton_fn",
     "causal_conv1d_split_qkv_triton_tile_fn",
     "causal_conv1d_update_split_qkv",
