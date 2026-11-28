@@ -390,6 +390,35 @@ def test_shared_in_fits_the_served_verify_buckets_and_not_a_narrow_grid():
             ), change
 
 
+def test_shared_in_fits_the_64_row_routed_tile_buckets():
+    """The 256 / 512 small-input buckets of EP8 V4.1-Flash run 64-row routed tiles; the shared pre-phase runs its
+    own 32-row tile bodies either way, so shared_in fits wherever every shared unit finds a consumer workgroup.
+    """
+    from dataclasses import replace
+
+    from aiter.ops.flydsl.kernels.mega_moe import mega_moe_small_m as sm
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import select_fused_config
+
+    for bucket, rows in ((256, 187), (256, 256), (512, 300), (512, 384)):
+        config = select_fused_config(
+            bucket, 512, world_size=8, experts_per_rank=48, model_dim=D, inter_dim=INTER
+        )
+        consumers = (
+            256 * min(config.stage1.grid_mult, 2) - 1 - config.stage1.num_dispatch_cu
+        )
+        fits = (rows + 31) // 32 * (D // 256) <= consumers
+        assert sm.shared_in_fits(config, rows, 256, D, INTER) == fits, (bucket, rows)
+        assert config.stage1.sort_block_m == 64, (bucket, config.stage1.sort_block_m)
+        narrow = replace(
+            config,
+            stage1=replace(config.stage1, sort_block_m=32),
+            stage2=replace(config.stage2, block_m=32),
+        )
+        assert sm.shared_in_fits(narrow, rows, 256, D, INTER) == fits
+        wide = replace(config, stage1=replace(config.stage1, sort_block_m=128))
+        assert not sm.shared_in_fits(wide, rows, 256, D, INTER)
+
+
 def test_dispatch_slots_and_sync_offsets_do_not_collide():
     from aiter.ops.flydsl.kernels.mega_moe import mega_moe_small_m as sm
 
@@ -556,8 +585,8 @@ def test_shared_in_fits_the_ep4_verify_buckets(override):
                 assert not any(
                     sm.shared_in_fits(config, t, 256, D, INTER) for t in rows
                 ), bucket
-    # Graph bs 1 (6 rows) .. 31 (186 rows) fuse; the token-wise combine buckets (1-5 rows) and the 64-row tiles of
-    # 192+ rows keep the dense shared expert.
+    # 6..256 rows fuse, the 256 bucket's 64-row routed tiles too (the shared units are 32-row tiles of their own);
+    # the token-wise combine buckets (1-5 rows) keep the dense shared expert.
     assert fits == {
         1: False,
         4: False,
@@ -566,7 +595,7 @@ def test_shared_in_fits_the_ep4_verify_buckets(override):
         32: True,
         64: True,
         128: True,
-        256: False,
+        256: True,
     }
 
 
@@ -589,10 +618,8 @@ def test_ep4_runtime_picks_the_split_of_each_graph_batch_and_skips_what_it_canno
     assert rt._shared_in_ksplits(8) == [1] and rt._shared_in_ksplits(16) == [1]
     assert rt._shared_in_ksplits(32) == [1, 2] and rt._shared_in_ksplits(64) == [1, 2]
     assert (
-        rt._shared_in_ksplits(1) == []
-        and rt._shared_in_ksplits(4) == []
-        and rt._shared_in_ksplits(256) == []
-    )
+        rt._shared_in_ksplits(1) == [] and rt._shared_in_ksplits(4) == []
+    ) and rt._shared_in_ksplits(256) == [1]
 
     # A re-tuned table: gate_up split-K 4 at 33..48 rows, unsplit at 49..64, a split down GEMM at 13..16 rows and
     # no tuned row from 100 rows on. The kernel follows the table or leaves those rows to the dense launches.
@@ -648,6 +675,14 @@ def test_dense_kernel_ksplit_reads_the_tuned_rows_kernel_name(monkeypatch):
             "kernelName": "flydsl_mxfp8_8w_256x256x128_F8_F8_B16_2x4",
             "splitK": 1,
         },
+        (8, 2 * INTER, D): {
+            "kernelName": "flydsl_mxfp8_8w_256x256x128_F8_F8_B16_2x4_ks2",
+            "splitK": 2,
+        },
+        (9, 2 * INTER, D): {
+            "kernelName": "flydsl_some_other_gemm_256x256x128",
+            "splitK": 1,
+        },
     }
     seen = []
 
@@ -660,7 +695,10 @@ def test_dense_kernel_ksplit_reads_the_tuned_rows_kernel_name(monkeypatch):
         se.dense_kernel_ksplit(48, 2 * INTER, D) == 2
         and se.dense_kernel_ksplit(96, D, INTER) == 1
     )
-    assert se.dense_kernel_ksplit(7, 2 * INTER, D) == 0  # a kernel name without a split
+    # the 8-wave MXFP8 kernel: no "_sk"; unsplit without "_ks<N>"
+    assert se.dense_kernel_ksplit(7, 2 * INTER, D) == 1
+    assert se.dense_kernel_ksplit(8, 2 * INTER, D) == 2
+    assert se.dense_kernel_ksplit(9, 2 * INTER, D) == 0  # a kernel name without a split
     assert (
         se.dense_kernel_ksplit(20, 2 * INTER, D) == 0
     )  # untuned: the dense launch runs a heuristic kernel

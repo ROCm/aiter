@@ -276,6 +276,7 @@ AOT_CACHES = {
             "AITER_MEGA_FIXED_SLOT_MAX_MTPR",
             "AITER_MEGA_FUSED_BUCKET_MAP",
             "AITER_MEGA_FUSED_DRAFT_LAYOUT",
+            "AITER_MEGA_SHARED_IN",
             "AITER_MEGA_SMALL_M_OVERRIDE",
         ),
     },
