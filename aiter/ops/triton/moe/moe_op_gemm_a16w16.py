@@ -1,16 +1,24 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MoE GEMM with 16-bit activations and 16-bit weights (gfx1250 Gluon)."""
+"""MoE GEMM with 16-bit activations and weights.
+
+This module owns the existing public ``moe_gemm_a16w16`` wrapper and extends
+it with a config-driven Triton backend surface. The validated public large-M
+enablement still lives in the gfx1201-specific fused-MoE follow-up path.
+"""
 
 import torch
 import triton
 
-from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a16w16 import (
-    _moe_gemm_a16w16,
-    get_moe_a16w16_layouts,
+from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a16w16 import (
+    _moe_gemm_a16w16 as _moe_gemm_a16w16_kernel_triton,
 )
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
+from aiter.ops.triton.moe.moe_routing.topk_align import (
+    align_topk_ids,
+    get_topk_align_config,
+)
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -31,6 +39,25 @@ def is_gluon_available():
         return get_arch() in _GLUON_SUPPORTED_ARCHS
     except Exception:  # noqa: BLE001
         return False
+
+
+def is_triton_a16w16_available():
+    """True when the current GPU arch ships Triton A16W16 MoE configs."""
+    try:
+        return bool(get_moe_dispatch("MOE-GEMM-A16W16", get_arch(), "triton"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _load_gluon_backend():
+    from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a16w16 import (
+        _moe_gemm_a16w16 as _moe_gemm_a16w16_gluon,
+    )
+    from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a16w16 import (
+        get_moe_a16w16_layouts,
+    )
+
+    return _moe_gemm_a16w16_gluon, get_moe_a16w16_layouts
 
 
 def can_overflow_int32(tensor: torch.Tensor):
@@ -86,13 +113,7 @@ def allocate_output(
 
 
 def get_kernel_config_gluon(m, n, k, routing_data, apply_swiglu=False):
-    """Tuned config for one call.
-
-    A call that fuses SwiGLU needs its own entry. The epilogue splits the whole
-    BLOCK_M x BLOCK_N accumulator, so it spills above block_n=128: 260 spilled
-    registers at 256 and 516 at 512, which costs 10x. A call without SwiGLU
-    prefers the wider tile, so the two cannot share one entry.
-    """
+    """Tuned gfx1250 Gluon config for one call."""
     block_m = routing_data.block_m
 
     tuned = get_moe_dispatch("A16W16", get_arch(), "gluon")
@@ -116,6 +137,160 @@ def get_kernel_config_gluon(m, n, k, routing_data, apply_swiglu=False):
     config["block_m"] = block_m
     config["num_buffers"] = num_buffers
     return config
+
+
+def _get_kernel_config_triton(block_m: int, n: int, k: int):
+    key = f"bm{block_m}_n{n}_k{k}"
+    dispatch = get_moe_dispatch("MOE-GEMM-A16W16", get_arch(), "triton")
+    if key not in dispatch:
+        raise NotImplementedError(f"MOE-GEMM-A16W16 config is not available for {key}")
+    config = dict(dispatch[key])
+    w_cache_modifier = (
+        config["w_cache_modifier"]
+        if block_m <= config["w_cache_modifier_block_m_leq"]
+        else None
+    )
+    return {
+        "block_m": block_m,
+        "block_n": config["block_n"],
+        "block_k": config["block_k"],
+        "group_m": config["group_m"],
+        "xcd_swizzle": config["xcd_swizzle"],
+        "w_cache_modifier": w_cache_modifier,
+        "split_k": 1,
+        "num_warps": config["num_warps"],
+        "num_stages": config["num_stages"],
+    }
+
+
+def build_routing_from_topk(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    num_experts: int,
+    block_m: int = 32,
+):
+    return align_topk_ids(
+        topk_ids, topk_weights, num_experts=num_experts, block_m=block_m
+    )
+
+
+def _moe_gemm_a16w16_triton(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    *,
+    routing_data: RoutingData,
+    gather_indx=None,
+    scatter_indx=None,
+    gammas=None,
+    out_dtype=torch.bfloat16,
+    apply_swiglu=False,
+    alpha=1.0,
+    limit=1.0,
+    swiglu_add_residual=True,
+    bias=None,
+):
+    assert is_triton_a16w16_available(), (
+        "Triton moe_gemm_a16w16 requires a MOE-GEMM-A16W16 config for the "
+        f"running arch, got {get_arch()!r}"
+    )
+    assert bias is None, "Triton moe_gemm_a16w16 does not support bias"
+    if apply_swiglu:
+        assert alpha == 1.0, "Triton a16w16 only supports alpha=1.0"
+        assert limit == 1.0, "Triton a16w16 only supports limit=1.0"
+        assert (
+            swiglu_add_residual
+        ), "Triton a16w16 requires swiglu_add_residual=True"
+
+    assert x.dtype in (torch.bfloat16, torch.float16)
+    assert w.dtype in (torch.bfloat16, torch.float16)
+    assert x.is_contiguous()
+    assert w.is_contiguous()
+
+    num_rows = x.shape[-2] if gather_indx is None else gather_indx.shape[0]
+    num_experts, n, k = w.shape
+    assert num_experts == routing_data.n_expts_tot
+    assert x.shape[-1] == k
+    cfg = _get_kernel_config_triton(routing_data.block_m, n, k)
+
+    reduction_n_matmul = 2 if apply_swiglu else 1
+    reduction_n_reduction = 1
+    y, y_final = allocate_output(
+        num_rows,
+        n,
+        out_dtype,
+        reduction_n_matmul,
+        reduction_n_reduction,
+        routing_data,
+        scatter_indx,
+        cfg["split_k"],
+        x.device,
+    )
+
+    expt_data = routing_data.expt_data
+    expt_hist = None if expt_data is None else expt_data.hist
+    expt_hist_sum = None if expt_data is None else expt_data.token_offs_pad[-1]
+    expt_token_offs_raw = None if expt_data is None else expt_data.token_offs_raw
+    expt_block_pid_map = None if expt_data is None else expt_data.block_pid_map
+
+    out_n = n // reduction_n_matmul
+    grid_m = routing_data.n_blocks(num_rows, cfg["block_m"])
+    grid_n = triton.cdiv(out_n, cfg["block_n"])
+    grid = grid_m * grid_n
+
+    _moe_gemm_a16w16_kernel_triton[(grid,)](
+        y,
+        y.stride(0),
+        y.stride(1),
+        y.stride(2),
+        x,
+        x.stride(0),
+        x.stride(1),
+        w,
+        w.stride(0),
+        w.stride(1),
+        w.stride(2),
+        gammas,
+        n,
+        k,
+        gather_indx,
+        expt_hist,
+        expt_token_offs_raw,
+        expt_hist_sum,
+        expt_block_pid_map,
+        grid_m,
+        grid_n,
+        apply_swiglu,
+        routing_data.n_expts_act,
+        cfg["block_m"],
+        cfg["block_n"],
+        cfg["block_k"],
+        cfg["group_m"],
+        cfg["xcd_swizzle"],
+        k % cfg["block_k"] == 0,
+        k % cfg["block_k"],
+        cfg["w_cache_modifier"],
+        False,
+        num_warps=cfg["num_warps"],
+        num_stages=cfg["num_stages"],
+    )
+
+    group_indx = (
+        None
+        if scatter_indx is None
+        else scatter_indx.view(-1, routing_data.n_expts_act)
+    )
+    return reduce_grouped(
+        y,
+        group_indx,
+        y_final,
+        False,
+        alpha,
+        limit,
+        reduction_n_reduction,
+        out_dtype=out_dtype,
+        swiglu_add_residual=swiglu_add_residual,
+    )
 
 
 def moe_gemm_a16w16(
@@ -145,42 +320,16 @@ def moe_gemm_a16w16(
     Y[:, :] = 0.
     for e in num_experts:
         Y[idxs_y_m(e), :] += matmul(X[idxs_x_m(e), :], W[e, :, :])
-
-    Args:
-        x (torch.Tensor): Activations with shape (num_tokens, K/hidden_dim). Must be 16-bit
-        w (torch.Tensor): Weight tensor with shape (E/num_experts_total, K/hidden_dim, N/int_dim).
-            Must be 16-bit and N-contiguous (``w.stride(-1) == 1``)
-        x_scales: Must be None since activations are 16-bit
-        w_scales: Must be None since weights are 16-bit
-        x_static_scale: Must be None
-        quant_static_scale: Must be None
-        bias(torch.Tensor): Optional bias tensor
-        routing_data: Generated by the routing kernels
-        gather_indx: Generated along with routing data by routing kernels
-        scatter_indx: Generated along with routing data by routing kernels
-        gammas(torch.Tensor): Optional gammas tensor
-        out_dtype(dtype): output dtype
-        apply_swiglu(bool): Whether to apply swiglu activation
-        alpha(float): swiglu alpha
-        limit(float): swiglu clamp limit
-        swiglu_add_residual(bool): Whether to add swiglu residual
-        backend(Optional[str]): "gluon" or None. Only the gluon backend exists
-            for this op, and only on gfx1250.
-
-    Returns:
-        torch.Tensor: Output with shape (num_tokens, N) or, with swiglu, (num_tokens, N // 2)
     """
-    # Read the arch first. A get_arch() call inside the assert message would
-    # re-raise the exception that is_gluon_available() catches, and hide it.
     arch = get_arch()
-    assert is_gluon_available(), (
-        f"moe_gemm_a16w16 is only implemented for {_GLUON_SUPPORTED_ARCHS}, got "
-        f"{arch}. There is no triton fallback for this op."
+    backend_name = None if backend is None else backend.lower()
+    use_gluon = backend_name in (None, "gluon") and is_gluon_available()
+    use_triton_a16w16 = backend_name in (None, "triton") and is_triton_a16w16_available()
+
+    assert use_gluon or use_triton_a16w16, (
+        "moe_gemm_a16w16 is implemented only for gfx1250/gluon or "
+        f"config-backed Triton, got arch={arch!r}, backend={backend!r}"
     )
-    if backend is not None:
-        assert (
-            backend.lower() == "gluon"
-        ), f"Unknown backend '{backend}', moe_gemm_a16w16 only has a 'gluon' backend"
 
     assert x_scales is None, "x_scales must be none"
     assert w_scales is None, "w_scales must be none"
@@ -189,7 +338,7 @@ def moe_gemm_a16w16(
     assert x.dtype.itemsize == 2, f"x must be 16-bit, got {x.dtype}"
     assert w.dtype.itemsize == 2, f"w must be 16-bit, got {w.dtype}"
     assert out_dtype.itemsize == 2, f"out_dtype must be 16-bit, got {out_dtype}"
-    assert w.stride(-1) == 1, "`w` must be N-contiguous, i.e. (E, K, N) row-major"
+    assert w.stride(-1) == 1, "`w` must be contiguous along its last dim"
 
     _LOGGER.info(
         "MOE_GEMM_A16W16: x=%s w=%s bias=%s apply_swiglu=%s",
@@ -198,6 +347,26 @@ def moe_gemm_a16w16(
         None if bias is None else bias.shape,
         apply_swiglu,
     )
+
+    if use_triton_a16w16:
+        assert unpadded_N is None, "Triton moe_gemm_a16w16 has no unpadded_N"
+        assert unpadded_K is None, "Triton moe_gemm_a16w16 has no unpadded_K"
+        return _moe_gemm_a16w16_triton(
+            x,
+            w,
+            routing_data=routing_data,
+            gather_indx=gather_indx,
+            scatter_indx=scatter_indx,
+            gammas=gammas,
+            out_dtype=out_dtype,
+            apply_swiglu=apply_swiglu,
+            alpha=alpha,
+            limit=limit,
+            swiglu_add_residual=swiglu_add_residual,
+            bias=bias,
+        )
+
+    _moe_gemm_a16w16_gluon, get_moe_a16w16_layouts = _load_gluon_backend()
 
     # determine shapes
     M = x.shape[-2] if gather_indx is None else gather_indx.shape[0]
@@ -221,7 +390,6 @@ def moe_gemm_a16w16(
         apply_swiglu_reduction = False
         reduction_n_reduction = 1
 
-    # allocate output memory
     y, y_final = allocate_output(
         M,
         N,
@@ -235,19 +403,17 @@ def moe_gemm_a16w16(
     )
     stride_bias = None if bias is None else bias.stride(0)
 
-    # moe metadata
     expt_data = routing_data.expt_data
     expt_hist = None if expt_data is None else expt_data.hist
     expt_hist_sum = None if expt_data is None else expt_data.token_offs_pad[-1]
     expt_token_offs_raw = None if expt_data is None else expt_data.token_offs_raw
     expt_block_pid_map = None if expt_data is None else expt_data.block_pid_map
 
-    # spmd grid
     grid_m = routing_data.n_blocks(M, config["block_m"])
     grid_n = triton.cdiv(N, config["block_n"])
     grid = grid_m * grid_n * config["split_k"]
 
-    _moe_gemm_a16w16[(grid,)](
+    _moe_gemm_a16w16_gluon[(grid,)](
         y,
         y.stride(0),
         y.stride(1),
@@ -324,3 +490,43 @@ def moe_gemm_a16w16(
     )
 
     return y_final
+
+
+def fused_moe_bf16_g1u1_gfx1201_large_m(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    output: torch.Tensor | None = None,
+):
+    """gfx1201 BF16 G1U1 selected-large-M path built on current MoE ops."""
+    assert w1.is_contiguous()
+    assert w2.is_contiguous()
+    experts = w1.shape[0]
+    route_cfg = get_topk_align_config()
+    routing_data, gather_indx, scatter_indx, sorted_weights = build_routing_from_topk(
+        topk_ids, topk_weight, num_experts=experts, block_m=route_cfg["block_m"]
+    )
+    stage1 = moe_gemm_a16w16(
+        hidden_states.contiguous(),
+        w1,
+        routing_data=routing_data,
+        gather_indx=gather_indx,
+        apply_swiglu=True,
+        out_dtype=torch.bfloat16,
+        backend="triton",
+    )
+    ret = moe_gemm_a16w16(
+        stage1.contiguous(),
+        w2,
+        routing_data=routing_data,
+        scatter_indx=scatter_indx,
+        gammas=sorted_weights,
+        out_dtype=torch.bfloat16,
+        backend="triton",
+    )
+    if output is None:
+        return ret
+    return output.copy_(ret)

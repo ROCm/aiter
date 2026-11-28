@@ -1,0 +1,7 @@
+{
+  "any": {
+    "block_m": 32,
+    "route_block": 256,
+    "num_warps": 8
+  }
+}
