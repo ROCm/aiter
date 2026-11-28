@@ -57,6 +57,17 @@ V41_FLASH_EP4_LAYOUT = (4, 96, 5120, 2304)
 V41_FLASH_EP2_LAYOUT = (2, 192, 5120, 2304)
 # EP8 DeepSeek-V4.1-Flash: V4-Pro's rank / expert geometry with V4.1-Flash's dims.
 V41_FLASH_EP8_LAYOUT = (8, 48, 5120, 2304)
+# DeepSeek-V4.1-Flash DSpark draft MoE (the shared expert computed apart): 128 routed experts
+# (dspark_n_routed_experts), topk 3, the target model's dims.
+V41_FLASH_DRAFT_EXPERTS = 128
+V41_FLASH_DRAFT_TOPK = 3
+# Its EP8 layout, 16 experts a rank: the small-input kernel only; larger calls keep the staged route.
+V41_FLASH_EP8_DRAFT_LAYOUT = (8, 16, 5120, 2304)
+# The draft MoE on every expert-parallel width (1, 2, 4 or 8 ranks); the EP1 / EP2 / EP4 ones take the staged
+# route only. Every route of each returns BF16 rows (BF16_RETURN_LAYOUTS).
+V41_FLASH_DRAFT_LAYOUTS = frozenset(
+    (world, V41_FLASH_DRAFT_EXPERTS // world, 5120, 2304) for world in (1, 2, 4, 8)
+)
 # (world_size, model_dim, inter_dim, experts, topk) of the layouts the fused (small- and large-input) kernels
 # serve: EP8 DeepSeek-V4-Pro and EP4 / EP2 / EP8 DeepSeek-V4.1-Flash.
 FUSED_LAYOUTS = frozenset(
@@ -70,8 +81,22 @@ FUSED_LAYOUTS = frozenset(
                 V41_FLASH_EP8_LAYOUT,
             )
         ),
+        (
+            V41_FLASH_EP8_DRAFT_LAYOUT[0],
+            *V41_FLASH_EP8_DRAFT_LAYOUT[2:],
+            V41_FLASH_EP8_DRAFT_LAYOUT[0] * V41_FLASH_EP8_DRAFT_LAYOUT[1],
+            V41_FLASH_DRAFT_TOPK,
+        ),
     }
 )
+# (world_size, experts_per_rank, model_dim, inter_dim) of the FUSED_LAYOUTS layouts without a large-input kernel.
+SMALL_M_ONLY_LAYOUTS = frozenset({V41_FLASH_EP8_DRAFT_LAYOUT})
+# (world_size, experts_per_rank, model_dim, inter_dim) of the layouts whose expert outputs go back to their source
+# rank as BF16 rows on every route: the staged route's p2p_quant "auto" resolves to "none" at every MTPR, and the
+# small-input kernel sends BF16 rows on every rank (bf16_rows_always). The DSpark draft MoE's precision is that of
+# the default (non-mega) MoE backend, whose MoRI combine returns BF16: every V4.1-Flash draft layout, whatever
+# its expert-parallel width.
+BF16_RETURN_LAYOUTS = V41_FLASH_DRAFT_LAYOUTS
 K3_MODEL_DIM, K3_INTER_DIM = 3584, 3072
 # EPLB redundant-expert profiles (r32 / r64) share V4-Pro's shape and FP4
 # prelude but have no per-bucket tuner of their own.
@@ -100,9 +125,10 @@ LARGE_M_MTPRS = (1024, 2048, 4096, 8192, 16384)
 V41_FLASH_EP4_LARGE_M_MTPRS = (8192, 16384)
 # EP2 DeepSeek-V4.1-Flash takes its large-input tune at the capacities it was measured at.
 V41_FLASH_EP2_LARGE_M_MTPRS = (8192, 16384)
-# EP8 DeepSeek-V4.1-Flash, whose large-input tune builds on EP4's, likewise: at 1024 it faulted the same way
-# (1 of 2 runs), so 1024, 2048 and 4096 stay staged.
-V41_FLASH_EP8_LARGE_M_MTPRS = (8192, 16384)
+# EP8 DeepSeek-V4.1-Flash, whose large-input tune builds on EP4's, serves every large-input capacity: the fault once
+# seen at 1024 came from another process's kernels sharing the GPUs (the persistent kernels need the whole grid
+# resident); on exclusive GPUs 1024, 2048 and 4096 run clean.
+V41_FLASH_EP8_LARGE_M_MTPRS = LARGE_M_MTPRS
 # (world_size, model_dim, inter_dim) -> large-input capacities of the DeepSeek-V4.1-Flash layouts.
 _V41_FLASH_LARGE_M_MTPRS = {
     (world, model_dim, inter_dim): mtprs
@@ -311,6 +337,20 @@ class FusedStage1Knobs:
     # (skewed routing) picks the cached-weight bodies (False: also from mega_moe_small_m._CACHED_W_MIN_ROWS routed
     # rows, where the experts span enough m-tiles to reuse their weights).
     stream_w: bool = False
+    # Small-input GEMM1 (interleaved local plan): a unit of an expert with more than one m-tile runs a pair of its
+    # m-tiles as one tile of twice the rows, which reads each W1 slab once for both (GEMM2 keeps its m-tile units).
+    # The pair reads W1 through the cache: with streamed W1 (b_nt) only a rank whose plan picks the cached-weight
+    # bodies (a hot expert or many routed rows) pairs. Rank-local: the ranks of a launch may differ.
+    pair_tiles: bool = False
+    # Small-input fused kernel: GEMM2 always sends BF16 rows, on every rank, instead of the rows-received choice of
+    # FP8 (1x32 E8M0) or BF16 rows; a hot expert or many received rows no longer switch a rank to FP8 rows. Set per
+    # layout, never per token bucket (BF16_RETURN_LAYOUTS).
+    bf16_rows_always: bool = False
+    # Small-input kernel unit order (local plan): bit 1 the GEMM1 units (m-tile units: not with pair_tiles), bit 2
+    # the GEMM2 units of the run of one expert's m-tiles that lies wholly in an XCD's slice go in (expert, n)-major
+    # order, so the run's m-tiles read each weight tile at about the same time; bit 4: such grouped units read their
+    # weights through the cache. Only the order changes, not what a tile computes (0: m-major).
+    en_order: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -485,14 +525,21 @@ def fused_layout_supported(
 
 
 def large_m_mtprs_for(
-    *, world_size: int, model_dim: int, inter_dim: int
+    *,
+    world_size: int,
+    model_dim: int,
+    inter_dim: int,
+    experts_per_rank: int | None = None,
 ) -> tuple[int, ...]:
     """Instance capacities the large-input kernel is built for on a FUSED_LAYOUTS layout.
 
     EP8 DeepSeek-V4-Pro takes LARGE_M_MTPRS; EP4 DeepSeek-V4.1-Flash takes V41_FLASH_EP4_LARGE_M_MTPRS, the
     capacities its one tune was measured at (see _tune_v41_flash_ep4_large), EP2 DeepSeek-V4.1-Flash
     V41_FLASH_EP2_LARGE_M_MTPRS and EP8 DeepSeek-V4.1-Flash V41_FLASH_EP8_LARGE_M_MTPRS (see their tunes).
+    A SMALL_M_ONLY_LAYOUTS layout (given experts_per_rank) takes none.
     """
+    if (world_size, experts_per_rank, model_dim, inter_dim) in SMALL_M_ONLY_LAYOUTS:
+        return ()
     return _V41_FLASH_LARGE_M_MTPRS.get(
         (world_size, model_dim, inter_dim), LARGE_M_MTPRS
     )
@@ -1313,6 +1360,15 @@ def select_mega_moe_config(
         )
     else:
         desired_p2p = p2p_quant
+    bf16_return = (
+        world_size,
+        experts_per_rank,
+        model_dim,
+        inter_dim,
+    ) in BF16_RETURN_LAYOUTS
+    if bf16_return and p2p_quant == P2P_QUANT_AUTO:
+        # BF16 rows back at every MTPR (BF16_RETURN_LAYOUTS).
+        desired_p2p = P2P_QUANT_NONE
     if desired_p2p != config.p2p_quant:
         config = replace(config, p2p_quant=desired_p2p)
     # Per-network tuning is dispatched by the matched profile above.  R1/V4-Pro
@@ -1348,6 +1404,15 @@ def select_mega_moe_config(
         # is the race-safe path (only the SYNC reg->LDS copy races at SBM32+nw8)
         # and it reclaims the small-bucket cost that forcing sync would add.
         config = _replace_config(config, stage1={"async_a_copy": True})
+    if (
+        bf16_return
+        and config.stage2.aligned_pair
+        and config.p2p_quant == P2P_QUANT_NONE
+    ):
+        # The aligned-pair Stage2 only emits FP8 rows: the plain Stage2 of the same bucket instead.
+        config = _replace_config(
+            config, stage2={"aligned_pair": False, "pair_cu": 0, "skew_cu": 96}
+        )
     if config.stage2.aligned_pair and config.p2p_quant != P2P_QUANT_FP8_BLOCKWISE:
         # The aligned-pair Stage2 kernel only emits the FP8 P2P row layout, so
         # reject the combination here instead of at launch.
@@ -1654,6 +1719,14 @@ def _tune_v41_flash_ep8_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConf
     small-input runtime keeps its own payload and combine buffers, as at EP4); the measurements are in the PR.
     """
     config = _tune_v41_flash_ep4_small(config, bucket)
+    if bucket in (64, 128):
+        # 32-row m-tiles and 256-wide GEMM1 n-tiles: on a rank that reads W1 through the cache (a hot expert or
+        # many routed rows) the experts with more than 32 rows read their W1 slabs once per m-tile pair; the other
+        # ranks keep streaming W1 per m-tile. (Up to 32 tokens no rank of these routes reads W1 cached, and at 16
+        # tokens, whose epilogue stores through per-tile resources, the pair body spills SGPRs.)
+        config = replace(
+            config, fused_stage1=replace(config.fused_stage1, pair_tiles=True)
+        )
     if bucket == 4:
         # The 1-token GEMM1 schedule at 4 tokens too, whose grid is one CTA a CU as well.
         return replace(
@@ -1663,14 +1736,14 @@ def _tune_v41_flash_ep8_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConf
                 config.fused_stage1, head_uniform=True, g1_a_ahead=2, g1_lookahead=2
             ),
         )
-    if bucket == 16:
-        # EP4's 256-wide GEMM1 / GEMM2 tiles lose under skewed routing here; keep the 128-wide ones.
+    if bucket in (16, 32):
+        # 256-wide GEMM1 / GEMM2 n-tiles: half the GEMM1 tiles and GEMM2 blocks, each streaming a longer weight slab.
         return replace(
             config,
-            stage1=replace(config.stage1, tile_n=128),
-            stage2=replace(config.stage2, block_n=128),
+            stage1=replace(config.stage1, tile_n=256),
+            stage2=replace(config.stage2, block_n=256),
         )
-    if bucket in (32, 64):
+    if bucket == 64:
         # Wider GEMM1 n-tiles, as at 128 tokens: each streams a longer W1 slab.
         return replace(config, stage1=replace(config.stage1, tile_n=256))
     if bucket == 512:
@@ -1679,10 +1752,120 @@ def _tune_v41_flash_ep8_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConf
     return config
 
 
+# Per-bucket small-input knobs of EP8 DeepSeek-V4.1-Flash on top of _tune_v41_flash_ep8_small: group -> field ->
+# value; the buckets not listed keep that tune. They read each weight tile once for more rows (en_order, 256-wide
+# GEMM1 tiles and cached W1 at 256 and 512 tokens), take the lean GEMM1 / GEMM2 epilogues and set the dispatch CUs
+# and waves per EU. At 64 and 128 tokens en_order's GEMM1 order replaces the m-tile pairs (it runs on single
+# m-tiles). None of them changes what ranks and launches exchange or what a tile computes: the outputs are those of
+# the tune without them, bit for bit (test_mega_moe_v2.py --suite routes --compare-untuned checks it on 8 GPUs).
+_V41_FLASH_EP8_SMALL_KNOBS = {
+    8: {
+        "stage1": {"grid_mult": 1, "num_dispatch_cu": 64},
+        "fused_stage1": {"epi_evec": 8, "epi_lean": 1, "g2_epi_lean": 2},
+    },
+    16: {"fused_stage1": {"epi_evec": 8, "epi_lean": 1, "g2_epi_lean": 2}},
+    # 32 (24..47 rows a rank: nearest_token_bucket) runs the bucket-64 config: 128 dispatch CUs, one wave per EU,
+    # streamed W1 (b_nt 3), the full GEMM2 epilogue. In serving (DeepSeek-V4.1-Flash c128 decode, 4..7 requests a
+    # rank) 64 dispatch CUs / 2 waves per EU / b_nt 1 made 42 rows slower than 48; the outputs are the same.
+    32: {
+        "stage1": {
+            "use_tile_resource": True,
+            "waves_per_eu_hint": 1,
+            "num_dispatch_cu": 128,
+        },
+        "stage2": {"block_n": 256},
+        "fused_stage1": {
+            "en_order": 7,
+            "pair_tiles": False,
+            "epi_evec": 8,
+            "epi_lean": 1,
+        },
+    },
+    64: {
+        "stage1": {
+            "use_tile_resource": True,
+            "waves_per_eu_hint": 1,
+            "num_dispatch_cu": 128,
+        },
+        "fused_stage1": {
+            "en_order": 7,
+            "pair_tiles": False,
+            "epi_evec": 8,
+            "epi_lean": 1,
+        },
+    },
+    128: {
+        "stage1": {
+            "use_tile_resource": True,
+            "waves_per_eu_hint": 1,
+            "num_dispatch_cu": 160,
+        },
+        "fused_stage1": {
+            "en_order": 7,
+            "pair_tiles": False,
+            "epi_evec": 8,
+            "epi_lean": 1,
+        },
+    },
+    256: {
+        "stage1": {"use_tile_resource": True, "tile_n": 256, "b_nt": 0},
+        "fused_stage1": {
+            "en_order": 7,
+            "epi_evec": 8,
+            "epi_lean": 1,
+            "g2_epi_lean": 2,
+            "head_uniform": True,
+        },
+    },
+    512: {
+        "stage1": {"use_tile_resource": True, "tile_n": 256, "b_nt": 0},
+        "fused_stage1": {
+            "en_order": 7,
+            "epi_evec": 8,
+            "epi_lean": 1,
+            "g2_epi_lean": 2,
+            "head_uniform": True,
+        },
+        "fused_stage2": {"early_k": 0},
+    },
+}
+
+
+def _with_bucket_knobs(config: MegaMoEConfig, knobs: dict | None) -> MegaMoEConfig:
+    """``config`` with one bucket's entry of a per-bucket knob table (group -> field -> value)."""
+    if not knobs:
+        return config
+    stage1 = replace(config.stage1, **knobs.get("stage1", {}))
+    return replace(
+        config,
+        stage1=stage1,
+        stage2=replace(
+            config.stage2, block_m=stage1.sort_block_m, **knobs.get("stage2", {})
+        ),
+        fused_stage1=replace(config.fused_stage1, **knobs.get("fused_stage1", {})),
+        fused_stage2=replace(config.fused_stage2, **knobs.get("fused_stage2", {})),
+    )
+
+
+def _tune_v41_flash_ep8_draft_small(
+    config: MegaMoEConfig, bucket: int
+) -> MegaMoEConfig:
+    """EP8 DeepSeek-V4.1-Flash DSpark draft MoE (16 experts a rank, topk 3), small-input kernel.
+
+    The 48-expert EP8 tune (_tune_v41_flash_ep8_small, without its per-bucket table) with a BF16 GEMM2 return on
+    every rank (bf16_rows_always, BF16_RETURN_LAYOUTS), as the layout's staged route. The activations (MXFP8),
+    weights (FP4) and BF16 return are the staged route's; only the route and its schedule change.
+    """
+    config = _tune_v41_flash_ep8_small(config, bucket)
+    return replace(
+        config, fused_stage1=replace(config.fused_stage1, bf16_rows_always=True)
+    )
+
+
 def _tune_v41_flash_ep8_large(config: MegaMoEConfig) -> MegaMoEConfig:
     """EP8 DeepSeek-V4.1-Flash large-input kernel (48 experts per rank), measured on gfx950 at MTPR 16384 (8 ranks;
-    uniform, zipf and all-to-rank-0 routes). It serves 8192 and 16384 (V41_FLASH_EP8_LARGE_M_MTPRS) unchanged, as
-    the EP4 tune.
+    uniform, zipf and all-to-rank-0 routes). It serves every large-input capacity, 1024..16384
+    (V41_FLASH_EP8_LARGE_M_MTPRS), unchanged.
 
     The EP4 tune (_tune_v41_flash_ep4_large) carries over except its GEMM2 claim order, streamed W1 loads and
     per-token combine wait; the measurements are in the PR.
@@ -1736,7 +1919,16 @@ def _fused_config(
     if layout == V41_FLASH_EP2_LAYOUT:
         return _tune_v41_flash_ep2_small(config, bucket)
     if layout == V41_FLASH_EP8_LAYOUT:
-        return _tune_v41_flash_ep8_small(config, bucket)
+        return _with_bucket_knobs(
+            _tune_v41_flash_ep8_small(config, bucket),
+            _V41_FLASH_EP8_SMALL_KNOBS.get(bucket),
+        )
+    if layout == V41_FLASH_EP8_DRAFT_LAYOUT:
+        return _tune_v41_flash_ep8_draft_small(config, bucket)
+    if layout in BF16_RETURN_LAYOUTS:
+        return replace(
+            config, fused_stage1=replace(config.fused_stage1, bf16_rows_always=True)
+        )
     return config
 
 
@@ -1755,7 +1947,10 @@ def select_fused_config(
     if mtpr <= 0 or mtpr & (mtpr - 1):
         raise ValueError(f"mtpr={mtpr} must be a positive power of two")
     large_mtprs = large_m_mtprs_for(
-        world_size=world_size, model_dim=model_dim, inter_dim=inter_dim
+        world_size=world_size,
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts_per_rank=experts_per_rank,
     )
     if mtpr > SMALL_M_MAX_MTPR and mtpr not in large_mtprs:
         raise ValueError(f"no small- or large-input config for mtpr={mtpr}")

@@ -411,9 +411,9 @@ def test_ep8_fused_configs_keep_fused_knobs_off():
         assert config.fused_stage2 == FusedStage2Knobs(), (mtpr, tokens)
 
 
-# Fused knobs added with the EP2 V4.1-Flash tune: they enter the table only when set, so a digest pinned before
-# them changes only where a config sets one.
-_EP2_KNOBS = ("stream_w",)
+# Fused knobs added with the EP2 V4.1-Flash tune and after it: they enter the table only when set, so a digest
+# pinned before them changes only where a config sets one.
+_EP2_KNOBS = ("stream_w", "pair_tiles", "en_order", "bf16_rows_always")
 
 
 def _knob_table(config):
@@ -493,9 +493,10 @@ def test_ep4_small_m_buckets_share_one_protocol(mtpr):
 
 
 # The EP8 V4.1-Flash fused configs (_tune_v41_flash_ep8_small / _large). On a mismatch the assertion shows the
-# current table.
+# current table. Pinned with the 256-wide GEMM1 / GEMM2 n-tiles at 16 and 32 tokens and the per-bucket small-input
+# knobs (_V41_FLASH_EP8_SMALL_KNOBS; en_order in place of pair_tiles at 64 and 128 tokens).
 _V41EP8_FUSED_DIGEST = (
-    "947797b9716d90a9387f6489c9558eaa24d002f63f104c4be9354cda0bc8d5f3"
+    "267922443e99411115b62607796fca51e1ff92b704b5c7270471f0cb9b0912af"
 )
 
 
@@ -512,16 +513,18 @@ def test_v41ep8_fused_configs_unchanged():
 
 
 def test_v41ep8_large_m_capacities():
-    """EP8 V4.1-Flash: 8192 and 16384 (as EP4, it faults at 1024), both with the tune measured at 16384."""
+    """EP8 V4.1-Flash: every large-input capacity, each with the tune measured at 16384."""
     assert large_m_mtprs_for(world_size=8, model_dim=5120, inter_dim=2304) == (
+        1024,
+        2048,
+        4096,
         8192,
         16384,
     )
     tuned = _knob_table(select_fused_config(16384, 16384, **V41_FLASH_EP8_SHAPE))
-    for mtpr in (1024, 2048, 4096, 32768):
-        with pytest.raises(ValueError):
-            select_fused_config(mtpr, mtpr, **V41_FLASH_EP8_SHAPE)
-    for mtpr in (8192, 16384):
+    with pytest.raises(ValueError):
+        select_fused_config(32768, 32768, **V41_FLASH_EP8_SHAPE)
+    for mtpr in (1024, 2048, 4096, 8192, 16384):
         for tokens in (0, 1, LARGE_M_MIN_TOKENS, mtpr):
             assert (
                 _knob_table(select_fused_config(tokens, mtpr, **V41_FLASH_EP8_SHAPE))

@@ -311,7 +311,7 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
 @flyc.jit
 def do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
     a_scale_lds, a_lds_i32, K_ITERS, M_REPEAT, NUM_ACC_N, A_K_STEP_BYTES, trb_rsrc, rows_rsrc, LA, row_map=None,
-    meta=None, a_ahead=1):
+    meta=None, a_ahead=1, a_major=False):
 # fmt: on
     """pipe_weights K-loop with B / B-scale issued LA K-steps ahead, unrolled xLA.
 
@@ -321,26 +321,30 @@ def do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_
     iteration, so the yielded sets coalesce with the loop arguments and loads stay in flight across the back-edge.
     Per-accumulator MFMA order (ksub 0 then 1, K-steps ascending) is unchanged -> bit-identical output.
     B-scale loads and epilogue stores use sc0|nt (_LA_CM); the epilogue stores are clamped to the tile's valid rows.
-    ``meta = (tile_row_base, valid_rows)`` replaces their loads (the caller's own plan); ``row_map`` as
-    :func:`do_tile`, without the arrival wait.
+    ``meta = (tile_row_base, valid_rows[, row_stride])`` replaces their loads (the caller's own plan; tile row r
+    reads srcmap slot tile_row_base + r * row_stride); ``row_map`` as :func:`do_tile`, without the arrival wait.
     a_ahead > 1: the A rows of K-step k + a_ahead are loaded into registers at step k and written to LDS at step
     k + a_ahead - 1. With a_ahead=1 the end-of-step LDS write waits for a load issued at the start of the same step.
+    a_major: the K-steps issue their MFMAs A-major (MfmaScaleGU.call_pipe_am, one A operand live), which keeps the
+    paired tiles' twice as many accumulators in registers.
     """
     assert 1 <= a_ahead < K_ITERS
     N_ACC = M_REPEAT * NUM_ACC_N
     NUM_B = NUM_ACC_N * _PACK
     NUM_SB = NUM_ACC_N // _PACK
-    valid_rows = None
+    valid_rows = row_stride = None
     if const_expr(meta is not None):
-        tile_row_base, valid_rows = meta
+        tile_row_base, valid_rows = meta[0], meta[1]
+        if const_expr(len(meta) > 2):
+            row_stride = meta[2]
     else:
         tile_row_base = fx.Int32(rocdl.readfirstlane(T.i32, trb_rsrc[m_tile]))
     b_row = sched.gate_base_row(expert) + n_tile_base
     if const_expr(meta is None and rows_rsrc is not None):
         valid_rows = fx.Int32(rocdl.readfirstlane(T.i32, rows_rsrc[m_tile]))
     if const_expr(row_map is not None):
-        a_srcs = a_gather.load_row_map(tile_row_base, row_map["srcmap"])
-        s_srcs = a_scale.load_row_map(tile_row_base, row_map["srcmap"])
+        a_srcs = a_gather.load_row_map(tile_row_base, row_map["srcmap"], row_stride)
+        s_srcs = a_scale.load_row_map(tile_row_base, row_map["srcmap"], row_stride)
         a_gather.for_tile(tile_row_base, valid_rows, row_map, a_srcs)
         a_gather.store(a_buf, a_gather.load_regs(fx.Int32(0)), fx.Int32(0))
         a_scale.stage(a_scale_lds, tile_row_base, row_map, valid_rows, s_srcs)
@@ -398,7 +402,8 @@ def do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_
             return b_loader.load_ni(b_row, ni, _kn)
 
         if const_expr(issue):
-            acc, b_new = mfma.call_pipe(a_load, bq[0], acc, sa, sbq[0], load_next)
+            call_pipe = mfma.call_pipe_am if const_expr(a_major) else mfma.call_pipe
+            acc, b_new = call_pipe(a_load, bq[0], acc, sa, sbq[0], load_next)
             bq = bq[1:] + [b_new]
             sbq = sbq[1:] + [sb_new]
         else:
@@ -439,7 +444,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     source_rows=0, a_dtype="fp8", out_dtype="fp8", swiglu_limit=0.0, pair_k=False, evec,
     act="silu", situ_beta=1.0, situ_linear_beta=1.0, narrow_final_a=False, rows_rsrc=None, lookahead=0,
     out_cache_modifier=0, tile_zero=False, fused_v8=False, epi_lean=0, row_map=None, short_rows=0, fold_rows=0,
-    a_async_lds=False, ascale_packed=False, plan_lookup=None, a_ahead=1):
+    a_async_lds=False, ascale_packed=False, plan_lookup=None, a_ahead=1, pair_tiles=False):
     # fmt: on
     """Build the GEMM1 atoms and return its expert resolver and tile runner.
 
@@ -448,8 +453,14 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     ``_LA_CM``) and ``tile_zero`` is forwarded to :func:`do_tile`.
     The remaining knobs serve the fused kernels: ``fused_v8`` / ``epi_lean`` pick the fused evec 8 epilogue
     (SiluQuantEpilogue), ``row_map`` reads A through the srcmap (:func:`do_tile`), ``a_async_lds`` /
-    ``ascale_packed`` are the A loaders' modes, ``plan_lookup(m_tile) -> (expert, tile_row_base, rows)`` takes
-    the lookahead tiles' metadata from the CTA's own plan and ``a_ahead`` is :func:`do_tile_la`'s.
+    ``ascale_packed`` are the A loaders' modes, ``plan_lookup(m_tile) -> (expert, tile_row_base, rows[,
+    row_stride])`` takes the lookahead tiles' metadata from the CTA's own plan and ``a_ahead`` is
+    :func:`do_tile_la`'s.
+
+    pair_tiles: returns two runners, ``(flat, plan)`` with the unit's plan ``(expert, m_tile, paired, tile_row_base,
+    (rows0, rows1), row_stride)`` from the caller: one runs m-tile m_tile (rows0 rows), the other a pair, m-tile
+    m_tile and the next interleaved m-tile of its expert (rows1 rows), as one 2 x sort_block_m row tile that reads
+    the W1 slab once for both and stores each m-tile as a sort_block_m tile.
 
     short_rows > 0 also returns a runner for tiles whose rows past the first short_rows are all padding: it
     computes and stores only those leading rows (m_repeat short_rows // 16) and leaves the rest unwritten.
@@ -513,14 +524,60 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
         m_tile, _n = _decode(flat)
         return sched.expert_of(m_tile)
 
+    if const_expr(pair_tiles):
+        assert lookahead > 0 and row_map is not None and not short_rows
+        mfma_p = MfmaScaleGU(m_repeat=2 * m_repeat, num_acc_n=num_acc_n, a_dtype=a_dtype)
+        epi_p = _PairEpilogue(epi, m_repeat * num_acc_n)
+
+        def unit_a_loaders(flat, rows):
+            # The unit's A loaders for a tile of ``rows`` rows (2 * sort_block_m: a pair). Their thread offsets depend
+            # on the unit (flat >= 0 adds 0): hoisted out of the persistent loop, the offsets of every GEMM1 body would
+            # stay live across all of them, which then spill.
+            tx = fx.thread_idx.x + (flat < fx.Int32(0)).select(flat, fx.Int32(0))
+            paired = rows > sort_block_m
+            # fmt: off
+            return (
+                ATileLoader(row_bytes=model_dim // a_pack, sort_block_m=rows, k_step_bytes=a_k_step_bytes,
+                    total_threads=total_threads, swizzle=swizzle_a, x_tensor=x_tensor, async_lds=a_async_lds,
+                    a_dtype=a_dtype, paired=paired, tx=tx),
+                AS2RLoader(k_step_bytes=a_k_step_bytes, swizzle=swizzle_a, a_dtype=a_dtype, tx=tx),
+                AScaleLoader(scale_rsrc=sx_rsrc, m_repeat=rows // 16, model_dim=model_dim, sort_block_m=rows,
+                    total_threads=total_threads, packed=ascale_packed, paired=paired, tx=tx),
+            )
+            # fmt: on
+
+        def do_planned_tile(flat, plan):
+            _group, n_tile = _decode(flat)
+            n_tile_base = n_wave_base + n_tile * fx.Int32(tile_n)
+            expert, m_tile, _paired, tile_row_base, rows, row_stride = plan
+            a_gather_u, a_s2r_u, a_scale_u = unit_a_loaders(flat, sort_block_m)
+            # fmt: off
+            do_tile_la(m_tile, n_tile_base, expert, sched, a_gather_u, a_s2r_u, b_loader, b_scale, a_scale_u, mfma,
+                epi, a_buf, a_scale_lds, a_lds_i32, k_iters, m_repeat, num_acc_n, a_k_step_bytes, trb_rsrc,
+                rows_rsrc, lookahead, row_map, (tile_row_base, rows[0], row_stride), a_ahead)
+            # fmt: on
+
+        def do_paired_tile(flat, plan):
+            _group, n_tile = _decode(flat)
+            n_tile_base = n_wave_base + n_tile * fx.Int32(tile_n)
+            expert, m_tile, _paired, tile_row_base, rows, row_stride = plan
+            a_gather_u, a_s2r_u, a_scale_u = unit_a_loaders(flat, 2 * sort_block_m)
+            # fmt: off
+            do_tile_la(m_tile, n_tile_base, expert, sched, a_gather_u, a_s2r_u, b_loader, b_scale, a_scale_u, mfma_p,
+                epi_p, a_buf, a_scale_lds, 2 * a_lds_i32, k_iters, 2 * m_repeat, num_acc_n, a_k_step_bytes,
+                trb_rsrc, rows_rsrc, lookahead, row_map, (tile_row_base, rows, row_stride), a_ahead, a_major=True)
+            # fmt: on
+
+        return expert_of_flat, do_planned_tile, do_paired_tile
+
     def do_scheduled_tile(flat):
         m_tile, n_tile = _decode(flat)
         n_tile_base = n_wave_base + n_tile * fx.Int32(tile_n)
         meta = None
         if const_expr(plan_lookup is not None):
-            # (local expert, tile row base, valid rows) from the CTA's own plan.
-            expert, trb, rows = plan_lookup(m_tile)
-            meta = (trb, rows)
+            # (local expert, tile row base, valid rows[, row stride]) from the CTA's own plan.
+            plan = plan_lookup(m_tile)
+            expert, meta = plan[0], plan[1:]
         else:
             expert = sched.expert_of(m_tile)
         # fmt: off
@@ -591,6 +648,20 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
         # fmt: on
 
     return expert_of_flat, do_scheduled_tile, do_short_tile, do_fold_tile
+
+
+class _PairEpilogue:
+    """Stores a paired tile: each of its two interleaved m-tiles as a tile of its own, with its own valid rows."""
+
+    def __init__(self, tile, tile_accs):
+        self._tile, self._tile_accs = tile, tile_accs
+
+    def store(self, acc, tile_i32, tile_row_base_i32, n_tile_base_i32, valid_rows, store_cm):
+        # Each store ends with an LDS barrier, so the second may reuse the cshuffle LDS. The next m-tile of the
+        # expert starts one slot later (emit_direct_fixed_slot_finalize interleave).
+        for half in range_constexpr(2):
+            self._tile.store(acc[half * self._tile_accs : (half + 1) * self._tile_accs], tile_i32 + fx.Int32(half),
+                tile_row_base_i32 + fx.Int32(half), n_tile_base_i32, valid_rows[half], store_cm)
 
 
 class _FoldEpilogue:
