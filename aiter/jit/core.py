@@ -300,6 +300,11 @@ AITER_CONFIG_PAGED_MQA_LOGITS = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/paged_mqa_logits_tuned.csv",
 )
 
+AITER_CONFIG_MOE_ROUTER_TOPK = os.getenv(
+    "AITER_CONFIG_MOE_ROUTER_TOPK",
+    f"{AITER_ROOT_DIR}/aiter/configs/moe_router_topk_tuned.csv",
+)
+
 
 def _runtime_power_selection() -> bool:
     """True when a running ``import aiter`` asked for power tables (AITER_SELECT).
@@ -553,6 +558,14 @@ class AITER_CONFIG:
             "AITER_CONFIG_PAGED_MQA_LOGITS",
             AITER_CONFIG_PAGED_MQA_LOGITS,
             "paged_mqa_logits_tuned",
+        )
+
+    @property
+    def AITER_CONFIG_MOE_ROUTER_TOPK_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_MOE_ROUTER_TOPK",
+            AITER_CONFIG_MOE_ROUTER_TOPK,
+            "moe_router_topk_tuned",
         )
 
     @property
