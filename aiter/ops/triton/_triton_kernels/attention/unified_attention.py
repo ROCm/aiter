@@ -141,6 +141,7 @@ def kernel_unified_attention_2d(
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
     ALL_DECODE: tl.constexpr = False,  # bool
+    ONE_Q_BLOCK: tl.constexpr = False,  # bool
     SHUFFLED_KV_CACHE: tl.constexpr = False,  # bool
     SPLIT_UNMASKED_LOOP: tl.constexpr = False,  # bool
     K_WIDTH: tl.constexpr = 0,  # int
@@ -162,11 +163,26 @@ def kernel_unified_attention_2d(
     RCP_LN2 = 1.4426950408889634
     qk_scale = scale * RCP_LN2
 
-    if ALL_DECODE:
+    if ALL_DECODE or ONE_Q_BLOCK:
+        # ONE_Q_BLOCK launches one program per sequence. The padded-grid index
+        # (start // BLOCK_Q + seq) does not apply, and q>1 is not ALL_DECODE's
+        # one-token layout, so the sequence start still comes from cu_seqlens.
         seq_idx = q_block_global_idx
         q_block_local_idx: tl.int32 = 0
-        cur_batch_query_len: tl.int32 = 1
-        cur_batch_in_all_start_index: tl.int32 = q_block_global_idx
+        if ALL_DECODE:
+            cur_batch_query_len: tl.int32 = 1
+            cur_batch_in_all_start_index: tl.int32 = q_block_global_idx
+        else:
+            cur_batch_in_all_start_index: tl.int32 = tl.load(
+                query_start_len_ptr + seq_idx
+            )
+            cur_batch_in_all_stop_index = tl.load(query_start_len_ptr + seq_idx + 1)
+            cur_batch_query_len: tl.int32 = (
+                cur_batch_in_all_stop_index - cur_batch_in_all_start_index
+            )
+            # local idx is 0, so the padded-grid empty check below does not run
+            if cur_batch_query_len == 0:
+                return
     else:
         seq_idx = find_seq_idx(
             query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
@@ -641,6 +657,7 @@ def kernel_unified_attention_3d(
     num_stages: tl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
     ALL_DECODE: tl.constexpr = False,  # bool
+    ONE_Q_BLOCK: tl.constexpr = False,  # bool
     SHUFFLED_KV_CACHE: tl.constexpr = False,  # bool
     K_WIDTH: tl.constexpr = 0,  # int
     IS_Q_FP8: tl.constexpr = False,  # bool
@@ -654,11 +671,26 @@ def kernel_unified_attention_3d(
     RCP_LN2 = 1.4426950408889634
     qk_scale = scale * RCP_LN2
 
-    if ALL_DECODE:
+    if ALL_DECODE or ONE_Q_BLOCK:
+        # ONE_Q_BLOCK launches one program per sequence. The padded-grid index
+        # (start // BLOCK_Q + seq) does not apply, and q>1 is not ALL_DECODE's
+        # one-token layout, so the sequence start still comes from cu_seqlens.
         seq_idx = q_block_global_idx
         q_block_local_idx: tl.int32 = 0
-        cur_batch_query_len: tl.int32 = 1
-        cur_batch_in_all_start_index: tl.int32 = q_block_global_idx
+        if ALL_DECODE:
+            cur_batch_query_len: tl.int32 = 1
+            cur_batch_in_all_start_index: tl.int32 = q_block_global_idx
+        else:
+            cur_batch_in_all_start_index: tl.int32 = tl.load(
+                query_start_len_ptr + seq_idx
+            )
+            cur_batch_in_all_stop_index = tl.load(query_start_len_ptr + seq_idx + 1)
+            cur_batch_query_len: tl.int32 = (
+                cur_batch_in_all_stop_index - cur_batch_in_all_start_index
+            )
+            # local idx is 0, so the padded-grid empty check below does not run
+            if cur_batch_query_len == 0:
+                return
     else:
         seq_idx = find_seq_idx(
             query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True

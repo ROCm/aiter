@@ -2661,3 +2661,409 @@ def test_unified_attn_split_rebalance_reduce_configs_k4v8(
     )
     assert not new[live].isnan().any()
     assert torch.equal(old[live].view(torch.int16), new[live].view(torch.int16))
+
+
+class _LaunchSpy:
+    """Forward each launch to the real kernel and record its grid, ONE_Q_BLOCK and NUM_SPLITS."""
+
+    def __init__(self, kernel, launches):
+        self._kernel = kernel
+        self._launches = launches
+
+    def __getitem__(self, grid):
+        launch = self._kernel[grid]
+
+        def run(*args, **kwargs):
+            self._launches.append(
+                (tuple(grid), kwargs["ONE_Q_BLOCK"], kwargs["NUM_SPLITS"])
+            )
+            return launch(*args, **kwargs)
+
+        return run
+
+
+def _run_one_q_block(
+    seq_lens, num_heads, head_size, block_size, q_dtype, use_descale, monkeypatch
+):
+    """Run unified_attention on the gfx950 gluon kernel and check it against the reference.
+
+    Returns the recorded launches as (grid, ONE_Q_BLOCK, NUM_SPLITS).
+    """
+    query_lens = [q for q, _ in seq_lens]
+    kv_lens_list = [kv for _, kv in seq_lens]
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        _sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _maybe_quant_query,
+        _query_scales,
+        q_descale,
+        k_descale,
+        v_descale,
+        _output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=len(seq_lens) * -(-max(kv_lens_list) // block_size),
+        block_size=block_size,
+        head_size=head_size,
+        num_heads=num_heads,
+        q_dtype=q_dtype,
+        kv_dtype=q_dtype,
+        use_q_descale=use_descale,
+        use_kv_descale=use_descale,
+        device="cuda",
+    )
+    module = sys.modules[unified_attention.__module__]
+    launches = []
+    monkeypatch.setattr(
+        module,
+        "_unified_attention_kernel_gfx950",
+        _LaunchSpy(module._unified_attention_kernel_gfx950, launches),
+    )
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+
+    assert launches, "the gfx950 gluon kernel did not launch"
+
+    ref = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=query_lens,
+        kv_lens=kv_lens_list,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    ).float()
+    out = output.float()
+    if use_descale:
+        # NaN > x is false, so an all-NaN fp8 output would pass the budget below
+        assert torch.isfinite(out).all()
+        assert torch.isfinite(ref).all()
+        # fp8 gets the same 0.5% mismatch budget as the fp8 gluon tests
+        mismatch = (out - ref).abs() > 1.5e-1 + 1.5e-1 * ref.abs()
+        mismatch_fraction = mismatch.float().mean().item()
+        assert mismatch_fraction < 0.005, (
+            f"fp8 mismatch fraction {mismatch_fraction:.4%} exceeds 0.5% "
+            f"(max abs diff {torch.max(torch.abs(out - ref))})"
+        )
+    else:
+        torch.testing.assert_close(out, ref, atol=1.5e-2, rtol=1e-2)
+    return launches
+
+
+@pytest.mark.parametrize(
+    "seq_lens, num_heads, head_size, block_size",
+    [
+        # max query length 2: one query block per sequence, 3d path for 5000 keys
+        ([(2, 300), (1, 1000), (2, 40), (1, 17), (2, 5000)], (16, 2), 128, 16),
+        ([(2, 96)], (16, 2), 128, 16),
+        # max_seqlen_q == BLOCK_Q: q * qpkv = 32 is a power of two and the launch splits
+        ([(4, 4096)] * 4, (16, 2), 128, 16),
+        # a zero-length sequence sits between the others in the search
+        ([(1, 64), (8, 512), (0, 33), (3, 7)], (8, 8), 64, 64),
+        ([(8, 5000), (1, 9)], (8, 8), 128, 16),
+    ],
+)
+@pytest.mark.parametrize(
+    "q_dtype, use_descale",
+    [(torch.bfloat16, False), (e4m3_dtype, True)],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_one_q_block(
+    seq_lens, num_heads, head_size, block_size, q_dtype, use_descale, monkeypatch
+):
+    """Short batches launch one query block per sequence, and the output is correct.
+
+    The launch is checked directly: every launch must set ONE_Q_BLOCK and use
+    grid[1] == num_seqs.
+    """
+    if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
+        pytest.skip("gfx950 gluon one-query-block launch")
+    launches = _run_one_q_block(
+        seq_lens, num_heads, head_size, block_size, q_dtype, use_descale, monkeypatch
+    )
+    for grid, one_q_block, _num_splits in launches:
+        assert one_q_block, "short batch did not take the one-query-block launch"
+        assert grid[1] == len(seq_lens), f"grid {grid}: want one program per sequence"
+
+
+@pytest.mark.parametrize(
+    "num_seqs, kv_len, num_splits",
+    [
+        # The split lookup starts from BLOCK_Q=1 (16 queries per KV head, BLOCK_M 16),
+        # so the padded count is 256 tokens // 1 + 64 seqs = 320 per KV head, 640
+        # programs for 2 KV heads: more than the 256 CUs, so the launch stays unsplit.
+        # The one-block grid is 64 * 2 = 128 programs, half the CUs. Counting it is
+        # what makes this launch split: 4 segments, the 4 that 8192 keys fill at
+        # the segment floor (2048 keys for 128 programs on 256 CUs).
+        (64, 8192, 4),
+        # at 2048 keys one segment holds the whole sequence: no split
+        (64, 2048, 1),
+        # at 2049 keys two segments would be 1088 and 961 keys, under the floor
+        (64, 2049, 1),
+        # at 8191 keys four segments would leave the last 2047 keys, so two
+        (64, 8191, 2),
+        # padded: 32 // 1 + 8 = 40 per KV head, 80 programs. That already splits (8),
+        # so it is kept. Counting the one-block grid (16 programs) as well would give
+        # 32 segments instead of 8.
+        (8, 8192, 8),
+        # padded: 1024 // 1 + 256 = 1280 per KV head, 2560 programs. One-block: 512.
+        # Both fill the CUs: nothing to split.
+        (256, 1024, 1),
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_one_q_block_split_transition(
+    num_seqs, kv_len, num_splits, monkeypatch
+):
+    """The one-block grid is counted for the split only while the padded count leaves
+    the launch unsplit (Qwen3.5-397B bf16: -hq 32 -hk 2 -d 256 -sq 4).
+
+    Checks the exact NUM_SPLITS of the launch, on top of the one-block launch and
+    the output. The counts are the kv_split table's for 256 CUs.
+    """
+    if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
+        pytest.skip("gfx950 gluon one-query-block launch")
+    if torch.cuda.get_device_properties(0).multi_processor_count != 256:
+        pytest.skip("the split counts are for 256 CUs")
+    launches = _run_one_q_block(
+        [(4, kv_len)] * num_seqs,
+        (32, 2),
+        256,
+        16,
+        torch.bfloat16,
+        False,
+        monkeypatch,
+    )
+    assert len(launches) == 1, f"want one launch, got {launches}"
+    grid, one_q_block, launched_splits = launches[0]
+    assert one_q_block, "short batch did not take the one-query-block launch"
+    assert launched_splits == num_splits, f"grid {grid}: want {num_splits} splits"
+    assert grid == (2, num_seqs) + ((num_splits,) if num_splits > 1 else ())
+
+
+@pytest.mark.parametrize(
+    "num_seqs, num_splits",
+    [
+        # one-block grid 256 * 2 = 512 programs, two CU waves: still split, in the
+        # 2 segments 8192 keys fill at the segment floor (4096 keys)
+        (256, 2),
+        # 320 * 2 = 640 programs, 2.5 CU waves: the grid fills the CUs, kept unsplit
+        (320, 1),
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_one_q_block_split_grid_gate(
+    num_seqs, num_splits, monkeypatch
+):
+    """The transition split stays off once the one-block grid fills the CUs
+    (fp8 -hq 16 -hk 2 -d 64 -sq 8 -sk 8192).
+    """
+    if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
+        pytest.skip("gfx950 gluon one-query-block launch")
+    if torch.cuda.get_device_properties(0).multi_processor_count != 256:
+        pytest.skip("the split counts are for 256 CUs")
+    launches = _run_one_q_block(
+        [(8, 8192)] * num_seqs, (16, 2), 64, 16, e4m3_dtype, True, monkeypatch
+    )
+    assert len(launches) == 1, f"want one launch, got {launches}"
+    grid, one_q_block, launched_splits = launches[0]
+    assert one_q_block, "short batch did not take the one-query-block launch"
+    assert launched_splits == num_splits, f"grid {grid}: want {num_splits} splits"
+
+
+@pytest.mark.parametrize(
+    "num_segments, max_seqlen_k, min_keys, tile_size, want",
+    [
+        (4, 8192, 2048, 64, 4),
+        (4, 2048, 2048, 64, 1),
+        # 1088 + 961 keys
+        (4, 2049, 2048, 64, 1),
+        # four segments leave 2047 keys in the last; two leave 4095
+        (4, 8191, 2048, 64, 2),
+        # 6144 keys fill three segments, rounded down to two
+        (8, 6144, 2048, 64, 2),
+        # the table's count still bounds it
+        (2, 65536, 512, 64, 2),
+        (4, 100, 4096, 64, 1),
+    ],
+)
+def test_gfx950_one_block_num_segments(
+    num_segments, max_seqlen_k, min_keys, tile_size, want
+):
+    """Every tile-aligned segment of the longest sequence keeps the floor."""
+    module = sys.modules[unified_attention.__module__]
+    n = module._gfx950_one_block_num_segments(
+        num_segments, max_seqlen_k, min_keys, tile_size
+    )
+    assert n == want
+    segment = -(-max_seqlen_k // (n * tile_size)) * tile_size
+    assert n == 1 or max_seqlen_k - (n - 1) * segment >= min_keys
+
+
+class _TritonLaunchSpy:
+    """Forward each launch and record the kernel, grid, and ONE_Q_BLOCK."""
+
+    def __init__(self, kernel, launches, name):
+        self._kernel = kernel
+        self._launches = launches
+        self._name = name
+
+    def __getitem__(self, grid):
+        launch = self._kernel[grid]
+
+        def run(*args, **kwargs):
+            self._launches.append((self._name, tuple(grid), kwargs["ONE_Q_BLOCK"]))
+            return launch(*args, **kwargs)
+
+        return run
+
+
+def _run_gfx942_one_q_block(seq_lens, num_heads, monkeypatch):
+    query_lens = [q for q, _ in seq_lens]
+    kv_lens_list = [kv for _, kv in seq_lens]
+    block_size = 16
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        _sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        *_,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=len(seq_lens) * -(-max(kv_lens_list) // block_size),
+        block_size=block_size,
+        head_size=64,
+        num_heads=num_heads,
+    )
+    module = sys.modules[unified_attention.__module__]
+    launches = []
+    monkeypatch.setattr(
+        module,
+        "kernel_unified_attention_2d",
+        _TritonLaunchSpy(module.kernel_unified_attention_2d, launches, "2d"),
+    )
+    monkeypatch.setattr(
+        module,
+        "kernel_unified_attention_3d",
+        _TritonLaunchSpy(module.kernel_unified_attention_3d, launches, "3d"),
+    )
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+    )
+    ref = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=query_lens,
+        kv_lens=kv_lens_list,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+    ).float()
+    torch.testing.assert_close(output.float(), ref, atol=1.5e-2, rtol=1e-2)
+    return launches
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        # KV <= 512 stays on the 2d kernel. A zero-length sequence sits in the middle.
+        [(2, 128), (1, 256), (0, 64), (2, 512)],
+        # longer KV takes the 3d kernel on a 304-CU MI300X
+        [(2, 300), (1, 1000), (0, 17), (2, 8192)],
+        [(2, 2048)],
+        [(1, 64), (2, 8192)],
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_gfx942_one_q_block(seq_lens, monkeypatch):
+    """q<=2 with 8 queries per KV head launches one query block per sequence.
+
+    BLOCK_Q is 2 for this head layout, so every sequence fits one block. The
+    2d grid counts sequences on axis 1 and the 3d grid on axis 0.
+    """
+    if DEVICE_ARCH != "gfx942":
+        pytest.skip("gfx942 one-query-block launch")
+    launches = _run_gfx942_one_q_block(seq_lens, (16, 2), monkeypatch)
+    assert launches, "neither Triton kernel launched"
+    for name, grid, one_q_block in launches:
+        assert one_q_block, f"{name} did not take the one-query-block launch"
+        q_blocks = grid[1] if name == "2d" else grid[0]
+        assert q_blocks == len(seq_lens), f"{name} {grid}: one block per sequence"
+
+
+@pytest.mark.parametrize(
+    "seq_lens, num_heads",
+    [
+        # q=8 does not fit BLOCK_Q 2
+        ([(8, 8192)], (16, 2)),
+        # 16 queries per KV head: BLOCK_Q is 1, so q=2 stays on the padded grid
+        ([(2, 2048), (2, 8192)], (16, 1)),
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_gfx942_one_q_block_off(seq_lens, num_heads, monkeypatch):
+    """The flag stays off when a sequence is longer than one query block."""
+    if DEVICE_ARCH != "gfx942":
+        pytest.skip("gfx942 one-query-block launch")
+    launches = _run_gfx942_one_q_block(seq_lens, num_heads, monkeypatch)
+    assert launches, "neither Triton kernel launched"
+    for name, _grid, one_q_block in launches:
+        assert not one_q_block, f"{name} took the one-query-block launch"

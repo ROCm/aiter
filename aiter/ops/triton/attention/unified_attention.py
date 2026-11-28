@@ -220,6 +220,10 @@ class _UAParams(NamedTuple):
     skip_reduce: bool = False
     # NVFP4 KV cache only: PV as an FP8 WMMA (P and the upcast V in e4m3) instead of BF16
     force_fp8_pv_on_fp4_kv_cache: bool = False
+    # host-side split cap: no more segments than max_seqlen_k fills at this many
+    # keys (0: no cap). Under CUDA graphs max_seqlen_k is the capture bound, so
+    # the cap does not follow the live length at replay
+    min_segment_keys: int = 0
 
 
 def gfx950_gluon_supported(
@@ -292,17 +296,76 @@ def _gfx950_gluon_supported(params: _UAParams):
     )
 
 
+def _gfx950_one_block_segment_keys(config: dict, prgms: int, num_sms: int) -> int:
+    """The one-block split's segment floor in keys, for a grid of prgms programs.
+
+    From the kv_split leaf: a segment shorter than ONE_BLOCK_SEGMENT_MIN_KEYS costs
+    more in its query block and partials than its keys save. That full floor holds
+    from ONE_BLOCK_FLOOR_FULL_FILL programs (num_seqs * num_kv_heads) per CU; a
+    smaller grid needs its segments for occupancy, so its floor drops in proportion,
+    by powers of two, down to ONE_BLOCK_SEGMENT_LO_KEYS.
+    A leaf without ONE_BLOCK_SEGMENT_MIN_KEYS sets no floor (0).
+    """
+    min_keys = config.get("ONE_BLOCK_SEGMENT_MIN_KEYS")
+    if min_keys is None:
+        return 0
+    lo_keys = config["ONE_BLOCK_SEGMENT_LO_KEYS"]
+    full = max(1, int(num_sms * config["ONE_BLOCK_FLOOR_FULL_FILL"]))
+    keys = min_keys * min(prgms, full) // full
+    keys = 1 << max(keys, 1).bit_length() - 1
+    return max(min(lo_keys, min_keys), keys)
+
+
+def _gfx950_one_block_num_segments(
+    num_segments: int, max_seqlen_k: int, min_keys: int, tile_size: int
+) -> int:
+    """The most of num_segments, halving, that keeps every segment of a
+    max_seqlen_k sequence at min_keys or more.
+
+    The kernel cuts a sequence into segments of cdiv(seq_len, n * tile_size) tiles,
+    and the last segment takes the rest, so that one is checked.
+    """
+    n = min(num_segments, 1 << max(1, max_seqlen_k // min_keys).bit_length() - 1)
+    while n > 1:
+        segment = triton.cdiv(max_seqlen_k, n * tile_size) * tile_size
+        if max_seqlen_k - (n - 1) * segment >= min_keys:
+            break
+        n //= 2
+    return n
+
+
 def _gfx950_split_params(params: _UAParams):
     """Size the split by the gluon grid when a sequence spans several query blocks."""
     q_rows = params.max_seqlen_q * params.num_queries_per_kv
-    if params.all_decode or (q_rows <= 128 and params.sliding_window <= 0):
+    if params.all_decode:
         return params
+    if q_rows <= 128 and params.sliding_window <= 0:
+        # one query block per sequence; count that grid only while the
+        # padded count leaves the launch unsplit and the grid does not fill the CUs
+        config = get_unified_attention_config("kv_split", params, backend="gluon")
+        if _split_launch_config(config)[0] > 1:
+            return params
+        # ONE_BLOCK_SPLIT_MAX_FILL: programs per CU from which the one-block grid
+        # fills the GPU, so a split only adds partials and a reduce
+        one_block_prgms = params.num_seqs * params.num_kv_heads
+        max_fill = config.get("ONE_BLOCK_SPLIT_MAX_FILL")
+        if max_fill is not None and one_block_prgms >= max_fill * params.num_sms:
+            return params
+        return params._replace(
+            num_2d_prgms=one_block_prgms,
+            min_segment_keys=_gfx950_one_block_segment_keys(
+                config, one_block_prgms, params.num_sms
+            ),
+        )
     config = get_unified_attention_config("attn_3d", params, backend="gluon")
     block_m = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
     if q_rows <= 128:
         block_m = max(block_m, triton.next_power_of_2(q_rows))
     block_q = block_m // params.num_queries_per_kv
     num_q_blocks = params.num_tokens // block_q + params.num_seqs
+    if params.max_seqlen_q <= block_q:
+        # the launch shrinks to one query block per sequence (ONE_Q_BLOCK)
+        num_q_blocks = params.num_seqs
     return params._replace(num_2d_prgms=num_q_blocks * params.num_kv_heads)
 
 
@@ -477,6 +540,9 @@ def unified_attention(
     v,
     out,
     cu_seqlens_q,
+    # upper bound on every sequence's query length; it must be at least the longest
+    # one. Short queries launch one query block per sequence, so rows past
+    # max_seqlen_q are left unwritten. This is not checked at runtime.
     max_seqlen_q,
     seqused_k,
     max_seqlen_k,
@@ -755,6 +821,16 @@ def unified_attention(
             TILE_SIZE = block_size
         else:
             TILE_SIZE = CONFIG_TILE_SIZE
+        # skip_reduce hands the caller the partials, and output_rows is
+        # reduce_segments' epilogue: both keep the split as is
+        if split_params.min_segment_keys and not skip_reduce and output_rows is None:
+            # no more segments than the longest sequence fills at the floor
+            NUM_SEGMENTS = _gfx950_one_block_num_segments(
+                NUM_SEGMENTS,
+                int(params.max_seqlen_k),
+                split_params.min_segment_keys,
+                TILE_SIZE,
+            )
 
         if NUM_SEGMENTS > 1:
             segm_output = torch.empty(
@@ -1021,6 +1097,21 @@ def _reject_nvfp4_kv_on_triton(params: _UAParams):
         )
 
 
+def _gfx942_one_q_block(params: _UAParams, block_q: int) -> bool:
+    """One program per sequence when the query fits in one Triton block.
+
+    gfx942 only. The padded grid is ``num_tokens // BLOCK_Q + num_seqs``, and
+    the prologue index ``start // BLOCK_Q + seq`` assumes those empty slots.
+    q=1 is already one block through ``ALL_DECODE``. The constexpr stays off
+    on every other arch, including the gfx950 gluon kernel.
+    """
+    return (
+        DEVICE_ARCH == "gfx942"
+        and not params.all_decode
+        and int(params.max_seqlen_q) <= int(block_q)
+    )
+
+
 def _unified_attention_2d_triton(params: _UAParams):
     _reject_nvfp4_kv_on_triton(params)
     if params.shuffled_kv_cache and (
@@ -1038,7 +1129,8 @@ def _unified_attention_2d_triton(params: _UAParams):
     assert config["BLOCK_Q"] >= 1
     if params.shuffled_kv_cache:
         config["TILE_SIZE"] = params.block_size
-    if params.all_decode:
+    one_q_block = _gfx942_one_q_block(params, config["BLOCK_Q"])
+    if params.all_decode or one_q_block:
         total_num_q_blocks = params.num_seqs
     else:
         total_num_q_blocks = params.num_tokens // config["BLOCK_Q"] + params.num_seqs
@@ -1093,6 +1185,7 @@ def _unified_attention_2d_triton(params: _UAParams):
         query_start_len_ptr=params.cu_seqlens_q,
         num_seqs=params.num_seqs,
         ALL_DECODE=params.all_decode,
+        ONE_Q_BLOCK=one_q_block,
         SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
         K_WIDTH=params.k_width,
         **config,
@@ -1116,7 +1209,8 @@ def _unified_attention_3d_triton(
     config["BLOCK_Q"] = config["BLOCK_M"] // params.num_queries_per_kv
     assert config["BLOCK_Q"] >= 1
 
-    if params.all_decode:
+    one_q_block = _gfx942_one_q_block(params, config["BLOCK_Q"])
+    if params.all_decode or one_q_block:
         total_num_q_blocks = params.num_seqs
     else:
         total_num_q_blocks = params.num_tokens // config["BLOCK_Q"] + params.num_seqs
@@ -1172,6 +1266,7 @@ def _unified_attention_3d_triton(
         query_start_len_ptr=params.cu_seqlens_q,
         num_seqs=params.num_seqs,
         ALL_DECODE=params.all_decode,
+        ONE_Q_BLOCK=one_q_block,
         SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
         K_WIDTH=params.k_width,
         IS_Q_FP8=(params.q_dtype == e4m3_dtype),
@@ -1683,11 +1778,18 @@ def _unified_attention_gfx950(
     BLOCK_Q = BLOCK_M // params.num_queries_per_kv
     assert BLOCK_Q >= 1
 
+    # every sequence fits one query block: launch exactly one per sequence.
+    # This trusts max_seqlen_q. An underestimate drops query rows (the
+    # previous grid covered them). Checking the lengths would sync the device.
+    one_q_block = not params.all_decode and params.max_seqlen_q <= BLOCK_Q
     if params.all_decode:
         total_query_blocks = params.num_seqs
         grid = (total_query_blocks, params.num_kv_heads)
     else:
-        total_query_blocks = params.num_tokens // BLOCK_Q + params.num_seqs
+        if one_q_block:
+            total_query_blocks = params.num_seqs
+        else:
+            total_query_blocks = params.num_tokens // BLOCK_Q + params.num_seqs
         grid = (params.num_kv_heads, total_query_blocks)
     if NUM_SEGMENTS > 1:
         grid = grid + (NUM_SEGMENTS,)
@@ -1759,6 +1861,7 @@ def _unified_attention_gfx950(
         USE_STORE_BUFFER_OP=USE_STORE_BUFFER_OP,
         num_warps=num_warps,
         ALL_DECODE=params.all_decode,
+        ONE_Q_BLOCK=one_q_block,
         CAUSAL=params.causal,
         # useful for debugging when needed
         REMOVE_INDIRECT_ACCESS=False,
