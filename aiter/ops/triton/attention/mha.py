@@ -50,6 +50,19 @@ _LOGGER = AiterTritonLogger()
 _GLUON_SUPPORTED_ARCHS = ("gfx950",)
 _TRITON_GE_36 = Version(triton.__version__) >= Version("3.6.0")
 
+# gfx1250 gluon forward, signature-compatible with `_attn_fwd`.
+_gluon_gfx1250_attn_fwd = None
+if get_arch() == "gfx1250":
+    try:
+        from aiter.ops.triton._gluon_kernels.gfx1250.attention.mha import (
+            _attn_fwd as _gluon_gfx1250_attn_fwd,
+        )
+    except Exception:  # noqa: BLE001 - any import/compile issue falls back to Triton
+        _gluon_gfx1250_attn_fwd = None
+
+# Escape hatch for benchmarking/debugging: 0 forces the Triton kernel.
+_MHA_GLUON_ENV = os.environ.get("AITER_TRITON_MHA_GLUON")
+
 _USE_FUSED_BWD_KERNEL = False
 
 
@@ -119,6 +132,46 @@ def mha_set_impl(impl: Literal["default", "dao_ai"]):
     """Set the default implementation for subsequent calls without an explicit choice."""
     global _MHA_IMPL
     _MHA_IMPL = _resolve_implementation(impl)
+
+
+def _use_gluon_fwd(q, k, v, IS_FP8, config, sm_scale) -> bool:
+    """Whether the gfx1250 gluon forward can serve this call.
+
+    The kernel implements every forward feature of `_attn_fwd`: causal / varlen
+    / GQA / sliding window / sink / LSE / alibi / padded head / PE head dim /
+    return_scores / dropout, in bf16 and fp8. What is left below are the
+    kernel's structural preconditions, not feature gaps.
+    """
+    if _gluon_gfx1250_attn_fwd is None or _MHA_GLUON_ENV == "0":
+        return False
+    if _MHA_SWIZZLE != "default":
+        return False
+    # bf16 throughout, or fp8 throughout -- no mixed-precision q/k/v.
+    if not (
+        all(t.dtype is torch.bfloat16 for t in (q, k, v))
+        or (IS_FP8 and q.dtype is k.dtype is v.dtype)
+    ):
+        return False
+    # The K/V TDM descriptors hardcode a unit innermost stride
+    # (`strides=[stride_kn, 1]`). Q and O are indexed with explicit strides, so
+    # only K/V are constrained.
+    if not all(t.stride(-1) == 1 for t in (k, v)):
+        return False
+    # Each warp needs at least one 16-row WMMA M-tile.
+    if config["BLOCK_M"] // 16 < config["num_warps"]:
+        return False
+    return sm_scale > 0
+
+
+def _disable_gluon_fwd(err: Exception) -> None:
+    """Use the Triton forward for the rest of the process after a Gluon failure."""
+    global _gluon_gfx1250_attn_fwd
+    _gluon_gfx1250_attn_fwd = None
+    _LOGGER.warning(
+        "gfx1250 Gluon MHA forward failed (%s: %s). Using the Triton kernel.",
+        type(err).__name__,
+        err,
+    )
 
 
 _USE_INT64_STRIDES = True
@@ -864,77 +917,89 @@ def _flash_attn_forward(
             batch * num_q_heads * triton.cdiv(seqlen_q, META["BLOCK_M"]),
         )
 
-        _attn_fwd[grid](
-            q,
-            k,
-            v,
-            descale_q,
-            descale_k,
-            descale_v,
-            o,
-            alibi_slopes,
-            s_dmask,
-            softmax_lse,
-            sink,
-            *q_strides,
-            *k_strides,
-            *v_strides,
-            descale_q.stride(0) if descale_q is not None else 0,
-            descale_k.stride(0) if descale_k is not None else 0,
-            descale_v.stride(0) if descale_v is not None else 0,
-            *o_strides,
-            alibi_slopes.stride(0) if alibi_slopes is not None else 0,
-            alibi_slopes.stride(1) if alibi_slopes is not None else 0,
-            sd_strides[0],
-            sd_strides[1],
-            sd_strides[2],
-            sd_strides[3],
-            stride_lse_z if softmax_lse is not None else 0,
-            stride_lse_h if softmax_lse is not None else 0,
-            stride_lse_m if softmax_lse is not None else 0,
-            softmax_scale,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            dropout_p,
-            philox_seed,
-            philox_offset,
-            SEQLEN_Q=max_seqlen_q,
-            SEQLEN_K=max_seqlen_k,
-            IS_CAUSAL=causal,
-            NUM_Q_HEADS=num_q_heads,
-            NUM_K_HEADS=num_k_heads,
-            BLOCK_DMODEL=v_head_dim,
-            BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
-            BLOCK_DMODEL_PE=pe_head_dim,
-            RETURN_SCORES=return_softmax,
-            ENABLE_DROPOUT=enable_dropout,
-            IS_FP8=IS_FP8,
-            FP8_MAX=FP8_MAX,
-            VARLEN=is_varlen,
-            BATCH=batch,
-            NUM_XCD=get_num_xcds(),
-            SWIZZLE=_effective_swizzle(
-                num_q_heads,
-                num_k_heads,
-                get_num_xcds(),
-                triton.cdiv(seqlen_q, config["BLOCK_M"]),
-                batch,
-            ),
-            USE_INT64_STRIDES=use_int64_strides,
-            ENABLE_SINK=sink is not None,
-            SLIDING_WINDOW=sliding_window,
-            # Soundness precondition: only set when every Q/K/V head-axis
-            # stride is a multiple of 8 elements. q_strides[1]/k_strides[1]/
-            # v_strides[1] are the head-axis strides in both thd and bshd
-            # layouts (see q_strides assembly above).
-            HEAD_STRIDE_ALIGNED_8=(
-                q_strides[1] % 8 == 0
-                and k_strides[1] % 8 == 0
-                and v_strides[1] % 8 == 0
-            ),
-            **config,
-            enable_fp_fusion=True,
-        )
+        def launch(fwd_impl):
+            fwd_impl[grid](
+                q,
+                k,
+                v,
+                descale_q,
+                descale_k,
+                descale_v,
+                o,
+                alibi_slopes,
+                s_dmask,
+                softmax_lse,
+                sink,
+                *q_strides,
+                *k_strides,
+                *v_strides,
+                descale_q.stride(0) if descale_q is not None else 0,
+                descale_k.stride(0) if descale_k is not None else 0,
+                descale_v.stride(0) if descale_v is not None else 0,
+                *o_strides,
+                alibi_slopes.stride(0) if alibi_slopes is not None else 0,
+                alibi_slopes.stride(1) if alibi_slopes is not None else 0,
+                sd_strides[0],
+                sd_strides[1],
+                sd_strides[2],
+                sd_strides[3],
+                stride_lse_z if softmax_lse is not None else 0,
+                stride_lse_h if softmax_lse is not None else 0,
+                stride_lse_m if softmax_lse is not None else 0,
+                softmax_scale,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                dropout_p,
+                philox_seed,
+                philox_offset,
+                SEQLEN_Q=max_seqlen_q,
+                SEQLEN_K=max_seqlen_k,
+                IS_CAUSAL=causal,
+                NUM_Q_HEADS=num_q_heads,
+                NUM_K_HEADS=num_k_heads,
+                BLOCK_DMODEL=v_head_dim,
+                BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
+                BLOCK_DMODEL_PE=pe_head_dim,
+                RETURN_SCORES=return_softmax,
+                ENABLE_DROPOUT=enable_dropout,
+                IS_FP8=IS_FP8,
+                FP8_MAX=FP8_MAX,
+                VARLEN=is_varlen,
+                BATCH=batch,
+                NUM_XCD=get_num_xcds(),
+                SWIZZLE=_effective_swizzle(
+                    num_q_heads,
+                    num_k_heads,
+                    get_num_xcds(),
+                    triton.cdiv(seqlen_q, config["BLOCK_M"]),
+                    batch,
+                ),
+                USE_INT64_STRIDES=use_int64_strides,
+                ENABLE_SINK=sink is not None,
+                SLIDING_WINDOW=sliding_window,
+                # Soundness precondition: only set when every Q/K/V head-axis
+                # stride is a multiple of 8 elements. q_strides[1]/k_strides[1]/
+                # v_strides[1] are the head-axis strides in both thd and bshd
+                # layouts (see q_strides assembly above).
+                HEAD_STRIDE_ALIGNED_8=(
+                    q_strides[1] % 8 == 0
+                    and k_strides[1] % 8 == 0
+                    and v_strides[1] % 8 == 0
+                ),
+                **config,
+                enable_fp_fusion=True,
+            )
+
+        use_gluon = _use_gluon_fwd(q, k, v, IS_FP8, config, softmax_scale)
+        if use_gluon:
+            # A Triton without the gfx1250 warp-pipeline support fails to compile it.
+            try:
+                launch(_gluon_gfx1250_attn_fwd)
+            except Exception as err:  # noqa: BLE001
+                _disable_gluon_fwd(err)
+                use_gluon = False
+        if not use_gluon:
+            launch(_attn_fwd)
 
     return o, softmax_lse, s_dmask, philox_seed, philox_offset, rng_state
 

@@ -900,6 +900,15 @@ def test_mha_varlen(
     )
 
 
+# The cases above stay at seqlen <= 2048. Longer sequences route head dims in
+# (64, 128] to the register-heavy forward configs on gfx1250.
+@pytest.mark.parametrize("CAUSAL, SEQLEN", [(True, 4608), (False, 3072)])
+@pytest.mark.parametrize("VARLEN", [False, True])
+def test_mha_long_seqlen(CAUSAL: bool, SEQLEN: int, VARLEN: bool):
+    impl = _test_mha_varlen_impl if VARLEN else _test_mha_impl
+    impl(2, SEQLEN, SEQLEN, 16, 4, 128, 0.0, False, False, CAUSAL)
+
+
 @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (8, 1)])
 @pytest.mark.parametrize("DROPOUT, RETURN_LSE, RETURN_SOFTMAX, ", [(0.2, True, True)])
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
