@@ -6,6 +6,7 @@
 #include "aiter_enum.h"
 #include "mla_reduce_cases.h"
 #include <cstdint>
+#include <cstdlib>
 #include <string_view>
 
 enum class MlaPlanner : int32_t
@@ -41,6 +42,47 @@ struct MlaDecodeHeadPlan
 };
 
 inline constexpr int32_t kMlaMetadataV10V11PackedQoLenPerWg = 128;
+
+// Query-head rows covered by one gfx1250 PS1 KV pass.
+inline constexpr int32_t kMlaPs1QoPassRows = 128;
+
+// Minimum batch size considered for row packing.
+inline constexpr int32_t kMlaPs1PackMinBatches = 16;
+
+// Shapes supported by the row-packed PS1 kernel.
+inline bool mla_ps1_rows_packed_shape(const std::string_view arch_id,
+                                      const int32_t num_heads,
+                                      const int32_t max_seqlen_qo,
+                                      const AiterDtype q_dtype,
+                                      const AiterDtype kv_dtype,
+                                      const bool flydsl_ps1)
+{
+    return flydsl_ps1 && (arch_id == "gfx1250" || arch_id == "gfx1250-strict") &&
+           (q_dtype == AITER_DTYPE_fp8) && (kv_dtype == AITER_DTYPE_fp8) && (num_heads == 96) &&
+           (max_seqlen_qo == 5);
+}
+
+// Unset selects automatically; 1 skips the profitability check and 0 disables packing.
+inline int32_t mla_ps1_pack_rows_mode()
+{
+    const char* env = std::getenv("AITER_MLA_PS1_PACK_ROWS");
+    return (env == nullptr) ? -1 : std::atoi(env);
+}
+
+// Return row capacity per pass for packable shapes, or 0.
+inline int32_t mla_ps1_qo_pass_rows(const std::string_view arch_id,
+                                    const int32_t num_heads,
+                                    const int32_t max_seqlen_qo,
+                                    const AiterDtype q_dtype,
+                                    const AiterDtype kv_dtype,
+                                    const bool flydsl_ps1,
+                                    const int32_t num_batches)
+{
+    const bool packs = mla_ps1_rows_packed_shape(
+                           arch_id, num_heads, max_seqlen_qo, q_dtype, kv_dtype, flydsl_ps1) &&
+                       (num_batches >= kMlaPs1PackMinBatches) && (mla_ps1_pack_rows_mode() != 0);
+    return packs ? kMlaPs1QoPassRows : 0;
+}
 
 namespace aiter_mla_decode_shape_detail {
 
@@ -154,13 +196,16 @@ inline MlaDecodeHeadPlan mla_decode_head_plan_v1_2(const std::string_view arch_i
     // FP8 or BF16 Q/KV, the dtypes the FlyDSL PS1 kernels take.
     const bool flydsl_ps1_dtypes =
         (q_dtype == kv_dtype) && (q_is_fp8 || (q_dtype == AITER_DTYPE_bf16));
+    // 32 and 64 heads take a multi-token query as several qo tiles of at most
+    // 128 / num_heads rows (mla_v12_num_qo_tiles), one per work item, which is
+    // what the kernel's wave layout holds (mla_common.planner_q_tile_rows). The
+    // bound is the kernel's MAX_TILED_SEQLEN_Q.
     const bool gfx1250_flydsl_ps1_heads =
         flydsl_ps1 && ((arch_id == "gfx1250" || arch_id == "gfx1250-strict")) && flydsl_ps1_dtypes &&
         ((num_heads == 96) ||
          (((num_heads == 32) || (num_heads == 64) || (num_heads == 128)) &&
           (max_seqlen_qo == 1)) ||
-         (((num_heads == 32) || (num_heads == 64)) && (max_seqlen_qo <= 4) &&
-          (num_heads * max_seqlen_qo <= 128)));
+         (((num_heads == 32) || (num_heads == 64)) && (max_seqlen_qo <= 8)));
 
     // gfx942 native QH64 FP8 only supports page_size=64; otherwise fold to QH16.
     const bool natively_supported =
@@ -279,15 +324,15 @@ inline MlaBackendId mla_decode_backend(const std::string_view arch_id,
         (ps1_is_fp8 || ps1_is_bf16) &&
         ((num_heads == 16) || (num_heads == 32) || (num_heads == 64) || (num_heads == 96) ||
          (num_heads == 128)) &&
-        ((num_heads == 96) || (max_seqlen_qo == 1) ||
-         ((num_heads <= 64) && (max_seqlen_qo <= 4) && (num_heads * max_seqlen_qo <= 128))) &&
+        ((num_heads == 96) || (max_seqlen_qo == 1) || ((num_heads == 16) && (max_seqlen_qo <= 4)) ||
+         (((num_heads == 32) || (num_heads == 64)) && (max_seqlen_qo <= 8))) &&
         ((cp_world_size == 1) || cp_round_robin) && !intra_batch_mode;
     if(use_flydsl_ps1)
     {
-        // FP8 head counts with code objects exported from the FlyDSL PS1 kernel
-        // (hsa/gfx1250/mla_dsl/mla_dsl.csv) take them by default;
-        // AITER_MLA_DECODE_PS1_ASM=0 keeps them on FlyDSL JIT. BF16 is JIT only.
-        if(use_ps1_asm && ps1_is_fp8 && ((num_heads == 96) || (num_heads == 128)))
+        // BF16 and QH64 round-robin CP remain on JIT.
+        const bool has_ps1_fp8_co = (num_heads == 96) || (num_heads == 128) ||
+                                    ((num_heads == 64) && !cp_round_robin);
+        if(use_ps1_asm && ps1_is_fp8 && has_ps1_fp8_co)
         {
             return MlaBackendId::Ps1Fp8Asm;
         }

@@ -87,6 +87,10 @@ __device__ __forceinline__ int32_t mla_v12_num_qo_tiles(const MlaMetadataV1Kerne
 {
     if constexpr(Traits::kQoSplits)
     {
+        if(params.qo_pass_rows > 0)
+        {
+            return 1;
+        }
         // An empty request (graph padding) still needs one tile; zero tiles never advance the
         // planner past it.
         if(params.num_heads * 2 > Traits::kPackedQoLenPerWg)
@@ -102,6 +106,47 @@ __device__ __forceinline__ int32_t mla_v12_num_qo_tiles(const MlaMetadataV1Kerne
     {
         return 1;
     }
+}
+
+__device__ __forceinline__ int32_t mla_v12_tile_passes(const MlaMetadataV1KernelParameter& params,
+                                                       const int32_t rows)
+{
+    if(params.qo_pass_rows <= 0)
+    {
+        return 1;
+    }
+    return max(integer_divide_ceil(rows * params.num_heads, params.qo_pass_rows), 1);
+}
+
+static constexpr int32_t kMlaV12PackTileTokens   = 64;
+static constexpr int32_t kMlaV12PackMinTiles     = 12;
+static constexpr int32_t kMlaV12PackTilesPerItem = 20;
+
+template <typename Traits>
+__device__ bool mla_v12_pack_pays(const MlaMetadataV1KernelParameter& params,
+                                  QoState<Traits>& qo_state,
+                                  const int32_t num_batches,
+                                  const int32_t lane_idx)
+{
+    int32_t saved_tiles = 0;
+    int32_t rows        = 0;
+    for(int32_t bid = lane_idx; bid < num_batches; bid += opus::get_warp_size())
+    {
+        const int32_t seqlen_kv =
+            params.p_seqlens_kv_indptr[bid + 1] - params.p_seqlens_kv_indptr[bid];
+        const int32_t seqlen_qo =
+            QoState<Traits>::is_unique()
+                ? qo_state.get_seqlen(bid)
+                : (params.p_seqlens_qo_indptr[bid + 1] - params.p_seqlens_qo_indptr[bid]);
+        saved_tiles += integer_divide_ceil(seqlen_kv, kMlaV12PackTileTokens) *
+                       (seqlen_qo - mla_v12_tile_passes(params, seqlen_qo));
+        rows += seqlen_qo;
+    }
+    saved_tiles = aiter::warpReduce<aiter::AddFunctor, int32_t, opus::get_warp_size()>(saved_tiles);
+    rows        = aiter::warpReduce<aiter::AddFunctor, int32_t, opus::get_warp_size()>(rows);
+    const int32_t added_items = max((params.max_tile_passes - 1) * params.num_cu - rows, 0);
+    return saved_tiles >=
+           kMlaV12PackMinTiles * params.num_cu + kMlaV12PackTilesPerItem * added_items;
 }
 
 template <typename Traits>
@@ -151,7 +196,9 @@ mla_v12_compute_sum_blocks(const MlaMetadataV1KernelParameter& params,
             seqlen_kv, params.kv_granularity, params.kv_granularity_log2);
         const int32_t num_qo_tiles = mla_v12_num_qo_tiles<Traits>(params, seqlen_qo);
         const int32_t unit_blocks  = num_blocks + params.fixed_over_head_num_blocks;
-        sum_blocks += unit_blocks * num_qo_tiles;
+        const int32_t passes =
+            mla_v12_tile_passes(params, integer_divide_ceil(seqlen_qo, num_qo_tiles));
+        sum_blocks += unit_blocks * num_qo_tiles * passes;
     }
 
     return aiter::warpReduce<aiter::AddFunctor, decltype(sum_blocks), opus::get_warp_size()>(
@@ -541,6 +588,13 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
 
     MlaWorkInfo* p_work_info_set = reinterpret_cast<MlaWorkInfo*>(params.p_work_info_set_raw);
 
+    if((params.qo_pass_rows > 0) && params.pack_rows_auto &&
+       !mla_v12_pack_pays<Traits>(params, qo_state, num_batches, lane_idx))
+    {
+        params.qo_pass_rows    = 0;
+        params.max_tile_passes = 1;
+    }
+
     const int32_t sum_blocks = mla_v12_compute_sum_blocks<Traits>(
         params, qo_state, p_lds_seqlens_qo, p_lds_seqlens_kv, ori_seqlen_qo, num_batches, lane_idx);
 
@@ -556,8 +610,11 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
 
     // same eff_splits as the phase-1 count so fill and count agree
     const int32_t eff_splits = mla_v12_effective_splits(params, sum_blocks);
+    // Reserve enough payload for the most expensive multi-pass item.
+    const int32_t max_passes = max(params.max_tile_passes, 1);
     const int32_t payload =
-        integer_divide_ceil(sum_blocks, eff_splits) + params.fixed_over_head_num_blocks;
+        integer_divide_ceil(sum_blocks, eff_splits) +
+        params.fixed_over_head_num_blocks * max_passes + (max_passes - 1);
     const int32_t page_size   = params.page_size;
     int32_t curr_batch        = 0; // batch ID of the batch which is under review
     int32_t curr_kv_block     = 0; // #blocks handled by previous cu part(s)
@@ -586,12 +643,13 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
             const int32_t seqlen_qo     = qo_state.get_seqlen(curr_batch);
             const int32_t num_qo_tiles  = mla_v12_num_qo_tiles<Traits>(params, seqlen_qo);
             const int32_t qo_tile_size  = integer_divide_ceil(seqlen_qo, num_qo_tiles);
+            const int32_t passes        = mla_v12_tile_passes(params, qo_tile_size);
             const int32_t num_kv_blocks = integer_divide_ceil_power2(
                 curr_kv_seqlen, params.kv_granularity, params.kv_granularity_log2);
             const int32_t remain_kv_blocks = num_kv_blocks - curr_kv_block;
 
             // If current cu part is able to handle this batch of seqences
-            if(remain_payload >= (remain_kv_blocks + params.fixed_over_head_num_blocks) ||
+            if(remain_payload >= (remain_kv_blocks + params.fixed_over_head_num_blocks) * passes ||
                cur_tail_done)
             {
                 const int32_t num_splits = curr_n_split_idx + 1;
@@ -695,7 +753,7 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
                 tot_qo_tiles += 1;
                 num_works += 1;
 
-                remain_payload -= (remain_kv_blocks + params.fixed_over_head_num_blocks);
+                remain_payload -= (remain_kv_blocks + params.fixed_over_head_num_blocks) * passes;
 
                 // update state
                 curr_qo_tile_idx =
@@ -745,11 +803,10 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
             }
             else
             {
-                if(remain_payload > params.fixed_over_head_num_blocks)
+                const int32_t consuming_blks =
+                    remain_payload / passes - params.fixed_over_head_num_blocks;
+                if(consuming_blks > 0)
                 {
-                    const int32_t consuming_blks =
-                        remain_payload - params.fixed_over_head_num_blocks;
-
                     auto fill_work_info = [&]() {
                         const int32_t curr_batch_kv =
                             Traits::kIsSparse ? (curr_batch / ori_seqlen_qo / params.qk_batch_ratio)
@@ -1430,6 +1487,19 @@ void get_mla_metadata_v1_2_device(const aiter_tensor_t& seqlens_qo_indptr, // [b
     params.qk_batch_ratio               = qk_batch_ratio;
     params.fixed_over_head_num_blocks   = max(1, (16 + page_size - 1) / page_size);
     params.tail_done_threshold          = max_seqlen_qo;
+
+    // Causal row packing requires token-granular offsets and is disabled for CP.
+    params.qo_pass_rows =
+        (!is_sparse && !is_cp_round_robin && (qk_batch_ratio == 1) &&
+         ((page_size == 1) || !is_causal))
+            ? mla_ps1_qo_pass_rows(
+                  arch_id, num_heads, max_seqlen_qo, q_dtype, kv_dtype, flydsl_ps1, num_batches)
+            : 0;
+    params.max_tile_passes =
+        (params.qo_pass_rows > 0)
+            ? integer_divide_ceil(max_seqlen_qo * num_heads, params.qo_pass_rows)
+            : 1;
+    params.pack_rows_auto = (mla_ps1_pack_rows_mode() != 1);
 
     params.num_xcd = (arch_id == "gfx950") ? 8 : 1;
 
