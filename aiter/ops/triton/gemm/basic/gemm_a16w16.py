@@ -93,6 +93,9 @@ def gemm_a16w16_(
 
     Uses the gluon backend automatically on supported architectures (gfx1250)
     and the triton backend everywhere else. Pass ``backend`` to force a choice.
+    On gfx950, ``backend="gluon"`` runs the compute-bound Gluon kernel. It needs
+    the TN layout, N and K that are multiples of 8, and K of at least 256. It has
+    no activation and no split-K.
 
     Args:
         x (torch.Tensor): Input matrix with shape (M, K).
@@ -200,6 +203,98 @@ def _gemm_a16w16_routed(
     )
 
 
+def _gluon_gfx950_unsupported_reason(M, N, K, x=None, w=None, y=None, activation=None):
+    """Why the gfx950 Gluon kernel cannot run the problem, or None if it can."""
+    if activation:
+        return "no activation support yet"
+    if M < 1 or N % 8:
+        return f"N must be a multiple of 8 (got M={M}, N={N})"
+    if K % 8 or K < 256:
+        return f"K must be a multiple of 8 and at least 256 (got K={K})"
+    for name, t in (("x", x), ("w", w), ("y", y)):
+        if t is not None and (t.stride(1) != 1 or t.stride(0) % 8):
+            return f"{name} must be row-major with a row stride that is a multiple of 8"
+    if x is not None and w is not None and x.dtype != w.dtype:
+        return f"x and w must have the same dtype (got {x.dtype} and {w.dtype})"
+    return None
+
+
+def _gemm_a16w16_gluon_gfx950(
+    x, w, bias, dtype, y, config, activation, skip_reduce, kernel_type
+):
+    """Runs the gfx950 Gluon kernel with the tile of its Gluon config."""
+    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a16w16 import (
+        _KERNEL_MAP,
+        TILE_SIDES,
+    )
+
+    M, K = x.shape
+    N, _ = w.shape
+    if config is None:
+        config, _ = get_gemm_config("GEMM-A16W16", M, N, K, backend="gluon")
+    kernel_type = config.pop("kernel_type", kernel_type)
+    if kernel_type not in _KERNEL_MAP:
+        raise ValueError(
+            f"gfx950 gluon a16w16: kernel_type must be one of {list(_KERNEL_MAP)}, "
+            f"got '{kernel_type}'"
+        )
+    if skip_reduce:
+        raise ValueError("gfx950 gluon a16w16: there is no split-K (skip_reduce)")
+    BLOCK_M, BLOCK_N, BLOCK_K = config["BLOCK_M"], config["BLOCK_N"], config["BLOCK_K"]
+    reason = _gluon_gfx950_unsupported_reason(M, N, K, x, w, y, activation)
+    if BLOCK_M not in TILE_SIDES or BLOCK_N not in TILE_SIDES:
+        reason = f"BLOCK_M and BLOCK_N must be in {TILE_SIDES}"
+    elif BLOCK_K != 64 or config["num_warps"] != 4:
+        reason = "the kernel needs BLOCK_K=64 and num_warps=4"
+    if reason is not None:
+        raise ValueError(f"gfx950 gluon a16w16: {reason}")
+    _LOGGER.info(
+        "GEMM_A16W16 [gluon/gfx950]: x=%s w=%s kernel=%s tile=%sx%s",
+        x.shape,
+        w.shape,
+        kernel_type,
+        BLOCK_M,
+        BLOCK_N,
+    )
+
+    if y is None:
+        y = torch.empty((M, N), dtype=dtype, device=x.device)
+    b = w.T  # the kernel loads B as (K, N) with K contiguous
+    grid_mn = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
+    # AITER_MFMA_SCHED=0 turns off the MFMA scheduler, for A/B runs.
+    schedule_hint = (
+        "" if os.environ.get("AITER_MFMA_SCHED", "1") == "0" else "mfma-schedule"
+    )
+    _KERNEL_MAP[kernel_type][(grid_mn, 1)](
+        x,
+        b,
+        y,
+        bias,
+        M,
+        N,
+        K,
+        x.stride(0),
+        x.stride(1),
+        b.stride(0),
+        b.stride(1),
+        y.stride(0),
+        y.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        GRID_MN=grid_mn,
+        NUM_XCDS=get_num_xcds(),
+        GROUP_SIZE_M=config["GROUP_SIZE_M"],
+        ADD_BIAS=bias is not None,
+        EVEN_M=M % BLOCK_M == 0,
+        EVEN_N=N % BLOCK_N == 0,
+        EVEN_K=K % (2 * BLOCK_K) == 0,
+        num_warps=config["num_warps"],
+        schedule_hint=schedule_hint,
+    )
+    return y
+
+
 def _gemm_a16w16_native(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -237,6 +332,11 @@ def _gemm_a16w16_native(
         torch.float16,
         torch.bfloat16,
     ), f"Weights (w) must be fp16 or bf16, got {w.dtype}"
+
+    if backend == "gluon" and not persistent and "gfx950" in get_arch():
+        return _gemm_a16w16_gluon_gfx950(
+            x, w, bias, dtype, y, config, activation, skip_reduce, kernel_type
+        )
 
     if persistent:
         assert not skip_reduce, (
@@ -721,6 +821,9 @@ def gemm_a16w16(
 
     Uses the gluon backend automatically on supported architectures (gfx1250)
     and the triton backend everywhere else. Pass ``backend`` to force a choice.
+    On gfx950, ``backend="gluon"`` runs the compute-bound Gluon kernel. It needs
+    the TN layout, N and K that are multiples of 8, and K of at least 256. It has
+    no activation and no split-K.
     See ``gemm_a16w16_`` for the full argument description; ``config`` is a dict
     here and is serialized before dispatch so the op is torch.compile-traceable.
     """
