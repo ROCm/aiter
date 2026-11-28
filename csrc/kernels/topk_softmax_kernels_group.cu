@@ -557,6 +557,10 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
         if constexpr(isBiased)
         {
             constexpr int lane_steps = [&]() {
+                if constexpr(THREAD_PER_GRP == 32)
+                    return 5;
+                if constexpr(THREAD_PER_GRP == 16)
+                    return 4;
                 if constexpr(THREAD_PER_GRP == 8)
                     return 3;
                 if constexpr(THREAD_PER_GRP == 4)
@@ -566,6 +570,8 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
                 else
                     return 0;
             }();
+            static_assert((1 << lane_steps) == THREAD_PER_GRP,
+                          "a group score must reduce over every lane of its group");
             const int lane_id = threadIdx.x % THREAD_PER_GRP;
             for(int g = threadIdx.x / THREAD_PER_GRP; g < NUM_GRP; g += blockDim.x / THREAD_PER_GRP)
             {
@@ -598,19 +604,37 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
                             return 0x4e; // quad_perm:[2,3,0,1]
                         if constexpr(i_step.value == 2)
                             return 0x141; // row_half_mirror
+                        if constexpr(i_step.value == 3)
+                            return 0x140; // row_mirror
                         else
                             return 0xffff; // return a value to let compile crash
                     };
                     opus::static_for<lane_steps>([&](auto i_step) {
-                        constexpr int dpp_i = get_dpp_i(i_step);
-                        float remote_max_1  = __builtin_bit_cast(
-                            float,
-                            __builtin_amdgcn_mov_dpp(
-                                __builtin_bit_cast(int, max1), dpp_i, row_mask, bank_mask, bound_ctrl));
-                        float remote_max_2 = __builtin_bit_cast(
-                            float,
-                            __builtin_amdgcn_mov_dpp(
-                                __builtin_bit_cast(int, max2), dpp_i, row_mask, bank_mask, bound_ctrl));
+                        float remote_max_1, remote_max_2;
+                        if constexpr(i_step.value == 4)
+                        {
+                            // DPP does not cross 16-lane rows.
+                            remote_max_1 = __shfl_xor(max1, 16);
+                            remote_max_2 = __shfl_xor(max2, 16);
+                        }
+                        else
+                        {
+                            constexpr int dpp_i = get_dpp_i(i_step);
+                            remote_max_1        = __builtin_bit_cast(
+                                float,
+                                __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, max1),
+                                                         dpp_i,
+                                                         row_mask,
+                                                         bank_mask,
+                                                         bound_ctrl));
+                            remote_max_2 = __builtin_bit_cast(
+                                float,
+                                __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, max2),
+                                                         dpp_i,
+                                                         row_mask,
+                                                         bank_mask,
+                                                         bound_ctrl));
+                        }
 
                         max2 = dev_max_(remote_max_1, max2);
                         max2 = remote_max_1 > max1 ? max1 : max2;
@@ -651,7 +675,12 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
                 max_idx     = gs_tmp > max_val ? g : max_idx;
                 max_val     = gs_tmp > max_val ? gs_tmp : max_val;
             }
-            group_scores[max_idx] = -INFINITY;
+            // Fewer than topk_group groups score above -inf (NaN or -inf
+            // inputs): max_idx stays NUM_GRP, one past group_scores. The
+            // unbiased launch reserves that slot; in biased mode it is
+            // sig_scores[0].
+            if(!isBiased || max_idx < NUM_GRP)
+                group_scores[max_idx] = -INFINITY;
         }
 
         for(int e = threadIdx.x; e < num_experts_vec; e += blockDim.x)
@@ -1855,7 +1884,15 @@ biased_grouped_topk_w32_kernel(const DTYPE_I* __restrict__ gating_output, // [nu
     LAUNCHER_TOPK_REG()                                                        \
     AITER_CHECK(!isBiased || correction_bias.dtype() == gating_output.dtype(), \
                 "Mixed bias dtype requires the register top-k path");          \
-    switch(num_experts % 4)                                                    \
+    AITER_CHECK(num_experts % num_expert_group == 0,                           \
+                "Unequal expert groups require the register top-k path, but "  \
+                "got num_experts=",                                            \
+                num_experts,                                                   \
+                ", num_expert_group=",                                         \
+                num_expert_group);                                             \
+    /* The group scores and the group mask read whole vectors, so a vector     \
+       must not cross a group boundary. */                                     \
+    switch((num_experts / num_expert_group) % 4)                               \
     {                                                                          \
     case 0:                                                                    \
         using vec4_type = opus::vector_t<float, 4>;                            \
