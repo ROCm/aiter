@@ -527,6 +527,7 @@ def flydsl_fp8_mqa_logits(
     clean_logits=True,
     stream=None,
     variant=None,
+    out: torch.Tensor | None = None,
 ):
     """FlyDSL gfx942/gfx950 FP8 MQA logits -- drop-in replacement for the Triton ``fp8_mqa_logits``.
 
@@ -545,15 +546,39 @@ def flydsl_fp8_mqa_logits(
     variant:      optional kernel-variant tag (see ``KERNEL_VARIANTS``). If None,
                   taken from ``FLYDSL_FP8_MQA_LOGITS_VARIANT`` or, failing that,
                   chosen adaptively from the problem shape (``_auto_variant``).
+    out:          optional output on Q.device: [seq_len, seq_len_kv] float32, unit
+                  column stride, row stride of at least seq_len_kv (same contract
+                  as the Triton ``out``). The kernel writes columns
+                  [0, seq_len_kv) of each row and nothing else. A caller whose
+                  seq_len_kv grows from call to call (chunked prefill) can keep
+                  one buffer instead of a new, larger allocation per call. A
+                  mismatch raises ValueError.
 
     Returns
     -------
-    logits: [seq_len, seq_len_kv], dtype float32.
+    logits: out, or an allocated [seq_len, seq_len_kv] float32 tensor.
     """
     seq_len, num_heads, head_size = Q.shape
     seq_len_kv = KV.shape[0]
     assert num_heads & (num_heads - 1) == 0, "num q. heads should be power of 2."
     assert head_size & (head_size - 1) == 0, "head size should be power of 2."
+    if out is not None:
+        if out.dtype != torch.float32 or out.dim() != 2:
+            raise ValueError(
+                f"out must be a 2-D float32 tensor, got {out.dtype} "
+                f"with {out.dim()} dims"
+            )
+        if tuple(out.shape) != (seq_len, seq_len_kv):
+            raise ValueError(
+                f"out must be [{seq_len}, {seq_len_kv}], got {tuple(out.shape)}"
+            )
+        if out.stride(1) != 1 or (seq_len > 1 and out.stride(0) < seq_len_kv):
+            raise ValueError(
+                "out needs a unit column stride and a row stride of at least "
+                f"seq_len_kv={seq_len_kv}, got strides {out.stride()}"
+            )
+        if out.device != Q.device:
+            raise ValueError(f"out is on {out.device}, Q on {Q.device}")
 
     # The gfx950 launcher assumes flat, contiguous row-major Q/KV: it derives
     # per-row/per-column byte offsets from the logical shape alone, with no
@@ -616,11 +641,13 @@ def flydsl_fp8_mqa_logits(
     # No torch.full even when clean_logits: the kernel writes -inf itself.
     aligned_size = 256
     seq_len_kv_aligned = (seq_len_kv + aligned_size - 1) // aligned_size * aligned_size
-    logits = torch.empty(
-        (seq_len, seq_len_kv_aligned),
-        dtype=torch.float32,
-        device=Q.device,
-    )[:, :seq_len_kv]
+    logits = out
+    if logits is None:
+        logits = torch.empty(
+            (seq_len, seq_len_kv_aligned),
+            dtype=torch.float32,
+            device=Q.device,
+        )[:, :seq_len_kv]
 
     if stream is None:
         stream = torch.cuda.current_stream()

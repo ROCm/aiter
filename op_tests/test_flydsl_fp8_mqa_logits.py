@@ -5,6 +5,7 @@ import argparse
 import contextlib
 import itertools
 import os
+import re
 import statistics
 import sys
 import warnings
@@ -433,6 +434,110 @@ def verify_auto_variant(s_q, s_k, num_heads):
             f"[s_q={s_q} s_k={s_k} nh={num_heads}]"
         )
     return {"gfx": get_gfx(), "variant": variant, "status": "ok"}
+
+
+# (s_q, s_k, num_heads) for out=: one row, a short last row block, KV splits on a
+# small-M / long-KV shape, and a long-context prefill chunk.
+_CALLER_OUT_SHAPES = [
+    (1, 113, 32),
+    (61, 1024, 64),
+    (1019, 1560, 32),
+    (64, 8192, 64),
+    (1024, 40000, 32),
+]
+_CALLER_OUT_LAYOUTS = ("aligned", "tight", "offset")
+
+
+@benchmark()
+def verify_caller_out(s_q, s_k, num_heads, clean_logits, layout):
+    """out= gets the allocating call's scores bit for bit and writes nothing
+    outside columns [0, s_k) of its rows: not the pitch padding, not before or
+    after the view."""
+    inp = _make_inputs(
+        s_q,
+        s_k,
+        num_heads,
+        128,
+        _DEFAULT_Q_DTYPES[0],
+        _DEFAULT_KV_DTYPES[0],
+        "misaligned",
+    )
+    tag = f"s_q={s_q} s_k={s_k} nh={num_heads} clean_logits={clean_logits} {layout}"
+    args = (inp.q_fp8, inp.kv_fp8, inp.scales, inp.weights, inp.ks, inp.ke)
+    aligned = (s_k + 255) // 256 * 256
+    pitch, offset = {
+        "aligned": (aligned, 0),
+        "tight": (s_k, 0),
+        "offset": (aligned + 17, 37),
+    }[layout]
+    with torch.inference_mode():
+        expected = flydsl_fp8_mqa_logits(*args, clean_logits)
+        plane = torch.full(
+            (offset + s_q * pitch + 4096,), float("nan"), dtype=torch.float32
+        )
+        rows = plane[offset : offset + s_q * pitch].view(s_q, pitch)
+        view = rows[:, :s_k]
+        got = flydsl_fp8_mqa_logits(*args, clean_logits, out=view)
+    if got.data_ptr() != view.data_ptr() or got.shape != view.shape:
+        raise AssertionError(f"out= did not return the caller's view [{tag}]")
+    cols = torch.arange(s_k)
+    inside = (cols[None, :] >= inp.ks[:, None]) & (cols[None, :] < inp.ke[:, None])
+    # bitwise, so a NaN or a -0.0 cannot slip through
+    if not torch.equal(
+        got[inside].view(torch.int32), expected[inside].view(torch.int32)
+    ):
+        raise AssertionError(
+            f"in-window scores differ from the allocating call [{tag}]"
+        )
+    outside = got[~inside]
+    if clean_logits and not torch.isneginf(outside).all():
+        raise AssertionError(f"clean_logits left a non -inf outside the window [{tag}]")
+    if not clean_logits and not torch.isnan(outside).all():
+        raise AssertionError(f"clean_logits=False wrote outside the window [{tag}]")
+    if not (
+        torch.isnan(plane[:offset]).all()
+        and torch.isnan(plane[offset + s_q * pitch :]).all()
+        and torch.isnan(rows[:, s_k:]).all()
+    ):
+        raise AssertionError(f"wrote outside the out view [{tag}]")
+    return {"gfx": get_gfx(), "status": "ok"}
+
+
+_MALFORMED_OUT = {
+    "shape": r"out must be \[",
+    "pitch": "unit column stride and a row stride",
+    "column_stride": "unit column stride and a row stride",
+    "dtype": "2-D float32",
+    "device": "out is on cpu",
+}
+
+
+@benchmark()
+def verify_malformed_out(bad):
+    """Each malformed out= raises ValueError with its own message."""
+    s_q, s_k = 4, 300
+    inp = _make_inputs(
+        s_q, s_k, 32, 128, _DEFAULT_Q_DTYPES[0], _DEFAULT_KV_DTYPES[0], "causal"
+    )
+    f32 = {"dtype": torch.float32}
+    buf = {
+        "shape": lambda: torch.empty(s_q, s_k + 256, **f32)[:, : s_k - 1],
+        "pitch": lambda: torch.empty(s_q * s_k, **f32).as_strided(
+            (s_q, s_k), (s_k - 1, 1)
+        ),
+        "column_stride": lambda: torch.empty(s_k, s_q, **f32).t(),
+        "dtype": lambda: torch.empty(s_q, s_k, dtype=torch.float16),
+        "device": lambda: torch.empty(s_q, s_k, device="cpu", **f32),
+    }[bad]()
+    try:
+        flydsl_fp8_mqa_logits(
+            inp.q_fp8, inp.kv_fp8, inp.scales, inp.weights, inp.ks, inp.ke, out=buf
+        )
+    except ValueError as exc:
+        if not re.search(_MALFORMED_OUT[bad], str(exc)):
+            raise AssertionError(f"{bad}: unexpected message {exc}") from exc
+        return {"gfx": get_gfx(), "status": "ok"}
+    raise AssertionError(f"{bad}: malformed out= was accepted")
 
 
 _FLUSH_CACHE = None
@@ -869,6 +974,34 @@ def main():
     elif "verify" in scenarios:
         aiter.logger.warning(
             "%s: skipping the auto_variant pins, which are gfx942-only", get_gfx()
+        )
+    if "verify" in scenarios:
+        rows = []
+        out_cases = [
+            (
+                "caller_out",
+                verify_caller_out,
+                dict(
+                    zip(("s_q", "s_k", "num_heads"), shape), clean_logits=cl, layout=lay
+                ),
+            )
+            for shape, cl, lay in itertools.product(
+                _CALLER_OUT_SHAPES, (False, True), _CALLER_OUT_LAYOUTS
+            )
+        ] + [
+            ("malformed_out", verify_malformed_out, {"bad": b}) for b in _MALFORMED_OUT
+        ]
+        for name, run, kw in out_cases:
+            try:
+                rows.append({"check": name, **run(**kw)})
+            except AssertionError as exc:
+                aiter.logger.error("FAILED %s case: %s", name, exc)
+                failures.append((name, str(kw), exc))
+                rows.append({"check": name, **kw, "gfx": get_gfx(), "status": "FAIL"})
+        total += len(rows)
+        aiter.logger.info(
+            "fp8_mqa_logits out= summary (markdown):\n%s",
+            pd.DataFrame(rows).to_markdown(index=False),
         )
 
     for scenario in scenarios:
