@@ -123,9 +123,10 @@ if [ "$KERNEL" = both ] || [ "$KERNEL" = asm ]; then
   asm_rc=$?
 fi
 
-python3 - "$KERNEL" "$DATA_INIT" "$FLY_LOG" "$ASM_LOG" "$fly_rc" "$asm_rc" <<'EOF'
-import json, re, sys
-mode, data_init, fly_log, asm_log, fly_rc, asm_rc = sys.argv[1:]
+python3 - "$KERNEL" "$DATA_INIT" "$FLY_LOG" "$ASM_LOG" "$fly_rc" "$asm_rc" \
+  "$AITER_DIR" "${FLYDSL_PYTHONPATH:-}" <<'EOF'
+import contextlib, io, json, re, sys
+mode, data_init, fly_log, asm_log, fly_rc, asm_rc, aiter_dir, fly_pp = sys.argv[1:]
 
 def load_fly(path):
     rows = {}
@@ -156,6 +157,24 @@ def load_fly(path):
         }
     return rows
 
+def fill_kernel_names(rows):
+    """The JSON summary has no kernelName: look the tuned row up in aiter."""
+    if not rows or all(r.get("kernelName") for r in rows.values()):
+        return
+    sys.path[:0] = [p for p in (fly_pp, aiter_dir) if p]
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+            io.StringIO()
+        ):
+            from aiter.ops.gemm_op_a8w8 import get_mxscale_bpreshuffle_config
+
+            for (M, N, K), r in rows.items():
+                if not r.get("kernelName"):
+                    cfg = get_mxscale_bpreshuffle_config(M, N, K, "32x32")
+                    r["kernelName"] = str(cfg["kernelName"]) if cfg else "untuned"
+    except Exception:
+        pass
+
 def load_asm(path):
     rows = {}
     try:
@@ -185,6 +204,7 @@ def us_tf(us, tf):
     return f"{us:.1f}µs / {tf:.0f} TF"
 
 fly = load_fly(fly_log) if mode in ("both", "flydsl") else {}
+fill_kernel_names(fly)
 asm = load_asm(asm_log) if mode in ("both", "asm") else {}
 keys = list(dict.fromkeys([*fly, *asm]))
 print(f"data_init={data_init}")
