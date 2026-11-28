@@ -593,6 +593,182 @@ def test_mha_v4_rotated_fp8_quantization_rejects_noncontiguous_input():
         quantize_fp8_rotated(value)
 
 
+def _strided_bshd_views(batch, sequence, heads):
+    """A sequence crop of a packed QKV tensor, NaN outside the crop, and a BHSD transpose."""
+    start = 37
+    qkv = torch.randn(
+        (batch, sequence + 2 * start, 3, heads, 128),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    qkv[:, :start] = float("nan")
+    qkv[:, start + sequence :] = float("nan")
+    bhsd = torch.randn(
+        (batch, heads, sequence, 128), device="cuda", dtype=torch.bfloat16
+    )
+    return {
+        "qkv_crop": qkv[:, start : start + sequence, 1],
+        "bhsd": bhsd.transpose(1, 2),
+    }
+
+
+def _bitwise_equal(actual, expected):
+    if isinstance(actual, tuple):
+        return all(_bitwise_equal(a, e) for a, e in zip(actual, expected))
+    return torch.equal(
+        actual.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8)
+    )
+
+
+_STRIDED_QUANTIZERS = {
+    "int8": quantize_int8,
+    "fp8": quantize_fp8,
+    "v_fp8": quantize_v_fp8,
+    "v_mxfp6": quantize_v_mxfp6,
+}
+_TRITON_V_QUANTIZERS = {"v_fp8": quantize_v_fp8, "v_mxfp6": quantize_v_mxfp6}
+_GFX942_STRIDED_QUANTIZERS = {"int8", "fp8", "v_fp8"}
+# Off gfx950 the MX quantizers abort rather than raise, so they are skipped there rather than run.
+_STRIDED_QUANTIZER_CASES = [
+    param(
+        quantizer,
+        skip=get_gfx() != "gfx950" and quantizer not in _GFX942_STRIDED_QUANTIZERS,
+    )
+    for quantizer in _STRIDED_QUANTIZERS
+]
+
+
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 MHA v4 quantizers")
+@parametrize("quantizer", _STRIDED_QUANTIZER_CASES)
+@parametrize("batch,sequence,heads", [(2, 1001, 5), (1, 129, 2)])
+def test_mha_v4_quantizers_read_strided_views_like_contiguous_input(
+    quantizer, batch, sequence, heads
+):
+    """A view whose rows alone are dense quantizes exactly as its contiguous copy does.
+
+    The crop is NaN outside its rows, so a read past them would surface in the codes or scales.
+    """
+    torch.manual_seed(41)
+    quantize = _STRIDED_QUANTIZERS[quantizer]
+    for value in _strided_bshd_views(batch, sequence, heads).values():
+        assert not value.is_contiguous()
+        assert _bitwise_equal(quantize(value), quantize(value.contiguous()))
+
+
+def _misaligned_bshd_view(layout, batch=1, sequence=128, heads=2):
+    """An hd128 BSHD view off the 16-byte grid, by its start pointer or its outer strides."""
+    row = 136 if layout == "misaligned_pointer" else 129
+    storage = torch.randn(
+        (batch, sequence, heads, row), device="cuda", dtype=torch.bfloat16
+    )
+    return storage[..., 1:129] if layout == "misaligned_pointer" else storage[..., :128]
+
+
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 MHA v4 quantizers")
+@parametrize(
+    "quantizer",
+    [
+        param(
+            quantizer,
+            skip=get_gfx() != "gfx950" and quantizer not in _GFX942_STRIDED_QUANTIZERS,
+        )
+        for quantizer in _TRITON_V_QUANTIZERS
+    ],
+)
+@parametrize("layout", ["misaligned_pointer", "misaligned_outer_stride"])
+def test_mha_v4_triton_v_quantizers_accept_misaligned_bshd_views(quantizer, layout):
+    """The Triton V producers take any pointer and strides."""
+    torch.manual_seed(43)
+    value = _misaligned_bshd_view(layout, batch=2, sequence=257, heads=3)
+    quantize = _TRITON_V_QUANTIZERS[quantizer]
+
+    assert _bitwise_equal(quantize(value), quantize(value.contiguous()))
+
+
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="~4 GB of gfx942/gfx950 memory")
+@parametrize(
+    "quantizer",
+    [
+        param(
+            quantizer,
+            skip=get_gfx() != "gfx950" and quantizer not in _GFX942_STRIDED_QUANTIZERS,
+        )
+        for quantizer in _TRITON_V_QUANTIZERS
+    ],
+)
+def test_mha_v4_triton_v_quantizers_address_strided_views_past_2_31_elements(
+    quantizer,
+):
+    """A view of three single rows can put its last batch 2^31 elements in, so the offsets must
+    be 64-bit. Out of process because a wrapped offset faults the GPU rather than failing.
+    """
+    source = textwrap.dedent(f"""
+        import torch
+        from aiter.ops.mha_v4_quant import quantize_v_fp8, quantize_v_mxfp6
+
+        quantize = {{"v_fp8": quantize_v_fp8, "v_mxfp6": quantize_v_mxfp6}}["{quantizer}"]
+        stride = 1 << 30
+        storage = torch.zeros(2 * stride + 128, device="cuda", dtype=torch.bfloat16)
+        value = storage.as_strided((3, 1, 1, 128), (stride, 128, 128, 1))
+        value.copy_(torch.randn((3, 1, 1, 128), device="cuda", dtype=torch.bfloat16))
+        actual = quantize(value)
+        expected = quantize(value.contiguous())
+        for a, e in zip(actual, expected):
+            assert torch.equal(
+                a.contiguous().view(torch.uint8), e.contiguous().view(torch.uint8)
+            )
+        torch.cuda.synchronize()
+        print("matched")
+        """)
+    finished = subprocess.run(
+        [sys.executable, "-c", source],
+        capture_output=True,
+        text=True,
+        timeout=1800,
+        check=False,
+    )
+
+    assert finished.returncode == 0, finished.stderr[-2000:]
+    assert "matched" in finished.stdout
+
+
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="~6 GB of gfx942/gfx950 memory")
+@parametrize("layout", ["contiguous", "expanded"])
+def test_mha_v4_per_tensor_quantization_addresses_past_2_31_elements(layout):
+    """A block starting past 2^31 elements, or past 2^31 rows of an expanded view, must not
+    wrap to a negative offset. The last element alone is 2, so it sets the scale and quantizes to
+    the FP8 maximum. Out of process because a wrapped offset faults the GPU rather than failing.
+    """
+    source = textwrap.dedent(f"""
+        import torch
+        from aiter.ops.mha_v4_quant import quantize_fp8
+
+        if "{layout}" == "contiguous":
+            value = torch.ones((1 << 31) + 8192, device="cuda", dtype=torch.bfloat16)
+            value[-1] = 2.0
+            value = value.view(-1, 128)
+        else:
+            value = torch.full((1, 1, 1, 1), 2.0, device="cuda", dtype=torch.bfloat16)
+            value = value.expand(1, 1, (1 << 31) + 1, 1)
+        quantized, scale = quantize_fp8(value)
+        fp8_max = torch.finfo(quantized.dtype).max
+        assert abs(scale.item() * fp8_max - 2) < 1e-5, scale.item()
+        assert quantized.view(-1)[-1].float().item() == fp8_max
+        torch.cuda.synchronize()
+        print("matched")
+        """)
+    finished = subprocess.run(
+        [sys.executable, "-c", source],
+        capture_output=True,
+        text=True,
+        timeout=1800,
+        check=False,
+    )
+
+    assert finished.returncode == 0, finished.stderr[-2000:]
+    assert "matched" in finished.stdout
+
+
 # The MX quantizers AITER_CHECK on gfx950, and that check aborts rather than raising.
 @skipif(get_gfx() != "gfx950", reason="gfx950 MX quantization")
 @parametrize(
