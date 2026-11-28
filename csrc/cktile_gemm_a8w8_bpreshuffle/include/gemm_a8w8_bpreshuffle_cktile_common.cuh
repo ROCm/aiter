@@ -496,6 +496,15 @@ gemm_a8w8_bpreshuffle_cktile_impl(torch::Tensor& XQ,
     int m                = XQ.size(0);
     int n                = out.size(1);
     int k                = XQ.size(1);
+    // ck_tile's MakeBFlatBlockWindow sizes the preshuffled B rows as
+    // flatKPerWarp * (K / K_Warp_Tile), which truncates, so a K tail reads B
+    // at the wrong stride. IsSupportedArgument only checks K % KPerBlock when
+    // kPadK is false, and the padded variants pass it.
+    TORCH_CHECK(k % FlatmmInstance::K_Warp_Tile == 0,
+                "CKTile bpreshuffle flatmm needs K to be a multiple of its warp-tile K (",
+                FlatmmInstance::K_Warp_Tile,
+                "); got K=",
+                k);
 
     using ScaleM = typename ck_tile::FlatmmScalePointer<1>;
     using ScaleN = typename ck_tile::FlatmmScalePointer<1>;
