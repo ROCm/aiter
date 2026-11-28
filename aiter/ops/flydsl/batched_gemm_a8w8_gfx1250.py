@@ -187,6 +187,7 @@ def bmm_candidates(b: int, m: int, n: int, k: int) -> list[dict[str, int]]:
     """Every batched config that can legally run this shape, tuner-ordered."""
     from .gemm_tune.flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common import (
         is_compute_kernel,
+        is_pow2_geometry,
         kernel_fits_shape,
         kernels_list,
     )
@@ -195,8 +196,10 @@ def bmm_candidates(b: int, m: int, n: int, k: int) -> list[dict[str, int]]:
     for ki in kernels_list.values():
         if is_compute_kernel(ki) or ki.split_k != 1:
             continue
-        if ki.cluster_m != 1 or ki.cluster_n != 1:
+        if ki.cluster_m != 1 or ki.cluster_n != 1 or not is_pow2_geometry(ki):
             continue
+        if ki.quad_early or ki.no_loop_cbar or ki.c_pad >= 0:
+            continue  # opt-in generic schedules; the batched launch has none
         if not kernel_fits_shape(ki, m, n, k):
             continue
         out.append(

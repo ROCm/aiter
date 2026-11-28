@@ -135,6 +135,38 @@ def test_mxscale_config_precheck_matches_padded_walk(mxscale_table):
         assert gemm_op_a8w8.get_mxscale_bpreshuffle_config(m, n, k, block) == want
 
 
+@pytest.mark.parametrize("tile_m", [128, 256])
+@pytest.mark.parametrize("offset", [-1, 0, 1])
+def test_mxscale_compute_row_serves_underfilled_m_tile(mxscale_table, tile_m, offset):
+    row = {
+        "libtype": "flydsl",
+        "kernelName": (
+            "flydsl_mxfp8_128_bpreshuffle_compute_wmma_"
+            f"t{tile_m}x128x128_mw2_nw2_nb4_sk1_cm1_cn4"
+        ),
+    }
+    mxscale_table.clear()
+    for tuned_m in (tile_m, 2 * tile_m):
+        mxscale_table[("gfx1250", 256, tuned_m, 7168, 8192, "128x128")] = row
+    # Below the tile, one full tile and a partial second tile all keep the row.
+    m = tile_m + offset
+    assert gemm_op_a8w8.get_mxscale_bpreshuffle_config(m, 7168, 8192, "128x128") is row
+
+
+@pytest.mark.parametrize(
+    "kernel_name",
+    [
+        "flydsl_mxfp8_128_bpreshuffle_wmma_t128x128x128_mw2_nw2_nb4_sk1_cm1_cn4",
+        "other_flydsl_kernel",
+    ],
+)
+def test_mxscale_noncompute_rows_keep_padded_lookup(mxscale_table, kernel_name):
+    row = {"libtype": "flydsl", "kernelName": kernel_name}
+    mxscale_table.clear()
+    mxscale_table[("gfx1250", 256, 128, 7168, 8192, "128x128")] = row
+    assert gemm_op_a8w8.get_mxscale_bpreshuffle_config(65, 7168, 8192, "128x128") is row
+
+
 def test_mxscale_untuned_reported_once_per_weight_shape(mxscale_table, monkeypatch):
     warnings = []
     monkeypatch.setattr(

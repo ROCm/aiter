@@ -18,6 +18,7 @@ from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
     cluster_m_grid_ok,
     compute_kernel_k_pair,
     fused_splitk_ok,
+    rank0_splitk_ok,
 )
 
 WMMA = 16  # WMMA M/N tile granularity
@@ -43,6 +44,8 @@ _NUM_BUFFERS_OPTS = (2, 3, 4)
 _WARP_OPTS = ((1, 4), (2, 2), (4, 1))
 _CLUSTER_OPTS = ((1, 1),)
 _SPLIT_K = (1, 2, 4, 8)
+# Fused split_k the row-stripe epilogue lacks: split 0 of a tile sums the splits.
+_RANK0_SPLIT_K = (3, 5, 6, 7, 10, 12, 14, 16)
 
 _COMPUTE_PROFILES = (
     (256, 256, 128, 2, 2, 4),
@@ -60,9 +63,19 @@ _CLUSTERS_POW2 = tuple(
 )
 _GENERIC_CLUSTERS_EXTRA = tuple(c for c in _CLUSTERS_POW2 if c != (1, 1))
 _COMPUTE_CLUSTERS_EXTRA = tuple(c for c in _CLUSTERS_POW2 if c not in _COMPUTE_CLUSTERS)
+# Clusters of 3 or 5 M tiles share each weight read when the M-tile count is not a
+# power of two; tile_m that are not powers of two fit decode M between them.
+_CLUSTERS_NPOT = ((3, 1), (3, 2), (5, 1), (5, 2))
+_COMPUTE_CLUSTERS_NPOT = ((3, 1), (3, 2), (3, 4), (5, 1), (5, 2))
+_TILE_M_NPOT = (96, 160, 192)
+_COMPUTE_CLUSTERS_ALL = (
+    _COMPUTE_CLUSTERS + _COMPUTE_CLUSTERS_EXTRA + _COMPUTE_CLUSTERS_NPOT
+)
 _COMPUTE_MIN_K_PER_SPLIT = 512
 _MAX_CLUSTER = 16  # workgroups of a gfx1250 cluster
 _PERSISTENT_N_TILES = (2, 4, 8)
+# Spare N tiles a bounded_n launch may add, as a fraction of the real ones.
+_N_TAIL_MAX_PAD = 0.5
 
 _LARGE_M_TILE_MIN = 256
 _MAX_M_BLOCKS = 32
@@ -83,12 +96,20 @@ class WmmaKernelInstance:
     a_preshuffle: bool = False
     persistent_n_tiles: int = 1
     fused_splitk: bool = False
+    # LDS row pad (elements) of the C staging tile; -1 = default.
+    c_pad: int = -1
+    # Opt-in schedules: _qe (quadrant early loads), _nlb (no in-loop cluster barrier).
+    quad_early: bool = False
+    no_loop_cbar: bool = False
 
     def name_for(self, a_preshuffle: bool = False) -> str:
         return (
             f"{self.name_prefix}_t{self.tile_m}x{self.tile_n}x{self.tile_k}_"
             f"mw{self.m_warp}_nw{self.n_warp}_nb{self.num_buffers}_sk{self.split_k}_"
             f"cm{self.cluster_m}_cn{self.cluster_n}"
+            + (f"_cp{self.c_pad}" if self.c_pad >= 0 else "")
+            + ("_qe" if self.quad_early else "")
+            + ("_nlb" if self.no_loop_cbar else "")
             + ("_fsk" if self.fused_splitk else "")
             + ("_apre" if (a_preshuffle or self.a_preshuffle) else "")
             + (f"_ps{self.persistent_n_tiles}" if self.persistent_n_tiles > 1 else "")
@@ -169,9 +190,9 @@ def kernel_instance_estimated_lds_bytes(ki: WmmaKernelInstance) -> int:
     return max(arena_bytes, total_d_bytes)
 
 
-def _generic_instances(clusters, fused):
-    for sk in _SPLIT_K:
-        for tm in _TILE_M_OPTS:
+def _generic_instances(clusters, fused, split_ks=_SPLIT_K, tile_ms=_TILE_M_OPTS):
+    for sk in split_ks:
+        for tm in tile_ms:
             for tn in _TILE_N_OPTS:
                 for tk in _TILE_K_OPTS:
                     for mw, nw in _WARP_OPTS:
@@ -198,8 +219,8 @@ def _generic_instances(clusters, fused):
                                 yield ki
 
 
-def _compute_instances(clusters, fused):
-    for sk in _SPLIT_K:
+def _compute_instances(clusters, fused, split_ks=_SPLIT_K):
+    for sk in split_ks:
         for tm, tn, tk, mw, nw, nb in _COMPUTE_PROFILES:
             for cm, cn in clusters:
                 for ps in (1, *_PERSISTENT_N_TILES) if sk == 1 else (1,):
@@ -239,27 +260,104 @@ def _build_kernels_list() -> dict[int, WmmaKernelInstance]:
     extra += [
         ki for ki in wide if ki.cluster_m * ki.cluster_n * ki.split_k <= _MAX_CLUSTER
     ]
+    # Single opt-in candidates used by K3 rows, appended last.
+    extra.append(
+        WmmaKernelInstance(
+            tile_m=64,
+            tile_n=64,
+            tile_k=256,
+            num_buffers=4,
+            split_k=4,
+            cluster_m=2,
+            cluster_n=2,
+            m_warp=2,
+            n_warp=2,
+            fused_splitk=True,
+            c_pad=4,
+        )
+    )
+    extra.append(
+        WmmaKernelInstance(
+            tile_m=64,
+            tile_n=128,
+            tile_k=512,
+            num_buffers=3,
+            split_k=1,
+            cluster_m=1,
+            cluster_n=1,
+            m_warp=1,
+            n_warp=4,
+            quad_early=True,
+        )
+    )
+    extra.append(
+        WmmaKernelInstance(
+            tile_m=128,
+            tile_n=128,
+            tile_k=256,
+            num_buffers=4,
+            split_k=1,
+            cluster_m=1,
+            cluster_n=2,
+            m_warp=2,
+            n_warp=2,
+            quad_early=True,
+        )
+    )
+    extra.append(
+        WmmaKernelInstance(
+            tile_m=64,
+            tile_n=128,
+            tile_k=256,
+            num_buffers=4,
+            split_k=4,
+            cluster_m=1,
+            cluster_n=1,
+            m_warp=1,
+            n_warp=4,
+            fused_splitk=True,
+            quad_early=True,
+            no_loop_cbar=True,
+        )
+    )
+    # Rank-0 fused split-K of the generic kernel, appended after the opt-in ones.
+    extra += [
+        ki
+        for ki in _generic_instances(_CLUSTERS_POW2, True, _RANK0_SPLIT_K)
+        if ki.cluster_m * ki.cluster_n * ki.split_k <= _MAX_CLUSTER
+    ]
+    # Clusters of 3 / 5 M tiles, then tile_m that are not powers of two.
+    npot = [
+        *_generic_instances(_CLUSTERS_NPOT, True, (1, 2, 4), (16, 32, 64, 128)),
+        *_compute_instances(_COMPUTE_CLUSTERS_NPOT, True, (1, 2, 4)),
+        *_generic_instances(
+            ((1, 1), (1, 2), (1, 4), (2, 1), (2, 2)), True, (1, 2, 4), _TILE_M_NPOT
+        ),
+    ]
+    extra += [
+        ki for ki in npot if ki.cluster_m * ki.cluster_n * ki.split_k <= _MAX_CLUSTER
+    ]
     return dict(enumerate([*base, *extra]))
 
 
 kernels_list: dict[int, WmmaKernelInstance] = _build_kernels_list()
-_N_BASE = len(_base_instances())
 
 
-def fallback_kernels() -> list[WmmaKernelInstance]:
-    """Candidates of the runtime fallback for shapes without a tuned row: the original
-    unfused kernels, not the widened tuner space (which is the tail of ``kernels_list``).
-    """
-    return [ki for i, ki in kernels_list.items() if i < _N_BASE]
+def kernel_fits_shape(
+    ki: WmmaKernelInstance, M: int, N: int, K: int, n_tail: bool = False
+) -> bool:
+    """Return True iff ``ki`` can be launched for runtime shape ``(M, N, K)``.
 
-
-def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
-    """Return True iff ``ki`` can be launched for runtime shape ``(M, N, K)``."""
+    ``n_tail`` admits a split_k=1 compute kernel whose N ends inside its last group
+    of ``tile_n * cluster_n * persistent_n_tiles`` columns (bounded_n); the tuner
+    sets it, the untuned fallback does not."""
 
     # Row pairs need both rows, so an odd M has no valid pairing.
     if ki.a_preshuffle and M % 2 != 0:
         return False
 
+    # Fused split-K: the row-stripe epilogue where it fits, else rank 0 (generic only).
+    rank0 = False
     if ki.fused_splitk and not fused_splitk_ok(
         ki.tile_m,
         ki.tile_n,
@@ -269,7 +367,11 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
         ki.cluster_n,
         ki.split_k,
     ):
-        return False
+        rank0 = not is_compute_kernel(ki) and rank0_splitk_ok(
+            M, N, ki.tile_m, ki.cluster_m, ki.cluster_n, ki.split_k
+        )
+        if not rank0:
+            return False
 
     if is_compute_kernel(ki):
         profile = (
@@ -284,26 +386,18 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
             return False
         if profile not in _COMPUTE_PROFILES:
             return False
-        if (
-            ki.cluster_m,
-            ki.cluster_n,
-        ) not in _COMPUTE_CLUSTERS + _COMPUTE_CLUSTERS_EXTRA:
+        if (ki.cluster_m, ki.cluster_n) not in _COMPUTE_CLUSTERS_ALL:
             return False
-        # Compute-bound kernels allocate a full tile_m tile; unlike sync WMMA they
-        # must not launch when M < tile_m (cluster barrier hang on decode M).
-        if M < ki.tile_m:
-            return False
-        if N % (ki.tile_n * ki.cluster_n) != 0:
-            return False
+        # M below tile_m is one partial tile (M OOB), so it clusters no M rows.
         if not cluster_m_grid_ok(M, ki.tile_m, ki.cluster_m):
             return False
-        if ki.persistent_n_tiles > 1:
-            if ki.split_k != 1:
+        if ki.persistent_n_tiles > 1 and ki.split_k != 1:
+            return False
+        if N % (ki.tile_n * ki.cluster_n * ki.persistent_n_tiles):
+            if not n_tail or ki.split_k != 1 or N % _BLOCK_N:
                 return False
-            n_tiles = N // ki.tile_n
-            if n_tiles % ki.persistent_n_tiles:
-                return False
-            if (n_tiles // ki.persistent_n_tiles) % ki.cluster_n:
+            n_tiles = _ceil_div(N, ki.tile_n)
+            if _padded_n_tiles(ki, N) - n_tiles > _N_TAIL_MAX_PAD * n_tiles:
                 return False
         if K % ki.split_k != 0:
             return False
@@ -324,11 +418,11 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
         return False
     if kernel_instance_estimated_lds_bytes(ki) > LDS_BYTES:
         return False
-    if N % ki.tile_n != 0 or K % (ki.split_k * ki.tile_k) != 0:
+    if N % ki.tile_n != 0 or K % (ki.tile_k * (1 if rank0 else ki.split_k)) != 0:
         return False
     # Generic K=128 with two buffers needs no steady-loop iteration.
     min_k_tiles = 1 if ki.num_buffers == 2 and K == ki.tile_k == 128 else ki.num_buffers
-    if (K // ki.split_k) // ki.tile_k < min_k_tiles:
+    if (K // ki.tile_k) // ki.split_k < min_k_tiles:
         return False
     # M may be ragged; the kernel handles partial M tiles via OOB clamping,
     # so tile_m > M is legal (and needed for small-M decode shapes).
@@ -337,8 +431,8 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
     n_blocks = N // ki.tile_n
     if ki.tile_m < _LARGE_M_TILE_MIN and m_blocks > _MAX_M_BLOCKS:
         return False
-    # A multicast cluster needs at least two tiles along each clustered axis.
-    if (ki.cluster_m > 1 or ki.cluster_n > 1) and M < 2 * ki.tile_m:
+    # A multicast cluster needs at least two tiles along each clustered axis (N below).
+    if ki.cluster_m > 1 and M < 2 * ki.tile_m:
         return False
     if ki.cluster_m > 1 and not cluster_m_grid_ok(M, ki.tile_m, ki.cluster_m):
         return False
@@ -347,10 +441,20 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
     )
 
 
+def _padded_n_tiles(ki: WmmaKernelInstance, N: int) -> int:
+    """N tiles of the launch: the real ones, filled up to whole cluster / persistent groups."""
+    group = ki.cluster_n * ki.persistent_n_tiles
+    return _ceil_div(_ceil_div(N, ki.tile_n), group) * group
+
+
 def compute_grid_ctas(ki: WmmaKernelInstance, M: int, N: int) -> int:
     gx = _ceil_div(M, ki.tile_m)
-    gy = N // ki.tile_n
-    return gx * (gy // ki.persistent_n_tiles) * ki.split_k
+    return gx * (_padded_n_tiles(ki, N) // ki.persistent_n_tiles) * ki.split_k
+
+
+def is_pow2_geometry(ki: WmmaKernelInstance) -> bool:
+    """Power-of-two tile_m and cluster: the families the untuned heuristics pick from."""
+    return all(v & (v - 1) == 0 for v in (ki.tile_m, ki.cluster_m, ki.cluster_n))
 
 
 def is_compute_kernel(kernel: WmmaKernelInstance) -> bool:

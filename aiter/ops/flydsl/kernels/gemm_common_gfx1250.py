@@ -122,8 +122,9 @@ def _kernel_code_span(func_index):
     return fx.Int64(pc) - 4, fx.Int32(size)
 
 
-def prefetch_kernel_code(num_waves, func_index=0):
-    """Prefetch this kernel's code into the instruction cache; each wave takes every num_waves-th 4 KiB.
+def prefetch_kernel_code(num_waves, func_index=0, max_bytes=KERNEL_PREFETCH_MAX_BYTES):
+    """Prefetch this kernel's code (its first ``max_bytes``) into the instruction cache; each wave takes
+    every num_waves-th 4 KiB.
 
     Code that another large kernel evicted from the CU is otherwise refetched line by line in the prologue and
     epilogue. s_prefetch_inst is a no-op unless MODE.SCALAR_PREFETCH_EN is set, and a wave only starts with it set
@@ -137,11 +138,11 @@ def prefetch_kernel_code(num_waves, func_index=0):
         None, "llvm.amdgcn.s.setreg", [mode_en, fx.Int32(1).ir_value()], [], []
     )
     start, size = _kernel_code_span(func_index)
-    cap = fx.Int32(KERNEL_PREFETCH_MAX_BYTES)
+    cap = fx.Int32(max_bytes)
     span = (size < cap).select(size, cap)
     last_line = ((span - 1) >> 7) << 7
     wave = fx.Int32(rocdl.wave_id())
-    chunks = KERNEL_PREFETCH_MAX_BYTES >> _PREFETCH_CHUNK_SHIFT
+    chunks = max_bytes >> _PREFETCH_CHUNK_SHIFT
     for i in range_constexpr(-(-chunks // num_waves)):
         off = (fx.Int32(i * num_waves) + wave) << _PREFETCH_CHUNK_SHIFT
         off = (off < last_line).select(

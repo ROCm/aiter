@@ -637,7 +637,8 @@ def run_gemm_flydsl(x, weight_shuffle, x_scale, w_scale, out, kernel_name):
 
 def gfx1250_candidates(m, n, k):
     """(kernelId, kernel) of the gfx1250 mxfp8_128 kernels the 2-D dispatch can
-    run for the shape (row-major A); split_k > 1 only as fused split-K."""
+    run for the shape (row-major A); split_k > 1 only as fused split-K, and compute
+    kernels with a partial last N group (bounded_n)."""
     from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common import (
         kernel_fits_shape,
         kernels_list,
@@ -648,7 +649,7 @@ def gfx1250_candidates(m, n, k):
         for kernel_id, ki in kernels_list.items()
         if not ki.a_preshuffle
         and (ki.split_k == 1 or ki.fused_splitk)
-        and kernel_fits_shape(ki, m, n, k)
+        and kernel_fits_shape(ki, m, n, k, n_tail=True)
     ]
 
 

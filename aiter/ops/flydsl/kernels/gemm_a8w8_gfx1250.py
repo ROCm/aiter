@@ -17,6 +17,7 @@ from aiter.jit.utils.lds_capacity import get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
     make_lds_copy_ops,
     pipeline_fence,
+    prefetch_kernel_code,
     workgroup_barrier,
 )
 from aiter.ops.flydsl.kernels.gfx1250_cluster import compute_mcast_masks_runtime
@@ -29,6 +30,9 @@ from aiter.ops.flydsl.kernels.splitk_fused_epilogue_gfx1250 import (
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    buf_copy_load,
+    buf_copy_store,
+    ptr_buf_tensor,
 )
 
 # Largest TDM pad interval the gfx1250 descriptor can encode for 1-byte
@@ -39,6 +43,8 @@ _TDM_MAX_PAD_INTERVAL_BYTES = 1024
 # kernels. This null pointer is only a signature placeholder; the bf16 path
 # launches with arg_c and never loads it.
 _NULL_SCALE_PTR = flyc.from_c_void_p(fx.Uint8, 0)
+# One prefetch per wave: 86% of these kernels are no larger.
+_PREFETCH_BYTES = 16 * 1024
 
 
 @flyc.jit
@@ -79,11 +85,16 @@ def launch_gemm_a8w8(
     k_tail: Constexpr[bool] = False,
     arg_scale_out: fx.Pointer = _NULL_SCALE_PTR,
     fuse_quant_out: Constexpr[bool] = False,
+    c_pad: Constexpr[int] = -1,
+    quad_early: Constexpr[bool] = False,
+    no_loop_cbar: Constexpr[bool] = False,
+    rank0_splitk: Constexpr[bool] = False,
 ):
     # i32_cm: runtime cluster_m; use_cluster is False only for a one-workgroup launch.
     # fused_splitk: the K splits of a tile are one cluster along grid.z and reduce
-    # through arg_c (FP32 scratch) into arg_out; otherwise split_k > 1 writes
-    # FP32 planes to arg_c for gemm_a8w8_splitk_reduce.
+    # through arg_c (FP32 scratch) into arg_out, each split reducing a row stripe or,
+    # with rank0_splitk, split 0 the whole tile (any split_k, uneven K tiles);
+    # otherwise split_k > 1 writes FP32 planes to arg_c for gemm_a8w8_splitk_reduce.
     # fuse_quant_out: the bf16 C tile is group-32 MXFP8-quantized in the
     # epilogue instead of written as bf16. arg_c carries the e4m3 [M,B,N]
     # output and arg_scale_out the row-major [M, (B*N)//32] e8m0 scale -- the
@@ -153,7 +164,13 @@ def launch_gemm_a8w8(
             f"use_cluster={use_cluster}"
         )
     cluster_k = split_k if fused_splitk else 1
-    if fused_splitk and not (split_k > 1 and tile_m % split_k == 0):
+    if rank0_splitk and not (fused_splitk and split_k > 1):
+        raise ValueError("[FlyDSL gfx1250] rank0_splitk needs fused_splitk")
+    if (
+        fused_splitk
+        and not rank0_splitk
+        and not (split_k > 1 and tile_m % split_k == 0)
+    ):
         raise ValueError(
             "[FlyDSL gfx1250] fused_splitk needs split_k > 1 dividing "
             f"tile_m, got split_k={split_k}, tile_m={tile_m}"
@@ -179,7 +196,7 @@ def launch_gemm_a8w8(
     n_acc = wmma_m_rep * wmma_n_rep
     num_waves = m_warp * n_warp
     block = num_waves * WAVE
-    if fused_splitk:
+    if fused_splitk and not rank0_splitk:
         # Geometry of splitk_fused_epilogue_gfx1250 (see fused_splitk_ok).
         if block < 128:
             raise ValueError(
@@ -261,7 +278,7 @@ def launch_gemm_a8w8(
     out_elem = fx.Float16 if out_is_f16 else fx.BFloat16
     out_cls = fx.Float32 if split_k > 1 else out_elem
     c_bytes = 4 if split_k > 1 else 2
-    C_PAD = 8 if tile_n >= 128 else 0
+    C_PAD = c_pad if c_pad >= 0 else (8 if tile_n >= 128 else 0)
     C_LDS_ROW = tile_n + C_PAD
     C_STORE_B = (tile_m * C_LDS_ROW * c_bytes + 127) // 128 * 128
     ARENA_B = max(PANEL_OFF + PANEL_A + PANEL_B, C_STORE_B)
@@ -275,12 +292,17 @@ def launch_gemm_a8w8(
             f"limit is {lds_cap} bytes"
         )
     use_quadrant = (wmma_m_rep % 2 == 0) and (wmma_n_rep % 2 == 0) and (n_acc >= 8)
+    if quad_early and not use_quadrant:
+        raise ValueError("quad_early applies to the quadrant kernels only")
     scale_tag = "mx32" if mx32 else ("mx128" if mx128 else "ptpc")
     kernel_name = format_kernel_name(
         f"{'batched_' if batched else ''}gemm_a8w8_{scale_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
         f"_mw{m_warp}_nw{n_warp}_nb{num_buffers}_sk{split_k}"
         f"_cn{cluster_n}"
+        + (f"_cp{c_pad}" if c_pad >= 0 else "")
+        + ("_qe" if quad_early else "")
+        + ("_nlb" if no_loop_cbar else "")
         + ("_fsk" if fused_splitk else "")
         + ("" if use_cluster else "_plain")
         + ("_mbn" if batched else "")
@@ -322,6 +344,14 @@ def launch_gemm_a8w8(
         bid_x, bid_y, bid_z = fx.block_idx
         kt_base = fx.Int64(bid_z) * fx.Int64(K_TILES) if split_k > 1 else None
         kt_base_i32 = fx.Int32(bid_z) * fx.Int32(K_TILES) if split_k > 1 else None
+        if const_expr(rank0_splitk):
+            # Even K-tile split: the first kt_rem splits take one more tile.
+            kt_div = (i32_k // tile_k) // split_k
+            kt_rem = (i32_k // tile_k) % split_k
+            K_TILES = kt_div + (bid_z < kt_rem).select(fx.Int32(1), fx.Int32(0))
+            kt_start = bid_z * kt_div + fx.min(bid_z, kt_rem)
+            kt_base = fx.Int64(kt_start)
+            kt_base_i32 = fx.Int32(kt_start)
         bz64 = fx.Int64(bid_z) if const_expr(batched) else None
         wave = rocdl.readfirstlane(T.i32, tid // WAVE)
         lane = tid % WAVE
@@ -798,34 +828,39 @@ def launch_gemm_a8w8(
                 return wt, sb_k, sa_k
             return wt, None, None
 
-        def _kstep(buf, sbuf, ks, state, nxt_ks, prefetch_kt=None):
+        def _kstep(buf, sbuf, ks, cur, nxt_ks, prefetch_kt=None):
+            # Issue the next sub-step's loads before this sub-step's WMMAs; with a single
+            # A row, prefetch the next A row too (with two, the longer queue costs more).
+            state, act_f = cur
             wt, sb_k, sa_k = state
-            act_f = [_rmem(16, load_a(buf, wm, ks)) for wm in _FRONT]
-            if const_expr(len(_BACK) > 0):
-                act_b = [_rmem(16, load_a(buf, wm, ks)) for wm in _BACK]
-                rocdl.s_wait_dscnt(len(_BACK) * DS_A)
-            else:
-                rocdl.s_wait_dscnt(0)
+            if const_expr(act_f is None):
+                act_f = [_rmem(16, load_a(buf, wm, ks)) for wm in _FRONT]
+            act_b = [_rmem(16, load_a(buf, wm, ks)) for wm in _BACK]
+            nxt, ahead = None, 0
+            if const_expr(nxt_ks is not None):
+                n_state = _load_state(buf, sbuf, nxt_ks)
+                n_f = None
+                if const_expr(len(_BACK) == 0):
+                    n_f = [_rmem(16, load_a(buf, wm, nxt_ks)) for wm in _FRONT]
+                nxt = (n_state, n_f)
+                ahead = _BS_DS + (len(_FRONT) * DS_A if n_f is not None else 0)
+            rocdl.s_wait_dscnt(len(_BACK) * DS_A + ahead)
             _mma_rows(_FRONT, act_f, wt, sa_k, sb_k)
             if const_expr(prefetch_kt is not None):
                 rocdl.sched_barrier(0)
                 issue(prefetch_kt % num_buffers, prefetch_kt)
                 rocdl.sched_barrier(0)
             if const_expr(len(_BACK) > 0):
-                rocdl.s_wait_dscnt(0)
+                rocdl.s_wait_dscnt(ahead)
                 _mma_rows(_BACK, act_b, wt, sa_k, sb_k)
-            return (
-                _load_state(buf, sbuf, nxt_ks)
-                if const_expr(nxt_ks is not None)
-                else None
-            )
+            return nxt
 
         def compute_ktile_row(buf, sbuf, prefetch_kt):
-            state = _load_state(buf, sbuf, 0)
+            cur = (_load_state(buf, sbuf, 0), None)
             for ks in range_constexpr(K_WS):
                 nxt_ks = ks + 1 if const_expr(ks + 1 < K_WS) else None
                 pk = prefetch_kt if const_expr(ks == 0) else None
-                state = _kstep(buf, sbuf, ks, state, nxt_ks, prefetch_kt=pk)
+                cur = _kstep(buf, sbuf, ks, cur, nxt_ks, prefetch_kt=pk)
             _fr, _bk = front_wm * wmma_n_rep, len(_BACK) * wmma_n_rep
             for _ks in range_constexpr(K_WS):
                 rocdl.sched_dsrd((_BS_DS if _ks == 0 else 0) + front_wm * DS_A)
@@ -922,9 +957,54 @@ def launch_gemm_a8w8(
                 if const_expr(nxt_ks is not None):
                     b_left, sb_k, sa_k = nxt_b_left, nxt_sb_k, nxt_sa_k
 
+        def compute_ktile_quad_early(buf, sbuf, prefetch_kt):
+            # _qe: issue the next sub-step's B and scale loads after this sub-step's A
+            # loads. Queue: a_top, a_bot, b_right, next b_left, next scales; each wait
+            # leaves only the loads the following block does not need.
+            if const_expr(not is_mxscale):
+                raise ValueError(
+                    "quad_early applies to the mxscale quadrant kernel only"
+                )
+            b_left = _load_b_half(buf, 0, 0)
+            sb_k, sa_k = _load_scales(buf, sbuf, 0)
+            for ks in range_constexpr(K_WS):
+                nxt_ks = ks + 1 if const_expr(ks + 1 < K_WS) else None
+                pf = ks == 0 and prefetch_kt is not None
+                a_top = [
+                    _rmem(16, load_a(buf, wm, ks)) for wm in range_constexpr(HALF_M)
+                ]
+                a_bot = [
+                    _rmem(16, load_a(buf, HALF_M + wm, ks))
+                    for wm in range_constexpr(HALF_M)
+                ]
+                b_right = _load_b_half(buf, HALF_N, ks)
+                n_nxt = 0
+                if const_expr(nxt_ks is not None):
+                    nxt_b_left = _load_b_half(buf, 0, nxt_ks)
+                    nxt_sb_k, nxt_sa_k = _load_scales(buf, sbuf, nxt_ks)
+                    n_nxt = HALF_N * DS_B + sb_loads + sa_loads
+                rocdl.s_wait_dscnt(DS_A * HALF_M + DS_B * HALF_N + n_nxt)
+                rocdl.sched_barrier(0)
+                _emit_block(0, 0, a_top, b_left, sa_k, sb_k)
+                rocdl.s_wait_dscnt(DS_B * HALF_N + n_nxt)
+                _emit_block(HALF_M, 0, a_bot, b_left, sa_k, sb_k)
+                if const_expr(pf):
+                    rocdl.sched_barrier(0)
+                    issue(prefetch_kt % num_buffers, prefetch_kt)
+                    rocdl.sched_barrier(0)
+                rocdl.s_wait_dscnt(n_nxt)
+                _emit_block(0, HALF_N, a_top, b_right, sa_k, sb_k)
+                _emit_block(HALF_M, HALF_N, a_bot, b_right, sa_k, sb_k)
+                rocdl.sched_barrier(0)
+                if const_expr(nxt_ks is not None):
+                    b_left, sb_k, sa_k = nxt_b_left, nxt_sb_k, nxt_sa_k
+
         def compute_ktile(buf, sbuf, prefetch_kt):
             if const_expr(use_quadrant):
-                compute_ktile_quad(buf, sbuf, prefetch_kt)
+                if const_expr(quad_early):
+                    compute_ktile_quad_early(buf, sbuf, prefetch_kt)
+                else:
+                    compute_ktile_quad(buf, sbuf, prefetch_kt)
             else:
                 compute_ktile_row(buf, sbuf, prefetch_kt)
 
@@ -993,6 +1073,8 @@ def launch_gemm_a8w8(
             cluster.cluster_barrier()
         for i in range_constexpr(num_buffers - 1):
             issue(i, i)
+        # Code another kernel evicted is refetched while the first loads land.
+        prefetch_kernel_code(num_waves, max_bytes=_PREFETCH_BYTES)
         n_steady = K_TILES - (num_buffers - 1)
         for kt in range(n_steady):
             s = kt % num_buffers
@@ -1000,7 +1082,10 @@ def launch_gemm_a8w8(
             buf = _bidx(pbuf)
             pipeline_fence(outstanding=(num_buffers - 2), use_cluster=False)
             compute_ktile(buf, _scale_buf(pbuf, kt), kt + (num_buffers - 1))
-            if const_expr(use_cluster) and kt % num_buffers == num_buffers - 1:
+            if (
+                const_expr(use_cluster and not no_loop_cbar)
+                and kt % num_buffers == num_buffers - 1
+            ):
                 cluster.cluster_barrier()
         scale_regs = None
         for j in range_constexpr(num_buffers - 1):
@@ -1019,6 +1104,79 @@ def launch_gemm_a8w8(
         pipeline_fence(outstanding=0, use_cluster=use_cluster)
         if const_expr(not is_mxscale):
             accs = epilogue_apply_ptpc_scale(scale_regs)
+        if const_expr(rank0_splitk):
+            # Splits publish FP32 fragments in accumulator order; split 0 sums them.
+            vec = 4
+            tile_elems = tile_m * tile_n
+            flat_tile = fx.Int64(bid_y) * fx.Int64(fx.grid_dim.x) + fx.Int64(bid_x)
+            workspace = ptr_buf_tensor(
+                arg_c,
+                fx.Float32,
+                unit_elems=vec,
+                num_records_bytes=fx.Int64(fx.grid_dim.x)
+                * fx.Int64(fx.grid_dim.y)
+                * fx.Int64(split_k * tile_elems * 4),
+            )
+            for ai in range_constexpr(n_acc):
+                value = Vec(accs[ai])
+                for half in range_constexpr(2):
+                    part = Vec.from_elements(
+                        [value[half * vec + j] for j in range_constexpr(vec)],
+                        fx.Float32,
+                    )
+                    buf_copy_store(
+                        workspace,
+                        (flat_tile * split_k + fx.Int64(bid_z)) * (tile_elems // vec)
+                        + (ai * block + tid) * 2
+                        + half,
+                        part,
+                        fx.Float32,
+                        vec,
+                        cache_modifier=16,
+                    )
+            # No stable FlyDSL call retires this wave's stores; the stores are device
+            # scope, so a retired store is visible to every workgroup.
+            rocdl.s_wait_storecnt(0)
+            cluster.cluster_barrier()
+            if bid_z == 0:
+                output = fx.inttoptr(
+                    fx.PointerType.get(
+                        out_elem.ir_type, arg_out_k.address_space, alignment=2
+                    ),
+                    fx.ptrtoint(arg_out_k),
+                )
+                for ai in range_constexpr(n_acc):
+                    values = []
+                    for half in range_constexpr(2):
+                        total = buf_copy_load(
+                            workspace,
+                            (flat_tile * split_k) * (tile_elems // vec)
+                            + (ai * block + tid) * 2
+                            + half,
+                            fx.Float32,
+                            vec,
+                            cache_modifier=16,
+                        )
+                        for part in range_constexpr(1, split_k):
+                            total = total + buf_copy_load(
+                                workspace,
+                                (flat_tile * split_k + part) * (tile_elems // vec)
+                                + (ai * block + tid) * 2
+                                + half,
+                                fx.Float32,
+                                vec,
+                                cache_modifier=16,
+                            )
+                        values.extend(total[j] for j in range_constexpr(vec))
+                    wm, wn = ai // wmma_n_rep, ai % wmma_n_rep
+                    row_rel = wmb + wm * 16 + lane16
+                    col_rel = wnb + wn * 16 + kgrp * 8
+                    if row_rel < mn_oob:
+                        fx.ptr_store(
+                            Vec.from_elements(values, fx.Float32).to(out_elem),
+                            output + (blk_m64 + row_rel) * ldc64 + blk_n64 + col_rel,
+                        )
+            return
         for wm in range_constexpr(wmma_m_rep):
             row_rel = wmb + wm * 16 + lane16
             if const_expr(fused_splitk):
