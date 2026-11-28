@@ -1207,6 +1207,42 @@ def test_head_192_full_context_regression(context_length, ps):
     assert result["err_gluon"] == 0, "pa_decode_gluon output is out of tolerance"
 
 
+@pytest.mark.parametrize("splits", [3, 8, 32])
+@pytest.mark.parametrize("query_length", [1, 3])
+@pytest.mark.parametrize("num_heads", [(24, 4), (8, 1)], ids=["kv4", "kv1"])
+@pytest.mark.parametrize("kv_varlen", [False, True], ids=["fixed", "varlen"])
+def test_ps_splits_inside_partitions(
+    monkeypatch, kv_varlen, num_heads, query_length, splits
+):
+    """Check ps=True at split counts that do not divide the 256-token partitions.
+
+    cdiv(1016, 8) = 127 tokens per split would put split edges inside
+    partitions. Both PS kernels (several KV heads, one KV head) round each
+    split up to whole partitions, so the last splits get no tokens: 1 of 3,
+    4 of 8 and 28 of 32 at 1016 tokens.
+    """
+    monkeypatch.setitem(globals(), "get_recommended_splits", lambda *a, **k: splits)
+    result = run_pa_gluon_test(
+        context_length=1016,
+        batch_size=8,
+        num_heads=num_heads,
+        head_size=128,
+        block_size=16,
+        compute_type=torch.bfloat16,
+        query_length=query_length,
+        quant_mode="per_tensor",
+        context_partition_size=256,
+        trans_v=False,
+        kv_varlen=kv_varlen,
+        quant_q=False,
+        quant_kv=False,
+        use_sinks=False,
+        sliding_window=0,
+        ps=True,
+    )
+    assert result["err_gluon"] == 0, "pa_decode_gluon output is out of tolerance"
+
+
 @pytest.mark.parametrize(
     "kv_heads, lengths",
     [
