@@ -1231,9 +1231,11 @@ def test_mla_gluon_decode_split_rebalance(batch, qlen, nhead, kv_dtype, use_2d_v
     torch.testing.assert_close(lse, lse_ref, atol=1e-3, rtol=0)
 
 
-def test_mla_gluon_prefill_attn_sink():
-    """Prefill mode with 64 heads (bh64): 64 queries get 4 KV splits; the sink is
-    in the softmax once for each query, not once for each split."""
+@pytest.mark.parametrize("num_queries", [64, 256])
+def test_mla_gluon_prefill_attn_sink(num_queries):
+    """Prefill mode with 64 heads (bh64): 64 queries get 4 KV splits, 256 one. The
+    sink is in the softmax once for each query, not once for each split, and an
+    empty query gives o = 0 and lse = sink."""
     if DEVICE_ARCH != "gfx950":
         pytest.skip("Gluon MLA decode is gfx950-only")
     from aiter.ops.triton.gluon.mla_gluon import mla_gluon
@@ -1242,7 +1244,8 @@ def test_mla_gluon_prefill_attn_sink():
     torch.manual_seed(0)
     nhead = 64
     # bh64 needs more than 3 * BLOCK_N keys in each split
-    lens = [random.randint(1000, 3000) for _ in range(64)]
+    lens = [random.randint(1000, 3000) for _ in range(num_queries)]
+    lens[2] = 0
     kv_c, block_table, q_nope, _ = _split_rebalance_inputs(
         len(lens), 1, nhead, torch.bfloat16, max(lens)
     )
@@ -1256,11 +1259,16 @@ def test_mla_gluon_prefill_attn_sink():
         q_nope=q_nope[:, 0],
         q_pe=None,
         kv_c=kv_c,
-        o=torch.empty(q_nope[:, 0].shape, dtype=torch.bfloat16, device="cuda"),
+        # NaN, so that a row the kernel does not write fails
+        o=torch.full(
+            q_nope[:, 0].shape, float("nan"), dtype=torch.bfloat16, device="cuda"
+        ),
         page_table=page_table,
         seq_info=seq_info,
         sm_scale=sm_scale,
-        min_kv_seq_len=min(lens),
+        # the bh64 bound is for non-empty splits; an empty query returns before
+        # the main loop
+        min_kv_seq_len=min(n for n in lens if n),
         return_lse=True,
         has_pe=False,
         attn_sink=attn_sink,
@@ -1275,23 +1283,29 @@ def test_mla_gluon_prefill_attn_sink():
     torch.testing.assert_close(lse.view(lse_ref.shape), lse_ref, atol=1e-3, rtol=0)
 
 
+# 200 sequences: one KV split each by default; the shorter long sequence keeps
+# kv_c below 2 GB
+@pytest.mark.parametrize("batch, long_len", [(60, 12000), (200, 6000)])
 @pytest.mark.parametrize("split_rebalance", [True, False])
 @pytest.mark.parametrize("qlen", [1, 2])
 @pytest.mark.parametrize(
     "nhead, kv_dtype", [(8, torch.float8_e4m3fn), (16, torch.bfloat16)]
 )
-def test_mla_gluon_decode_attn_sink(split_rebalance, qlen, nhead, kv_dtype):
-    """A sequence has several KV splits (60 sequences: 2 or 4 each by default,
-    more for the long ones with kv_split_info); the sink is in the softmax once
-    for each sequence, not once for each split."""
+def test_mla_gluon_decode_attn_sink(
+    batch, long_len, split_rebalance, qlen, nhead, kv_dtype
+):
+    """With several KV splits (60 sequences: 2 or 4 each by default, more for the
+    long ones with kv_split_info) the sink is in the softmax once for each
+    sequence, not once for each split; with one split (200 sequences) an empty
+    sequence gives o = 0 and lse = sink."""
     if DEVICE_ARCH != "gfx950":
         pytest.skip("Gluon MLA decode is gfx950-only")
     from aiter.ops.triton.gluon.mla_gluon import mla_gluon, mla_gluon_split_metadata
 
     random.seed(0)
     torch.manual_seed(0)
-    lens = [random.randint(qlen, 3000) for _ in range(60)]
-    lens[1] = 12000
+    lens = [random.randint(qlen, 3000) for _ in range(batch)]
+    lens[1] = long_len
     if qlen == 1:
         lens[2] = 0
     kv_c, block_table, q_nope, q_pe = _split_rebalance_inputs(
@@ -1312,7 +1326,8 @@ def test_mla_gluon_decode_attn_sink(split_rebalance, qlen, nhead, kv_dtype):
         q_nope=q_n,
         q_pe=q_p,
         kv_c=kv_c,
-        o=torch.empty(q_n.shape, dtype=torch.bfloat16, device="cuda"),
+        # NaN, so that a row the kernel does not write fails
+        o=torch.full(q_n.shape, float("nan"), dtype=torch.bfloat16, device="cuda"),
         page_table=block_table,
         seq_info=seq_lens,
         sm_scale=sm_scale,
