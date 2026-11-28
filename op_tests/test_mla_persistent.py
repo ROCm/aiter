@@ -6,6 +6,8 @@ import itertools
 import math
 import os
 import random
+import subprocess
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -2067,6 +2069,106 @@ def check_fp8_gqa16_multi_tile_batch(
     )
 
 
+_GPU_LOAD_SRC = """
+import sys, time, torch
+torch.cuda.set_device(int(sys.argv[1]))
+a = torch.randn(4096, 4096, dtype=torch.bfloat16, device="cuda")
+src = torch.empty(64 << 20, device="cuda")
+dst = torch.empty_like(src)
+a @ a
+torch.cuda.synchronize()
+print("ready", flush=True)
+end = time.time() + float(sys.argv[2])
+while time.time() < end:
+    for _ in range(8):
+        a @ a
+        dst.copy_(src)
+    torch.cuda.synchronize()
+"""
+
+
+def check_fp8_gqa32_q_kv_lds_reuse(calls: int = 3000) -> None:
+    """gfx950 fp8 128-head decode with qlen 1 and 4 (qh32 qseqlen4 gqa32 kernel).
+    The first KV prefetch overwrites LDS that still holds the tail of Q. Without
+    an s_barrier a slow wave can read the overwritten Q, giving wrong heads in a
+    few calls per thousand. It shows only when another process uses the GPU, so
+    a GEMM and copy loop runs in a child process. Correct calls stay below 0.014
+    error."""
+    nhead, kv_lora_rank, qk_head_dim = 128, 512, 576
+    batch_size, sm_scale = 16, 192**-0.5
+    one = torch.ones(1, dtype=torch.float)
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    kv_lens = torch.randint(32, 57, (batch_size,), generator=gen, dtype=torch.int)
+    kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
+    kv_indptr[1:] = kv_lens.cumsum(0)
+    total_kv = int(kv_indptr[-1])
+    kv_buffer = (torch.randn((total_kv, qk_head_dim), generator=gen) * 0.5).to(
+        dtypes.fp8
+    )
+    kv_indices = torch.randperm(total_kv, generator=gen).int()
+    kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
+    cases = {}
+    for decode_qlen in (1, 4):
+        q = torch.randn((batch_size * decode_qlen, nhead, qk_head_dim), generator=gen)
+        q = (q * 0.5).to(dtypes.fp8)
+        qo_indptr = torch.arange(batch_size + 1, dtype=torch.int) * decode_qlen
+        splits = _make_mla_metadata(
+            qo_indptr,
+            kv_indptr,
+            kv_last_page_lens,
+            nhead,
+            1,
+            dtypes.fp8,
+            dtypes.fp8,
+            1,
+            decode_qlen,
+            decode_qlen,
+            1,
+        )
+        ref = torch.empty((batch_size * decode_qlen, nhead, kv_lora_rank))
+        for b in range(batch_size):
+            kv_len = int(kv_lens[b])
+            k = kv_buffer[kv_indices[kv_indptr[b] : kv_indptr[b + 1]].long()].float()
+            rows = slice(b * decode_qlen, (b + 1) * decode_qlen)
+            s = torch.einsum("qhd,kd->qhk", q[rows].float(), k) * sm_scale
+            last = kv_len - decode_qlen + torch.arange(decode_qlen).view(-1, 1, 1)
+            s = s.masked_fill(torch.arange(kv_len) > last, float("-inf"))
+            ref[rows] = torch.softmax(s, -1) @ k[:, :kv_lora_rank]
+        cases[decode_qlen] = (q, qo_indptr, splits, ref)
+
+    load = subprocess.Popen(
+        [sys.executable, "-c", _GPU_LOAD_SRC, str(torch.cuda.current_device()), "300"],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    num_bad = dict.fromkeys(cases, 0)
+    try:
+        assert load.stdout.readline().strip() == "ready", "GPU load process failed"
+        for decode_qlen, (q, qo_indptr, splits, ref) in cases.items():
+            for _ in range(calls):
+                out = torch.empty_like(ref, dtype=torch.bfloat16)
+                aiter.mla.mla_decode_fwd(
+                    q,
+                    kv_buffer.view(-1, 1, 1, qk_head_dim),
+                    out,
+                    qo_indptr,
+                    kv_indptr,
+                    kv_indices,
+                    kv_last_page_lens,
+                    decode_qlen,
+                    sm_scale=sm_scale,
+                    q_scale=one,
+                    kv_scale=one,
+                    **splits,
+                )
+                err = (out.float() - ref).abs().amax(-1)
+                num_bad[decode_qlen] += int((err > 0.03).any())
+    finally:
+        load.kill()
+        load.wait()
+    assert sum(num_bad.values()) == 0, f"wrong calls of {calls} per qlen: {num_bad}"
+
+
 _HEADS = 16
 _KV_LEN = 2048
 _KV_LORA_RANK = 512
@@ -2534,6 +2636,8 @@ def main():
         check_fp8_gqa16_multi_tile_batch(1)
         check_fp8_gqa16_multi_tile_batch(1, return_lse=True)
         aiter.logger.info("fp8 gqa16 qlen 1 multi-tile batch: passed")
+        check_fp8_gqa32_q_kv_lds_reuse()
+        aiter.logger.info("fp8 gqa32 qlen 1 and 4 Q/KV LDS reuse: passed")
     return df if args.nhead else None
 
 
