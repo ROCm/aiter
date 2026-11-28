@@ -91,7 +91,9 @@ __launch_bounds__(TPB) __global__
     for(int ii = threadIdx.x; ii < num_cols; ii += TPB)
     {
         const int idx = thread_row_offset + ii;
-        threadData    = max(static_cast<float>(input[idx]), threadData);
+        // NaN loads as -FLT_MAX so one invalid expert cannot poison the row's
+        // max and sum; it ends up with probability 0, like a -inf logit.
+        threadData    = max(fmaxf(static_cast<float>(input[idx]), -FLT_MAX), threadData);
     }
 
     const float maxElem = block_reduce<float, aiter::Max, TPB, true>(threadData, aiter::Max());
@@ -106,7 +108,7 @@ __launch_bounds__(TPB) __global__
     for(int ii = threadIdx.x; ii < num_cols; ii += TPB)
     {
         const int idx = thread_row_offset + ii;
-        threadData += exp((static_cast<float>(input[idx]) - float_max));
+        threadData += exp((fmaxf(static_cast<float>(input[idx]), -FLT_MAX) - float_max));
     }
 
     const auto Z = block_reduce<float, aiter::Sum, TPB, true>(threadData, sum);
@@ -117,11 +119,16 @@ __launch_bounds__(TPB) __global__
     }
     __syncthreads();
 
+    // A row with no finite logit (all NaN or -inf) would normalize to a uniform
+    // 1/num_cols; it routes nowhere instead, with probability 0 everywhere.
+    const bool dead_row = float_max <= -FLT_MAX;
     for(int ii = threadIdx.x; ii < num_cols; ii += TPB)
     {
         const float val =
-            exp((static_cast<float>(input[thread_row_offset + ii]) - float_max)) *
-            normalizing_factor;
+            dead_row ? 0.f
+                     : exp((fmaxf(static_cast<float>(input[thread_row_offset + ii]), -FLT_MAX) -
+                            float_max)) *
+                           normalizing_factor;
         output[output_row_offset + ii] = val;
     }
 }
@@ -172,7 +179,10 @@ __launch_bounds__(TPB) __global__ void moeTopK(const float* inputs_after_softmax
         {
             const int idx = thread_read_offset + expert;
             inp_kvp.key   = expert;
-            inp_kvp.value = inputs_after_softmax[idx];
+            // A NaN probability enters as 0: it then ranks with the lowest real
+            // ones, above the -1 seed, so a NaN row still yields k distinct ids.
+            const float prob = inputs_after_softmax[idx];
+            inp_kvp.value    = prob != prob ? 0.0f : prob;
 
             for(int prior_k = 0; prior_k < k_idx; ++prior_k)
             {
@@ -344,7 +354,11 @@ __launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
         AccessType vec = vec_thread_read_ptr[ii * THREADS_PER_ROW];
         for(int jj = 0; jj < ELTS_PER_LDG; ++jj)
         {
-            row_chunk_vec_ptr[ii][jj] = static_cast<float>(vec[jj]);
+            // NaN and -inf load as -FLT_MAX so they stay above the -INFINITY
+            // that marks a selected expert: a row of them still yields k
+            // distinct ids instead of repeating the first one.
+            const float v             = static_cast<float>(vec[jj]);
+            row_chunk_vec_ptr[ii][jj] = fmaxf(v, -FLT_MAX);
         }
     }
 
@@ -402,6 +416,10 @@ __launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
     thread_kvp        = multithread_reduce(thread_kvp, arg_max, THREADS_PER_ROW);
     thread_max        = thread_kvp.value;
     first_topk_expert = thread_kvp.key;
+    // A row with no finite logit (all NaN or -inf) loads as -FLT_MAX everywhere and
+    // would softmax to a uniform 1/E. It routes nowhere instead: k distinct ids at
+    // weight 0, as topk_gating weights a dead row.
+    const bool dead_row = thread_max <= -FLT_MAX;
 
     // From this point, thread max in all the threads have the max within the row.
     // Next: select top-K and compute softmax only on them; if need_renorm=false, normalize by the
@@ -461,7 +479,7 @@ __launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
             const int output_idx  = output_stride * thread_row + k_idx;
             const int indices_idx = indices_stride * thread_row + k_idx;
             const int idx         = k * thread_row + k_idx;
-            const float numer     = expf(max_val - thread_max);
+            const float numer     = dead_row ? 0.f : expf(max_val - thread_max);
             output[output_idx]    = pad ? 0.f : numer;
             indices[indices_idx]  = pad                  ? -1
                                     : should_process_row ? (expert - start_expert)
@@ -944,7 +962,11 @@ __launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
         AccessType vec = vec_thread_read_ptr[ii * THREADS_PER_ROW];
         for(int jj = 0; jj < ELTS_PER_LDG; ++jj)
         {
-            row_chunk_vec_ptr[ii][jj] = static_cast<float>(vec[jj]);
+            // NaN and -inf load as -FLT_MAX so they stay above the -INFINITY
+            // that marks a selected expert: a row of them still yields k
+            // distinct ids instead of repeating the first one.
+            const float v             = static_cast<float>(vec[jj]);
+            row_chunk_vec_ptr[ii][jj] = fmaxf(v, -FLT_MAX);
         }
     }
 
@@ -1030,6 +1052,10 @@ __launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
     thread_kvp        = multithread_reduce(thread_kvp, arg_max, THREADS_PER_ROW);
     thread_max        = thread_kvp.value;
     first_topk_expert = thread_kvp.key;
+    // A row with no finite logit (all NaN or -inf) loads as -FLT_MAX everywhere and
+    // would softmax to a uniform 1/E. It routes nowhere instead: k distinct ids at
+    // weight 0, as topk_gating weights a dead row.
+    const bool dead_row = thread_max <= -FLT_MAX;
 
     // From this point, thread max in all the threads have the max within the row.
     // Next: select top-K and compute softmax only on them; if need_renorm=false, normalize by the
@@ -1089,7 +1115,7 @@ __launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
             const int output_idx  = output_stride * thread_row + k_idx;
             const int indices_idx = indices_stride * thread_row + k_idx;
             const int idx         = k * thread_row + k_idx;
-            const float numer     = expf(max_val - thread_max);
+            const float numer     = dead_row ? 0.f : expf(max_val - thread_max);
             output[output_idx]    = pad ? 0.f : numer;
             // Filtered-slot marker must sit OUTSIDE the valid id space
             // [0, NUM_EXPERTS + NUM_SHARED_EXPERTS): the shared ids occupy
