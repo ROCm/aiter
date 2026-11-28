@@ -8,21 +8,27 @@ Exposes ``pa_prefill_sparse`` — grid ``(T, cdiv(H, BLOCK_H))``, one token
 and BLOCK_H heads per CTA. Same grid as the decode kernel. No split-K:
 prefill fills the GPU via the token dimension.
 
-Gfx950(`mla_gluon`) and others(Triton `_sparse_attn_prefill_kernel`, they
-take a 1-D ``(kv_indices, kv_indptr)`` pair over one pool.
+Gfx950 (the single-pass gluon kernel, or `mla_gluon`) and others (Triton
+`_sparse_attn_prefill_kernel`) take a 1-D ``(kv_indices, kv_indptr)`` pair
+over one pool.
 
 ``pa_prefill_sparse`` — a single entry that dispatches on arch:
 
     gfx1250 -> gluon ``_pa_prefill_sparse``           (two sources, native)
-    gfx950  -> gluon wrapper ``mla_gluon``            (single source)
+    gfx950  -> gluon ``_pa_prefill_sparse``           (single source, H=32 or 64, D=512, bf16)
+               else gluon wrapper ``mla_gluon``       (single source)
     else    -> triton ``_sparse_attn_prefill_kernel`` (single source)
 """
 
 import functools
 
+import numpy as np
 import torch
 import triton
 
+from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_prefill_sparse import (
+    _pa_prefill_sparse as _pa_prefill_sparse_gfx950,
+)
 from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_prefill_sparse import (
     _pa_prefill_sparse as gluon_pa_prefill_sparse,
 )
@@ -33,6 +39,8 @@ from aiter.ops.triton.gluon.mla_gluon import (
     mla_gluon as gluon_mla_sparse_prefill,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
+from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.tuned_config_utils import get_tuned_kernel_config
 
@@ -78,13 +86,15 @@ def pa_prefill_sparse(
 ) -> torch.Tensor:
     """Sparse prefill attention over two KV sources with sink.
 
-    Dispatches on arch: gfx1250 -> gluon (two sources), gfx950 -> `mla_gluon`,
+    Dispatches on arch: gfx1250 -> gluon (two sources), gfx950 -> a single-pass
+    gluon kernel for bf16 q and KV with H=32 or 64 and D=512, else `mla_gluon`;
     otherwise the Triton kernel. Only gfx1250 reads a second KV source; the
-    other two serve the prefix source alone and reject a non-empty extend.
+    other two serve the prefix source alone and reject any extend source.
 
-    Meant for prefill-sized calls. The grid is one program per query token with
-    no split over the KV slots, so a call with only a few query rows (a decode
-    step) leaves most of the GPU idle; use a split-KV decode kernel for those.
+    Meant for prefill-sized calls. The grid is one program per query token and
+    block of heads with no split over the KV slots, so a call with only a few
+    query rows (a decode step) leaves most of the GPU idle; use a split-KV
+    decode kernel for those.
 
     Args:
         q:                 [T, H, D] BF16/FP16 — queries.
@@ -103,8 +113,9 @@ def pa_prefill_sparse(
         softmax_scale:     float.
         has_invalid:       gfx1250 only: whether index lists may hold ``-1``
             sentinels (``None`` picks a heuristic). The Triton fallback always
-            skips ``-1`` and out-of-pool slots. gfx950 (``mla_gluon``) does not
-            check slot values: pass only valid slots there.
+            skips ``-1`` and out-of-pool slots. gfx950 does not check slot
+            values: pass only valid slots there. ``True`` keeps gfx950 on
+            ``mla_gluon``.
         out:               optional contiguous [T, H, D] buffer on q's device,
             same dtype as q; written in place and returned.
 
@@ -227,6 +238,21 @@ def pa_prefill_sparse(
             kv_indices_extend,
             kv_indptr_extend,
         )
+        # The single-pass kernel takes every call it serves, at any T:
+        # `mla_gluon` adds the sink once per key split, leaves rows without
+        # keys unwritten when it runs one split, and at H=64 asserts unless T
+        # is a multiple of 64 and gets rows with few keys wrong.
+        if _single_pass_unsupported(q, unified_kv, has_invalid) is None:
+            _single_pass_prefill(
+                q,
+                unified_kv,
+                kv_indices_prefix,
+                kv_indptr_prefix,
+                attn_sink,
+                softmax_scale,
+                out,
+            )
+            return out
         gluon_mla_sparse_prefill(
             q,  # q_nope = combined-D query (RoPE folded in)
             None,  # q_pe unused in prefill mode
@@ -320,6 +346,108 @@ def pa_prefill_sparse(
             BLOCK_D=block_d,
         )
         return out
+
+
+# ---------------------------------------------------------------------------
+# gfx950 single-pass kernel
+# ---------------------------------------------------------------------------
+
+_LOG2E = 1.44269504089
+
+
+@functools.lru_cache
+def _single_pass_config() -> dict:
+    """Launch config of the gfx950 single-pass kernel.
+
+    Returns the cached dict: do not change it.
+    """
+    cfg_dir = resolve_config_dir("attention", "PA_PREFILL_SPARSE", backend="gluon")
+    return load_config_json(f"{cfg_dir}/DEFAULT.json")["_pa_prefill_sparse"]
+
+
+# The kernel computes 32 heads per program, so at H=64 two programs share each
+# query row, one per half of the heads, in one launch. The kernel places a
+# row's two programs on one XCD, so the second one's KV gathers can hit the
+# first one's in L2: on random slots over a 1 GiB pool, half as many KV reads
+# miss L2 as with one launch per half. One 64-head program measured slower.
+_GROUP_HEADS = 32
+_SINGLE_PASS_HEADS = (32, 64)
+
+
+def _single_pass_unsupported(
+    q: torch.Tensor, unified_kv: torch.Tensor, has_invalid: bool | None
+) -> str | None:
+    """Why the gfx950 single-pass kernel cannot serve the call, or None."""
+    _, H, D = q.shape
+    if H not in _SINGLE_PASS_HEADS or D != 512:
+        return f"needs H in {_SINGLE_PASS_HEADS} and D=512, got H={H} D={D}"
+    if q.dtype != torch.bfloat16 or unified_kv.dtype != torch.bfloat16:
+        return f"needs bf16 q and unified_kv, got {q.dtype} and {unified_kv.dtype}"
+    if unified_kv.dim() != 2 or unified_kv.shape[1] != D:
+        return f"needs a [total_pages, {D}] unified_kv, got {tuple(unified_kv.shape)}"
+    if q.stride(2) != 1 or unified_kv.stride(1) != 1:
+        return (
+            f"needs unit inner strides, got q {q.stride(2)} "
+            f"and unified_kv {unified_kv.stride(1)}"
+        )
+    if has_invalid is True:
+        return "reads valid slots only: has_invalid must not be True"
+    return None
+
+
+@functools.lru_cache(maxsize=64)
+def _qk_scale(softmax_scale: float) -> float:
+    """fp32(softmax_scale) * fp32(log2(e)), rounded once in fp32.
+
+    A product in [0, the smallest normal fp32) becomes that value: the kernel
+    masks the scores past a row's last key to -inf before scaling them, and
+    -inf * 0 is NaN. Masked scores stay -inf, and for scores below 1e8 every
+    other exponent s * qk_scale - m is within 1e-30 of 0: each key weighs 1, as
+    at 0.
+    """
+    tiny = float(np.finfo(np.float32).tiny)
+    qk_scale = float(np.float32(softmax_scale) * np.float32(_LOG2E))
+    return tiny if 0.0 <= qk_scale < tiny else qk_scale
+
+
+def _single_pass_prefill(
+    q: torch.Tensor,
+    unified_kv: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    attn_sink: torch.Tensor | None,
+    softmax_scale: float,
+    out: torch.Tensor,
+) -> None:
+    """Launch the gfx950 single-pass kernel once: a program per query row and
+    _GROUP_HEADS heads."""
+    T, H, _ = q.shape
+    groups = H // _GROUP_HEADS
+    cfg = _single_pass_config()
+    _LOGGER.info("PA_PREFILL_SPARSE gfx950 single-pass T=%d H=%d", T, H)
+    if attn_sink is not None:
+        attn_sink = attn_sink.to(torch.float32).contiguous()
+    _pa_prefill_sparse_gfx950[(T * groups,)](
+        q,
+        unified_kv,
+        kv_indices,
+        kv_indptr,
+        attn_sink,
+        out,
+        q.stride(0),
+        q.stride(1),
+        unified_kv.stride(0),
+        out.stride(0),
+        out.stride(1),
+        _qk_scale(float(softmax_scale)),
+        H=_GROUP_HEADS,
+        HEAD_GROUPS=groups,
+        # one compile for every device at H=32, where no row is shared
+        NUM_XCDS=get_num_xcds() if groups > 1 else 1,
+        BLOCK_K=cfg["BLOCK_K"],
+        HAS_SINK=attn_sink is not None,
+        num_warps=cfg["num_warps"],
+    )
 
 
 # ---------------------------------------------------------------------------
