@@ -100,10 +100,15 @@ is retained as historical context in [NAMED_REG_VALIDATION.md](NAMED_REG_VALIDAT
 gen_co/
 ├── co_kernels_gfx1250.json # gfx1250 source of truth (see below)
 ├── co_kernels_gfx950_a8w8_blockscale_bpreshuffle.json
+├── co_kernels_gfx950_a16w16.json
 ├── build_co.py            # the producer
 ├── gfx950/
-│   └── a8w8_blockscale_bpreshuffle/
-│       ├── <launcher_name>.co
+│   ├── a8w8_blockscale_bpreshuffle/
+│   │   ├── <launcher_name>.co
+│   │   ├── build_info.json
+│   │   └── asm/           # debug listings, .gitignored
+│   └── a16w16/
+│       ├── <kid_name>_<nt|nn|tt|tn>.co
 │       ├── build_info.json
 │       └── asm/           # debug listings, .gitignored
 └── gfx1250/
@@ -123,6 +128,10 @@ The default output of `build_co.py --arch gfx950` uses this layout.
 host launcher append
 `gfx950/a8w8_blockscale_bpreshuffle/<launcher_name>.co`.
 The small-shape `direct_b` and `staged_b` families are generated through the JIT.
+
+The gfx950 a16w16 4-wave manifest is `gen_co/co_kernels_gfx950_a16w16.json`: one
+image per (kid, layout NT/NN/TT/TN) in `gfx950/a16w16/`, built with
+`build_co.py --arch gfx950 --family a16w16`.
 
 `<launcher_name>` is the same string three times over — the `.co` filename, the
 `extern "C"` kernel symbol inside it, and the host launcher symbol — because all

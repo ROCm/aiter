@@ -10,6 +10,7 @@ from functools import cache, lru_cache
 import torch
 
 from csrc.opus_gemm.opus_gemm_common import (
+    _A16W16_4WAVE_GFX950_TAGS,
     GFX942_BF16WS_EXACT_N,
     GFX942_EVEN_LOOP_SPLITK_TAGS,
     GFX942_MAX_AUTO_SPLIT_K,
@@ -32,6 +33,9 @@ _GFX1250_FUSED_SPLITK_TAG = "a16w16_clusterlaunch_tdm_splitk_fuse"
 _GFX1250_CO_TAGS = frozenset(
     {"a16w16_4wave_co", "a16w16_4wave_wl_co", "a16w16_4wave_wlr_co"}
 )
+# gfx950 a16w16 4-wave (pre-built .co): direct and fp32 split-K workspace kids.
+GFX950_4WAVE_TAGS = _A16W16_4WAVE_GFX950_TAGS
+_GFX950_4WAVE_B_K = 64
 
 
 @dataclass(frozen=True)
@@ -77,6 +81,10 @@ def _supports_a16w16_shape(
 
     if instance.kernel_tag == "a16w16_mono_tile":
         return N % instance.B_N == 0 and K % instance.B_K == 0
+
+    if instance.kernel_tag in GFX950_4WAVE_TAGS:
+        # K tiles of 64, at least 2 per split; any M and N.
+        return K % _GFX950_4WAVE_B_K == 0 and K >= 2 * _GFX950_4WAVE_B_K
 
     if not instance.has_oob:
         return M % instance.B_M == 0 and N % instance.B_N == 0
@@ -162,6 +170,11 @@ def _plan_gfx950_split_k(
             break
         abi_split_k -= 1
     return abi_split_k
+
+
+def _plan_gfx950_4wave_split_k(*, K: int, requested: int) -> int:
+    """Mirror of the 4wave workspace launcher clamp: >= 2 K tiles per split."""
+    return min(max(1, requested), (K // _GFX950_4WAVE_B_K) // 2)
 
 
 def _plan_gfx1250_split_k(
@@ -385,6 +398,8 @@ def _build_a16w16_launch_plan(
                 cu_num=cu_num,
                 requested=requested_split_k,
             )
+        elif instance.kernel_tag == "a16w16_4wave_ws":
+            abi_split_k = _plan_gfx950_4wave_split_k(K=K, requested=requested_split_k)
         elif registry_arch == GFX950:
             abi_split_k = _plan_gfx950_split_k(
                 instance,

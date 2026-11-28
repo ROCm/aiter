@@ -31,6 +31,7 @@ from opus_gemm_common import (
     a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list,
     a8w8_kernels_list,
     a8w8_scale_kernels_list,
+    a16w16_co_kernels_list,
     a16w16_flatmm_kernels_list,
     a16w16_flatmm_splitk_kernels_list,
     a16w16_kernels_list,
@@ -324,6 +325,8 @@ SPLITK_TAGS = {
     "a16w16_clusterlaunch_tdm_splitk_ws",
     "a16w16_clusterlaunch_tdm_splitk_fuse",
     "a16w16_em3en4_lds1_pgr2_sk",
+    # gfx950 4-wave: pre-built fp32 split-K image + the shared gfx950 reduce.
+    "a16w16_4wave_ws",
     *_SPLITK,
 }
 
@@ -1434,6 +1437,16 @@ if __name__ == "__main__":
         "a16w16_cluster_tdm_splitk_ws": gfx1250_kernels_list,
         "a16w16_clusterlaunch_tdm_splitk_ws": gfx1250_clusterlaunch_kernels_list,
         "a16w16_clusterlaunch_tdm_splitk_fuse": gfx1250_splitk_fuse_kernels_list,
+        "a16w16_4wave": {
+            kid: instance
+            for kid, instance in a16w16_co_kernels_list.items()
+            if instance.kernel_tag == "a16w16_4wave"
+        },
+        "a16w16_4wave_ws": {
+            kid: instance
+            for kid, instance in a16w16_co_kernels_list.items()
+            if instance.kernel_tag == "a16w16_4wave_ws"
+        },
         "a16w16_4wave_co": {
             kid: instance
             for kid, instance in gfx1250_4wave_co_kernels_list.items()
