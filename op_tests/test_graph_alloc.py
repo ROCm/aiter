@@ -85,6 +85,9 @@ def test_every_cached_scratch_comes_from_the_private_pool():
     from aiter.ops.flydsl.gemm_a16w16_gfx1250 import _split_k_counters
     from aiter.ops.flydsl.gemm_kernels import _get_preshuffle_split_buffers
     from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import get_split_k_buffers
+    from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
+        _fused_splitk_workspace as _gfx1250_mxfp8_workspace,
+    )
     from aiter.ops.flydsl.mxscale_preshuffle_kernels import _fused_splitk_buffers
     from aiter.ops.gemm_op_a8w8 import get_zero_bias_buf_keyed
     from aiter.ops.gemm_op_a16w16 import _get_semaphore_workspace_keyed
@@ -97,6 +100,7 @@ def test_every_cached_scratch_comes_from_the_private_pool():
         "preshuffle_split_k": _get_preshuffle_split_buffers(dev, s),
         "a16w16_gfx950": get_split_k_buffers(s, dev, 1),
         "a16w16_gfx1250": _split_k_counters(dev, s),
+        "mxfp8_gfx1250": _gfx1250_mxfp8_workspace(dev, sid, (2, 16, 128)),
         "mxscale_fused_split_k": _fused_splitk_buffers(dev, sid, 2, 16, 256, 4),
         "a16w16_asm": _get_semaphore_workspace_keyed(dev, sid),
         "a8w8_zero_bias": get_zero_bias_buf_keyed(dev, sid, 64),

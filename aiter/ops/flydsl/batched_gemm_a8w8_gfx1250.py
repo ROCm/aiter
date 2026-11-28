@@ -39,10 +39,16 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_lds_capacity_byte
 from .mxfp8_bpreshuffle_gemm_gfx1250 import (
     BASE_NAME_SUFFIX_RE,
     MX32_COMPUTE_WMMA_NAME_PREFIX,
+    MX32_STREAM_NAME_PREFIX,
     compute_kernel_k_pair,
     is_compute_wmma_kernel_name,
     parse_mxfp8_32_wmma_kernel_name,
     run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250,
+    run_gemm_a8w8_mxfp8_32_stream_gfx1250,
+)
+from .mxfp8_decode_gemm_gfx1250 import (
+    MX32_DECODE_NAME_PREFIX,
+    run_gemm_a8w8_mxfp8_32_decode_gfx1250,
 )
 
 BLOCK_K = 128
@@ -187,8 +193,8 @@ def bmm_candidates(b: int, m: int, n: int, k: int) -> list[dict[str, int]]:
     """Every batched config that can legally run this shape, tuner-ordered."""
     from .gemm_tune.flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common import (
         is_compute_kernel,
-        kernel_fits_shape,
         kernels_list,
+        mxfp8_32_kernel_fits_shape,
     )
 
     out = []
@@ -197,7 +203,7 @@ def bmm_candidates(b: int, m: int, n: int, k: int) -> list[dict[str, int]]:
             continue
         if ki.cluster_m != 1 or ki.cluster_n != 1:
             continue
-        if not kernel_fits_shape(ki, m, n, k):
+        if not mxfp8_32_kernel_fits_shape(ki, m, n, k):
             continue
         out.append(
             {
@@ -210,6 +216,24 @@ def bmm_candidates(b: int, m: int, n: int, k: int) -> list[dict[str, int]]:
             }
         )
     return out
+
+
+@functools.lru_cache(maxsize=4096)
+def bmm_mx32_kernel_launchable(kernel_name: str, m: int, n: int, k: int) -> bool:
+    """Whether a tuned batched mx32 name can launch at B=1 for this shape."""
+    cfg = parse_bmm_mx32_kernel_name(kernel_name)
+    return bool(
+        cfg is not None
+        and m > 0
+        and cfg["split_k"] == cfg["cluster_m"] == cfg["cluster_n"] == 1
+        and cfg["tile_m"] % (cfg["m_warp"] * 16) == 0
+        and cfg["tile_n"] % (cfg["n_warp"] * 16) == 0
+        and cfg["tile_n"] % 32 == 0
+        and n % cfg["tile_n"] == 0
+        and k % cfg["tile_k"] == 0
+        and k // cfg["tile_k"] >= cfg["num_buffers"]
+        and mx32_lds_bytes(cfg) <= get_lds_capacity_bytes(get_gfx())
+    )
 
 
 @functools.lru_cache(maxsize=1024)
@@ -526,19 +550,54 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
         or pick_bmm_mx32_compute_kernel_name(b, m, n, k)
         or pick_bmm_mx32_kernel_name(b, m, n, k, w_scale_32x32)
     )
-    if is_compute_wmma_kernel_name(name):
-        ccfg = parse_mxfp8_32_wmma_kernel_name(name) if fused else None
+    if name.startswith(MX32_STREAM_NAME_PREFIX + "_"):
+        run_b1 = run_gemm_a8w8_mxfp8_32_stream_gfx1250
+    elif name.startswith(MX32_DECODE_NAME_PREFIX + "_"):
+        run_b1 = run_gemm_a8w8_mxfp8_32_decode_gfx1250
+    else:
+        run_b1 = None
+    if run_b1 is not None:
+        # The streaming and decode kernels: B = 1, row-major A and A scale, 1x32
+        # B scale.
+        if b != 1 or fused or w_scale_32x32:
+            raise ValueError(
+                f"[FlyDSL gfx1250 bmm] {name!r} needs B=1, a 1x32 w_scale and no "
+                "fused output quant"
+            )
+        if m:
+            from aiter.utility import dtypes
+
+            run_b1(
+                XQ[:, 0],
+                WQ[0],
+                x_scale[:, 0].view(dtypes.fp8_e8m0),
+                w_scale[0].view(dtypes.fp8_e8m0),
+                Out[:, 0],
+                name,
+            )
+        return Out
+    direct_cfg = parse_mxfp8_32_wmma_kernel_name(name)
+    if direct_cfg is not None:
+        compute = is_compute_wmma_kernel_name(name)
+        if fused and not compute:
+            raise ValueError(
+                f"[FlyDSL gfx1250 bmm] direct kernel {name!r} has no fused quant "
+                "epilogue; drop y_scale_out or use a compute kernel"
+            )
         if fused and (
-            ccfg is None
-            or ccfg["split_k"] != 1
-            or ccfg["persistent_n_tiles"] != 1
-            or ccfg["a_preshuffle"]
-            or ccfg["a_scale_preshuffled"]
+            direct_cfg["split_k"] != 1
+            or direct_cfg["persistent_n_tiles"] != 1
+            or direct_cfg["a_preshuffle"]
+            or direct_cfg["a_scale_preshuffled"]
         ):
             raise ValueError(
                 f"[FlyDSL gfx1250 bmm] compute kernel {name!r} has no fused quant "
                 "epilogue (it needs split_k 1, no persistent tiles and row-major "
                 "A); drop y_scale_out or pick another kernel"
+            )
+        if b != 1 and not compute:
+            raise ValueError(
+                f"[FlyDSL gfx1250 bmm] non-compute direct kernel {name!r} needs B=1"
             )
         if m:
             from aiter.utility import dtypes
@@ -551,7 +610,7 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
                 Out[:, 0],
                 name,
                 w_scale_32x32=w_scale_32x32,
-                batch=b,
+                batch=b if compute else 1,
                 y_scale_out=y_scale_out,
             )
         return Out
@@ -600,6 +659,7 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
         bool(w_scale_32x32),
         k_tail,
         fused,  # fuse_quant_out
+        False,  # fused_splitk
     )
     # Cached CompiledFunction per constexpr set; see _run_compiled.
     _run_compiled(
@@ -637,6 +697,8 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
         k_tail,
         _ptr_arg(y_scale_out) if fused else _ptr_arg(Out),  # arg_scale_out
         fused,  # fuse_quant_out
+        _ptr_arg(Out),  # arg_out
+        False,  # fused_splitk
         specialization_key=bmm_spec,
     )
     return Out
@@ -708,6 +770,7 @@ def run_bmm_a8w8_mxfp8_128_gfx1250(
         True,  # batched
         preload_ks,
         False,  # a_preshuffle
+        False,  # fused_splitk
     )
     # Cached CompiledFunction per constexpr set; see _run_compiled.
     _run_compiled(
@@ -744,6 +807,9 @@ def run_bmm_a8w8_mxfp8_128_gfx1250(
         False,  # b_scale_32x32
         False,  # k_tail
         _ptr_arg(Out),  # arg_scale_out
+        False,  # fuse_quant_out
+        _ptr_arg(Out),  # arg_out
+        False,  # fused_splitk
         specialization_key=bmm_spec,
     )
     return Out
