@@ -198,6 +198,59 @@ def _get_padded_m(m):
     return min(_next_pow2(m), 131072)
 
 
+# (id(rows), model_dim, inter_dim, experts) -> mid-bucket token keys.
+_MID_TOKEN_CACHE: dict = {}
+
+
+def _csv_mid_tokens(model_dim, inter_dim, experts):
+    """Token keys of this shape's CSV rows that lie strictly inside a pow2
+    bucket, ascending. Keyed by the loaded row list, so switching the CSV
+    (``AITER_CONFIG_GROUPED_FMOE``) recomputes them."""
+    rows = _load_grouped_config_rows()
+    ck = (id(rows), int(model_dim), int(inter_dim), int(experts))
+    got = _MID_TOKEN_CACHE.get(ck)
+    if got is None:
+        mids = set()
+        for row in rows:
+            try:
+                t = int(float(str(row.get("token") or "").strip()))
+                if (
+                    int(float(str(row.get("model_dim") or "0"))) != ck[1]
+                    or int(float(str(row.get("inter_dim") or "0"))) != ck[2]
+                    or int(float(str(row.get("expert") or "0"))) != ck[3]
+                ):
+                    continue
+            except ValueError:
+                continue
+            if 0 < t < _get_padded_m(t):
+                mids.add(t)
+        got = tuple(sorted(mids))
+        _MID_TOKEN_CACHE[ck] = got
+    return got
+
+
+def _find_grouped_config_for(token_num: int, **kwargs):
+    """CSV row for a token count (a recv-token bound on the EP path).
+
+    A row whose token key lies strictly inside a pow2 bucket is tuned for the
+    token counts from the bucket's lower edge (or the previous such row) up to
+    its key. When this shape has such rows, the smallest one >= ``token_num``
+    in the same bucket wins; otherwise the pow2 bucket row, as before. Every
+    token count resolves to one fixed row, so the GEMM tiles and the compact
+    plan alignment, both looked up through here, stay in step.
+    """
+    t = int(token_num)
+    padded = _get_padded_m(t)
+    for mid in _csv_mid_tokens(
+        kwargs["model_dim"], kwargs["inter_dim"], kwargs["experts"]
+    ):
+        if t <= mid < padded and _get_padded_m(mid) == padded:
+            row = _find_grouped_config(token_num=mid, **kwargs)
+            if row is not None:
+                return row
+    return _find_grouped_config(token_num=padded, **kwargs)
+
+
 @functools.lru_cache(maxsize=1024)
 def _find_grouped_config(
     *,
@@ -2012,8 +2065,8 @@ def grouped_gemm_gfx1250_a8w4(
     tile_m = 64
     n_warp = 4
     num_buffers = 2
-    cfg_row = _find_grouped_config(
-        token_num=_get_padded_m(_csv_tokens),
+    cfg_row = _find_grouped_config_for(
+        _csv_tokens,
         model_dim=model_dim,
         inter_dim=inter_dim,
         experts=E,

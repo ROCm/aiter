@@ -81,7 +81,7 @@ def _compact_gemm_tiles(
     before it clamps both tiles to the plan alignment.
 
     Same precedence as ``grouped_gemm_gfx1250_a8w4``: the grouped-GEMM CSV row
-    for ``_get_padded_m(recv_bound)`` (64 / 64 / 1 when it misses), then
+    ``_find_grouped_config_for(recv_bound)`` (64 / 64 / 1 when it misses), then
     ``AITER_TDM_TILE_M{,2}`` and ``AITER_TDM_M_WARP{,2}``, the stage-2 value
     following the stage-1 one when only that is set. The stage-1 kernel's
     verdict and its launcher key are computed from this, so it has to name the
@@ -89,16 +89,13 @@ def _compact_gemm_tiles(
     """
     from aiter.ops.flydsl.grouped_moe_gfx1250 import (
         _as_int,
-        _find_grouped_config,
-        _get_padded_m,
+        _find_grouped_config_for,
     )
 
     row = None
     if config.dispatch_wire in ("fp4", "fp8"):
-        row = _find_grouped_config(
-            token_num=_get_padded_m(
-                config.max_recv if recv_bound is None else int(recv_bound)
-            ),
+        row = _find_grouped_config_for(
+            config.max_recv if recv_bound is None else int(recv_bound),
             model_dim=config.hidden_dim,
             inter_dim=config.geometry.inter_dim,
             experts=config.experts_per_rank,
