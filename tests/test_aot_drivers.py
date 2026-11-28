@@ -244,3 +244,41 @@ class MegaMoEProductionJobsTest(unittest.TestCase):
                 if job["model_dim"] == 5120
             ]
         )
+
+
+class MegaMoEReplayDeviceTest(unittest.TestCase):
+    def test_each_rank_replays_on_its_own_device(self):
+        # MegaMoEV2 runs on cuda:{rank} and its dispatch/combine op on the
+        # current device, so a rank's replay must make cuda:{rank} current.
+        # dry_run alone leaves cuda:0 current, as the stand-in below does.
+        from contextlib import contextmanager, nullcontext
+        from types import ModuleType
+
+        from aiter.aot.flydsl import dry_run as dry_run_module
+        from aiter.aot.flydsl import mega_moe
+
+        @contextmanager
+        def dry_run(*_args, **_kwargs):
+            with patch.object(torch.cuda, "current_device", lambda: 0):
+                yield
+
+        seen = []
+
+        class MegaMoEV2:
+            def __init__(self, *, rank, **_kwargs):
+                seen.append((rank, torch.cuda.current_device()))
+                raise RuntimeError("stop after construction")
+
+        module = ModuleType("aiter.ops.flydsl.kernels.mega_moe.mega_moe_v2")
+        module.MegaMoEV2 = MegaMoEV2
+        jobs = [job for job in mega_moe.production_jobs() if job["mtpr"] == 8192]
+        jobs = [job for job in jobs if job["experts_per_rank"] == 48][:8]
+        with (
+            patch.object(dry_run_module, "dry_run", dry_run),
+            patch.object(mega_moe, "_fake_shmem", lambda *_args: nullcontext()),
+            patch.object(mega_moe, "_weights", lambda *_args: {}),
+            patch.dict(sys.modules, {module.__name__: module}),
+        ):
+            for job in jobs:
+                mega_moe.compile_one_config(**job)
+        self.assertEqual(seen, [(rank, rank) for rank in range(8)])

@@ -68,7 +68,11 @@ def _vote(group, error):
 
 
 class MoriSymmetricHeap:
-    """MoRI shmem symmetric heap. MoRI must be initialized by the caller.
+    """MoRI shmem symmetric heap.
+
+    MoRI is initialized here over the EP group if an aiter EP all-to-all
+    manager registered one (see ``ensure_mori_shmem``); otherwise the caller
+    must have initialized it.
 
     The memory type is MoRI's, set by ``MORI_SHMEM_HEAP_TYPE``: uncached unless
     it is ``normal``.
@@ -81,6 +85,9 @@ class MoriSymmetricHeap:
     def __init__(self, *, rank, world_size, device, group):
         import mori.shmem as ms
 
+        from aiter.dist.device_communicators.all2all import ensure_mori_shmem
+
+        ensure_mori_shmem()
         if rank != ms.shmem_mype() or world_size != ms.shmem_npes():
             raise ValueError(
                 f"rank/world_size ({rank}/{world_size}) != MoRI "

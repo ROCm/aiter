@@ -248,7 +248,7 @@ for file in "${sharded_files[@]}"; do
             } | tee -a latest_test.log
             test_cmd=(env AITER_MLA_DECODE_PERSISTENT_MAX_BATCH=0 timeout 60m python3 "$file")
             ;;
-        op_tests/test_flydsl_pa_decode.py|op_tests/flydsl_tests/test_flydsl_allreduce_policy.py|op_tests/flydsl_tests/test_flydsl_allreduce_rank_agreement.py|op_tests/flydsl_tests/test_flydsl_quick_allreduce_codec.py)
+        op_tests/test_flydsl_pa_decode.py|op_tests/flydsl_tests/test_flydsl_allreduce_policy.py|op_tests/flydsl_tests/test_flydsl_allreduce_rank_agreement.py|op_tests/flydsl_tests/test_flydsl_quick_allreduce_codec.py|op_tests/flydsl_tests/test_group_coordinator_destroy.py|op_tests/flydsl_tests/test_mori_all2all_flydsl_routing.py)
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
             ;;
         op_tests/test_f4gemm.py)
