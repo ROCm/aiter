@@ -7,6 +7,7 @@
 // shared codecs and legacy QuickReduce kernels have been defined.
 
 #include "quick_all_reduce_base.h"
+#include <cstdlib>
 
 namespace aiter {
 
@@ -209,6 +210,63 @@ struct AllReducePullQ4
             dst_offset += kAtomStride * sizeof(int32x4_t);
         }
     }
+    __device__ static void reduce_prefetched(T* __restrict__ output,
+                                  uint32_t N,
+                                  int block,
+                                  int rank,
+                                  uint8_t** __restrict__ buffer_list,
+                                  uint32_t data_offset,
+                                  uint32_t epoch,
+                                  int64_t size_per_phase)
+    {
+        const int thread           = threadIdx.x + threadIdx.y * blockDim.x;
+        const int64_t phase_offset = (epoch & 1u) * size_per_phase;
+        Codec codec(thread, rank);
+        int32x4_t reduced[kAtoms] = {};
+
+#pragma unroll
+        for(int r = 0; r < world_size; ++r)
+        {
+            int32x4_t* peer_recv = reinterpret_cast<int32x4_t*>(
+                buffer_list[r] + data_offset + phase_offset + block * Codec::kTransmittedTileSize);
+            int32_t packed[kAtoms];
+            int scales[kAtoms];
+            // Issue this peer's independent payload/scale reads before decoding.
+#pragma unroll
+            for(int i = 0; i < kAtoms; ++i)
+            {
+                uint8_t* atom_ptr = reinterpret_cast<uint8_t*>(
+                    peer_recv + i * Codec::kRankBufferTileStride);
+                packed[i] = __builtin_nontemporal_load(
+                    reinterpret_cast<int32_t*>(atom_ptr) + thread);
+                scales[i] = 0;
+                if(threadIdx.x == codec.group_leader)
+                    scales[i] = __builtin_nontemporal_load(
+                        reinterpret_cast<int*>(atom_ptr + Codec::kRankTileScaleOffset)
+                        + thread / 8);
+            }
+#pragma unroll
+            for(int i = 0; i < kAtoms; ++i)
+            {
+                const int leader_lane =
+                    ((threadIdx.x % warpSize) / kThreadGroupSize) * kThreadGroupSize;
+                const int scale = __shfl(scales[i], leader_lane);
+                int32x4_t peer_atom;
+                Codec::decode_atom(packed[i], scale, &peer_atom);
+                // Identical half-precision accumulation, in fixed rank order.
+                packed_assign_add<T>(&reduced[i], &peer_atom);
+            }
+        }
+
+        BufferResource dst_buffer(output, N * sizeof(T));
+        uint32_t dst_offset = block * kTileSize + thread * sizeof(int32x4_t);
+#pragma unroll
+        for(int i = 0; i < kAtoms; ++i)
+        {
+            store_output_atom(output, dst_buffer.descriptor, N, dst_offset, reduced[i]);
+            dst_offset += kAtomStride * sizeof(int32x4_t);
+        }
+    }
 };
 
 template <typename AllReduceKernel, typename T>
@@ -267,6 +325,23 @@ allreduce_prototype_pull_q4_reduce(T* B,
             B, N, block, rank, dbuffer_list, data_offset, epoch, size_per_phase);
 }
 
+template <typename AllReduceKernel, typename T>
+__global__ __quickreduce_launch_bounds_two_shot__ static void
+allreduce_prototype_pull_q4_reduce_prefetched(T* B,
+                                   uint32_t N,
+                                   uint32_t num_blocks,
+                                   int rank,
+                                   uint8_t** dbuffer_list,
+                                   uint32_t data_offset,
+                                   uint32_t* d_epoch,
+                                   int64_t size_per_phase)
+{
+    const uint32_t epoch = d_epoch[0];
+    for(int block = blockIdx.x; block < num_blocks; block += gridDim.x)
+        AllReduceKernel::reduce_prefetched(
+            B, N, block, rank, dbuffer_list, data_offset, epoch, size_per_phase);
+}
+
 template <typename T, int world_size, bool cast_bf2half>
 void quick_reduce_launch_pull_q4(T const* A,
                                  T* B,
@@ -305,6 +380,28 @@ void quick_reduce_launch_pull_q4(T const* A,
                        data_offset,
                        d_epoch,
                        size_per_phase);
+    static const bool prefetch = [] {
+        const char* value = std::getenv("AITER_PULL_Q4_PREFETCH");
+        return value && std::string(value) == "1";
+    }();
+    if(prefetch && world_size == 4)
+    {
+    hipLaunchKernelGGL((allreduce_prototype_pull_q4_reduce_prefetched<AllReduceKernel, T>),
+                       dim3(grid),
+                       dim3(kBlockTwoShot),
+                       0,
+                       stream,
+                       B,
+                       N,
+                       num_blocks,
+                       rank,
+                       dbuffer_list,
+                       data_offset,
+                       d_epoch,
+                       size_per_phase);
+    }
+    else
+    {
     hipLaunchKernelGGL((allreduce_prototype_pull_q4_reduce<AllReduceKernel, T>),
                        dim3(grid),
                        dim3(kBlockTwoShot),
@@ -318,6 +415,8 @@ void quick_reduce_launch_pull_q4(T const* A,
                        data_offset,
                        d_epoch,
                        size_per_phase);
+    }
+
 }
 
 template <typename T, bool cast_bf2half>
