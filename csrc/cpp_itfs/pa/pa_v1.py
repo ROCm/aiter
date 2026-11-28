@@ -27,6 +27,11 @@ def compile(
     sliding_window_enabled: bool = False,
     folder: str | None = None,
 ):
+    if gqa_ratio > 16 and gqa_ratio % math.ceil(gqa_ratio / 16):
+        raise ValueError(
+            f"paged_attention_v1: GQA ratio {gqa_ratio} is not supported; "
+            "ratios above 16 must be a multiple of ceil(ratio / 16)"
+        )
     return compile_template_op(
         src_template,
         MD_NAME,

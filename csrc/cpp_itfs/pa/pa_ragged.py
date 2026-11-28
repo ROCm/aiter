@@ -26,6 +26,11 @@ def compile(
     logits_soft_cap_enabled: bool = False,
     func_name: str | None = None,
 ):
+    if gqa_ratio > 16 and gqa_ratio % math.ceil(gqa_ratio / 16):
+        raise ValueError(
+            f"paged_attention_ragged: GQA ratio {gqa_ratio} is not supported; "
+            "ratios above 16 must be a multiple of ceil(ratio / 16)"
+        )
     import os
 
     version = os.getenv("QKV_VERSION", "GOLDEN")
