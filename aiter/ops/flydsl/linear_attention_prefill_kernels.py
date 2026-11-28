@@ -25,6 +25,7 @@ import triton
 from flydsl.runtime.device import get_rocm_arch
 
 from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.utils.chip_info import log_tuned_cu_fallback
 
 from ..triton._triton_kernels.gated_delta_net.utils import (
     GatedDeltaRulePrefillMetadata,
@@ -151,7 +152,7 @@ def _opt_check() -> bool:
 
 
 _OPT_PLACEHOLDERS: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-_TUNED_BV_RUNTIME: tuple[str, int] | None = None
+_TUNED_BV_RUNTIME: tuple[str, int, tuple[int, ...]] | None = None
 
 
 def _placeholder_pair(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -165,12 +166,18 @@ def _placeholder_pair(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]
     return dummy, int32_dummy
 
 
-def _tuned_bv_runtime() -> tuple[str, int]:
+def _tuned_bv_runtime() -> tuple[str, int, tuple[int, ...]]:
+    """(gfx, CU count, get_tuned_cu_nums()) of the GPU, read once."""
     global _TUNED_BV_RUNTIME
     if _TUNED_BV_RUNTIME is None:
-        from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+        from aiter.jit.utils.chip_info import (
+            get_cu_num,
+            get_gfx_runtime,
+            get_tuned_cu_nums,
+        )
 
-        _TUNED_BV_RUNTIME = (get_gfx_runtime(), get_cu_num())
+        cu_num = get_cu_num()
+        _TUNED_BV_RUNTIME = (get_gfx_runtime(), cu_num, get_tuned_cu_nums(cu_num))
     return _TUNED_BV_RUNTIME
 
 
@@ -260,28 +267,32 @@ def _tuned_bv(
     """Measured BV for this batch shape, or None to use the rule.
 
     Lookup requires an exact ``(gfx, cu_num, shape)`` match on the current GPU,
-    same as MoE tuned-config lookup. Binned SKUs (e.g. MI308X cu_num=80) never
-    reuse rows tuned on a sibling card (e.g. MI300X cu_num=304).
+    same as MoE tuned-config lookup: a compute partition also uses the rows of
+    its full chip (``get_tuned_cu_nums``). Binned SKUs (e.g. MI308X cu_num=80)
+    never reuse rows tuned on a sibling card (e.g. MI300X cu_num=304).
     """
     if not _BV_TUNED_TABLE:
         return None
-    gfx, cu_num = _tuned_bv_runtime()
-    return _BV_TUNED_TABLE.get(
-        (
-            gfx,
-            cu_num,
-            H,
-            Hg,
-            V,
-            is_varlen,
-            use_h0,
-            store_fs,
-            snapshot_bf16,
-            state_bf16,
-            total_chunks,
-            max_seq_chunks,
-        )
+    gfx, cu_num, cu_nums = _tuned_bv_runtime()
+    shape = (
+        H,
+        Hg,
+        V,
+        is_varlen,
+        use_h0,
+        store_fs,
+        snapshot_bf16,
+        state_bf16,
+        total_chunks,
+        max_seq_chunks,
     )
+    for tuned_cu in cu_nums:
+        bv = _BV_TUNED_TABLE.get((gfx, tuned_cu, *shape))
+        if bv is not None:
+            if tuned_cu != cu_num:
+                log_tuned_cu_fallback("chunk_gdn_h_opt", gfx, cu_num, tuned_cu)
+            return bv
+    return None
 
 
 _INT32_ATTR = "_flydsl_int32_view"
