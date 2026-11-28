@@ -935,6 +935,7 @@ _fused_silu_mul_fp8_per_tensor_static_quant_repr = make_kernel_repr(
     [
         "BLOCK_SIZE_N",
         "SILU_CONVERT_TO_INP_TYPE",
+        "STORE_CACHE_MODIFIER",
     ],
 )
 
@@ -954,9 +955,12 @@ def _fused_silu_mul_fp8_per_tensor_static_quant_kernel(
     DTYPE_MAX: tl.constexpr,
     DTYPE_MIN: tl.constexpr,
     SILU_CONVERT_TO_INP_TYPE: tl.constexpr,
+    STORE_CACHE_MODIFIER: tl.constexpr = "",
 ):
     m_pid = tl.program_id(0)
-    n_offs = tl.arange(0, BLOCK_SIZE_N)
+    # Column tile. Always 0 on a 1D grid.
+    n_pid = tl.program_id(1)
+    n_offs = n_pid * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     first_half_ptrs = inp_ptr + m_pid * row_stride + n_offs * col_stride
     second_half_ptrs = inp_ptr + m_pid * row_stride + (n_cols + n_offs) * col_stride
 
@@ -994,4 +998,5 @@ def _fused_silu_mul_fp8_per_tensor_static_quant_kernel(
         out_fp8_ptr + m_pid * out_fp8_row_stride + n_offs * out_fp8_col_stride,
         quant_fp8_out.to(out_fp8_ptr.dtype.element_ty),
         mask=mask,
+        cache_modifier=STORE_CACHE_MODIFIER,
     )

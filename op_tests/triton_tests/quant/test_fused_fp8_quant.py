@@ -798,7 +798,9 @@ def triton_silu_mul_fp8_quantization_fuse(x, x_scale, rocm_fp8_dtype):
 
 
 @pytest.mark.parametrize(
-    "m, n", [(m, n) for m in [1, 2, 4, 8, 256, 1024, 8192] for n in [128, 4096, 8192]]
+    "m, n",
+    [(m, n) for m in [1, 2, 4, 8, 256, 1024, 8192] for n in [128, 4096, 8192, 14336]]
+    + [(16384, 14336)],
 )
 def test_silu_mul_quant_fuse(m, n):
     torch.manual_seed(0)
