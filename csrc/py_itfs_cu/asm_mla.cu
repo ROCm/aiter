@@ -384,7 +384,7 @@ static MlaAsmDecodeCfg mla_asm_decode_remap(const std::string& arch_id,
     } else if (gqa_ratio == 64){
         if (q_type == "bf16" && kv_type == "bf16"){
             if(!persistent){
-                if(max_seqlen_q == 1){
+                if(max_seqlen_q == 1 && arch_id == "gfx950"){
                     config_max_seqlen_q = 1;
                 } else {
                     config_max_seqlen_q = 0;
