@@ -309,6 +309,31 @@ table for each op (`attn_2d`, `attn_3d`, `reduce`, `kv_split`) and a
 - Do not use `any` in a three-dtype key. Do not write a three-dtype key with
   the same V and K tags: the loader never tries it.
 
+## KDA batch invariant
+
+`kda_bi_fwd` reads `<arch>/gluon/attention/kda_bi/DEFAULT.json` with
+`resolve_config_dir()` and `load_config_json()`. The file has one entry per
+kernel, with no shape keys:
+
+- `intra`: `num_warps`.
+- `state` and `out`: `num_warps` and `bv`, the V block.
+- `state_grid`: `bv_choices` and `min_programs`. The state pass uses the widest
+  `bv` in `bv_choices` that still gives `min_programs` programs, else the
+  smallest one.
+- `seq_chunks` and `chunk_table`: `num_warps` and `block`, for the chunk table
+  kernels.
+
+The bits do not depend on `bv`, `block` or the `state_grid` values (a test
+checks every `bv`), so these can be retuned. `intra`'s `num_warps` and the
+kernels' layouts cannot change without a new `BI_CONTRACT_VERSION`.
+
+`kda_bi_decode` reads `<arch>/gluon/attention/kda_bi_decode/DEFAULT.json`
+the same way: `step` (`max_requests_one_launch`: the largest request count
+that runs the one-launch kernel; `bv` of that kernel), `out` (`bv` of the
+multi-launch output kernel) and `fill` (`num_warps`). The kernels take
+`num_warps` from the `kda_bi` file, because the shared helpers' layouts
+depend on it. Neither the launch split nor `bv` changes the bits.
+
 ## Autotune
 
 - Give every `@triton.autotune` its list through

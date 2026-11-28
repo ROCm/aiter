@@ -1,0 +1,9 @@
+{
+    "intra": {"num_warps": 4},
+    "state": {"num_warps": 4, "bv": 16},
+    "state_grid": {"bv_choices": [16, 32, 64, 128], "min_programs": 512, "fuse_out_min_seq_heads": 512},
+    "out": {"num_warps": 4, "bv": 64},
+    "seq_chunks": {"num_warps": 4, "block": 1024},
+    "chunk_table": {"num_warps": 4, "block": 256},
+    "seq_order": {"num_warps": 4, "block": 64}
+}
