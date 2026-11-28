@@ -13,6 +13,7 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton.attention.unified_attention import (
+    _head_split,
     _is_gluon_available,
     is_2d_gluon_available,
     unified_attention,
@@ -634,7 +635,9 @@ def test_triton_unified_attn(
     use_out_scale: bool,
     shuffled_kv_cache: bool,
     backend: str,  # "triton" | "gluon"
+    v_head_size: int | None = None,
 ) -> None:
+    v_head_size = head_size if v_head_size is None else v_head_size
     if backend == "gluon" and not _is_gluon_available():
         pytest.skip(f"skip gluon backend, not available on {DEVICE_ARCH}")
     use_gluon_2d = is_2d_gluon_available(
@@ -645,7 +648,7 @@ def test_triton_unified_attn(
             use_qq_bias=False,
             use_alibi_slopes=False,
             head_size=head_size,
-            head_size_v=head_size,
+            head_size_v=v_head_size,
             shuffled_kv_cache=shuffled_kv_cache,
             block_size=block_size,
             k_width=16 // kv_dtype.itemsize,
@@ -687,6 +690,7 @@ def test_triton_unified_attn(
         num_blocks=num_blocks,
         block_size=block_size,
         head_size=head_size,
+        v_head_size=v_head_size,
         num_heads=num_heads,
         sliding_window=sliding_window,
         q_dtype=q_dtype,
@@ -764,20 +768,28 @@ def test_triton_unified_attn(
 
 
 # Query lengths that leave padded rows in the last query block (BLOCK_Q of 2/4/8),
-# on the 3D split-KV path (long KV) and the 2D path (KV <= 512).
+# on the 3D split-KV path (long KV) and the 2D path (KV <= 512). Head 192 / V 128
+# hits the gfx950 MiMo tiles: a BLOCK_M 64 3D tile holds 4 query positions, so 6
+# leaves padded rows, and the 2D prefill tile holds 16, so 264 leaves 8.
 @pytest.mark.parametrize(
-    "num_heads, query_len, kv_len",
+    "num_heads, query_len, kv_len, head_size, v_head_size",
     [
-        ((32, 8), 3, 4096),
-        ((32, 8), 4, 4096),
-        ((16, 1), 3, 4096),
-        ((32, 8), 3, 256),
-        ((32, 8), 5, 256),
+        ((32, 8), 3, 4096, 128, 128),
+        ((32, 8), 4, 4096, 128, 128),
+        ((16, 1), 3, 4096, 128, 128),
+        ((32, 8), 3, 256, 128, 128),
+        ((32, 8), 5, 256, 128, 128),
+        ((16, 1), 6, 2000, 192, 128),
+        ((16, 1), 264, 4096, 192, 128),
     ],
 )
 @torch.inference_mode()
 def test_triton_unified_attn_qq_bias_padded_query_rows(
-    num_heads: tuple[int, int], query_len: int, kv_len: int
+    num_heads: tuple[int, int],
+    query_len: int,
+    kv_len: int,
+    head_size: int,
+    v_head_size: int,
 ) -> None:
     if DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
         pytest.skip("gfx1250 Gluon kernel does not mask padded qq_bias rows")
@@ -802,7 +814,8 @@ def test_triton_unified_attn_qq_bias_padded_query_rows(
         seq_lens=seq_lens,
         num_blocks=2048,
         block_size=16,
-        head_size=128,
+        head_size=head_size,
+        v_head_size=v_head_size,
         num_heads=num_heads,
         device="cuda",
     )
@@ -2661,3 +2674,103 @@ def test_unified_attn_split_rebalance_reduce_configs_k4v8(
     )
     assert not new[live].isnan().any()
     assert torch.equal(old[live].view(torch.int16), new[live].view(torch.int16))
+
+
+@pytest.mark.parametrize(
+    "arch, head_size, sliding_window, shuffled_kv_cache, q_dtype, kv_dtype, split",
+    [
+        ("gfx950", 192, 0, False, torch.bfloat16, torch.bfloat16, (128, 64)),
+        ("gfx950", 192, 0, False, torch.float16, torch.float16, (128, 64)),
+        ("gfx950", 128, 0, False, torch.bfloat16, torch.bfloat16, (0, 0)),
+        ("gfx950", 160, 0, False, torch.bfloat16, torch.bfloat16, (0, 0)),
+        ("gfx950", 96, 0, False, torch.bfloat16, torch.bfloat16, (0, 0)),
+        ("gfx950", 192, 128, False, torch.bfloat16, torch.bfloat16, (0, 0)),
+        ("gfx950", 192, 0, True, torch.bfloat16, torch.bfloat16, (0, 0)),
+        ("gfx950", 192, 0, False, torch.bfloat16, e4m3_dtype, (0, 0)),
+        ("gfx950", 192, 0, False, e4m3_dtype, e4m3_dtype, (0, 0)),
+        ("gfx950", 192, 0, False, torch.uint8, torch.uint8, (0, 0)),
+        ("gfx942", 192, 0, False, torch.bfloat16, torch.bfloat16, (0, 0)),
+        ("gfx1250", 192, 0, False, torch.bfloat16, torch.bfloat16, (0, 0)),
+    ],
+)
+def test_head_split(
+    monkeypatch,
+    arch,
+    head_size,
+    sliding_window,
+    shuffled_kv_cache,
+    q_dtype,
+    kv_dtype,
+    split,
+):
+    monkeypatch.setattr(
+        "aiter.ops.triton.attention.unified_attention.DEVICE_ARCH", arch
+    )
+    params = SimpleNamespace(
+        head_size=head_size,
+        sliding_window=sliding_window,
+        shuffled_kv_cache=shuffled_kv_cache,
+        q_dtype=q_dtype,
+        kv_cache_dtype=kv_dtype,
+    )
+    assert _head_split(params) == split
+
+
+@pytest.mark.parametrize("v_head_size", [128, None])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        # spec-decode verify (split-KV 3D) next to a decode row
+        [(8, 1031), (8, 517), (1, 2049), (8, 64)],
+        # a short extend on a prefix: 303 programs, still the 3D kernel
+        [(300, 1500), (1, 777)],
+        # a long prefill chunk: 2049 programs > 4 per CU, so the 2D kernel with
+        # the head-192 prefill config (max_seqlen_q >= 256)
+        [(2048, 4096)],
+    ],
+)
+@pytest.mark.parametrize("block_size", [1, 16])
+def test_triton_unified_attn_split_head(v_head_size, dtype, seq_lens, block_size):
+    test_triton_unified_attn(
+        seq_lens=seq_lens,
+        num_heads=(16, 1),
+        head_size=192,
+        sliding_window=None,
+        block_size=block_size,
+        soft_cap=None,
+        num_blocks=32768,
+        q_dtype=dtype,
+        kv_dtype=dtype,
+        out_dtype=dtype,
+        use_q_descale=False,
+        use_kv_descale=False,
+        use_out_scale=False,
+        shuffled_kv_cache=False,
+        backend="triton",
+        v_head_size=v_head_size,
+    )
+
+
+@pytest.mark.parametrize("v_head_size", [128, None])
+def test_triton_unified_attn_single_segment(v_head_size):
+    # pages as long as the context leave one KV segment on gfx950, so the 3D
+    # kernel stores straight into the output, whose rows are V wide, not padded
+    test_triton_unified_attn(
+        seq_lens=[(8, 1024), (1, 700)],
+        num_heads=(16, 1),
+        head_size=192,
+        sliding_window=None,
+        block_size=1024,
+        soft_cap=None,
+        num_blocks=16,
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
+        use_q_descale=False,
+        use_kv_descale=False,
+        use_out_scale=False,
+        shuffled_kv_cache=False,
+        backend="triton",
+        v_head_size=v_head_size,
+    )
