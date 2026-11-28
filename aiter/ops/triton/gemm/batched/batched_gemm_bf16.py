@@ -32,6 +32,104 @@ def _is_gluon_available():
         return False
 
 
+def _run_multicast_bmm(XQ, WQ, YQ, bias, dtype, config):
+    from aiter.ops.triton._gluon_kernels.gfx1250.gemm.batched.batched_gemm_bf16_multicast import (
+        _batched_gemm_bf16_multicast_kernel,
+        create_multicast_layouts,
+    )
+
+    B, M, K = XQ.shape
+    N = WQ.shape[2]
+    if config is None:
+        config, _ = get_gemm_config(
+            "BATCHED_GEMM-A16W16-MULTICAST", M, N, K, B=B, backend="gluon"
+        )
+    bm, bn, bk = (
+        config[key] for key in ("BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K")
+    )
+    cm, cn, warps = (config[key] for key in ("CTAS_M", "CTAS_N", "num_warps"))
+    if (bm, bn, bk, warps) != (256, 256, 128, 4) or cm * cn != 16:
+        raise ValueError(
+            "multicast requires 256x256x128 tiles, four waves, and 16 CTAs"
+        )
+    if cm <= 0 or cn <= 0 or cm & (cm - 1) or cn & (cn - 1):
+        raise ValueError("multicast cluster dimensions must be positive powers of two")
+    if (
+        B <= 0
+        or M <= 0
+        or N <= 0
+        or K < 2 * bk
+        or M % (cm * bm)
+        or N % (cn * bn)
+        or K % (2 * bk)
+    ):
+        raise ValueError(
+            "multicast requires whole cluster tiles and an even number of K tiles"
+        )
+    if (
+        bias is not None
+        or dtype != torch.bfloat16
+        or XQ.dtype != dtype
+        or WQ.dtype != dtype
+    ):
+        raise ValueError("multicast supports BF16 inputs/output without bias")
+    if XQ.device.type != "cuda" or WQ.device != XQ.device:
+        raise ValueError("multicast inputs must be on the same GPU")
+    if YQ is None:
+        YQ = torch.empty((B, M, N), dtype=dtype, device=XQ.device)
+    if YQ.shape != (B, M, N) or YQ.dtype != dtype or YQ.device != XQ.device:
+        raise ValueError("multicast output must match the shape, dtype, and device")
+    if XQ.stride() not in ((M * K, K, 1), (K, B * K, 1)) or WQ.stride() != (
+        N * K,
+        1,
+        K,
+    ):
+        raise ValueError(
+            "multicast requires batch-major weights and batch-major or token-major inputs"
+        )
+    if YQ.stride() not in ((M * N, N, 1), (N, B * N, 1)):
+        raise ValueError("multicast requires batch-major or token-major output")
+    if any(t.data_ptr() % 16 for t in (XQ, WQ, YQ)):
+        raise ValueError("multicast requires 16-byte-aligned tensor pointers")
+    if YQ.untyped_storage().data_ptr() in (
+        XQ.untyped_storage().data_ptr(),
+        WQ.untyped_storage().data_ptr(),
+    ):
+        raise ValueError("multicast output must not share storage with either input")
+    la, lb, lc, lw = create_multicast_layouts(cm, cn, bm, bn, bk, warps)
+    _batched_gemm_bf16_multicast_kernel[(M // (cm * bm) * (N // (cn * bn)), B)](
+        XQ,
+        WQ,
+        YQ,
+        M,
+        N,
+        K,
+        XQ.stride(1),
+        XQ.stride(2),
+        WQ.stride(1),
+        WQ.stride(2),
+        YQ.stride(1),
+        YQ.stride(2),
+        XQ.stride(0),
+        WQ.stride(0),
+        YQ.stride(0),
+        CTA_M=cm,
+        CTA_N=cn,
+        LOCAL_M=bm,
+        LOCAL_N=bn,
+        BLOCK_K=bk,
+        EVEN_K=True,
+        TILES_ODD=False,
+        SHARED_LAYOUT_A=la,
+        SHARED_LAYOUT_B=lb,
+        SHARED_LAYOUT_C=lc,
+        WMMA_LAYOUT=lw,
+        num_warps=warps,
+        num_ctas=cm * cn,
+    )
+    return YQ
+
+
 def batched_gemm_bf16(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -59,7 +157,11 @@ def batched_gemm_bf16(
         splitK (Optional[int]): Not supported. Must be None.
         YQ (Optional[torch.Tensor]): Pre-allocated output tensor with shape (B, M, N).
         config (Optional[dict]): Kernel tuning parameters.
-        kernel_type (str): [gluon only] Kernel variant ("bandwidth_bound", "compute_bound").
+        kernel_type (str): [gluon only] "bandwidth_bound", "compute_bound", or
+            "multicast". Multicast supports BF16 without bias. M and N must
+            cover whole cluster tiles. K must be a multiple of 256. Inputs
+            and output can be batch-major or token-major; weights must be
+            batch-major. Output storage must not overlap either input.
         backend (Optional[str]): "triton", "gluon", or None (auto-detect).
 
     Returns:
@@ -96,11 +198,15 @@ def batched_gemm_bf16(
         "triton",
         "gluon",
     ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
+    if kernel_type == "multicast" and backend != "gluon":
+        raise ValueError("multicast requires the Gluon backend")
 
     if backend == "gluon":
         assert (
             _is_gluon_available()
         ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
+        if kernel_type == "multicast":
+            return _run_multicast_bmm(XQ, WQ, YQ, bias, dtype, config)
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
             create_shared_layouts,
             create_wmma_layouts,

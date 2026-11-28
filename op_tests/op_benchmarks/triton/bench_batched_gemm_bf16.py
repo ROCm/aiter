@@ -36,6 +36,10 @@ def bench_gemm_fn(
     K: int,
     metric: str,
     layout: str,
+    backend=None,
+    kernel_type="bandwidth_bound",
+    token_major=False,
+    add_bias=True,
 ):
     c_dtype = torch.bfloat16
 
@@ -48,13 +52,17 @@ def bench_gemm_fn(
         dtype=c_dtype,
         layout=layout,
         output=True,
+        token_major=token_major,
+        add_bias=add_bias,
     )
     # batched_gemm_bf16 names its activation/weight/output kwargs XQ/WQ/YQ
     _out_vals_keys = ["XQ", "WQ", "bias", "YQ"]
 
     rot_bufs = bencher.build_pool([_p_gen], [_out_vals_keys])
 
-    kernel_fn = functools.partial(batched_gemm_bf16, dtype=c_dtype)
+    kernel_fn = functools.partial(
+        batched_gemm_bf16, dtype=c_dtype, backend=backend, kernel_type=kernel_type
+    )
 
     # FLOPs for batched GEMM:
     # C[B, M, N] = A[B, M, K] @ W[B, N, K]^T
@@ -125,7 +133,19 @@ def run_model_benchmark(args):
         else:
             raise ValueError(f"Unsupported layer: {layer}")
 
-        return bench_gemm_fn(bencher, batch, M, N, K, metric, args.layout)
+        return bench_gemm_fn(
+            bencher,
+            batch,
+            M,
+            N,
+            K,
+            metric,
+            args.layout,
+            args.backend,
+            args.kernel_type,
+            args.token_major,
+            not args.no_bias,
+        )
 
     bench_batched_gemm_bf16.run(
         save_path="." if args.o else None,
@@ -146,7 +166,19 @@ def run_shape_benchmark(args):
 
     @triton.testing.perf_report([benchmark])
     def bench_batched_gemm_bf16(batch, M, N, K, metric, **kwargs):
-        return bench_gemm_fn(bencher, batch, M, N, K, metric, args.layout)
+        return bench_gemm_fn(
+            bencher,
+            batch,
+            M,
+            N,
+            K,
+            metric,
+            args.layout,
+            args.backend,
+            args.kernel_type,
+            args.token_major,
+            not args.no_bias,
+        )
 
     bench_batched_gemm_bf16.run(
         save_path="." if args.o else None,
@@ -185,6 +217,18 @@ def run_benchmark(args, defaults):
 def parse_args():
     parser = get_parser("Batched BF16 GEMM")
     parser = add_argparse_ff(parser)
+    parser.add_argument(
+        "--kernel-type",
+        choices=["bandwidth_bound", "compute_bound", "multicast"],
+        default="bandwidth_bound",
+        help="Gluon kernel variant; multicast requires --no-bias",
+    )
+    parser.add_argument(
+        "--token-major",
+        action="store_true",
+        help="Use (M, B, K)/(M, B, N) storage views",
+    )
+    parser.add_argument("--no-bias", action="store_true", help="Omit the bias input")
     parser.add_argument(
         "-B",
         type=int,
