@@ -57,21 +57,28 @@ V41_FLASH_EP4_LAYOUT = (4, 96, 5120, 2304)
 V41_FLASH_EP2_LAYOUT = (2, 192, 5120, 2304)
 # EP8 DeepSeek-V4.1-Flash: V4-Pro's rank / expert geometry with V4.1-Flash's dims.
 V41_FLASH_EP8_LAYOUT = (8, 48, 5120, 2304)
+# EP4 MiniMax-M3.1: (world_size, experts_per_rank, model_dim, inter_dim); SwiGLU-OAI clamped at 7.
+M31_EP4_LAYOUT = (4, 32, 6144, 3072)
 # (world_size, model_dim, inter_dim, experts, topk) of the layouts the fused (small- and large-input) kernels
-# serve: EP8 DeepSeek-V4-Pro and EP4 / EP2 / EP8 DeepSeek-V4.1-Flash.
-FUSED_LAYOUTS = frozenset(
-    {
-        (8, V4_MODEL_DIM, V4_INTER_DIM, 8 * REFERENCE_EXPERTS_PER_RANK, 6),
-        *(
-            (world, model_dim, inter_dim, world * epr, 6)
-            for world, epr, model_dim, inter_dim in (
-                V41_FLASH_EP4_LAYOUT,
-                V41_FLASH_EP2_LAYOUT,
-                V41_FLASH_EP8_LAYOUT,
-            )
+# serve, each with the one (act, swiglu_limit) it is built for: EP8 DeepSeek-V4-Pro, EP4 / EP2 / EP8
+# DeepSeek-V4.1-Flash (clamped SiLU at 10) and EP4 MiniMax-M3.1 (small-input only, see large_m_mtprs_for).
+FUSED_LAYOUTS = {
+    (world, model_dim, inter_dim, world * epr, topk): act
+    for (world, epr, model_dim, inter_dim), topk, act in (
+        (
+            (8, REFERENCE_EXPERTS_PER_RANK, V4_MODEL_DIM, V4_INTER_DIM),
+            6,
+            ("silu", 10.0),
         ),
-    }
-)
+        (V41_FLASH_EP4_LAYOUT, 6, ("silu", 10.0)),
+        (V41_FLASH_EP2_LAYOUT, 6, ("silu", 10.0)),
+        (V41_FLASH_EP8_LAYOUT, 6, ("silu", 10.0)),
+        (M31_EP4_LAYOUT, 4, ("swigluoai", 7.0)),
+    )
+}
+# The FUSED_LAYOUTS keys the fused kernels also serve with MXFP4 activations (a4w4): the small-input kernel's
+# a4w4 path is measured on MiniMax-M3.1 only, and that layout has no large-input capacity (large_m_mtprs_for).
+A4W4_FUSED_LAYOUTS = frozenset({(4, 6144, 3072, 128, 4)})  # EP4 MiniMax-M3.1
 K3_MODEL_DIM, K3_INTER_DIM = 3584, 3072
 # EPLB redundant-expert profiles (r32 / r64) share V4-Pro's shape and FP4
 # prelude but have no per-bucket tuner of their own.
@@ -311,6 +318,12 @@ class FusedStage1Knobs:
     # (skewed routing) picks the cached-weight bodies (False: also from mega_moe_small_m._CACHED_W_MIN_ROWS routed
     # rows, where the experts span enough m-tiles to reuse their weights).
     stream_w: bool = False
+    # Small-input fused kernel: the GEMM2 rows are BF16 at any routed-row count and under a hot expert, for a
+    # layout whose numerics require a BF16 combine wire (False: such ranks send FP8 rows).
+    bf16_wire: bool = False
+    # Small-input fused kernel: routed rows a rank receives from which its GEMM1 / GEMM2 read the weights through the
+    # cache (0: mega_moe_small_m._CACHED_W_MIN_ROWS, measured with 96 experts a rank).
+    cached_w_rows: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -469,17 +482,17 @@ def fused_layout_supported(
     act: str = "silu",
     fanout_masks: tuple[int, ...] = (),
 ) -> bool:
-    """Whether the fused kernels support this layout: one of FUSED_LAYOUTS, a8w4 on gfx950.
+    """Whether the fused kernels support this layout: one of FUSED_LAYOUTS on gfx950, a8w4 or (A4W4_FUSED_LAYOUTS)
+    a4w4.
 
     The small-input kernel serves every such layout; the large-input kernel the
     capacities large_m_mtprs_for() gives it.
     """
+    layout = (world_size, model_dim, inter_dim, experts, topk)
     return (
         arch.split(":", 1)[0] == "gfx950"
-        and (world_size, model_dim, inter_dim, experts, topk) in FUSED_LAYOUTS
-        and quant == "a8w4"
-        and swiglu_limit == 10.0
-        and act == "silu"
+        and FUSED_LAYOUTS.get(layout) == (act, swiglu_limit)
+        and (quant == "a8w4" or (quant == "a4w4" and layout in A4W4_FUSED_LAYOUTS))
         and not fanout_masks
     )
 
@@ -492,7 +505,10 @@ def large_m_mtprs_for(
     EP8 DeepSeek-V4-Pro takes LARGE_M_MTPRS; EP4 DeepSeek-V4.1-Flash takes V41_FLASH_EP4_LARGE_M_MTPRS, the
     capacities its one tune was measured at (see _tune_v41_flash_ep4_large), EP2 DeepSeek-V4.1-Flash
     V41_FLASH_EP2_LARGE_M_MTPRS and EP8 DeepSeek-V4.1-Flash V41_FLASH_EP8_LARGE_M_MTPRS (see their tunes).
+    EP4 MiniMax-M3.1 takes none: the large-input kernel has no SwiGLU-OAI epilogue.
     """
+    if (world_size, model_dim, inter_dim) == (M31_EP4_LAYOUT[0], *M31_EP4_LAYOUT[2:]):
+        return ()
     return _V41_FLASH_LARGE_M_MTPRS.get(
         (world_size, model_dim, inter_dim), LARGE_M_MTPRS
     )
@@ -1349,10 +1365,11 @@ def select_mega_moe_config(
         # and it reclaims the small-bucket cost that forcing sync would add.
         config = _replace_config(config, stage1={"async_a_copy": True})
     if config.stage2.aligned_pair and config.p2p_quant != P2P_QUANT_FP8_BLOCKWISE:
-        # The aligned-pair Stage2 kernel only emits the FP8 P2P row layout, so
-        # reject the combination here instead of at launch.
-        raise ValueError(
-            f"p2p_quant={config.p2p_quant!r} conflicts with aligned-pair Stage2"
+        # The aligned-pair Stage2 kernel only emits the FP8 P2P row layout: a
+        # BF16 wire takes the plain Stage2.
+        config = _replace_config(
+            config,
+            stage2={"aligned_pair": False, "pair_cu": 0},
         )
     return config
 
@@ -1706,6 +1723,20 @@ def _tune_v41_flash_ep8_large(config: MegaMoEConfig) -> MegaMoEConfig:
     )
 
 
+def _tune_m31_ep4_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConfig:
+    """EP4 MiniMax-M3.1 small-input kernel (32 experts per rank, top-4), measured on gfx950 with captured routing.
+
+    The EP4 DeepSeek-V4.1-Flash tune (_tune_v41_flash_ep4_small) carries over; the measurements are in the PR.
+    """
+    config = _tune_v41_flash_ep4_small(config, bucket)
+    # BF16 combine wire at every row count (the M3.1 numerics). Cached weights from 512 received rows: with 32
+    # experts a rank, the experts that span two m-tiles then reread their W1 / W2 slabs from the cache.
+    return replace(
+        config,
+        fused_stage1=replace(config.fused_stage1, bf16_wire=True, cached_w_rows=512),
+    )
+
+
 @cache
 def _fused_config(
     bucket: int,
@@ -1737,6 +1768,8 @@ def _fused_config(
         return _tune_v41_flash_ep2_small(config, bucket)
     if layout == V41_FLASH_EP8_LAYOUT:
         return _tune_v41_flash_ep8_small(config, bucket)
+    if layout == M31_EP4_LAYOUT:
+        return _tune_m31_ep4_small(config, bucket)
     return config
 
 
