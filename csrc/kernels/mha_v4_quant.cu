@@ -101,14 +101,14 @@ __device__ __forceinline__ int32_t mxfp6_k_tail(const int32_t head,
 }
 
 #if defined(__gfx950__)
+using f32x16_t = float __attribute__((ext_vector_type(16)));
+using u32x6_t  = uint32_t __attribute__((ext_vector_type(6)));
+
 // The convert writes its destination while still reading the sources, and ROCm 7.2 may allocate
 // the result over them; early-clobber keeps them disjoint.
-__device__ __forceinline__ uint32_t __attribute__((ext_vector_type(6)))
-cvt_scalef32_2xpk16_fp6(float __attribute__((ext_vector_type(16))) lo,
-                        float __attribute__((ext_vector_type(16))) hi,
-                        float scale)
+__device__ __forceinline__ u32x6_t cvt_scalef32_2xpk16_fp6(f32x16_t lo, f32x16_t hi, float scale)
 {
-    uint32_t __attribute__((ext_vector_type(6))) packed;
+    u32x6_t packed;
     asm("v_cvt_scalef32_2xpk16_fp6_f32 %0, %1, %2, %3"
         : "=&v"(packed)
         : "v"(lo), "v"(hi), "v"(scale));
