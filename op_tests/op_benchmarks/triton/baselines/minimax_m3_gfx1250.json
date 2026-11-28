@@ -1,0 +1,1200 @@
+{
+  "torch": "2.11.0+rocm10.1.0a20260811-bkc.20260820",
+  "triton": "3.9.0",
+  "device": {
+    "name": "AMD Radeon Graphics",
+    "total_memory": 463856467968,
+    "compute_units": 256
+  },
+  "arch": "gfx1250",
+  "sources": {
+    "aiter.ops.triton.gemm.basic.gemm_a16w16": {
+      "file": "aiter/aiter/ops/triton/gemm/basic/gemm_a16w16.py",
+      "sha256": "6069d71ea2b6ac200b028602a367333ef617743e2099cfc18e420148ac1e78c9",
+      "git_revision": "3d3d56db3e3e32d823b109bfb60d061a1e0b5b82"
+    },
+    "atom.model_ops.minimax_m3.index_topk": {
+      "file": "ATOM/atom/model_ops/minimax_m3/index_topk.py",
+      "sha256": "42163c67df6380f15440a0cb2612ace23aeb4cd85e19658a6e6753a72ecc2fce",
+      "git_revision": "f6bf6f0aff2fd8267be7bff9deee51ce8863ad7c"
+    },
+    "atom.model_ops.minimax_m3.indexer_context_parallel": {
+      "file": "ATOM/atom/model_ops/minimax_m3/indexer_context_parallel.py",
+      "sha256": "a180db32ce4ab2351a13f41e744414fe661e4a213166be36c110145be0373276",
+      "git_revision": "f6bf6f0aff2fd8267be7bff9deee51ce8863ad7c"
+    },
+    "atom.model_ops.minimax_m3.indexer_candidate_exchange": {
+      "file": "ATOM/atom/model_ops/minimax_m3/indexer_candidate_exchange.py",
+      "sha256": "0032a237d5f4e170cb517899812aa58d19467aeaf54c9816bec44dc11c6102cd",
+      "git_revision": "f6bf6f0aff2fd8267be7bff9deee51ce8863ad7c"
+    },
+    "atom.model_ops.swiglu_oai": {
+      "file": "ATOM/atom/model_ops/swiglu_oai.py",
+      "sha256": "20c1881a3110e1626e0b2f3d62c66ffa625cb61112ed4efaeb91f08fb98da154",
+      "git_revision": "f6bf6f0aff2fd8267be7bff9deee51ce8863ad7c"
+    },
+    "atom.model_ops.triton_fused_qkv_norm_rope_cache": {
+      "file": "ATOM/atom/model_ops/triton_fused_qkv_norm_rope_cache.py",
+      "sha256": "5493f9e42dd0c8326b67aa3c3821b5d86cfa8f7e657b0d3d83419932e9f1d446",
+      "git_revision": "f6bf6f0aff2fd8267be7bff9deee51ce8863ad7c"
+    },
+    "atom.model_ops.base_attention": {
+      "file": "ATOM/atom/model_ops/base_attention.py",
+      "sha256": "1999cd8f0800686125f65d7b22c8e942b6f1f57ba1e1932dd69966c5f9d30171",
+      "git_revision": "f6bf6f0aff2fd8267be7bff9deee51ce8863ad7c"
+    }
+  },
+  "results": {
+    "router-16": {
+      "median_us": 8.737260246276856,
+      "samples_us": [
+        8.728178405761719,
+        8.808166503906252,
+        8.737260246276856
+      ],
+      "pool_len": 117,
+      "inputs": {
+        "x": {
+          "shape": [
+            16,
+            6144
+          ],
+          "dtype": "torch.bfloat16",
+          "stride": [
+            6144,
+            1
+          ]
+        },
+        "w": {
+          "shape": [
+            128,
+            6144
+          ],
+          "dtype": "torch.bfloat16",
+          "stride": [
+            1,
+            128
+          ]
+        }
+      },
+      "kernels": [
+        "_gemm_a16w16_gfx1250_bandwidth_bound_kernel_BLOCK_M_16_BLOCK_N_32_BLOCK_K_512_NUM_BUFFERS_4_LAYOUT_TT_USE_ACTIVATION_0_ADD_BIAS_0"
+      ]
+    },
+    "swiglu-16": {
+      "median_us": 1.5602658867836001,
+      "samples_us": [
+        1.5589320898056032,
+        1.5683622002601625,
+        1.5602658867836001
+      ],
+      "pool_len": 1000,
+      "inputs": {
+        "gate_up": {
+          "shape": [
+            16,
+            6144
+          ],
+          "dtype": "torch.bfloat16",
+          "stride": [
+            6144,
+            1
+          ]
+        }
+      },
+      "kernels": [
+        "_swiglu_oai_kernel"
+      ]
+    },
+    "norm-rope-16": {
+      "median_us": 2.2544020652770995,
+      "samples_us": [
+        2.2544020652770995,
+        2.279752111434936,
+        2.2491142034530642
+      ],
+      "pool_len": 1000,
+      "inputs": {
+        "q": {
+          "shape": [
+            16,
+            2048
+          ],
+          "dtype": "torch.bfloat16",
+          "stride": [
+            2304,
+            1
+          ]
+        },
+        "k": {
+          "shape": [
+            16,
+            128
+          ],
+          "dtype": "torch.bfloat16",
+          "stride": [
+            2304,
+            1
+          ]
+        },
+        "v": {
+          "shape": [
+            16,
+            128
+          ],
+          "dtype": "torch.bfloat16",
+          "stride": [
+            2304,
+            1
+          ]
+        },
+        "positions": {
+          "shape": [
+            16
+          ],
+          "dtype": "torch.int64",
+          "stride": [
+            1
+          ]
+        },
+        "q_norm": "SimpleNamespace; see shared input generator for tensor geometry",
+        "k_norm": "SimpleNamespace; see shared input generator for tensor geometry",
+        "rotary_emb": "SimpleNamespace; see shared input generator for tensor geometry",
+        "num_heads": "16",
+        "num_kv_heads": "1",
+        "head_dim": "128",
+        "k_cache": {
+          "shape": [
+            1,
+            1,
+            8,
+            128,
+            16
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "stride": [
+            16384,
+            16384,
+            2048,
+            16,
+            1
+          ]
+        },
+        "v_cache": {
+          "shape": [
+            1,
+            1,
+            8,
+            128,
+            16
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "stride": [
+            16384,
+            16384,
+            2048,
+            16,
+            1
+          ]
+        },
+        "k_scale": {
+          "shape": [
+            1,
+            1,
+            128
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            128,
+            128,
+            1
+          ]
+        },
+        "v_scale": {
+          "shape": [
+            1,
+            1,
+            128
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            128,
+            128,
+            1
+          ]
+        },
+        "slot_mapping": {
+          "shape": [
+            16
+          ],
+          "dtype": "torch.int64",
+          "stride": [
+            1
+          ]
+        },
+        "kv_cache_dtype": "fp8"
+      },
+      "kernels": [
+        "_fused_qkv_norm_rope_cache_kernel"
+      ]
+    },
+    "router-128": {
+      "median_us": 10.149340057373047,
+      "samples_us": [
+        9.512838459014892,
+        10.196406555175782,
+        10.149340057373047
+      ],
+      "pool_len": 66,
+      "inputs": {
+        "x": {
+          "shape": [
+            128,
+            6144
+          ],
+          "dtype": "torch.bfloat16",
+          "stride": [
+            6144,
+            1
+          ]
+        },
+        "w": {
+          "shape": [
+            128,
+            6144
+          ],
+          "dtype": "torch.bfloat16",
+          "stride": [
+            1,
+            128
+          ]
+        }
+      },
+      "kernels": [
+        "_gemm_a16w16_gfx1250_bandwidth_bound_kernel_BLOCK_M_64_BLOCK_N_64_BLOCK_K_256_NUM_BUFFERS_4_LAYOUT_TT_USE_ACTIVATION_0_ADD_BIAS_0"
+      ]
+    },
+    "swiglu-128": {
+      "median_us": 1.7074145913124086,
+      "samples_us": [
+        1.7074145913124086,
+        1.7086203813552856,
+        1.7060483932495116
+      ],
+      "pool_len": 131,
+      "inputs": {
+        "gate_up": {
+          "shape": [
+            128,
+            6144
+          ],
+          "dtype": "torch.bfloat16",
+          "stride": [
+            6144,
+            1
+          ]
+        }
+      },
+      "kernels": [
+        "_swiglu_oai_kernel"
+      ]
+    },
+    "norm-rope-128": {
+      "median_us": 4.231665134429932,
+      "samples_us": [
+        4.231060123443603,
+        4.231665134429932,
+        4.2335076332092285
+      ],
+      "pool_len": 329,
+      "inputs": {
+        "q": {
+          "shape": [
+            128,
+            2048
+          ],
+          "dtype": "torch.bfloat16",
+          "stride": [
+            2304,
+            1
+          ]
+        },
+        "k": {
+          "shape": [
+            128,
+            128
+          ],
+          "dtype": "torch.bfloat16",
+          "stride": [
+            2304,
+            1
+          ]
+        },
+        "v": {
+          "shape": [
+            128,
+            128
+          ],
+          "dtype": "torch.bfloat16",
+          "stride": [
+            2304,
+            1
+          ]
+        },
+        "positions": {
+          "shape": [
+            128
+          ],
+          "dtype": "torch.int64",
+          "stride": [
+            1
+          ]
+        },
+        "q_norm": "SimpleNamespace; see shared input generator for tensor geometry",
+        "k_norm": "SimpleNamespace; see shared input generator for tensor geometry",
+        "rotary_emb": "SimpleNamespace; see shared input generator for tensor geometry",
+        "num_heads": "16",
+        "num_kv_heads": "1",
+        "head_dim": "128",
+        "k_cache": {
+          "shape": [
+            1,
+            1,
+            8,
+            128,
+            16
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "stride": [
+            16384,
+            16384,
+            2048,
+            16,
+            1
+          ]
+        },
+        "v_cache": {
+          "shape": [
+            1,
+            1,
+            8,
+            128,
+            16
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "stride": [
+            16384,
+            16384,
+            2048,
+            16,
+            1
+          ]
+        },
+        "k_scale": {
+          "shape": [
+            1,
+            1,
+            128
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            128,
+            128,
+            1
+          ]
+        },
+        "v_scale": {
+          "shape": [
+            1,
+            1,
+            128
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            128,
+            128,
+            1
+          ]
+        },
+        "slot_mapping": {
+          "shape": [
+            128
+          ],
+          "dtype": "torch.int64",
+          "stride": [
+            1
+          ]
+        },
+        "kv_cache_dtype": "fp8"
+      },
+      "kernels": [
+        "_fused_qkv_norm_rope_cache_kernel"
+      ]
+    },
+    "router-2048": {
+      "median_us": 21.020365905761718,
+      "samples_us": [
+        21.020365905761718,
+        21.3119234085083,
+        20.973868560791015
+      ],
+      "pool_len": 8,
+      "inputs": {
+        "x": {
+          "shape": [
+            2048,
+            6144
+          ],
+          "dtype": "torch.bfloat16",
+          "stride": [
+            6144,
+            1
+          ]
+        },
+        "w": {
+          "shape": [
+            128,
+            6144
+          ],
+          "dtype": "torch.bfloat16",
+          "stride": [
+            1,
+            128
+          ]
+        }
+      },
+      "kernels": [
+        "_gemm_a16w16_gfx1250_bandwidth_bound_kernel_BLOCK_M_128_BLOCK_N_128_BLOCK_K_128_NUM_BUFFERS_4_LAYOUT_TT_USE_ACTIVATION_0_ADD_BIAS_0"
+      ]
+    },
+    "swiglu-2048": {
+      "median_us": 5.7699779033660885,
+      "samples_us": [
+        5.7699779033660885,
+        5.780213356018066,
+        5.769525432586669
+      ],
+      "pool_len": 9,
+      "inputs": {
+        "gate_up": {
+          "shape": [
+            2048,
+            6144
+          ],
+          "dtype": "torch.bfloat16",
+          "stride": [
+            6144,
+            1
+          ]
+        }
+      },
+      "kernels": [
+        "_swiglu_oai_kernel"
+      ]
+    },
+    "norm-rope-2048": {
+      "median_us": 18.51276798248291,
+      "samples_us": [
+        18.51276798248291,
+        18.460410499572756,
+        18.693735504150393
+      ],
+      "pool_len": 21,
+      "inputs": {
+        "q": {
+          "shape": [
+            2048,
+            2048
+          ],
+          "dtype": "torch.bfloat16",
+          "stride": [
+            2304,
+            1
+          ]
+        },
+        "k": {
+          "shape": [
+            2048,
+            128
+          ],
+          "dtype": "torch.bfloat16",
+          "stride": [
+            2304,
+            1
+          ]
+        },
+        "v": {
+          "shape": [
+            2048,
+            128
+          ],
+          "dtype": "torch.bfloat16",
+          "stride": [
+            2304,
+            1
+          ]
+        },
+        "positions": {
+          "shape": [
+            2048
+          ],
+          "dtype": "torch.int64",
+          "stride": [
+            1
+          ]
+        },
+        "q_norm": "SimpleNamespace; see shared input generator for tensor geometry",
+        "k_norm": "SimpleNamespace; see shared input generator for tensor geometry",
+        "rotary_emb": "SimpleNamespace; see shared input generator for tensor geometry",
+        "num_heads": "16",
+        "num_kv_heads": "1",
+        "head_dim": "128",
+        "k_cache": {
+          "shape": [
+            16,
+            1,
+            8,
+            128,
+            16
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "stride": [
+            16384,
+            16384,
+            2048,
+            16,
+            1
+          ]
+        },
+        "v_cache": {
+          "shape": [
+            16,
+            1,
+            8,
+            128,
+            16
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "stride": [
+            16384,
+            16384,
+            2048,
+            16,
+            1
+          ]
+        },
+        "k_scale": {
+          "shape": [
+            16,
+            1,
+            128
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            128,
+            128,
+            1
+          ]
+        },
+        "v_scale": {
+          "shape": [
+            16,
+            1,
+            128
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            128,
+            128,
+            1
+          ]
+        },
+        "slot_mapping": {
+          "shape": [
+            2048
+          ],
+          "dtype": "torch.int64",
+          "stride": [
+            1
+          ]
+        },
+        "kv_cache_dtype": "fp8"
+      },
+      "kernels": [
+        "_fused_qkv_norm_rope_cache_kernel"
+      ]
+    },
+    "router-3072": {
+      "median_us": 24.33361091613769,
+      "samples_us": [
+        24.392138481140137,
+        24.27607650756836,
+        24.33361091613769
+      ],
+      "pool_len": 6,
+      "inputs": {
+        "x": {
+          "shape": [
+            3072,
+            6144
+          ],
+          "dtype": "torch.bfloat16",
+          "stride": [
+            6144,
+            1
+          ]
+        },
+        "w": {
+          "shape": [
+            128,
+            6144
+          ],
+          "dtype": "torch.bfloat16",
+          "stride": [
+            1,
+            128
+          ]
+        }
+      },
+      "kernels": [
+        "_gemm_a16w16_gfx1250_bandwidth_bound_kernel_BLOCK_M_128_BLOCK_N_128_BLOCK_K_64_NUM_BUFFERS_6_LAYOUT_TT_USE_ACTIVATION_0_ADD_BIAS_0"
+      ]
+    },
+    "swiglu-3072": {
+      "median_us": 7.981892490386962,
+      "samples_us": [
+        7.97511019706726,
+        7.981892490386962,
+        7.994391059875488
+      ],
+      "pool_len": 6,
+      "inputs": {
+        "gate_up": {
+          "shape": [
+            3072,
+            6144
+          ],
+          "dtype": "torch.bfloat16",
+          "stride": [
+            6144,
+            1
+          ]
+        }
+      },
+      "kernels": [
+        "_swiglu_oai_kernel"
+      ]
+    },
+    "norm-rope-3072": {
+      "median_us": 24.952045822143553,
+      "samples_us": [
+        24.952045822143553,
+        24.92357883453369,
+        25.2794319152832
+      ],
+      "pool_len": 14,
+      "inputs": {
+        "q": {
+          "shape": [
+            3072,
+            2048
+          ],
+          "dtype": "torch.bfloat16",
+          "stride": [
+            2304,
+            1
+          ]
+        },
+        "k": {
+          "shape": [
+            3072,
+            128
+          ],
+          "dtype": "torch.bfloat16",
+          "stride": [
+            2304,
+            1
+          ]
+        },
+        "v": {
+          "shape": [
+            3072,
+            128
+          ],
+          "dtype": "torch.bfloat16",
+          "stride": [
+            2304,
+            1
+          ]
+        },
+        "positions": {
+          "shape": [
+            3072
+          ],
+          "dtype": "torch.int64",
+          "stride": [
+            1
+          ]
+        },
+        "q_norm": "SimpleNamespace; see shared input generator for tensor geometry",
+        "k_norm": "SimpleNamespace; see shared input generator for tensor geometry",
+        "rotary_emb": "SimpleNamespace; see shared input generator for tensor geometry",
+        "num_heads": "16",
+        "num_kv_heads": "1",
+        "head_dim": "128",
+        "k_cache": {
+          "shape": [
+            24,
+            1,
+            8,
+            128,
+            16
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "stride": [
+            16384,
+            16384,
+            2048,
+            16,
+            1
+          ]
+        },
+        "v_cache": {
+          "shape": [
+            24,
+            1,
+            8,
+            128,
+            16
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "stride": [
+            16384,
+            16384,
+            2048,
+            16,
+            1
+          ]
+        },
+        "k_scale": {
+          "shape": [
+            24,
+            1,
+            128
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            128,
+            128,
+            1
+          ]
+        },
+        "v_scale": {
+          "shape": [
+            24,
+            1,
+            128
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            128,
+            128,
+            1
+          ]
+        },
+        "slot_mapping": {
+          "shape": [
+            3072
+          ],
+          "dtype": "torch.int64",
+          "stride": [
+            1
+          ]
+        },
+        "kv_cache_dtype": "fp8"
+      },
+      "kernels": [
+        "_fused_qkv_norm_rope_cache_kernel"
+      ]
+    },
+    "context-score": {
+      "median_us": 20.7952449798584,
+      "samples_us": [
+        20.553999328613283,
+        20.7952449798584,
+        21.182548904418944
+      ],
+      "pool_len": 4,
+      "inputs": {
+        "idx_q": {
+          "shape": [
+            128,
+            4,
+            128
+          ],
+          "dtype": "torch.bfloat16",
+          "stride": [
+            512,
+            128,
+            1
+          ]
+        },
+        "index_cache": {
+          "shape": [
+            48512,
+            128,
+            128
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "stride": [
+            16384,
+            128,
+            1
+          ]
+        },
+        "block_table": {
+          "shape": [
+            32,
+            1516
+          ],
+          "dtype": "torch.int32",
+          "stride": [
+            1516,
+            1
+          ]
+        },
+        "seq_lens": {
+          "shape": [
+            32
+          ],
+          "dtype": "torch.int32",
+          "stride": [
+            1
+          ]
+        },
+        "context": "194048",
+        "query": "4"
+      },
+      "kernels": [
+        "_context_score"
+      ]
+    },
+    "local-topk": {
+      "median_us": 2.8270240545272824,
+      "samples_us": [
+        2.825550103187561,
+        3.1593942880630492,
+        2.8270240545272824
+      ],
+      "pool_len": 265,
+      "inputs": {
+        "scores": {
+          "shape": [
+            4,
+            128,
+            379
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            48512,
+            379,
+            1
+          ]
+        },
+        "seq_lens": {
+          "shape": [
+            32
+          ],
+          "dtype": "torch.int32",
+          "stride": [
+            1
+          ]
+        },
+        "context": "194048"
+      },
+      "kernels": [
+        "_local_topk"
+      ]
+    },
+    "merge-topk": {
+      "median_us": 2.1244556903839116,
+      "samples_us": [
+        2.1244556903839116,
+        2.1313616037368774,
+        2.078057384490967
+      ],
+      "pool_len": 792,
+      "inputs": {
+        "keys": {
+          "shape": [
+            4,
+            128,
+            16
+          ],
+          "dtype": "torch.int64",
+          "stride": [
+            2048,
+            16,
+            1
+          ]
+        },
+        "seq_lens": {
+          "shape": [
+            32
+          ],
+          "dtype": "torch.int32",
+          "stride": [
+            1
+          ]
+        },
+        "block_table": {
+          "shape": [
+            32,
+            1516
+          ],
+          "dtype": "torch.int32",
+          "stride": [
+            1516,
+            1
+          ]
+        }
+      },
+      "kernels": [
+        "_merge_topk"
+      ]
+    },
+    "index-prefill": {
+      "median_us": 143.62115936279295,
+      "samples_us": [
+        143.62115936279295,
+        143.76701354980466,
+        143.61793365478513
+      ],
+      "pool_len": 10,
+      "inputs": {
+        "idx_q": {
+          "shape": [
+            2763,
+            1,
+            128
+          ],
+          "dtype": "torch.bfloat16",
+          "stride": [
+            128,
+            128,
+            1
+          ]
+        },
+        "index_cache": {
+          "shape": [
+            1251,
+            128,
+            128
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "stride": [
+            16384,
+            128,
+            1
+          ]
+        },
+        "block_table": {
+          "shape": [
+            1,
+            1251
+          ],
+          "dtype": "torch.int32",
+          "stride": [
+            1251,
+            1
+          ]
+        },
+        "seq_lens": {
+          "shape": [
+            1
+          ],
+          "dtype": "torch.int32",
+          "stride": [
+            1
+          ]
+        },
+        "context": "160075",
+        "query": "2763",
+        "cu_seqlens_q": {
+          "shape": [
+            2
+          ],
+          "dtype": "torch.int32",
+          "stride": [
+            1
+          ]
+        },
+        "prefix_lens": {
+          "shape": [
+            1
+          ],
+          "dtype": "torch.int32",
+          "stride": [
+            1
+          ]
+        }
+      },
+      "kernels": [
+        "_index_block_score_kernel",
+        "_topk_index_packed_kernel"
+      ]
+    },
+    "cache-gather": {
+      "median_us": 76.5188102722168,
+      "samples_us": [
+        76.50317611694337,
+        76.52266311645509,
+        76.5188102722168
+      ],
+      "pool_len": 4,
+      "inputs": {
+        "key_cache": {
+          "shape": [
+            1251,
+            1,
+            8,
+            128,
+            16
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "stride": [
+            16384,
+            16384,
+            2048,
+            16,
+            1
+          ]
+        },
+        "value_cache": {
+          "shape": [
+            1251,
+            1,
+            8,
+            128,
+            16
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "stride": [
+            16384,
+            16384,
+            2048,
+            16,
+            1
+          ]
+        },
+        "key": {
+          "shape": [
+            160075,
+            1,
+            128
+          ],
+          "dtype": "torch.bfloat16",
+          "stride": [
+            128,
+            128,
+            1
+          ]
+        },
+        "value": {
+          "shape": [
+            160075,
+            1,
+            128
+          ],
+          "dtype": "torch.bfloat16",
+          "stride": [
+            128,
+            128,
+            1
+          ]
+        },
+        "block_tables": {
+          "shape": [
+            1,
+            1251
+          ],
+          "dtype": "torch.int32",
+          "stride": [
+            1251,
+            1
+          ]
+        },
+        "k_scales": {
+          "shape": [
+            1251,
+            1,
+            128
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            128,
+            128,
+            1
+          ]
+        },
+        "v_scales": {
+          "shape": [
+            1251,
+            1,
+            128
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            128,
+            128,
+            1
+          ]
+        },
+        "cu_seqlens_kv": {
+          "shape": [
+            2
+          ],
+          "dtype": "torch.int32",
+          "stride": [
+            1
+          ]
+        },
+        "batch_id_per_k_token": {
+          "shape": [
+            160075
+          ],
+          "dtype": "torch.int32",
+          "stride": [
+            1
+          ]
+        },
+        "seq_starts": {
+          "shape": [
+            1
+          ],
+          "dtype": "torch.int32",
+          "stride": [
+            1
+          ]
+        },
+        "dequant": "True",
+        "kv_cache_layout": "SHUFFLE",
+        "total_tokens": "160075",
+        "per_token_quant": "True"
+      },
+      "kernels": [
+        "cp_mha_gather_cache_kernel"
+      ]
+    }
+  },
+  "method": "RotatingBufferBench defaults, 3 independent graph means unless --repeats overrides",
+  "aiter_revision": "3d3d56db3e3e32d823b109bfb60d061a1e0b5b82",
+  "atom_revision": "f6bf6f0aff2fd8267be7bff9deee51ce8863ad7c",
+  "flydsl": "0.5.0",
+  "validation": {
+    "passed": 16,
+    "skipped": 0,
+    "xfailed": 0
+  },
+  "normalization": "Machine identifiers and absolute paths removed; tensor value reprs omitted. Timings, input tensor geometry, kernel names and source SHA256 are unchanged."
+}

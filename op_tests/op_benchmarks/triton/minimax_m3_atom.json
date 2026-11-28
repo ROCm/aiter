@@ -1,0 +1,12 @@
+{
+  "repository": "https://github.com/ROCm/ATOM.git",
+  "revision": "f6bf6f0aff2fd8267be7bff9deee51ce8863ad7c",
+  "modules": {
+    "atom.model_ops.minimax_m3.index_topk": "42163c67df6380f15440a0cb2612ace23aeb4cd85e19658a6e6753a72ecc2fce",
+    "atom.model_ops.minimax_m3.indexer_context_parallel": "a180db32ce4ab2351a13f41e744414fe661e4a213166be36c110145be0373276",
+    "atom.model_ops.minimax_m3.indexer_candidate_exchange": "0032a237d5f4e170cb517899812aa58d19467aeaf54c9816bec44dc11c6102cd",
+    "atom.model_ops.swiglu_oai": "20c1881a3110e1626e0b2f3d62c66ffa625cb61112ed4efaeb91f08fb98da154",
+    "atom.model_ops.triton_fused_qkv_norm_rope_cache": "5493f9e42dd0c8326b67aa3c3821b5d86cfa8f7e657b0d3d83419932e9f1d446",
+    "atom.model_ops.base_attention": "1999cd8f0800686125f65d7b22c8e942b6f1f57ba1e1932dd69966c5f9d30171"
+  }
+}
