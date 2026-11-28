@@ -59,10 +59,14 @@ def store_global_f32_vec(c_ptr, global_offset, vec, vec_size):
 
 
 class BlockSwizzle:
-    def __init__(self, NUM_XCDS, NUM_PIDS_THRESHOLD, GROUP_M):
+    def __init__(
+        self, NUM_XCDS, NUM_PIDS_THRESHOLD, GROUP_M, GROUP_M_ON_ALL_GRIDS=False
+    ):
         self.NUM_XCDS = NUM_XCDS
         self.NUM_PIDS_THRESHOLD = NUM_PIDS_THRESHOLD
         self.GROUP_M = GROUP_M
+        # False: a grid with no XCD remap keeps the row-major order.
+        self.GROUP_M_ON_ALL_GRIDS = GROUP_M_ON_ALL_GRIDS
 
     @flyc.jit
     def swizzle(self, num_pid_m, num_pid_n, pid):
@@ -77,6 +81,9 @@ class BlockSwizzle:
         intra_xcd = linear_id // num_xcds
         xcd = linear_id % num_xcds
         wgid = xcd * (num_wg // num_xcds) + intra_xcd
+        if const_expr(self.GROUP_M_ON_ALL_GRIDS):
+            use_xcd = (num_wg >= swizzle_threshold) & ((num_wg % num_xcds) == 0)
+            wgid = use_xcd.select(wgid, linear_id)
         group_m = self.GROUP_M
         wgid_per_group = group_m * num_pid_n
         group_id = wgid // wgid_per_group
@@ -86,6 +93,8 @@ class BlockSwizzle:
         group_size_m = (remaining_m < group_m).select(remaining_m, group_m)
         swizzled_n = intra_group // group_size_m
         swizzled_m = first_pid_m + (intra_group % group_size_m)
+        if const_expr(self.GROUP_M_ON_ALL_GRIDS):
+            return swizzled_m, swizzled_n
         use_simple = (num_wg < swizzle_threshold) | ((num_wg % num_xcds) != 0)
         return (
             use_simple.select(simple_m, swizzled_m),

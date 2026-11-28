@@ -15,12 +15,28 @@ from .kernels.gemm_a16w16_gfx950 import (
     GEMM_A16W16_DTYPE_BF16,
     GEMM_A16W16_DTYPE_FP16,
     GEMM_A16W16_DTYPE_FP32,
-    make_gemm_a16w16_param_and_validate,
+    SPLIT_K_WORKSPACE_MAX_ELEMS,
+    split_k_workspace_supported,
+    validate_gemm_a16w16_candidate,
 )
 from .kernels.gemm_a16w16_kernel_gfx1250 import LDS_PAD_A, LDS_PAD_B
 from .kernels.gemm_a16w16_skinny_gfx950 import skinny_config_error
 
 __all__ = ["GemmConfigPruner", "get_flydsl_a16w16_configs"]
+
+_WIDE_GRID_BLOCK_M = (192, 208, 224)
+
+
+def _config_key(config):
+    return tuple(sorted(config.items()))
+
+
+def _uniform_async_loads(param):
+    """Whether whole-thread vector loads cover the A and B tiles exactly."""
+    per_iter = param.block_threads * param.async_load_bytes // param.in_data_bytes
+    return all(
+        rows * param.block_k % per_iter == 0 for rows in (param.block_m, param.block_n)
+    )
 
 
 @dataclass(frozen=True)
@@ -111,25 +127,91 @@ class GemmConfigPruner:
             return configs
         ious = [self._iou(config) for config in configs]
         keep_ratio = max(0.625, 1 - self.m / 160, 1 - 120 / self.m)
+        # Large-M tuning must retain wider N tiles for ragged model dimensions
+        # such as 2112 and 2880. Their 6-9% N padding can be cheaper than the
+        # poor MFMA efficiency of an exactly-dividing BN64 tile.
+        if self.m >= 4096:
+            keep_ratio = min(keep_ratio, 0.90)
         min_iou = max(ious) * keep_ratio
         num_cus = self.device_props.multi_processor_count
-        max_tiles = (
-            max(num_cus, min(self._tiles(config) for config in configs))
-            * self.max_tile_grid_ratio
-        )
+        # Hand-added tiles wider than the 256x256 grid must not tighten the limit.
+        grid_tiles = [
+            self._tiles(config)
+            for config in configs
+            if config["block_m"] <= 256 and config["block_n"] <= 256
+        ] or [self._tiles(config) for config in configs]
+        max_tiles = max(num_cus, min(grid_tiles)) * self.max_tile_grid_ratio
         kept = []
         for config, iou in zip(configs, ious):
             tiles = self._tiles(config)
+            hti = config.get("use_half_tile_interleaved", False)
+            hti_256 = hti and (
+                config["block_m"],
+                config["block_n"],
+                config["block_k"],
+                config["stages"],
+                config["m_waves"],
+                config["n_waves"],
+                config["k_waves"],
+            ) == (256, 256, 64, 2, 2, 4, 1)
+            # HTI tiles validated on Kimi-K3 shapes: 256x256 with no split-K,
+            # 256x256 with a workspace split-K, and 192x128x128 with Group-M 4.
+            validated_half_tile = (
+                (
+                    hti_256
+                    and config["split_k"] == 1
+                    and config["group_m"] in (0, 1, 2, 4, 8, 16)
+                )
+                or (
+                    hti_256
+                    and config["split_k"] > 1
+                    and config["group_m"] in (0, 4, 8, 16)
+                    and config["split_k"] * self.m * self.n
+                    <= SPLIT_K_WORKSPACE_MAX_ELEMS
+                )
+                or (
+                    hti
+                    and config["group_m"] == 4
+                    and (
+                        config["block_m"],
+                        config["block_n"],
+                        config["block_k"],
+                        config["m_waves"],
+                        config["n_waves"],
+                    )
+                    == (192, 128, 128, 2, 4)
+                )
+            )
+            near_cu_rect = (
+                iou >= 0.90 and tiles * 4 >= num_cus * 3 and tiles * 4 <= num_cus * 5
+            )
             max_split_k = (
                 1
                 if tiles >= num_cus
                 else self._ceil_div(self.max_split_grid_rounds * num_cus, tiles)
             )
             if (
-                iou >= min_iou
+                (iou >= min_iou or near_cu_rect or validated_half_tile)
                 and tiles <= max_tiles
                 and config["split_k"] <= max_split_k
-                and (config["group_m"] == 0 or (tiles >= num_cus and tiles % 8 == 0))
+                and (
+                    config["group_m"] == 0
+                    or validated_half_tile
+                    or (
+                        config["block_m"],
+                        config["block_n"],
+                        config["group_m"],
+                    )
+                    in (
+                        (320, 224, 2),
+                        (320, 224, 4),
+                        (320, 224, 16),
+                        (224, 320, 8),
+                        (160, 192, 16),
+                        (128, 128, 1),
+                    )
+                    or (tiles >= num_cus and tiles % 8 == 0)
+                )
             ):
                 kept.append(config)
 
@@ -338,7 +420,7 @@ def get_flydsl_a16w16_configs(
         return _gfx1250_tdm_configs(m, n, k, dtype) + _gfx1250_configs(m, n, k)
     if get_gfx_runtime() in ("gfx1250", "gfx1250-strict"):
         return _gfx1250_configs(m, n, k)
-    if make_gemm_a16w16_param_and_validate is None:
+    if validate_gemm_a16w16_candidate is None:
         return []
     if get_gfx_runtime() != "gfx950":
         return []
@@ -347,7 +429,7 @@ def get_flydsl_a16w16_configs(
     # the stricter HTI/alignment requirements for each candidate.
     split_k_candidates = list(range(1, min(k, 9) + 1))
     selections = {
-        "block_m": [16, 32, 48, 64, 80, 96, 128, 256],
+        "block_m": [16, 32, 48, 64, 80, 96, 128, *_WIDE_GRID_BLOCK_M, 256],
         "block_n": [16, 32, 64, 80, 96, 128, 160, 256],
         "block_k": [64, 128, 256],
         "stages": list(range(2, 10)),
@@ -362,25 +444,68 @@ def get_flydsl_a16w16_configs(
         dict(zip(selections, combo))
         for combo in itertools.product(*selections.values())
     ]
-    device_props = torch.cuda.get_device_properties(torch.cuda.current_device())
-    configs = GemmConfigPruner(
-        m,
-        n,
-        k,
-        device_props,
-        2,
-    ).prune(configs)
+    # Stagger and B cache-policy copies cover only the original grid with
+    # uniform loads. Copying the added tiles too overflows the tuning budget.
+    memory_bases = {
+        _config_key(config)
+        for config in configs
+        if config["block_m"] not in _WIDE_GRID_BLOCK_M
+    }
 
-    in_dtype_id = (
-        GEMM_A16W16_DTYPE_FP16 if dtype == torch.float16 else GEMM_A16W16_DTYPE_BF16
-    )
-    out_dtype_id = GEMM_A16W16_DTYPE_FP32 if out_dtype == torch.float32 else in_dtype_id
-    valid_configs = []
-    memory_configs = []
+    def fits_workspace(split_k):
+        return split_k * m * n <= SPLIT_K_WORKSPACE_MAX_ELEMS
+
+    # Tiles outside the grid: (block_m, block_n, stages, split_k, m_waves,
+    # n_waves, k_waves, group_m, use_half_tile_interleaved), block_k 64.
+    added = [(256, 256, 2, 1, 2, 4, 1, group_m, True) for group_m in (1, 2, 8, 16)]
+    added += [
+        (256, 256, 2, split_k, 2, 4, 1, group_m, True)
+        for split_k in split_k_candidates[1:]
+        if fits_workspace(split_k)
+        for group_m in (8, 16)
+    ]
+    if m <= 320 and k % 5 == 0:
+        added.append((320, 192, 2, 5, 4, 2, 1, 0, False))
+    added += [
+        (320, 192, 2, split_k, 4, 4, 1, 0, False)
+        for split_k in (2, 4)
+        if k % split_k == 0 and fits_workspace(split_k)
+    ]
+    if 384 < m <= 400 and k % 4 == 0:
+        added.append((400, 128, 2, 4, 5, 2, 1, 0, False))
+    if m <= 320 and k % 7 == 0:
+        added.append((320, 192, 2, 7, 4, 4, 1, 0, False))
+    if k % 7 == 0 and fits_workspace(7):
+        added += [
+            (256, 256, 2, 7, 4, 2, 1, 0, False),
+            (256, 256, 2, 7, 2, 4, 1, 0, False),
+        ]
+    if 320 < m <= 384 and k % 7 == 0:
+        added.append((384, 192, 2, 7, 8, 1, 1, 0, False))
+    added += [
+        (256, 192, 2, 1, 4, 4, 1, 0, False),
+        (288, 192, 2, 1, 2, 4, 1, 0, False),
+        (320, 224, 2, 1, 4, 2, 1, 0, False),
+        (320, 224, 2, 1, 4, 2, 1, 2, False),
+        (320, 224, 2, 1, 4, 2, 1, 4, False),
+        (320, 224, 2, 1, 4, 2, 1, 16, False),
+        (224, 320, 2, 1, 2, 4, 1, 8, False),
+        (224, 192, 3, 1, 2, 6, 1, 0, False),
+        (160, 192, 3, 1, 2, 4, 1, 16, False),
+        (192, 192, 3, 1, 3, 4, 1, 0, False),
+        (128, 128, 3, 1, 2, 2, 2, 1, False),
+        (128, 128, 3, 1, 4, 4, 1, 1, False),
+    ]
+    configs += [
+        dict(zip(selections, (block_m, block_n, 64, *fields)))
+        for block_m, block_n, *fields in added
+    ]
     is_large_gemm = m >= 4096 and n >= 4096 and k >= 4096
-    for config in configs:
-        if is_large_gemm:
-            if not (
+    if is_large_gemm:
+        configs = [
+            config
+            for config in configs
+            if (
                 config["use_half_tile_interleaved"]
                 and config["block_m"] == 256
                 and config["block_n"] == 256
@@ -390,15 +515,49 @@ def get_flydsl_a16w16_configs(
                 and config["m_waves"] == 2
                 and config["n_waves"] == 4
                 and config["k_waves"] == 1
-            ):
-                continue
-        elif not config["use_half_tile_interleaved"]:
+            )
+        ]
+    device_props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    if not is_large_gemm:
+        configs = GemmConfigPruner(
+            m,
+            n,
+            k,
+            device_props,
+            2,
+        ).prune(configs)
+
+    in_dtype_id = (
+        GEMM_A16W16_DTYPE_FP16 if dtype == torch.float16 else GEMM_A16W16_DTYPE_BF16
+    )
+    out_dtype_id = GEMM_A16W16_DTYPE_FP32 if out_dtype == torch.float32 else in_dtype_id
+    valid_configs = []
+    memory_configs = []
+    for config in configs:
+        if not is_large_gemm and not config["use_half_tile_interleaved"]:
             mma_m_iters = config["block_m"] // config["m_waves"] // 16
             mma_n_iters = config["block_n"] // config["n_waves"] // 16
             # Decode tiles can stream a wider N panel per wave. The old
             # four-repeat cutoff excluded 128x96 / 4x1-wave candidates.
             max_n_iters = 8 if m <= 128 and m <= config["block_m"] else 4
-            if mma_m_iters > 4 or mma_n_iters > max_n_iters:
+            if (mma_m_iters > 4 or mma_n_iters > max_n_iters) and (
+                (config["block_m"], config["block_n"])
+                not in (
+                    (208, 256),
+                    (224, 256),
+                    (320, 192),
+                    (256, 192),
+                    (288, 192),
+                    (320, 224),
+                    (224, 320),
+                    (224, 192),
+                    (160, 192),
+                    (192, 192),
+                    (384, 192),
+                    (256, 256),
+                    (400, 128),
+                )
+            ):
                 continue
 
         validation_config = {
@@ -409,26 +568,33 @@ def get_flydsl_a16w16_configs(
             "b_is_transposed": True,
             "has_bias": has_bias,
         }
-        if (
-            make_gemm_a16w16_param_and_validate(
-                m,
-                n,
-                k,
-                validation_config,
-            )
-            is not None
-        ):
+        param = validate_gemm_a16w16_candidate(m, n, k, validation_config)
+        if param is not None:
             valid_configs.append(config)
             # Stagger is a measured option, never a global default. At small
             # M, a single row tile streams B; preserve the original catalog
             # and let tuning race stagger and B cache policy against the original.
-            if m <= 128 and m <= config["block_m"]:
+            if (
+                m <= 128
+                and m <= config["block_m"]
+                and _config_key(config) in memory_bases
+                and _uniform_async_loads(param)
+            ):
                 memory_configs.extend(
                     {**config, "k_stagger": stride, "b_non_temporal": nt}
                     for stride in (0, 1, 3)
                     for nt in (False, True)
                     if stride or nt
                 )
+
+        # Atomic and workspace reductions trade launch count for traffic.
+        # Validate workspace independently because an unsafe HTI atomic base
+        # can still have a safe FP32 workspace reduction.
+        workspace_config = {**validation_config, "use_split_k_workspace": True}
+        if split_k_workspace_supported(
+            m, n, config["split_k"], out_dtype_id, has_bias
+        ) and validate_gemm_a16w16_candidate(m, n, k, workspace_config):
+            valid_configs.append({**config, "use_split_k_workspace": True})
     skinny_configs = []
     if dtype == out_dtype == torch.bfloat16 and not has_bias and 0 < m <= 128:
         # The public wrapper and tuned-name parser already support skinny,

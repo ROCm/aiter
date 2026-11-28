@@ -159,7 +159,10 @@ AOT_CACHES = {
         ),
     },
     "gemm_a16w16_gfx950": {
-        "sources": ("kernels/gemm_a16w16_gfx950_utils.py",),
+        "sources": (
+            "kernels/gemm_a16w16_gfx950_utils.py",
+            "kernels/gemm_a8w8_splitk_reduce_gfx1250.py",
+        ),
     },
     "gemm_a16w16_band_gfx950": {},
     "gemm_a16w16_skinny_gfx950": {},
