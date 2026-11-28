@@ -1106,6 +1106,32 @@ def test_mha_bwd_sink_null_gives_same_as_no_sink(dtype):
     )
 
 
+# Deterministic dQ is reduced from per-split fp32 dq_acc slices. With batch = nhead = 1
+# the persistent kernel uses the most splits, so one head's slices span 8 GiB at these
+# shapes, past 32-bit buffer offsets (ROCm/aiter#8420). It must match the
+# non-deterministic dQ.
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("hdim,seqlen", [(128, 65536), (256, 32768)])
+def test_flash_attn_deterministic_dq_long_seqlen(hdim, seqlen, causal):
+    torch.manual_seed(0)
+    q, k, v, dout = (
+        torch.randn(1, seqlen, 1, hdim, device="cuda", dtype=dtypes.bf16)
+        for _ in range(4)
+    )
+    grads = {}
+    for deterministic in (True, False):
+        qq, kk, vv = (t.clone().requires_grad_() for t in (q, k, v))
+        out = aiter.flash_attn_func(
+            qq, kk, vv, causal=causal, deterministic=deterministic, return_lse=True
+        )[0]
+        grads[deterministic] = torch.autograd.grad(out, (qq, kk, vv), dout)
+    for name, det, ndet in zip(("dQ", "dK", "dV"), grads[True], grads[False]):
+        err = ((det.float() - ndet.float()).norm() / ndet.float().norm()).item()
+        assert (
+            err < 1e-2
+        ), f"deterministic {name} differs from non-deterministic: {err:.3e}"
+
+
 # OPUS gfx950 dense (batch) cases, shared by the D=128 and D_QK=192/D_V=128 tests.
 # Causal is bottom-right aligned, so seqlen_q > seqlen_kv gives O=0 / LSE=-inf rows.
 #   (batch, seqlen_q, seqlen_kv, nheads, nheads_k)
