@@ -93,6 +93,19 @@ _LAUNCH_CACHE: dict = {}
 _MAX_INT32 = 2**31 - 1
 
 
+def _gluon_attn_res(backend: str):
+    """The gfx1250 Gluon module for backend="gluon" on gfx1250, else None (Triton)."""
+    if backend not in ("triton", "gluon"):
+        raise ValueError(f"backend must be 'triton' or 'gluon', got {backend!r}")
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+    if backend == "triton" or get_arch() != "gfx1250":
+        return None
+    from aiter.ops.triton.gluon import attn_res_gluon
+
+    return attn_res_gluon
+
+
 def _tensor_spec(t: torch.Tensor | None):
     """The properties of ``t`` that Triton specializes the compiled kernel on.
 
@@ -507,6 +520,7 @@ def attn_res_fwd(
     scale: float = 1.0,
     *,
     layout: str = "sequence",
+    backend: str = "triton",
 ) -> torch.Tensor:
     """Attention-residual forward.
 
@@ -520,11 +534,19 @@ def attn_res_fwd(
     - rms_eps: epsilon of both the per-candidate and the output RMSNorm.
     - scale: multiplies the logits before the softmax.
     - layout: "sequence" or "packed".
+    - backend: "triton" (default) or "gluon" (gfx1250 kernels where they fit).
 
     Returns the mixed residual ``o`` of shape ``[.., D]``.
     """
     if layout not in ("sequence", "packed"):
         raise ValueError(f"layout must be 'sequence' or 'packed', got {layout!r}")
+    gluon = _gluon_attn_res(backend) if layout == "packed" and scale == 1.0 else None
+    if gluon is not None:
+        out = gluon.attn_res_fwd(
+            query, residuals, rms_weight, output_rms_weight, rms_eps
+        )
+        if out is not None:
+            return out
 
     _LOGGER.info(
         "ATTN_RES: query=%s rms_weight=%s layout=%s",
@@ -690,6 +712,7 @@ def attn_res_gate(
     scale: float = 1.0,
     close_block: bool = False,
     out_quant_dtype: torch.dtype | None = None,
+    backend: str = "triton",
 ):
     """Inference-shaped attention-residual gate over ``B + 1`` candidates.
 
@@ -740,7 +763,17 @@ def attn_res_gate(
       ``[.., B + 1, D]``.
     - ``out_quant_dtype`` set: ``y`` above becomes the tuple
       ``(y_fp8, y_scale)``; the rest of the contract is unchanged.
+
+    ``backend``: "triton" (default) or "gluon" (gfx1250 kernels where they fit).
     """
+    plain = add_hidden is None and not close_block and out_quant_dtype is None
+    gluon = _gluon_attn_res(backend) if plain and scale == 1.0 else None
+    if gluon is not None:
+        y = gluon.attn_res_gate(
+            prefix, block_residual, score_weight, eps, output_rms_weight, output_rms_eps
+        )
+        if y is not None:
+            return y, prefix
     if not prefix.is_cuda:
         raise ValueError("Triton attn_res requires CUDA/ROCm tensors")
     if block_residual.dtype != prefix.dtype:
@@ -921,3 +954,84 @@ def attn_res_gate(
     if not close_block:
         return y_out, prefix_result
     return y_out, prefix_result, block_out
+
+
+def attn_res_schedule(calls, *, use_ahead=True, residual_added=False):
+    """Mix-ahead state for one forward of attn_res_inplace calls (one dict per call).
+
+    Returns None on archs other than gfx1250."""
+    gluon = _gluon_attn_res("gluon")
+    if gluon is None:
+        return None
+    return gluon.attn_res_schedule(
+        calls, use_ahead=use_ahead, residual_added=residual_added
+    )
+
+
+def attn_res_inplace(
+    prefix: torch.Tensor,
+    delta: torch.Tensor | None,
+    blocks: torch.Tensor,
+    norm_weight: torch.Tensor,
+    qk_weight: torch.Tensor,
+    output_norm_weight: torch.Tensor | None,
+    num_blocks: int,
+    block_write_idx: int,
+    eps: float,
+    output_norm_eps: float,
+    *,
+    quant_dtype: torch.dtype | None = None,
+    store_prefix: bool = True,
+    residual_added: bool = False,
+    schedule=None,
+    call_idx: int | None = None,
+    backend: str = "gluon",
+):
+    """AttnRes in place: p = bf16(prefix + delta) is stored, then mixed with blocks.
+
+    residual_added: delta is in prefix already (delta=None). schedule: mix-ahead.
+    Returns out, or (out, scale) with quant_dtype."""
+    if residual_added and delta is not None:
+        raise ValueError("residual_added: the caller adds delta, so pass delta=None")
+    args = (prefix, delta, blocks, norm_weight, qk_weight, output_norm_weight)
+    args += (num_blocks, block_write_idx, eps, output_norm_eps)
+    kw = {"quant_dtype": quant_dtype, "store_prefix": store_prefix}
+    gluon = _gluon_attn_res(backend)
+    if gluon is not None:
+        out = gluon.attn_res_inplace(
+            *args,
+            **kw,
+            residual_added=residual_added,
+            schedule=schedule,
+            call_idx=call_idx,
+        )
+        if out is not None:
+            return out
+    return _attn_res_inplace_triton(*args, **kw)
+
+
+def _attn_res_inplace_triton(
+    prefix, delta, blocks, nw, qkw, onw, n, widx, eps, oeps, quant_dtype, store_prefix
+):
+    p = (
+        prefix if delta is None else prefix + delta
+    )  # bf16 add: the rounded sum is a source
+    if delta is not None and store_prefix:
+        prefix.copy_(p)
+    if widx >= 0:
+        blocks[:, widx].copy_(p)
+    if n == 0:
+        y = p.float()
+        if onw is not None:
+            y = y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + oeps) * onw.float()
+        y = y.to(prefix.dtype)
+    else:
+        sw = nw.float() * qkw.float()
+        y, _ = attn_res_gate(
+            p, blocks[:, :n], sw, eps, output_rms_weight=onw, output_rms_eps=oeps
+        )
+    if quant_dtype is None:
+        return y
+    qmax = _dtype_max(quant_dtype)
+    scale = y.float().abs().amax(-1, keepdim=True).clamp(min=1e-10) * (1.0 / qmax)
+    return (y.float() * (1.0 / scale)).clamp(-qmax, qmax).to(quant_dtype), scale
