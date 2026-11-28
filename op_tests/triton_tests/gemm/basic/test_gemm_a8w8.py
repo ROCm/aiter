@@ -11,7 +11,10 @@ import torch.nn.functional as F
 
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8 as triton_gemm_a8w8
-from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8_preshuffle
+from aiter.ops.triton.gemm.basic.gemm_a8w8 import (
+    gemm_a8w8_negate_w_k_tail,
+    gemm_a8w8_preshuffle,
+)
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.gemm_config_utils import (
     compute_splitk_params,
@@ -164,6 +167,84 @@ def test_gemm_fp8(in_dtype, m, n, k, impl: str):
     else:
         raise ValueError(f"Unknown implementation: {impl}")
     b = run_triton(x, weight_triton, x_scale, w_scale, bias, out_dtype, y, impl)
+
+    torch.testing.assert_close(a, b, atol=0.02, rtol=1e-2)
+
+
+def get_ptpc_x_vals():
+    x_vals = [(1, 16, 128), (3, 5, 2)]  # one tile, irregular shape
+    x_vals += [(8, 80, 1000)]  # partial M, N and K tiles
+    x_vals += [(m, 12448, 7168) for m in (8, 128, 1024)]  # in_proj, TP4
+    x_vals += [(m, 6288, 7168) for m in (16, 600)]  # in_proj, TP8
+    x_vals += [(4096, 1024, 2048)]
+    return x_vals
+
+
+@pytest.mark.parametrize("m, n, k", get_ptpc_x_vals())
+@pytest.mark.parametrize("output", [True, False])
+@pytest.mark.parametrize("has_bias", [True, False])
+def test_gemm_fp8_ptpc_gluon_gfx1250(m, n, k, output, has_bias):
+    """Per-token and per-channel scales through the gfx1250 Gluon kernel."""
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
+        pytest.skip("The Gluon PTPC kernel requires gfx1250.")
+
+    torch.cuda.empty_cache()
+    out_dtype = str_to_torch_dtype["bf16"]
+    x, weight, _, x_scale, w_scale, bias, y = generate_gemm_a8w8_inputs(
+        M=m,
+        N=n,
+        K=k,
+        in_dtype=e4m3_type,
+        out_dtype=out_dtype,
+        layout="TN",
+        output=output,
+    )
+    if not has_bias:
+        bias = None
+
+    a = run_torch(x, weight, x_scale, w_scale, bias, out_dtype)
+    b = triton_gemm_a8w8(
+        x, weight, x_scale, w_scale, bias, out_dtype, y, backend="gluon"
+    )
+    if output:
+        assert b is y
+
+    torch.testing.assert_close(a, b, atol=0.02, rtol=1e-2)
+
+
+@pytest.mark.parametrize("m, n, k", get_ptpc_x_vals())
+@pytest.mark.parametrize("has_bias", [True, False])
+def test_gemm_fp8_ptpc_gluon_gfx1250_w_negated(m, n, k, has_bias):
+    """The gfx1250 Gluon kernel with a weight whose K tail is negated one time."""
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
+        pytest.skip("The Gluon PTPC kernel requires gfx1250.")
+
+    torch.cuda.empty_cache()
+    out_dtype = str_to_torch_dtype["bf16"]
+    x, weight, _, x_scale, w_scale, bias, y = generate_gemm_a8w8_inputs(
+        M=m,
+        N=n,
+        K=k,
+        in_dtype=e4m3_type,
+        out_dtype=out_dtype,
+        layout="TN",
+        output=True,
+    )
+    if not has_bias:
+        bias = None
+
+    a = run_torch(x, weight, x_scale, w_scale, bias, out_dtype)
+    b = triton_gemm_a8w8(
+        x,
+        gemm_a8w8_negate_w_k_tail(weight),
+        x_scale,
+        w_scale,
+        bias,
+        out_dtype,
+        y,
+        backend="gluon",
+        w_k_tail_negated=True,
+    )
 
     torch.testing.assert_close(a, b, atol=0.02, rtol=1e-2)
 

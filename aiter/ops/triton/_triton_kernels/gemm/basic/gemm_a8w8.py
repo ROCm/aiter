@@ -390,3 +390,13 @@ def _get_config(M: int, N: int, K: int, shuffle: bool = False):
     else:
         config, is_tuned = get_gemm_config("GEMM-A8W8", M, N, K)
     return compute_splitk_params(config, K), is_tuned
+
+
+@triton.jit
+def _negate_k_tail_kernel(x_ptr, y_ptr, n, k_words, k0_words, BLOCK: tl.constexpr):
+    # Copy x as int32 words with the FP8 sign bits of columns k0_words.. of each row flipped.
+    offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    v = tl.load(x_ptr + offs, mask=mask)
+    v = tl.where(offs % k_words >= k0_words, v ^ -2139062144, v)  # 0x80808080
+    tl.store(y_ptr + offs, v, mask=mask)
