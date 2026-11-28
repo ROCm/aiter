@@ -3883,23 +3883,15 @@ void fused_dynamic_mx_quant_moe_sort_hip_bounded(aiter_tensor_t& output,
 // correctness.
 constexpr long MXFP4_MOE_SORT_COALESCED_LDS_WORK_MAX = 700000;
 
-// AITER_MXFP4_MOE_SORT_COALESCE_COLS (default 128; 0 restores the plain
-// product gate): rows of at most this many scale bytes (scaleN_pad) take the
-// coalesced path whatever the grid. Narrow rows are where the per-byte
+// Rows of at most this many scale bytes (scaleN_pad) take the coalesced path
+// whatever the grid. Narrow rows are where the per-byte
 // scatter is slowest per useful byte: on Kimi-K3's prefill MoE (dim 3584 ->
 // 112 bytes, 896 experts, block_m 256, M = 16384) the product is ~1.7M and
 // the scatter path takes ~48 us against ~22 us coalesced. A row of at most
 // 128 bytes (dim <= 4096) passes the product gate anyway until the grid
 // exceeds ~5.4K tiles, so the default only moves grids that large; the
 // measured regressor above has 224-byte rows and is unaffected.
-static int mxfp4_moe_sort_coalesce_cols()
-{
-    static const int cols = [] {
-        const char* v = std::getenv("AITER_MXFP4_MOE_SORT_COALESCE_COLS");
-        return v ? std::atoi(v) : 128;
-    }();
-    return cols;
-}
+constexpr int MXFP4_MOE_SORT_COALESCE_COLS = 128;
 
 // Bytes per buffer load of a mxfp4_moe_sort_kernel thread's scale bytes.
 __host__ __device__ constexpr int mxfp4_moe_sort_load_bytes(int vec_size)
@@ -4121,7 +4113,7 @@ __global__ void mxfp4_moe_sort_kernel(
                 reinterpret_cast<int32_t*>(sorted_ids.data_ptr()),                      \
                 reinterpret_cast<int32_t*>(num_valid_ids.data_ptr()),                   \
                 token_num, cols, num_blocks, num_tg, topk,                              \
-                mxfp4_moe_sort_coalesce_cols());                                        \
+                MXFP4_MOE_SORT_COALESCE_COLS);                                        \
     };                                                                                  \
     /* Only rows whose last load crosses the row end need the byte tail.      */       \
     if(((cols + GROUP_SIZE - 1) / GROUP_SIZE) % mxfp4_moe_sort_load_bytes(THREAD_DATA)) \

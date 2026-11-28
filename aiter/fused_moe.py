@@ -107,12 +107,13 @@ from aiter.moev2.segments.sort import (  # noqa: F401
     _mxfp4_aux_instance_supported,
     moe_sorting,
 )
-from aiter.moev2.shapes import (
+from aiter.moev2.shapes import (  # noqa: F401
     _PADDED_M_TIERS,
     _is_row_major_2d,
     get_inter_dim,
     get_padded_M,
     nextPow2,
+    tuned_M,
 )
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
 from aiter.ops.flydsl.moe_common import (
@@ -163,27 +164,12 @@ def _get_flydsl_moe_kernels():
 _SILU_VALUE = int(ActivationType.Silu)
 
 
-# Extra tuned-row tiers below a power-of-two bucket: M in (p / 2, T] for a listed
-# T < p = nextPow2(M) looks up the row tuned at token = T, and the bucket's row
-# (token = p) when the table has no row at T for that shape. Comma-separated;
-# empty turns it off. 3584 by default: Kimi-K3.1's A4W4 table has a bm64 row
-# there that is bit-identical to its 4096 row and faster at 2049-3584 tokens.
-_EXTRA_M_TIERS = tuple(
-    sorted(
-        int(t)
-        for t in os.environ.get("AITER_MOE_EXTRA_M_TIERS", "3584").split(",")
-        if t.strip()
-    )
-)
-
-
 def _tuned_M(M):
-    """The token the tuned-row lookup keys on for M (get_padded_M or an extra tier)."""
-    padded = get_padded_M(M)
-    for tier in _EXTRA_M_TIERS:
-        if M <= tier < padded and tier > padded // 2:
-            return tier
-    return padded
+    """The token the tuned-row lookup keys on for M: the bucket, or a tier the
+    default tuned table has rows at (``extra_m_tiers``; e.g. Kimi-K3.1's A4W4
+    row at 3584 tokens, bit-identical to its 4096 row and faster at 2049-3584).
+    ``moev2.api.dispatch_key`` keys on the same function."""
+    return tuned_M(M, moev2_tuned.extra_m_tiers(AITER_CONFIGS.AITER_CONFIG_FMOE_FILE))
 
 
 def swiglu_limit_tag(swiglu_limit):
@@ -4782,10 +4768,13 @@ def get_2stage_cfgs(
         fhmoe_keys = (expert - 1, hidden_pad, intermediate_pad, str(gate_mode))
         keys += fhmoe_keys
         keys_disabled += fhmoe_keys
-    # An extra tier (_EXTRA_M_TIERS) serves only shapes whose table has a row at
-    # it. Any other shape is looked up and configured at its power-of-two bucket,
-    # as if the tier were not listed.
-    if token in _EXTRA_M_TIERS and nextPow2(token) != token:
+    # A tier token (``_tuned_M``: off the get_padded_M buckets) serves only the
+    # shapes whose table has a row at it. Any other shape is looked up and
+    # configured at its power-of-two bucket, as if there were no tier.
+    if (
+        moev2_tuned.EXTRA_TIER_MIN_TOKENS < token < _PADDED_M_TIERS[0]
+        and nextPow2(token) != token
+    ):
         primary, fallback = active_cfg_2stages or ({}, {})
         if primary.get(keys[:7] + (str(activation),) + keys[8:]) is None and (
             config_file is not None or fallback.get(keys_disabled) is None
