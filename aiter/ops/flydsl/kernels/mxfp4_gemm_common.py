@@ -253,10 +253,15 @@ def _clamp_gate_up_batch(gate_values, up_values, limit=7.0):
     return gates, ups
 
 
-def _swiglu_mul_batch(gate_values, up_values, limit):
+def _swiglu_mul_batch(gate_values, up_values, limit, alpha_first=False):
     gates, ups = _clamp_gate_up_batch(gate_values, up_values, limit)
-    # Fold alpha into the exp2 constant to retain this kernel's rounding.
-    sigmoids = sigmoid_batch(gates, alpha=1.702)
+    if alpha_first:
+        # Scale the gate by alpha before the exp2, as the two-stage SwiGLU
+        # (act.swiglu_mul_batch) does, so both paths round identically.
+        sigmoids = sigmoid_batch([fx.Float32(1.702) * gate for gate in gates])
+    else:
+        # Fold alpha into the exp2 constant to retain this kernel's rounding.
+        sigmoids = sigmoid_batch(gates, alpha=1.702)
     return [
         gate * sigmoid * (up + 1.0) for gate, sigmoid, up in zip(gates, sigmoids, ups)
     ]
@@ -285,9 +290,12 @@ def _activation_mul_batch(
     situ_beta=1.0,
     situ_linear_beta=1.0,
     swiglu_limit=7.0,
+    swiglu_alpha_first=False,
 ):
     if act == "swiglu":
-        return _swiglu_mul_batch(gate_values, up_values, limit=swiglu_limit)
+        return _swiglu_mul_batch(
+            gate_values, up_values, limit=swiglu_limit, alpha_first=swiglu_alpha_first
+        )
     if act == "situv2":
         return _situ_mul_batch(
             gate_values,

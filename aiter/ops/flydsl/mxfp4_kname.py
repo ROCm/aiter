@@ -17,6 +17,9 @@ _MXMOE_G1_FLAG_TOKENS = {
     "SITUV2",
     "SWIGLU",
     "W2",
+    # GEMM1 rounds the activation to bf16 before its fused MX quant and scales
+    # the gate by alpha before exp2, as the two-stage path does (MXFP4 output).
+    "BF16Q",
 }
 _MXMOE_G2_FLAG_TOKENS = {"NT", "ATOMIC", "F4OUT", "CSHUFFLE"}
 _MXMOE_NUMERIC_RE = re.compile(r"^([A-Z]+)(\d+)$")
@@ -124,6 +127,7 @@ def _parse_mxfp4_g1_kname_cached(kname: str) -> dict:
         "act": act,
         "num_waves": 2 if "W2" in flags else 4,
         "k_wave": nums.get("k_wave", 1),
+        "bf16_act_quant": "BF16Q" in flags,
     }
 
 

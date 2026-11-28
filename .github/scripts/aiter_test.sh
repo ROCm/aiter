@@ -105,7 +105,7 @@ for file in "${sharded_files[@]}"; do
     # batch gate so they exercise the persistent kernel at every batch size.
     test_cmd=(timeout 60m python3 "$file")
     case "$file" in
-        op_tests/test_flydsl_moe_a16wfp4.py)
+        op_tests/test_flydsl_moe_a16wfp4.py|op_tests/test_flydsl_mxmoe_gemm1_bf16q.py)
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
             ;;
         op_tests/test_gemm_a8w8.py)
