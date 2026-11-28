@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""BF16/MXFP4 scatter bounds regression at MiniMax-M3 H=6144, TOPK=5.
+"""BF16/MXFP4 scatter reference and bounds tests for generated (H, TOPK) keys.
 
 Run with: pytest op_tests/test_moe_scatter_reduce.py -q
 """
@@ -17,11 +17,14 @@ aiter = pytest.importorskip("aiter")
 
 pytest.importorskip("aiter.ops.moe_mxfp4_aux", reason="mxfp4 MoE aux module")
 
-# MiniMax-M3 TP4 shape from gen_instances.SHAPES / the C40 fault.
-M3_H = 6144
-M3_TOPK = 5
+from aiter.jit.utils.chip_info import get_gfx_runtime
+
+# (D_HIDDEN, TOPK) scatter keys from gen_instances.SHAPES: MiniMax-M3 TP4 (the
+# C40 fault) and Muse Spark TP4+EP4.
+SCATTER_KEYS = ((6144, 5), (4096, 2))
+SCATTER_IDS = tuple(f"H{h}_TOPK{topk}" for h, topk in SCATTER_KEYS)
 # Keep unit-test M small; coverage of the NT path is via MB>=128, not M.
-M3_MS = (1, 64)
+TEST_MS = (1, 64)
 
 
 def _reference(flat_out, reverse_sorted, sorted_weights, M, topk, max_sorted):
@@ -67,11 +70,11 @@ def _run_scatter(flat_out, reverse_sorted, sorted_weights, out, topk, mb):
     torch.cuda.synchronize()
 
 
+@pytest.mark.parametrize("D, topk", SCATTER_KEYS, ids=SCATTER_IDS)
 @pytest.mark.parametrize("mb", (16, 128), ids=("nt0", "nt1"))
-@pytest.mark.parametrize("M", M3_MS)
-def test_scatter_reduce_matches_reference(M, mb):
+@pytest.mark.parametrize("M", TEST_MS)
+def test_scatter_reduce_matches_reference(M, mb, D, topk):
     torch.manual_seed(M * 17 + mb)
-    D, topk = M3_H, M3_TOPK
     # Enough staging rows for a dense (token, topk) map with BM padding headroom.
     max_sorted = ((M * topk + mb - 1) // mb) * mb + mb
     flat = torch.randn(max_sorted, D, dtype=torch.bfloat16, device="cuda")
@@ -85,42 +88,28 @@ def test_scatter_reduce_matches_reference(M, mb):
     _assert_bf16_matches(out, ref)
 
 
+@pytest.mark.parametrize("D, topk", SCATTER_KEYS, ids=SCATTER_IDS)
 @pytest.mark.parametrize("mb", (16, 128), ids=("nt0", "nt1"))
-def test_scatter_reduce_skips_negative_and_oob_indices(mb):
+def test_scatter_reduce_skips_negative_and_oob_indices(mb, D, topk):
     """Corrupt reverse map must not aperture-fault; skipped routes contribute 0."""
     torch.manual_seed(mb)
-    M, D, topk = 4, M3_H, M3_TOPK
+    M = 4
     max_sorted = 32
     flat = torch.randn(max_sorted, D, dtype=torch.bfloat16, device="cuda")
     weights = torch.ones(max_sorted, dtype=torch.float32, device="cuda")
     # Mix of legal, EP-skip (-1), and past-the-end indices.
-    rs = torch.tensor(
+    rs = torch.arange(M * topk, dtype=torch.int32, device="cuda")
+    rs[1:6] = torch.tensor(
         [
-            0,
             -1,
             max_sorted,  # == max_sorted: must skip
             max_sorted + 7,  # well past flat_out
-            1,
             -3,
             2**20,  # huge garbage
-            3,
-            4,
-            5,
-            6,
-            7,
-            8,
-            9,
-            10,
-            11,
-            12,
-            13,
-            14,
-            15,
         ],
         dtype=torch.int32,
         device="cuda",
     )
-    assert rs.numel() == M * topk
     out = torch.full((M, D), float("nan"), dtype=torch.bfloat16, device="cuda")
 
     _run_scatter(flat, rs, weights, out, topk, mb)
@@ -128,11 +117,17 @@ def test_scatter_reduce_skips_negative_and_oob_indices(mb):
     _assert_bf16_matches(out, ref, exact=True)
 
 
+# opus::fp4_to_fp32_packed_x8 is a zero-returning stub on gfx942, so the packed
+# FP4 output cannot match the reference there.
+@pytest.mark.skipif(
+    get_gfx_runtime() != "gfx950", reason="MXFP4 scatter decode needs gfx950"
+)
+@pytest.mark.parametrize("D, topk", SCATTER_KEYS, ids=SCATTER_IDS)
 @pytest.mark.parametrize("mb", (16, 128), ids=("nt0", "nt1"))
-def test_scatter_reduce_mxfp4_bounds_and_reference(mb):
+def test_scatter_reduce_mxfp4_bounds_and_reference(mb, D, topk):
     """Exercise packed FP4 data and varying E8M0 scales, including OOB skips."""
     torch.manual_seed(mb)
-    M, rows, D, topk = 6, 32, M3_H, M3_TOPK
+    M, rows = 6, 32
     packed = torch.randint(0, 256, (rows, D // 2), dtype=torch.uint8, device="cuda")
     scales = torch.randint(125, 130, (rows, D // 32), dtype=torch.uint8, device="cuda")
     lut = torch.tensor(
@@ -164,14 +159,17 @@ def test_scatter_reduce_mxfp4_bounds_and_reference(mb):
     assert torch.count_nonzero(out[0]) == 0
 
 
+@pytest.mark.parametrize("D, topk", SCATTER_KEYS, ids=SCATTER_IDS)
 @pytest.mark.parametrize("mb", (16, 128), ids=("nt0", "nt1"))
-def test_scatter_reduce_last_row_and_all_skipped(mb):
-    rows, D, topk = 32, M3_H, M3_TOPK
+def test_scatter_reduce_last_row_and_all_skipped(mb, D, topk):
+    rows = 32
     flat = torch.full((rows, D), float("nan"), dtype=torch.bfloat16, device="cuda")
     flat[-1] = 2
     weights = torch.ones(rows, device="cuda")
+    # Token 0 routes are all skipped; token 1 reads only the last staging row.
+    skipped = [-1, -7, rows, rows + 7, 2**20]
     rs = torch.tensor(
-        [-1, -7, rows, rows + 7, 2**20, rows - 1, -1, rows, -1, -1],
+        (skipped * topk)[:topk] + ([rows - 1] + [-1, rows, -1, -1] * topk)[:topk],
         dtype=torch.int32,
         device="cuda",
     )
