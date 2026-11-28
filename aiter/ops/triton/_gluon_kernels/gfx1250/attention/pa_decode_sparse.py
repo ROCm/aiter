@@ -520,6 +520,10 @@ def _pa_decode_sparse_reduce(
     BLOCK_K: gl.constexpr,
     HAS_EXTRA: gl.constexpr,
     num_warps: gl.constexpr,
+    lse_ptr=None,
+    HAS_LSE: gl.constexpr = False,
+    ALL_SPLITS: gl.constexpr = False,
+    live_splits=0,
 ):
     """Gluon reduce for pa_decode_sparse: combine KV_SPLITS partials, fold in
     attn_sink, write final output.
@@ -624,6 +628,8 @@ def _pa_decode_sparse_reduce(
     # free to hand us: every segment is then inactive and the output is zero.
     act_num_segments = gl.cdiv(num_tiles, gl.maximum(tiles_per_segment, 1))
     seg_active = offs_k[:, None] < act_num_segments
+    if ALL_SPLITS:  # the caller launched exactly live_splits splits, all used
+        seg_active = offs_k[:, None] < live_splits
     neg_inf = gl.full([KV_SPLITS, BLOCK_H], float("-inf"), gl.float32, layout=L_KH)
     zero_kh = gl.full([KV_SPLITS, BLOCK_H], 0.0, gl.float32, layout=L_KH)
     zero_khd = gl.full([KV_SPLITS, BLOCK_H, BLOCK_D], 0.0, gl.float32, layout=BLK3)
@@ -665,6 +671,17 @@ def _pa_decode_sparse_reduce(
     l_combined_hd = gl.convert_layout(l_combined, gl.SliceLayout(1, L_HD))
     l_final = l_combined_hd * alpha_kv + alpha_sink
     acc_final = acc_combined * alpha_kv[:, None]
+
+    if HAS_LSE:
+        LN2: gl.constexpr = 0.6931471805599453
+        log_l = gl.log2(l_combined_hd) * LN2
+        m_nat = m_max_hd * LN2
+        gl.amd.cdna4.buffer_store(
+            gl.where(l_combined_hd > 0.0, m_nat + log_l, float("-inf")),
+            ptr=lse_ptr + t * H,
+            offsets=h_offs_out_eff.to(gl.int32),
+            mask=h_offs_out_eff < H,
+        )
 
     safe_denom = gl.maximum(l_final, 1.0e-30)
     out_val = gl.where(l_final[:, None] > 0.0, acc_final / safe_denom[:, None], 0.0)
