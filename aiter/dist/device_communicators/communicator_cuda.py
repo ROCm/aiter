@@ -22,6 +22,10 @@ from .base_device_communicator import All2AllManagerBase, DeviceCommunicatorBase
 _GLUON_AR_MAX_BYTES = 8 << 20
 # The plain Gluon all-reduce is faster than the custom all-reduce and RCCL up to 4 MiB.
 _GLUON_PLAIN_AR_MAX_BYTES = 4 << 20
+# Where the Lamport one-shot can take the call, the Gluon all-reduce + RMSNorm for
+# power-of-2 hidden (self.gluon_ar) is the faster route up to this hidden size only:
+# at 4096 / 8192 it took 1.02-1.63x / 1.45-4.85x the time of the routes after it.
+_GLUON_AR_MAX_HIDDEN_WITH_LAMPORT = 2048
 
 should_nccl_symm_mem_allreduce = False
 _SUPPORTED_ALL2ALL_MANAGER_BACKENDS = ("flydsl", "mori", "mori_v2")
@@ -426,9 +430,19 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if x_pad_to_multiple > 0:
             out_n = (n + x_pad_to_multiple - 1) // x_pad_to_multiple * x_pad_to_multiple
         total_bytes = input_.numel() * input_.element_size()
+        ca_comm = self.ca_comm
+        # gfx1250 Lamport one-shot fused kernel: no barrier and no copy-in, so
+        # it beats the routes below up to its size cap (see
+        # _LAMPORT_AR_RMS_MAX_BYTES).
+        lamport = (
+            ca_comm is not None
+            and x_pad_to_multiple == 0
+            and ca_comm.should_lamport_ar_rms(input_, res_inp_, weight_, out_n)
+        )
         if (
             self.gluon_ar is not None
             and total_bytes <= _GLUON_AR_MAX_BYTES
+            and (n <= _GLUON_AR_MAX_HIDDEN_WITH_LAMPORT or not lamport)
             and input_.dim() == 2
             and input_n == n
             and n >= 256
@@ -455,15 +469,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 self.cpu_group,
                 *self.gluon_ar,
             )
-        ca_comm = self.ca_comm
-        # gfx1250 Lamport one-shot fused kernel: no barrier and no copy-in, so
-        # it beats the routes below up to its size cap (see
-        # _LAMPORT_AR_RMS_MAX_BYTES).
-        lamport = (
-            ca_comm is not None
-            and x_pad_to_multiple == 0
-            and ca_comm.should_lamport_ar_rms(input_, res_inp_, weight_, out_n)
-        )
         if x_pad_to_multiple == 0 and _use_gluon_ar_norm(
             self, input_, res_inp_, weight_, lamport
         ):
