@@ -2437,23 +2437,77 @@ def test_mha_v4_bf16fp8_matches_dequantized_reference(sequence_q, sequence_k):
     assert cosine > 0.998
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 hd128 BF16 XCD relabel")
+_FP8_NATIVE = native_fp8_format()
+# (formats, scale modes, head dim, bound): each bound is about twice the recipe's own error
+# against float32 attention.
+_XCD_RELABEL_RECIPES = [
+    param((AttentionFormat.BF16,) * 3, {}, 128, 0.01, id="bf16"),
+    param(
+        (AttentionFormat.BF16, AttentionFormat.BF16, AttentionFormat.FP8),
+        {},
+        128,
+        0.1,
+        id="bf16fp8",
+    ),
+    param(
+        (AttentionFormat.INT8, AttentionFormat.INT8, _FP8_NATIVE),
+        {},
+        128,
+        0.1,
+        id="i8fp8",
+    ),
+    param((_FP8_NATIVE,) * 3, {}, 128, 0.15, id="fp8"),
+    param(*_mx_recipe_args("mxfp8"), 128, 0.12, id="mxfp8"),
+    param((_FP8_NATIVE, _FP8_NATIVE, AttentionFormat.MXFP6), {}, 128, 0.15, id="f8f6"),
+    param(
+        (AttentionFormat.MXFP6, AttentionFormat.MXFP6, _FP8_NATIVE),
+        {},
+        128,
+        0.12,
+        id="f6f8",
+    ),
+    param(*_mx_recipe_args("mxfp6"), 128, 0.13, id="mxfp6"),
+    param(
+        (AttentionFormat.MXFP6, AttentionFormat.MXFP6, AttentionFormat.MXFP4),
+        {},
+        128,
+        0.25,
+        id="f6f4",
+    ),
+    param(*_mx_recipe_args("mxfp4"), 128, 0.4, id="mxfp4"),
+    param((AttentionFormat.BF16,) * 3, {}, 256, 0.01, id="bf16_hd256"),
+    param(*_mx_recipe_args("mxfp4"), 256, 0.4, id="mxfp4_hd256"),
+    param(*_mx_recipe_args("mxfp6"), 256, 0.13, id="mxfp6_hd256"),
+    param(*_mx_recipe_args("mxfp8"), 256, 0.12, id="mxfp8_hd256"),
+]
+
+
+_XCD_RELABEL_SEEDS = itertools.count(46)
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 XCD relabel")
 @parametrize(
-    ("v_format", "bound"),
+    ("heads", "queries"),
     [
-        param(AttentionFormat.BF16, 0.01, id="bf16"),
-        # FP8 V alone costs about 0.04 against float32 attention.
-        param(AttentionFormat.FP8, 0.1, id="bf16fp8"),
+        # Work-groups = heads x Q tiles of 256. The kernels relabel them per XCD: by eighths of
+        # the grid when it is a multiple of 8 up to about 32 heads, else in blocks of 64.
+        param(8, 2048, id="multiple_of_8"),
+        param(5, 3400, id="not_multiple_of_8"),
+        param(40, 512, id="40_heads"),
     ],
 )
-def test_mha_v4_bf16_hd128_xcd_relabel_matches_attention(v_format, bound):
-    # 8 heads x 2 Q tiles: the kernel relabels its work-groups per XCD.
-    torch.manual_seed(46)
-    q = torch.randn((1, 300, 8, 128), device="cuda", dtype=torch.bfloat16)
-    k = torch.randn((1, 384, 8, 128), device="cuda", dtype=torch.bfloat16)
+@parametrize(("formats", "scale_modes", "head_dim", "bound"), _XCD_RELABEL_RECIPES)
+def test_mha_v4_xcd_relabel_matches_attention(
+    heads, queries, formats, scale_modes, head_dim, bound
+):
+    # New inputs every case: a row that no work-group writes keeps what the allocator left
+    # there, which must not be an earlier case's output for the same inputs.
+    torch.manual_seed(next(_XCD_RELABEL_SEEDS))
+    q = torch.randn((1, queries, heads, head_dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 384, heads, head_dim), device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
 
-    out = mha_v4(q, k, v, AttentionFormat.BF16, AttentionFormat.BF16, v_format)
+    out = mha_v4(q, k, v, *formats, **scale_modes)
     torch.cuda.synchronize()
 
     reference = _dense_reference(q.float(), k.float(), v.float(), k.shape[1])
