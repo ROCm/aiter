@@ -6,7 +6,6 @@ Triton kernel to build the block-sparse LUT (kv_block_indices) from a 4D block
 attention mask without using nonzero or argsort.
 """
 
-import torch
 import triton
 import triton.language as tl
 
@@ -79,35 +78,3 @@ def _block_attn_mask_to_lut_kernel(
         write_offset = write_offset + tl.sum(mask_vals)
 
     # No return; kv_block_indices is written in place
-
-
-def block_attn_mask_to_lut_kernel(
-    block_attn_mask: torch.Tensor,
-    lut_start: torch.Tensor,
-    lut_count: torch.Tensor,
-    kv_block_indices: torch.Tensor,
-    BLOCK_KB: int = 128,
-):
-    """
-    Launch the LUT-fill kernel. Caller must ensure block_attn_mask is 4D
-    (batch, num_heads, num_q_blocks, num_kv_blocks) and kv_block_indices has
-    length lut_count.sum().
-    """
-    batch, num_heads, num_q_blocks, num_kv_blocks = block_attn_mask.shape
-    num_programs = batch * num_heads * num_q_blocks
-
-    grid = (num_programs,)
-    _block_attn_mask_to_lut_kernel[grid](
-        block_attn_mask,
-        lut_start,
-        lut_count,
-        kv_block_indices,
-        stride_mask_b=block_attn_mask.stride(0),
-        stride_mask_h=block_attn_mask.stride(1),
-        stride_mask_qb=block_attn_mask.stride(2),
-        stride_mask_kb=block_attn_mask.stride(3),
-        num_heads=num_heads,
-        num_q_blocks=num_q_blocks,
-        num_kv_blocks=num_kv_blocks,
-        BLOCK_KB=BLOCK_KB,
-    )
