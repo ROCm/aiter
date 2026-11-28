@@ -1170,7 +1170,9 @@ class ValidateKernelPrTests(unittest.TestCase):
         SKILL.md rather than restating it means the two cannot drift apart silently.
         """
         skill = review_skill_text()
-        blocks = [b for b in re.findall(r"<<'PY'\n(.*?)\nPY\n", skill, re.DOTALL)
+        # fetch.sh redirects the gate's stderr on the heredoc line (<<'PY' 2>...), so
+        # the opener may carry text after the delimiter.
+        blocks = [b for b in re.findall(r"<<'PY'[^\n]*\n(.*?)\nPY\n", skill, re.DOTALL)
                   if "expected_verdict" in b]
         # Selected by what the block IS, not by its position. Indexing into the heredocs
         # made this test depend on how many unrelated Python blocks happened to precede
