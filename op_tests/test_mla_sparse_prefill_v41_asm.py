@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Correctness checks for gfx1250 H64 fused V4.1 sparse MLA.
+"""Existing H64 ASM suite, updated for the 144B BF16-Q / FP8-O Q/O contract.
 
-Set ``AITER_TEST_V41_ASM_COMPILE=1`` to include the torch.compile check.
+AITER_TEST_V41_ASM_COMPILE=1 enables fullgraph checks for both allocating and
+preallocated outputs. OPUS attention-only routing is tested separately below.
 """
 
 import importlib
@@ -16,71 +17,90 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from aiter.ops.mla_sparse_prefill import mla_sparse_prefill_v41
-from aiter.test_common import checkAllclose
 from op_tests.test_mla_sparse_prefill import (
+    _check_v41_qo_output,
     _get_gpu_arch,
     _make_inputs_v41,
+    _prepare_v41_qo_inputs,
+    _qo_dequantize,
+    _qo_quantize,
     _ref_mla_sparse_prefill_fp8,
+    _ref_mla_sparse_prefill_qo,
 )
 
-_SCALE = 1.0 / math.sqrt(512)
+native = importlib.import_module("aiter.ops.mla_sparse_prefill_v41_asm")
+_SCALE = 512**-0.5
+_ORDER = [
+    "q_nope",
+    "cos",
+    "sin",
+    "positions",
+    "unified_kv",
+    "unified_kv_scale",
+    "kv",
+    "kv_scale",
+    "kv_indptr_prefix",
+    "kv_indices_prefix",
+    "kv_indptr_extend",
+    "kv_indices_extend",
+    "attn_sink",
+]
 
 
 @pytest.fixture(scope="module", autouse=True)
 def _requires_gfx1250():
     if torch.version.hip is None or not torch.cuda.is_available():
-        pytest.skip("requires a ROCm GPU")
+        pytest.skip("requires ROCm")
     if _get_gpu_arch() != "gfx1250":
-        pytest.skip("the fused V4.1 A8W4 CO requires gfx1250")
+        pytest.skip("Q/O ASM requires gfx1250")
 
 
 def _case(n=2, csa_rows=65, swa_rows=128, *, no_sink=False, window=None):
     data = _make_inputs_v41(
-        n,
-        64,
-        csa_rows,
-        swa_rows,
-        topk=0,
-        window=window,
-        prefix_fp4=True,
-        seed=0,
+        n, 64, csa_rows, swa_rows, topk=0, window=window, prefix_fp4=True, seed=0
     )
-    inputs = data["kernel"]
-    for name in ("unified_kv", "unified_kv_scale"):
-        value = inputs[name]
-        inputs[name] = value.view(torch.uint8).contiguous().view(value.dtype)
+    inputs = _prepare_v41_qo_inputs(data)
     if no_sink:
         inputs["attn_sink"] = None
-        data["ref"]["attn_sink"] = torch.full(
-            (64,), -math.inf, dtype=torch.float32, device="cuda"
-        )
-    reference = _ref_mla_sparse_prefill_fp8(**data["ref"], softmax_scale=_SCALE)
-    return inputs, reference
+    reference = _ref_mla_sparse_prefill_qo(inputs, data["ref"], _SCALE)
+    return inputs, (reference, inputs, data["ref"])
 
 
-def _invoke(inputs, splits=1, *, out=None, backend="asm", softmax_scale=_SCALE):
-    return mla_sparse_prefill_v41(
+def _invoke(
+    inputs,
+    splits=1,
+    *,
+    out=None,
+    out_scale=None,
+    partial_r=None,
+    partial_lse=None,
+    softmax_scale=_SCALE,
+):
+    return native._asm_sparse_prefill_v41(
         **inputs,
         softmax_scale=softmax_scale,
-        out=out,
         num_kv_splits=splits,
-        backend=backend,
+        out=out,
+        out_scale=out_scale,
+        partial_r=partial_r,
+        partial_lse=partial_lse,
     )
 
 
 def _check(actual, expected):
-    assert actual.shape == expected.shape
-    assert actual.dtype == torch.bfloat16
-    assert bool(torch.isfinite(actual).all())
-    error = checkAllclose(actual, expected, rtol=0.01, atol=0.01, tol_err_ratio=0.01)
-    assert error <= 0.01, f"mismatch fraction {error} exceeds 0.01"
+    ref, inputs, _ = expected
+    return _check_v41_qo_output(actual, ref, inputs)
+
+
+def _equal(a, b):
+    assert torch.equal(
+        a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8)
+    )
 
 
 @pytest.mark.parametrize("splits", range(1, 17))
 @pytest.mark.parametrize("csa_rows,swa_rows", [(1025, 128), (1, 1)])
 def test_explicit_splits(splits, csa_rows, swa_rows):
-    # 1025 CSA rows exercise every split; 1+1 tiles exercise empty splits.
     inputs, expected = _case(csa_rows=csa_rows, swa_rows=swa_rows)
     _check(_invoke(inputs, splits), expected)
 
@@ -103,7 +123,6 @@ def test_explicit_splits(splits, csa_rows, swa_rows):
     ],
 )
 def test_pool_and_tile_boundaries(splits, n, csa_rows, swa_rows):
-    # N=65 covers SWA's 64/65 boundary with causal CSR.
     inputs, expected = _case(n, csa_rows, swa_rows)
     _check(_invoke(inputs, splits), expected)
 
@@ -111,324 +130,382 @@ def test_pool_and_tile_boundaries(splits, n, csa_rows, swa_rows):
 @pytest.mark.parametrize("splits", [1, 4, 16])
 @pytest.mark.parametrize(
     "n,csa_rows,window",
-    [
-        (129, 65, 0),
-        (129, 0, 128),
-        (129, 65, 128),
-        (257, 65, 128),
-        (129, 65, 1000),
-    ],
+    [(129, 65, 0), (129, 0, 128), (129, 65, 128), (257, 65, 128), (129, 65, 1000)],
 )
 def test_sliding_window(splits, n, csa_rows, window):
     inputs, expected = _case(n, csa_rows, n, window=window)
-    indptr = inputs["kv_indptr_extend"].tolist()
-    indices = inputs["kv_indices_extend"].tolist()
-    if window == 0:
-        assert indptr == [0] * (n + 1) and indices == []
-    else:
-        assert indices[indptr[0] : indptr[1]] == [0]
-        # Check the advancing row IDs independently of the numerical reference,
-        # which consumes the generated CSR too. N=257 also crosses the next window.
-        for token in (127, 128, n - 1):
-            rows = indices[indptr[token] : indptr[token + 1]]
-            assert rows == list(range(max(0, token + 1 - window), token + 1))
+    ip, ix = inputs["kv_indptr_extend"].tolist(), inputs["kv_indices_extend"].tolist()
+    for i in [0, 127, 128, n - 1]:
+        assert ix[ip[i] : ip[i + 1]] == list(range(max(0, i + 1 - window), i + 1))
     _check(_invoke(inputs, splits), expected)
 
 
 @pytest.mark.parametrize("splits", [None, 1, 3, 16])
-@pytest.mark.parametrize("provided_out", [False, True])
-def test_no_sink_and_output(splits, provided_out):
+@pytest.mark.parametrize("provided", [False, True])
+def test_no_sink_and_preallocated_outputs(splits, provided):
     inputs, expected = _case(n=3, no_sink=True)
-    out = torch.empty_like(expected) if provided_out else None
-    actual = _invoke(inputs, splits, out=out)
-    if out is not None:
-        assert actual.data_ptr() == out.data_ptr()
+    out = (
+        torch.empty((3, 64, 512), device="cuda", dtype=torch.float8_e4m3fn)
+        if provided
+        else None
+    )
+    sc = (
+        torch.empty((3, 64, 16), device="cuda", dtype=torch.uint8) if provided else None
+    )
+    actual = _invoke(inputs, splits, out=out, out_scale=sc)
+    if provided:
+        assert actual[0] is out and actual[1] is sc
     _check(actual, expected)
 
 
 @pytest.mark.parametrize("splits", [1, 4])
-def test_public_default_reaches_native_entry(monkeypatch, splits):
-    native_module = importlib.import_module("aiter.ops.mla_sparse_prefill_v41_asm")
-    native_entry = native_module.asm_mla_sparse_prefill_v41_fwd
+def test_wrapper_uses_exact_kernel_order(monkeypatch, splits):
+    actual_entry = native.asm_mla_sparse_prefill_v41_fwd
     calls = []
 
-    def record_and_launch(*args):
+    def record(*args):
         calls.append(args)
-        return native_entry(*args)
+        return actual_entry(*args)
 
-    monkeypatch.setattr(
-        native_module, "asm_mla_sparse_prefill_v41_fwd", record_and_launch
-    )
+    monkeypatch.setattr(native, "asm_mla_sparse_prefill_v41_fwd", record)
     inputs, expected = _case(no_sink=True)
-    actual = _invoke(inputs, splits, backend=None)
-    _check(actual, expected)
-    assert len(calls) == 1
+    out, scale = _invoke(inputs, splits)
+    _check((out, scale), expected)
+    assert len(calls) == 1 and len(calls[0]) == 19
     args = calls[0]
-    assert len(args) == 16
-    assert args[10] is not None and args[10].shape == (64,)
-    assert bool(torch.isneginf(args[10]).all())
-    assert args[11].data_ptr() == actual.data_ptr()
-    assert args[12] == _SCALE and args[13] == splits
+    for i, name in enumerate(_ORDER[:-1]):
+        assert args[i].data_ptr() == inputs[name].data_ptr()
+    assert torch.isneginf(args[12]).all() and args[12].shape == (64,)
+    assert args[13] == _SCALE and args[14] == splits
+    assert (
+        args[15].data_ptr() == out.data_ptr()
+        and args[16].data_ptr() == scale.data_ptr()
+    )
     if splits == 1:
-        assert args[14] is None and args[15] is None
+        assert args[17] is None and args[18] is None
     else:
-        assert args[14].shape == (2, splits, 65, 512)
-        assert args[15].shape == (2, splits, 64)
-        assert args[14].dtype == args[15].dtype == torch.float32
+        assert args[17].shape == (2, splits, 65, 512) and args[18].shape == (
+            2,
+            splits,
+            64,
+        )
 
 
 @pytest.mark.parametrize(
-    "n,csa_rows,window",
+    "n,topk,splits",
+    [(8, 512, 1), (32, 512, 1), (32, 1024, 4), (64, 1024, 2), (96, 1024, 1)],
+)
+def test_auto_split_matches_forced(n, topk, splits):
+    data = _make_inputs_v41(
+        n, 64, topk, 128, topk=topk, window=128, prefix_fp4=True, seed=0
+    )
+    x = _prepare_v41_qo_inputs(data)
+    assert (
+        native._auto_v41_asm_splits(
+            n,
+            x["kv_indices_prefix"].numel() + x["kv_indices_extend"].numel(),
+            prefix_nnz=x["kv_indices_prefix"].numel(),
+            prefix_rows=x["unified_kv"].shape[0],
+        )
+        == splits
+    )
+    a, b = _invoke(x, None), _invoke(x, splits)
+    for x, y in zip(a, b):
+        _equal(x, y)
+
+
+@pytest.mark.parametrize(
+    "n,pool,topk,splits",
     [
-        (8, 4096, None),
-        (16, 1024, None),
-        (32, 1024, None),
-        (96, 1024, None),
-        (32, 1024, 16),
+        (8, 65536, 512, 4),
+        (16, 65536, 512, 4),
+        (8, 65536, 1024, 8),
+        (16, 65536, 1024, 8),
+        (32, 65536, 512, 1),
+        (32, 1048576, 512, 4),
+        (48, 65536, 1024, 4),
+        (64, 65536, 1024, 4),
     ],
 )
-def test_auto_split_matches_forced(monkeypatch, n, csa_rows, window):
-    native_module = importlib.import_module("aiter.ops.mla_sparse_prefill_v41_asm")
-    native_entry = native_module.asm_mla_sparse_prefill_v41_fwd
-    selected = []
-
-    def record_and_launch(*args):
-        selected.append(args[13])
-        return native_entry(*args)
-
-    monkeypatch.setattr(
-        native_module, "asm_mla_sparse_prefill_v41_fwd", record_and_launch
+def test_tuned_auto_split_matches_forced(n, pool, topk, splits):
+    data = _make_inputs_v41(
+        n, 64, pool, 128, topk=topk, window=128, prefix_fp4=True, seed=0
     )
-    inputs, expected = _case(
-        n=n, csa_rows=csa_rows, swa_rows=128 if window is None else n, window=window
-    )
-    nnz = inputs["kv_indices_prefix"].numel() + inputs["kv_indices_extend"].numel()
-    split = native_module._auto_v41_asm_splits(
-        n, nnz, prefix_nnz=inputs["kv_indices_prefix"].numel()
-    )
-    if window is not None:
-        # Cover sliding-window correctness with the host-selected S4 launch.
-        assert split == 4
-        indptr = inputs["kv_indptr_extend"].tolist()
-        indices = inputs["kv_indices_extend"].tolist()
-        for token in (window - 1, window, n - 1):
-            assert indices[indptr[token] : indptr[token + 1]] == list(
-                range(max(0, token + 1 - window), token + 1)
-            )
-    actual = _invoke(inputs, None)
-    _check(actual, expected)
-    forced = _invoke(inputs, split)
-    assert selected == [split, split]
-    assert torch.equal(actual, forced)
+    x = _prepare_v41_qo_inputs(data)
+    ref = _ref_mla_sparse_prefill_qo(x, data["ref"], _SCALE)
+    a, b = _invoke(x, None), _invoke(x, splits)
+    _check_v41_qo_output(a, ref, x)
+    for actual, forced in zip(a, b):
+        _equal(actual, forced)
 
 
-@pytest.mark.parametrize(
-    "n,topk,expected",
-    [
-        (0, 512, 1),
-        (1, 512, 1),
-        (1, 1024, 4),
-        (31, 1024, 4),
-        (32, 512, 1),
-        (32, 1024, 4),
-        (33, 512, 1),
-        (33, 1024, 2),
-        (48, 1024, 2),
-        (63, 1024, 2),
-        (64, 512, 1),
-        (64, 1024, 2),
-        (65, 1024, 1),
-        (65, 4096, 1),
-        (96, 512, 1),
-        (192, 4096, 1),
-    ],
-)
-def test_auto_split_scalar_policy(monkeypatch, n, topk, expected):
-    native_module = importlib.import_module("aiter.ops.mla_sparse_prefill_v41_asm")
-
-    def unexpected_cu_query():
-        pytest.fail("the fixed scalar policy must not query CU count")
-
-    monkeypatch.setattr(native_module, "get_cu_num", unexpected_cu_query)
-    prefix_nnz = n * topk
-    extend_nnz = n * (n + 1) // 2 if n <= 128 else 128 * n - 8128
-    split = native_module._auto_v41_asm_splits(
-        n, prefix_nnz + extend_nnz, prefix_nnz=prefix_nnz
-    )
-    assert split == expected
+@pytest.mark.parametrize("splits", [1, 3, 16])
+def test_positions_and_input_immutability(splits):
+    x, expected = _case(3)
+    x["positions"] = torch.tensor([1030, 0, 517], device="cuda", dtype=torch.int64)
+    ref = _ref_mla_sparse_prefill_qo(x, expected[2], _SCALE)
+    before = {
+        k: v.view(torch.uint8).clone()
+        for k, v in x.items()
+        if isinstance(v, torch.Tensor)
+    }
+    a = _invoke(x, splits)
+    _check_v41_qo_output(a, ref, x)
+    b = _invoke(x, splits)
+    for k, v in before.items():
+        _equal(x[k], v)
+    for v, w in zip(a, b):
+        _equal(v, w)
 
 
-@pytest.mark.parametrize(
-    "n,topk,pass_prefix,expected",
-    [(8, 384, True, 1), (32, 2048, True, 5), (33, 1024, False, 3)],
-)
-def test_auto_split_scalar_fallback(monkeypatch, n, topk, pass_prefix, expected):
-    native_module = importlib.import_module("aiter.ops.mla_sparse_prefill_v41_asm")
-    queried = []
+@pytest.mark.parametrize("splits", [1, 7, 16])
+@pytest.mark.parametrize("fill", [0xA5, 0x5A, 0xFF])
+def test_guards_workspace_and_repeated_output(splits, fill):
+    x, expected = _case(2, 129, 129)
 
-    def cu_count():
-        queried.append(True)
-        return 256
+    def guarded(shape, dtype):
+        count = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+        raw = torch.full((count + 1024,), 0x35, device="cuda", dtype=torch.uint8)
+        raw[512:-512].fill_(fill)
+        return raw[512:-512].view(dtype).view(shape), raw
 
-    monkeypatch.setattr(native_module, "get_cu_num", cu_count)
-    nnz = n * topk + n * (n + 1) // 2
-    kwargs = {"prefix_nnz": n * topk} if pass_prefix else {}
-    split = native_module._auto_v41_asm_splits(n, nnz, **kwargs)
-    # Frozen RR fallback at 256 CUs: c0=290, c1=.045, auto candidates 1..16.
-    assert split == expected
-    assert queried == [True]
+    out, g0 = guarded((2, 64, 512), torch.float8_e4m3fn)
+    sc, g1 = guarded((2, 64, 16), torch.uint8)
+    r = lse = None
+    guards = [g0, g1]
+    if splits > 1:
+        r, g2 = guarded((2, splits, 65, 512), torch.float32)
+        lse, g3 = guarded((2, splits, 64), torch.float32)
+        guards += [g2, g3]
+    a = _invoke(x, splits, out=out, out_scale=sc, partial_r=r, partial_lse=lse)
+    _check(a, expected)
+    for guard in guards:
+        assert bool((guard[:512] == 0x35).all() and (guard[-512:] == 0x35).all())
+    if r is not None:
+        assert bool((r[:, :, 64].contiguous().view(torch.uint8) == fill).all())
+
+
+@pytest.mark.parametrize("value", [0.0, 1e-15, 1e-10, 448 * 2.0**-20, 449 * 2.0**-20])
+@pytest.mark.parametrize("splits", [1, 16])
+def test_zero_tiny_and_scale_boundaries(value, splits):
+    x, expected = _case(1, 0, 1, no_sink=True, window=1)
+    x["q_nope"].zero_()
+    x["cos"].fill_(1)
+    x["sin"].zero_()
+    real = torch.full((1, 512), value, device="cuda", dtype=torch.float32)
+    kv, sc = _qo_quantize(real)
+    x["kv"] = kv
+    x["kv_scale"] = sc
+    expected[2]["kv_fp32"] = _qo_dequantize(kv, sc)
+    ref = _ref_mla_sparse_prefill_qo(x, expected[2], _SCALE)
+    out, scale = _invoke(x, splits)
+    _check_v41_qo_output((out, scale), ref, x)
+    rq, rs = _qo_quantize(ref)
+    _equal(out, rq)
+    _equal(scale, rs)
 
 
 def test_zero_queries_does_not_launch(monkeypatch):
-    native_module = importlib.import_module("aiter.ops.mla_sparse_prefill_v41_asm")
+    x, _expected = _case(0, 0, 0)
 
-    def unexpected_launch(*_args):
-        pytest.fail("N=0 must return before the native entry")
+    def forbidden(*args):
+        pytest.fail("zero query launched")
 
-    monkeypatch.setattr(
-        native_module, "asm_mla_sparse_prefill_v41_fwd", unexpected_launch
-    )
-    inputs, expected = _case(0, 0, 0, no_sink=True)
-    actual = _invoke(inputs, 16)
-    assert actual.shape == expected.shape == (0, 64, 512)
-    assert actual.dtype == torch.bfloat16
+    monkeypatch.setattr(native, "asm_mla_sparse_prefill_v41_fwd", forbidden)
+    out, scale = _invoke(x)
+    assert out.shape == (0, 64, 512) and scale.shape == (0, 64, 16)
 
 
-@pytest.mark.parametrize("splits", [1, 4])
-def test_raw_byte_csa(splits):
-    inputs, expected = _case()
-    inputs["unified_kv"] = inputs["unified_kv"].view(torch.uint8)
-    inputs["unified_kv_scale"] = inputs["unified_kv_scale"].view(torch.uint8)
-    _check(_invoke(inputs, splits), expected)
-
-
-@pytest.mark.parametrize("splits", [0, -1, 17, 32])
+@pytest.mark.parametrize("splits", [0, -1, 17, 1.5, True])
 def test_reject_invalid_splits(splits):
-    inputs, _ = _case()
-    with pytest.raises(ValueError, match="num_kv_splits"):
-        _invoke(inputs, splits)
+    x, _ = _case()
+    with pytest.raises((ValueError, RuntimeError, TypeError)):
+        _invoke(x, splits)
 
 
-def test_reject_fractional_split():
-    inputs, _ = _case()
-    # Torch's public SymInt schema may reject this before the Python guard.
-    with pytest.raises((ValueError, TypeError, RuntimeError)):
-        _invoke(inputs, 1.5)
-
-
-@pytest.mark.parametrize("scale", [0.08, 0.0, -1.0, math.nan, math.inf])
-def test_reject_unsupported_softmax_scale(scale):
-    inputs, _ = _case(n=1, csa_rows=1, swa_rows=1)
-    with pytest.raises(ValueError, match="softmax_scale"):
-        _invoke(inputs, softmax_scale=scale)
-
-
-def test_accept_fp32_rounded_default_scale():
-    inputs, expected = _case(n=1, csa_rows=1, swa_rows=1)
-    rounded_scale = torch.tensor(_SCALE, dtype=torch.float32).item()
-    _check(_invoke(inputs, softmax_scale=rounded_scale), expected)
+@pytest.mark.parametrize("scale", [0.0, 0.04, float("nan"), float("inf")])
+def test_reject_unsupported_scale(scale):
+    x, _ = _case()
+    with pytest.raises((ValueError, RuntimeError)):
+        _invoke(x, softmax_scale=scale)
 
 
 @pytest.mark.parametrize(
-    "bad_argument",
+    "bad",
     [
+        "q_fp8",
+        "position_i32",
+        "position_shape",
+        "cos_fp32",
+        "sin_rows",
+        "q_stride",
         "packed_csa",
-        "heads",
-        "dimension",
-        "q_dtype",
-        "q_scale_dtype",
-        "csr_dtype",
-        "csr_shape",
-        "swa_scale_rows",
-        "sink_dtype",
-        "cpu_scale",
-        "out_dtype",
-        "out_stride",
+        "csr_i64",
+        "out_bf16",
+        "scale_fp8",
+        "workspace_pair",
+        "workspace_shape",
     ],
 )
-def test_reject_invalid_layout(bad_argument):
-    inputs, expected = _case()
-    out = None
-    if bad_argument == "packed_csa":
-        packed = _make_inputs_v41(2, 64, 65, 128, topk=0, prefix_fp4=True)["kernel"]
-        inputs["unified_kv"] = packed["unified_kv"]
-        inputs["unified_kv_scale"] = packed["unified_kv_scale"]
-    elif bad_argument == "heads":
-        inputs["q"] = inputs["q"][:, :32].contiguous()
-    elif bad_argument == "dimension":
-        inputs["q"] = inputs["q"][..., :256].contiguous()
-    elif bad_argument == "q_dtype":
-        inputs["q"] = inputs["q"].to(torch.bfloat16)
-    elif bad_argument == "q_scale_dtype":
-        inputs["q_scale"] = inputs["q_scale"].to(torch.int32)
-    elif bad_argument == "csr_dtype":
-        inputs["kv_indices_prefix"] = inputs["kv_indices_prefix"].to(torch.int64)
-    elif bad_argument == "csr_shape":
-        inputs["kv_indptr_extend"] = inputs["kv_indptr_extend"][:-1]
-    elif bad_argument == "swa_scale_rows":
-        inputs["kv_scale"] = inputs["kv_scale"][:-1]
-    elif bad_argument == "sink_dtype":
-        inputs["attn_sink"] = inputs["attn_sink"].to(torch.bfloat16)
-    elif bad_argument == "cpu_scale":
-        inputs["q_scale"] = inputs["q_scale"].cpu()
-    elif bad_argument == "out_dtype":
-        out = torch.empty_like(expected, dtype=torch.float32)
-    elif bad_argument == "out_stride":
-        out = torch.empty((2, 512, 64), device="cuda", dtype=torch.bfloat16).transpose(
-            1, 2
+def test_reject_invalid_interface(bad):
+    x, _ = _case()
+    kw = {}
+    if bad == "q_fp8":
+        x["q_nope"] = x["q_nope"].to(torch.float8_e4m3fn)
+    elif bad == "position_i32":
+        x["positions"] = x["positions"].int()
+    elif bad == "position_shape":
+        x["positions"] = x["positions"][:, None]
+    elif bad == "cos_fp32":
+        x["cos"] = x["cos"].float()
+    elif bad == "sin_rows":
+        x["sin"] = x["sin"][:-1]
+    elif bad == "q_stride":
+        x["q_nope"] = torch.empty((2, 64, 1024), device="cuda", dtype=torch.bfloat16)[
+            ..., ::2
+        ]
+    elif bad == "packed_csa":
+        d = _make_inputs_v41(2, 64, 65, 128, topk=0, prefix_fp4=True)["kernel"]
+        x["unified_kv"] = d["unified_kv"]
+        x["unified_kv_scale"] = d["unified_kv_scale"]
+    elif bad == "csr_i64":
+        x["kv_indptr_prefix"] = x["kv_indptr_prefix"].long()
+    elif bad == "out_bf16":
+        kw["out"] = torch.empty_like(x["q_nope"])
+    elif bad == "scale_fp8":
+        kw["out_scale"] = torch.empty(
+            (2, 64, 16), device="cuda", dtype=torch.float8_e8m0fnu
         )
-    with pytest.raises(ValueError):
-        _invoke(inputs, out=out)
+    elif bad == "workspace_pair":
+        kw["partial_r"] = torch.empty((2, 4, 65, 512), device="cuda")
+    elif bad == "workspace_shape":
+        kw["partial_r"] = torch.empty((2, 4, 64, 512), device="cuda")
+        kw["partial_lse"] = torch.empty((2, 4, 64), device="cuda")
+    with pytest.raises((ValueError, RuntimeError, TypeError)):
+        _invoke(x, 4, **kw)
 
 
-@pytest.mark.parametrize("splits", [1, 4])
-def test_current_stream(splits):
-    inputs, expected = _case()
+@pytest.mark.parametrize("kind", ["out_q", "scale_q", "out_scale", "workspace_q"])
+def test_reject_overlapping_buffers(kind):
+    x, _ = _case()
+    kw = {}
+    raw = x["q_nope"].view(torch.uint8).flatten()
+    if kind == "out_q":
+        kw["out"] = raw[: 2 * 64 * 512].view(torch.float8_e4m3fn).view(2, 64, 512)
+    elif kind == "scale_q":
+        kw["out_scale"] = raw[: 2 * 64 * 16].view(2, 64, 16)
+    elif kind == "out_scale":
+        out = torch.empty((2, 64, 512), device="cuda", dtype=torch.float8_e4m3fn)
+        kw["out"] = out
+        kw["out_scale"] = out.view(torch.uint8).flatten()[: 2 * 64 * 16].view(2, 64, 16)
+    else:
+        raw = torch.empty(2 * 4 * 65 * 512 * 4, device="cuda", dtype=torch.uint8)
+        x["q_nope"] = raw[: 2 * 64 * 512 * 2].view(torch.bfloat16).view(2, 64, 512)
+        kw["partial_r"] = raw.view(torch.float32).view(2, 4, 65, 512)
+        kw["partial_lse"] = torch.empty((2, 4, 64), device="cuda")
+    with pytest.raises((ValueError, RuntimeError), match="overlap"):
+        _invoke(x, 4, **kw)
+
+
+@pytest.mark.parametrize("splits", [1, 4, 16])
+def test_current_stream_and_graph(splits):
+    x, expected = _case(3)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        actual = _invoke(inputs, splits)
-        # The consumer is queued on the same nondefault stream as the launch.
-        consumed = actual.clone()
+        out, scale = _invoke(x, splits)
+        r = torch.empty((3, splits, 65, 512), device="cuda") if splits > 1 else None
+        lse = torch.empty((3, splits, 64), device="cuda") if splits > 1 else None
+        _invoke(x, splits, out=out, out_scale=scale, partial_r=r, partial_lse=lse)
     stream.synchronize()
-    _check(consumed, expected)
-
-
-@pytest.mark.parametrize("splits", [1, 4])
-def test_graph_replay(splits):
-    inputs, expected = _case(no_sink=True)
-    out = torch.empty_like(expected)
-    # Finish JIT/module loading and initialize the nondefault stream before capture.
-    warmup = torch.cuda.Stream()
-    warmup.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(warmup):
-        _invoke(inputs, splits, out=out)
-    warmup.synchronize()
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=warmup):
-        captured = _invoke(inputs, splits, out=out)
+    with torch.cuda.graph(graph, stream=stream):
+        _invoke(x, splits, out=out, out_scale=scale, partial_r=r, partial_lse=lse)
+        seen = out.view(torch.uint8).clone()
     for _ in range(3):
-        out.fill_(math.nan)
         graph.replay()
-        _check(captured, expected)
+    torch.cuda.synchronize()
+    _check((out, scale), expected)
+    _equal(out, seen)
 
 
 @pytest.mark.skipif(
-    os.environ.get("AITER_TEST_V41_ASM_COMPILE") != "1",
-    reason="set AITER_TEST_V41_ASM_COMPILE=1 to test torch.compile fullgraph",
+    os.environ.get("AITER_TEST_V41_ASM_COMPILE") != "1", reason="opt-in torch.compile"
 )
-def test_torch_compile_fullgraph():
-    inputs, expected = _case()
-    # Warm the native entry before testing Torch's graph/fake-tensor dispatch.
-    _check(_invoke(inputs, 4), expected)
+@pytest.mark.parametrize("provided", [False, True])
+def test_torch_compile_fullgraph(provided):
+    x, expected = _case()
+    out, scale = _invoke(x, 4)
 
     def forward(q):
-        call_inputs = dict(inputs)
-        call_inputs["q"] = q
-        return _invoke(call_inputs, 4)
+        inputs = dict(x, q_nope=q)
+        return _invoke(
+            inputs,
+            4,
+            out=out if provided else None,
+            out_scale=scale if provided else None,
+        )
 
     compiled = torch.compile(forward, fullgraph=True)
-    _check(compiled(inputs["q"]), expected)
+    _check(compiled(x["q_nope"]), expected)
+
+
+@pytest.mark.parametrize("n,h,split", [(2, 64, 1), (7, 128, 1), (8, 64, 4)])
+def test_opus_a8w8_numerical_regression(n, h, split):
+    # Real OPUS A8W8 execution, not only a mocked backend check.
+    d = _make_inputs_v41(n, h, 65, 128, topk=0, prefix_fp4=False, seed=0)
+    ref = _ref_mla_sparse_prefill_fp8(**d["ref"], softmax_scale=_SCALE)
+    from aiter.ops.mla_sparse_prefill import mla_sparse_prefill_v41
+
+    for backend in ["opus", None]:
+        out = mla_sparse_prefill_v41(
+            **d["kernel"], softmax_scale=_SCALE, num_kv_splits=split, backend=backend
+        )
+        assert isinstance(out, torch.Tensor) and out.dtype == torch.bfloat16
+        assert (
+            float(
+                (~torch.isclose(out.float(), ref.float(), rtol=0.01, atol=0.01))
+                .float()
+                .mean()
+            )
+            <= 0.01
+        )
+
+
+@pytest.mark.parametrize(
+    "bad", ["positions_i32", "out_bf16", "scale_e8m0", "partial_shape", "out_q_alias"]
+)
+def test_native_entry_checks_before_launch(bad):
+    x, _expected = _case()
+    q_before = x["q_nope"].clone()
+    out, scale = _invoke(x, 4)
+    args = [x[name] for name in _ORDER] + [
+        _SCALE,
+        4,
+        out,
+        scale,
+        torch.empty((2, 4, 65, 512), device="cuda"),
+        torch.empty((2, 4, 64), device="cuda"),
+    ]
+    if bad == "positions_i32":
+        args[3] = x["positions"].int()
+    elif bad == "out_bf16":
+        args[15] = torch.empty_like(x["q_nope"])
+    elif bad == "scale_e8m0":
+        args[16] = scale.view(torch.float8_e8m0fnu)
+    elif bad == "partial_shape":
+        args[17] = torch.empty((2, 4, 64, 512), device="cuda")
+    else:
+        args[15] = (
+            x["q_nope"]
+            .view(torch.uint8)
+            .flatten()[: 2 * 64 * 512]
+            .view(torch.float8_e4m3fn)
+            .view(2, 64, 512)
+        )
+    with pytest.raises(RuntimeError):
+        native.asm_mla_sparse_prefill_v41_fwd(*args)
+    _equal(q_before, x["q_nope"])
 
 
 # Metadata-only capability and dispatcher checks share this existing suite.
@@ -522,7 +599,7 @@ def arguments(
 
 CASES = [
     ("gfx1250", 8, 64, 512, torch.uint8, SCALE, "contiguous", True, "asm"),
-    ("gfx1250", 65536, 64, 512, torch.uint8, SCALE, "contiguous", True, "asm"),
+    ("gfx1250", 65535, 64, 512, torch.uint8, SCALE, "contiguous", True, "asm"),
     ("gfx1250", 65537, 64, 512, torch.uint8, SCALE, "contiguous", True, None),
     ("gfx1250", 0, 64, 512, torch.uint8, SCALE, "contiguous", True, "asm"),
     ("gfx1250", 8, 32, 512, torch.uint8, SCALE, "contiguous", True, None),
@@ -555,13 +632,20 @@ class TestV41Capability:
         import aiter
 
         assert "get_mla_sparse_prefill_v41_backend" in public.__all__
-        assert aiter.get_mla_sparse_prefill_v41_backend is query
+        if not aiter.AITER_AOT_IMPORT:
+            assert aiter.get_mla_sparse_prefill_v41_backend is query
+        assert "_asm_sparse_prefill_v41" in public.__all__
 
     @pytest.mark.parametrize("gfx,n,h,d,prefix,scale,layout,asm,expected", CASES)
     def test_query_matches_automatic_dispatch(
         self, runtime, monkeypatch, gfx, n, h, d, prefix, scale, layout, asm, expected
     ):
         runtime.update(gfx=gfx, asm=asm)
+        q_dtype = (
+            torch.bfloat16
+            if gfx.startswith("gfx1250") and prefix == torch.uint8
+            else public.dtypes.fp8
+        )
         assert (
             query(
                 "cuda:0",
@@ -569,6 +653,7 @@ class TestV41Capability:
                 unified_kv_dtype=prefix,
                 softmax_scale=scale,
                 layout=layout,
+                q_dtype=q_dtype,
             )
             == expected
         )
@@ -586,7 +671,7 @@ class TestV41Capability:
             lambda op, canonicalize, native, args, kwargs: native(*args, **kwargs),
         )
         args = arguments(n, h, d, prefix, layout)
-        if expected is None:
+        if expected in (None, "asm"):
             with pytest.raises(RuntimeError, match="no native backend"):
                 execute(*args, scale)
             assert not calls
@@ -628,7 +713,15 @@ class TestV41Capability:
         monkeypatch.setattr(public, "_asm_sparse_prefill_v41", forbidden)
         monkeypatch.setattr(public, "_opus_sparse_prefill_v41", forbidden)
         monkeypatch.setattr(public, "compile_ops", forbidden)
-        assert query("cuda:0", (65536, 64, 512), unified_kv_dtype=torch.uint8) == "asm"
+        assert (
+            query(
+                "cuda:0",
+                (65535, 64, 512),
+                unified_kv_dtype=torch.uint8,
+                q_dtype=torch.bfloat16,
+            )
+            == "asm"
+        )
         runtime["gfx"] = "gfx950"
         assert query("cuda:0", (8, 64, 512), unified_kv_dtype=torch.uint8) == "opus"
 
@@ -640,6 +733,7 @@ class TestV41Capability:
                 (8, 64, 512),
                 unified_kv_dtype=torch.uint8,
                 softmax_scale=fp32_scale,
+                q_dtype=torch.bfloat16,
             )
             == "asm"
         )
@@ -703,7 +797,7 @@ class TestV41Capability:
             is None
         )
 
-    @pytest.mark.parametrize("backend", ["asm", "opus"])
+    @pytest.mark.parametrize("backend", ["opus"])
     def test_explicit_backend_errors_propagate(self, runtime, monkeypatch, backend):
         error = ValueError("execution validation or launch failed")
 
@@ -744,3 +838,132 @@ class TestV41Capability:
 
         monkeypatch.setattr(public._plugin, "_dispatch", provider)
         assert execute(*args, backend=backend) == "provider"
+
+    def test_old_asm_pin_reports_new_contract(self, runtime, monkeypatch):
+        monkeypatch.setattr(
+            public._plugin,
+            "_dispatch",
+            lambda op, canonicalize, native, args, kw: native(*args, **kw),
+        )
+        with pytest.raises(RuntimeError, match="raw BF16 q_nope"):
+            execute(*arguments(), SCALE, backend="asm")
+
+    def test_asm_query_rejects_old_q_and_n65536(self, runtime):
+        assert query("cuda:0", (8, 64, 512), unified_kv_dtype=torch.uint8) is None
+        assert (
+            query(
+                "cuda:0",
+                (65536, 64, 512),
+                unified_kv_dtype=torch.uint8,
+                q_dtype=torch.bfloat16,
+            )
+            is None
+        )
+        assert (
+            query(
+                "cuda:0",
+                (8, 64, 512),
+                unified_kv_dtype=torch.uint8,
+                q_dtype=torch.bfloat16,
+            )
+            == "asm"
+        )
+
+    def test_asm_query_checks_kv_dtypes_without_q_scale(self, runtime):
+        # The generic query keeps q_scale_dtype for OPUS only.
+        assert (
+            query(
+                "cuda:0",
+                (8, 64, 512),
+                unified_kv_dtype=torch.uint8,
+                q_dtype=torch.bfloat16,
+                q_scale_dtype=torch.float16,
+            )
+            == "asm"
+        )
+        for field in ["unified_kv_scale_dtype", "kv_dtype", "kv_scale_dtype"]:
+            assert (
+                query(
+                    "cuda:0",
+                    (8, 64, 512),
+                    unified_kv_dtype=torch.uint8,
+                    q_dtype=torch.bfloat16,
+                    **{field: torch.float16},
+                )
+                is None
+            )
+
+    @pytest.mark.parametrize(
+        "n",
+        [
+            8,
+            16,
+            32,
+            48,
+            64,
+            96,
+            192,
+            384,
+            768,
+            1536,
+            2048,
+            3072,
+            4096,
+            6144,
+            8192,
+            16384,
+        ],
+    )
+    @pytest.mark.parametrize("pool", [65536, 1048576])
+    @pytest.mark.parametrize("topk", [512, 1024])
+    def test_auto_policy_matches_measured_winners(self, n, pool, topk):
+        if n in (8, 16):
+            expected = 4 if topk == 512 else 8
+        elif topk == 512:
+            expected = 4 if n == 32 and pool == 1048576 else 1
+        else:
+            expected = 4 if n in (32, 48, 64) else 1
+        for swa_nnz in (0, n * 128, n * 4096):
+            assert (
+                native._auto_v41_asm_splits(
+                    n, n * topk + swa_nnz, prefix_nnz=n * topk, prefix_rows=pool
+                )
+                == expected
+            )
+
+    @pytest.mark.parametrize("n", [1, 2, 4, 24, 33, 63])
+    @pytest.mark.parametrize("topk", [512, 1024])
+    def test_auto_policy_keeps_unmeasured_batches(self, n, topk):
+        previous = 1 if topk == 512 else 4 if n <= 32 else 2
+        assert (
+            native._auto_v41_asm_splits(
+                n, n * (topk + 128), prefix_nnz=n * topk, prefix_rows=65536
+            )
+            == previous
+        )
+
+    @pytest.mark.parametrize("pool", [None, 512, 32768, 131072, 2097152])
+    @pytest.mark.parametrize(
+        "n,topk,expected", [(8, 512, 1), (16, 1024, 4), (32, 512, 1), (64, 1024, 2)]
+    )
+    def test_auto_policy_keeps_unmeasured_pools(self, pool, n, topk, expected):
+        assert (
+            native._auto_v41_asm_splits(
+                n, n * (topk + 128), prefix_nnz=n * topk, prefix_rows=pool
+            )
+            == expected
+        )
+
+    def test_auto_policy_other_prefixes_keep_fallback(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(native, "get_cu_num", lambda: 256)
+        monkeypatch.setattr(
+            public, "_asm_v41_kv_splits", lambda *args: calls.append(args) or 3
+        )
+        assert (
+            native._auto_v41_asm_splits(
+                16, 16000, prefix_nnz=16000 - 1, prefix_rows=65536
+            )
+            == 3
+        )
+        assert calls == [(16, 16000, 256)]

@@ -6,8 +6,9 @@
 Three backends implement the same two-region sparse attention -- a paged
 prefix source (``unified_kv``) plus a flat extend source (``kv``), joined by
 one online softmax with a per-head sink. Every backend in a case runs on the
-same inputs and is checked against the same PyTorch reference, so the reported
-latencies are directly comparable.
+same KV/CSR fixture. Attention-only OPUS and Q/O-fused ASM use separate
+references and explicitly different timing boundaries; do not compare a bare
+OPUS attention time with the complete ASM Q/O pipeline as an E2E speedup.
 
 Inputs model a DSA page table: each token draws ``topk`` prefix rows and its
 last ``window`` extend rows (pytest: ``topk`` random rows of ``[0, i]``).
@@ -21,7 +22,8 @@ The ``prec`` axis picks both the input format and the backends that run:
 * ``v41_fp8`` -- MLA v4.1: 512 e4m3 rows with separate E8M0 scales
   (``mla_sparse_prefill_v41``): ``opus``.
 * ``v41_fp4`` -- ``v41_fp8`` with an NVFP4 prefix source: 512 e2m1 and 32 e4m3
-  scales: ``opus`` on gfx950, fused ``asm`` on gfx1250 with ``H_Q == 64``.
+  scales: ``opus`` on gfx950, Q/O-fused ``asm`` on gfx1250 with ``H_Q == 64``. Its input is raw BF16 Q
+  plus BF16 cos/sin and int64 positions; it returns FP8 O and E8M0 bytes.
   The generator's 288-byte rows are separated into contiguous data and scales
   outside the timed call for the fixed-stride gfx1250 code object.
 
@@ -66,7 +68,10 @@ from aiter.ops.mla_sparse_prefill import (
     mla_sparse_prefill_v4,
     mla_sparse_prefill_v41,
 )
-from aiter.ops.mla_sparse_prefill_v41_asm import _auto_v41_asm_splits
+from aiter.ops.mla_sparse_prefill_v41_asm import (
+    _asm_sparse_prefill_v41,
+    _auto_v41_asm_splits,
+)
 from aiter.test_common import (
     benchmark,
     checkAllclose,
@@ -627,6 +632,133 @@ def _make_inputs_v41(
     return {"kernel": kernel, "ref": ref}
 
 
+def _prepare_v41_qo_inputs(data, *, seed=0, data_init="norm"):
+    """Shared KV/CSR fixture, but genuinely unquantized BF16 Q for Q/O ASM."""
+    x = dict(data["kernel"])
+    n, h, d = x.pop("q").shape
+    x.pop("q_scale")
+    device = x["kv"].device
+    gen = make_generator(seed + 7919, device=device)
+    x["q_nope"] = (
+        fill((n, h, d), data_init, gen, dtype=torch.float32, device=device) * 0.5
+    ).bfloat16()
+    for name in ("unified_kv", "unified_kv_scale"):
+        value = x[name]
+        x[name] = value.view(torch.uint8).contiguous().view(value.dtype)
+    angle = torch.arange(1031, device=device, dtype=torch.float32)[:, None] * torch.exp(
+        -torch.arange(32, device=device, dtype=torch.float32)[None, :] / 8
+    )
+    x["cos"], x["sin"] = angle.cos().bfloat16(), angle.sin().bfloat16()
+    x["positions"] = (
+        torch.arange(n, device=device, dtype=torch.int64) * 37 + 17
+    ) % 1031
+    return x
+
+
+def _qo_rotate(values, cos, sin, positions, inverse=False):
+    result = values.float().clone()
+    pairs = result[..., 448:].unflatten(-1, (32, 2))
+    a, b = pairs[..., 0].clone(), pairs[..., 1].clone()
+    c, s = cos[positions].float()[:, None, :], sin[positions].float()[:, None, :]
+    if inverse:
+        s = -s
+    pairs[..., 0], pairs[..., 1] = a * c - b * s, a * s + b * c
+    return result
+
+
+def _qo_quantize(values):
+    groups = values.float().unflatten(-1, (16, 32))
+    amax = groups.abs().amax(-1).clamp_min(1e-10)
+    # FP64 log2/ceil is deliberately independent of the ASM bit arithmetic.
+    exponent = torch.ceil(torch.log2(amax.double() / 448)).to(torch.int32)
+    quant = (
+        (groups / torch.exp2(exponent.float())[..., None])
+        .to(torch.float8_e4m3fn)
+        .flatten(-2)
+    )
+    return quant, (exponent + 127).to(torch.uint8)
+
+
+def _qo_dequantize(values, scales):
+    return (
+        values.float().unflatten(-1, (16, 32))
+        * torch.exp2(scales.view(torch.uint8).float() - 127)[..., None]
+    ).flatten(-2)
+
+
+def _ref_mla_sparse_prefill_qo(inputs, decoded, softmax_scale):
+    """Independent pre-inverse-RoPE FP32 attention for the direct-quant contract."""
+    q = _qo_rotate(inputs["q_nope"], inputs["cos"], inputs["sin"], inputs["positions"])
+    q = _qo_dequantize(*_qo_quantize(q))
+    n, h, d = q.shape
+    result = torch.zeros((n, h, d), device=q.device, dtype=torch.float32)
+    pp = inputs["kv_indptr_prefix"].cpu().tolist()
+    ep = inputs["kv_indptr_extend"].cpu().tolist()
+    pi = inputs["kv_indices_prefix"].long()
+    ei = inputs["kv_indices_extend"].long()
+    sink = inputs["attn_sink"]
+    if sink is None:
+        sink = torch.full((h,), -math.inf, device=q.device, dtype=torch.float32)
+    for i in range(n):
+        kv = torch.cat(
+            (
+                decoded["ukv_fp32"][pi[pp[i] : pp[i + 1]]],
+                decoded["kv_fp32"][ei[ep[i] : ep[i + 1]]],
+            )
+        )
+        if not kv.shape[0]:
+            continue
+        scores = q[i] @ kv.T * softmax_scale
+        probability = torch.softmax(torch.cat((scores, sink[:, None]), dim=-1), dim=-1)[
+            :, :-1
+        ]
+        result[i] = probability @ kv
+    return result
+
+
+def _check_v41_qo_output(actual, attention, inputs):
+    """Original FP32 attention bound propagated through inverse RoPE and FP8 rounding."""
+    out, scale = actual
+    assert out.shape == attention.shape and out.dtype == torch.float8_e4m3fn
+    assert (
+        tuple(scale.shape) == (*attention.shape[:-1], 16) and scale.dtype == torch.uint8
+    )
+    if not out.numel():
+        return 0.0
+    pos, cos, sin = inputs["positions"], inputs["cos"], inputs["sin"]
+    reference = _qo_rotate(attention, cos, sin, pos, inverse=True)
+    error = 0.01 + 0.01 * attention.abs()
+    tail = error[..., 448:].unflatten(-1, (32, 2))
+    a, b = tail[..., 0].clone(), tail[..., 1].clone()
+    c, s = cos[pos].float().abs()[:, None, :], sin[pos].float().abs()[:, None, :]
+    tail[..., 0], tail[..., 1] = a * c + b * s, a * s + b * c
+    normalized = out.float().abs()
+    ulp = torch.exp2(torch.floor(torch.log2(normalized.clamp_min(2**-6))) - 3)
+    step = torch.exp2(scale.float() - 127).repeat_interleave(32, -1)
+    bound = (
+        error + 0.5 * ulp * step + 8 * torch.finfo(torch.float32).eps * reference.abs()
+    )
+    got = _qo_dequantize(out, scale)
+    assert bool(torch.isfinite(got).all()), "nonfinite fused output"
+    bad = float(((got - reference).abs() > bound).float().mean())
+    assert bad <= 0.01, f"Q/O quantization-aware mismatch ratio {bad} exceeds .01"
+    refgroups = reference.unflatten(-1, (16, 32)).abs()
+    egroups = error.unflatten(-1, (16, 32))
+    lo = (refgroups - egroups).clamp_min(0).amax(-1).clamp_min(1e-10)
+    hi = (refgroups + egroups).amax(-1).clamp_min(1e-10)
+    elo, ehi = (
+        torch.ceil(torch.log2(lo.double() / 448)) + 127,
+        torch.ceil(torch.log2(hi.double() / 448)) + 127,
+    )
+    assert bool(
+        ((scale >= elo) & (scale <= ehi) & (scale < 255)).all()
+    ), "invalid scale interval"
+    zero = refgroups.amax(-1) == 0
+    assert bool((scale[zero] == 85).all()), "zero-group E8M0 floor must be 85"
+    assert bool((out.float().unflatten(-1, (16, 32))[zero] == 0).all())
+    return bad
+
+
 # ---------------------------------------------------------------------------
 # Backends
 # ---------------------------------------------------------------------------
@@ -744,21 +876,19 @@ def run_mla_sparse_prefill(
             and h == _ASM_V41_HEADS
             and _get_gpu_arch() == "gfx1250"
         ):
-            # Prepare separate CSA data/scale buffers before kernel timing.
-            asm_inputs = dict(kernel_inputs)
-            for key in ("unified_kv", "unified_kv_scale"):
-                tensor = asm_inputs[key]
-                asm_inputs[key] = (
-                    tensor.view(torch.uint8).contiguous().view(tensor.dtype)
-                )
+            # The shipped ASM now has a different Q/O boundary. OPUS still
+            # uses its FP8-Q/BF16-O contract above on supported devices.
+            asm_inputs = _prepare_v41_qo_inputs(data, seed=seed, data_init=data_init)
+            kernel_inputs = asm_inputs
+            ref_fn = _ref_mla_sparse_prefill_qo
+            ref_inputs = {"inputs": asm_inputs, "decoded": data["ref"]}
             candidates.append(
                 (
                     "asm",
-                    lambda: mla_sparse_prefill_v41(
+                    lambda: _asm_sparse_prefill_v41(
                         **asm_inputs,
                         softmax_scale=softmax_scale,
                         num_kv_splits=num_kv_splits,
-                        backend="asm",
                     ),
                 )
             )
@@ -847,14 +977,17 @@ def run_mla_sparse_prefill(
 
     for name, invoke in candidates:
         if verify:
-            err = checkAllclose(
-                invoke(),
-                ref,
-                rtol=_RTOL,
-                atol=_ATOL,
-                tol_err_ratio=_ERR_TOL,
-                msg=f"{name}: {msg}",
-            )
+            if name == "asm" and prec == "v41_fp4":
+                err = _check_v41_qo_output(invoke(), ref, kernel_inputs)
+            else:
+                err = checkAllclose(
+                    invoke(),
+                    ref,
+                    rtol=_RTOL,
+                    atol=_ATOL,
+                    tol_err_ratio=_ERR_TOL,
+                    msg=f"{name}: {msg}",
+                )
             # float() so a skipped backend's NaN holes don't split the dtype.
             row[f"{name} err"] = float(err)
             # checkAllclose only raises on catastrophic mismatches, not on this.
@@ -870,19 +1003,27 @@ def run_mla_sparse_prefill(
             row[f"{name} us"] = round(float(lat_us), 2)
             row[f"{name} TFLOPS"] = round(float(tflops), 2)
             if name == "asm":
-                # Effective Q/KV reads + BF16 output writes; KV is shared by
+                # Logical Q/KV/output traffic for each contract; KV is shared by
                 # K/V and all heads. Count each CSR entry without adjusting
                 # for cache reuse or adding internal partial-workspace traffic.
                 if prec == "v41_fp4":
                     prefix_nnz = kernel_inputs["kv_indices_prefix"].numel()
                     extend_nnz = kernel_inputs["kv_indices_extend"].numel()
                     nbytes = (
-                        (n * h + extend_nnz) * (_V41_D + _V41_D_SCALE)
+                        n * h * d * 2  # raw BF16 Q
+                        + extend_nnz * (_V41_D + _V41_D_SCALE)
                         + prefix_nnz * (_V41_D // 2 + _V41_D // _NVFP4_BLK)
-                        + n * h * d * 2
+                        + n * h * (_V41_D + _V41_D_SCALE)  # FP8 O + E8M0
+                        + n * (128 + 8)  # two BF16 coefficient rows + int64 position
                     )
+                    row["asm boundary"] = "BF16 Q -> FP8 O/E8M0"
                     row["asm split"] = (
-                        _auto_v41_asm_splits(n, total_nnz, prefix_nnz=prefix_nnz)
+                        _auto_v41_asm_splits(
+                            n,
+                            total_nnz,
+                            prefix_nnz=prefix_nnz,
+                            prefix_rows=kernel_inputs["unified_kv"].shape[0],
+                        )
                         if num_kv_splits is None
                         else num_kv_splits
                     )
