@@ -455,6 +455,29 @@ __global__ void add_rmsnorm_quant_kernel(
                     n / 32, ") scale, got numel ", scale.numel());
     }
 
+    // add_rmsnorm_quant_kernel bounds every row with a buffer descriptor and moves it in
+    // 4-byte words, and the bound is rounded up to a whole word (ooba_i / ooba_o). A row
+    // whose byte length is not a multiple of 4 therefore has its last word reach past the
+    // row. With the 16-bit inputs an odd n reads element n of the input, the residual and
+    // the weight, and a 16-bit output gets it written; an 8-bit output gets up to 3 bytes
+    // written past the row. That is the start of the next row, or memory past the tensor.
+    // Refuse those widths. aiter/ops/rmsnorm.py keeps them off this kernel wherever another
+    // backend exists. fp4x2 rows are bounded to the packed row above and are left as they are.
+    // This check is the word bound that gfx942 and gfx950 need. gfx1250 needs more: there the
+    // bounds check drops a whole 16-byte vector, so a row with n % 8 != 0 loses its last
+    // n % 8 elements. That rule lives in _use_hip_common (aiter/ops/rmsnorm.py) and is not
+    // checked here.
+    static inline void check_row_words(const char* func, const aiter_tensor_t& input,
+                                       const aiter_tensor_t& out, int n)
+    {
+        const int64_t in_row_bytes  = static_cast<int64_t>(n) * input.element_size();
+        const int64_t out_row_bytes = static_cast<int64_t>(n) * out.element_size();
+        AITER_CHECK(in_row_bytes % 4 == 0 &&
+                        (out.dtype() == AITER_DTYPE_fp4x2 || out_row_bytes % 4 == 0),
+                    func, " needs rows of whole 4-byte words, got n = ", n, " (", in_row_bytes,
+                    " input bytes, ", out_row_bytes, " output bytes per row)");
+    }
+
     // A zero-element placeholder for optional operands (residual / scale) that a
     // given entry point does not use. The kernel never dereferences these when
     // the corresponding ADD_RESIDUAL / FUSE_QUANT path is disabled; only
@@ -486,8 +509,12 @@ __global__ void add_rmsnorm_quant_kernel(
         bool scale_layout_m32k4 = false
     )
     {
+        // A failed check has to reach Python as an exception, not abort() the
+        // interpreter: this is the binding boundary, so flip throw mode here.
+        aiter_detail::AiterThrowGuard throw_guard;
         int n = input.size(1);
         int m = input.numel() / n;
+        check_row_words(__func__, input, out, n);
         int input_stride = input.stride(0);
         int residual_in_stride = residual_in.stride(0);
         int residual_out_stride = residual_out.stride(0);
@@ -566,11 +593,15 @@ __global__ void add_rmsnorm_quant_kernel(
         bool scale_layout_m32k4 = false
     )
     {
+        // A failed check has to reach Python as an exception, not abort() the
+        // interpreter: this is the binding boundary, so flip throw mode here.
+        aiter_detail::AiterThrowGuard throw_guard;
         aiter_tensor_t residual_in = empty_placeholder(input.dtype(), input.device_id);
         aiter_tensor_t residual_out = empty_placeholder(input.dtype(), input.device_id);
 
         int n = input.size(1);
         int m = input.numel() / n;
+        check_row_words(__func__, input, out, n);
         int residual_in_stride = residual_in.stride(0);
         int residual_out_stride = residual_out.stride(0);
         int input_stride = input.stride(0);
@@ -640,10 +671,14 @@ __global__ void add_rmsnorm_quant_kernel(
         bool gemma_norm = false
     )
     {
+        // A failed check has to reach Python as an exception, not abort() the
+        // interpreter: this is the binding boundary, so flip throw mode here.
+        aiter_detail::AiterThrowGuard throw_guard;
         aiter_tensor_t scale = empty_placeholder(AITER_DTYPE_fp32, input.device_id);
 
         int n = input.size(1);
         int m = input.numel() / n;
+        check_row_words(__func__, input, out, n);
         int residual_in_stride = residual_in.stride(0);
         int residual_out_stride = residual_out.stride(0);
         int input_stride = input.stride(0);
@@ -695,12 +730,16 @@ __global__ void add_rmsnorm_quant_kernel(
         bool gemma_norm = false
     )
     {
+        // A failed check has to reach Python as an exception, not abort() the
+        // interpreter: this is the binding boundary, so flip throw mode here.
+        aiter_detail::AiterThrowGuard throw_guard;
         aiter_tensor_t scale = empty_placeholder(AITER_DTYPE_fp32, input.device_id);
         aiter_tensor_t residual_in = empty_placeholder(input.dtype(), input.device_id);
         aiter_tensor_t residual_out = empty_placeholder(input.dtype(), input.device_id);
 
         int n = input.size(1);
         int m = input.numel() / n;
+        check_row_words(__func__, input, out, n);
         int residual_in_stride = residual_in.stride(0);
         int residual_out_stride = residual_out.stride(0);
         int input_stride = input.stride(0);

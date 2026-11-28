@@ -30,6 +30,10 @@ gluon kernel that takes both KV sources natively. The v4 ``asm`` needs
 ``H_Q == 128``; the v4.1 ``asm`` needs ``H_Q == 64``. Both asm variants and
 triton are gfx1250-only here and drop out of the sweep elsewhere.
 
+Routine performance comparisons use ``--num_kv_splits auto`` so each backend
+uses its host-selected split count. Explicit split sweeps remain available for
+manual tuning and functional checks.
+
 Example CLI usage::
 
     PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py
@@ -37,9 +41,10 @@ Example CLI usage::
     PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py --backend opus \\
         -n 1024 --h_q 128 --prec v4_fp8 --no-verify
     PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py --backend opus asm \\
-        --prec v41_fp8 v41_fp4 --h_q 64 -n 96 192 384 768 1536 2048 3072 4096 \\
-        --total_pages 65536 1048576 --topk 512 1024 --total_tokens 128 \\
-        --num_kv_splits 1
+        --prec v41_fp8 v41_fp4 --h_q 64 \\
+        -n 8 16 32 48 64 96 192 384 768 1536 2048 3072 4096 6144 8192 16384 \\
+        --total_pages 65536 1048576 --topk 512 1024 --window 128 \\
+        --num_kv_splits auto
 """
 
 from __future__ import annotations

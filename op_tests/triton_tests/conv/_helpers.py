@@ -146,25 +146,34 @@ def apply_activation(y: torch.Tensor, activation: str):
     return y
 
 
-def conv2d_padding_reference(
+def conv_padding_reference(
     source,
     weight,
     bias=None,
-    stride=(1, 1),
-    padding=(0, 0),
-    dilation=(1, 1),
+    stride=1,
+    padding=0,
+    dilation=1,
     padding_mode="zeros",
 ):
     """Reference convolution without using production padding preparation."""
+    if source.ndim == 4:
+        convolution = F.conv2d
+    elif source.ndim == 5:
+        convolution = F.conv3d
+    else:
+        raise ValueError(
+            f"convolution reference requires a 4-D or 5-D input, got {source.ndim}-D"
+        )
     if padding_mode != "zeros":
-        pad_height, pad_width = (
-            (padding, padding) if isinstance(padding, int) else padding
+        spatial_padding = (
+            (padding,) * (source.ndim - 2) if isinstance(padding, int) else padding
         )
-        source = F.pad(
-            source, (pad_width, pad_width, pad_height, pad_height), mode=padding_mode
+        pad = tuple(
+            value for amount in reversed(spatial_padding) for value in (amount, amount)
         )
-        padding = (0, 0)
-    return F.conv2d(source, weight, bias, stride, padding, dilation)
+        source = F.pad(source, pad, mode=padding_mode)
+        padding = 0
+    return convolution(source, weight, bias, stride, padding, dilation)
 
 
 # -- Architecture gating ------------------------------------------------------

@@ -79,6 +79,10 @@ def is_tdm_avail():
     return get_arch() in ("gfx1250", "gfx1250-strict")
 
 
+def is_cdna3():
+    return get_arch() == "gfx942"
+
+
 def is_cdna4():
     return get_arch() == "gfx950"
 

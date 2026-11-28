@@ -573,6 +573,16 @@ namespace py = pybind11;
           py::arg("open_fp8_quant"),                                                 \
           py::arg("reg_inp_ptr"),                                                    \
           py::arg("reg_inp_bytes"));                                                 \
+    m.def("all_reduce_add",                                                          \
+          &aiter::all_reduce_add,                                                    \
+          py::arg("_fa"),                                                            \
+          py::arg("inp"),                                                            \
+          py::arg("addend"),                                                         \
+          py::arg("out"),                                                            \
+          py::arg("use_new"),                                                        \
+          py::arg("open_fp8_quant"),                                                 \
+          py::arg("reg_inp_ptr"),                                                    \
+          py::arg("reg_inp_bytes"));                                                 \
     m.def("all_reduce_residual",                                                     \
           &aiter::all_reduce_residual,                                               \
           py::arg("_fa"),                                                            \
@@ -581,6 +591,11 @@ namespace py = pybind11;
           py::arg("residual"),                                                       \
           py::arg("reg_inp_ptr"),                                                    \
           py::arg("reg_inp_bytes"));                                                 \
+    m.def("all_reduce_one_shot",                                                     \
+          &aiter::all_reduce_one_shot,                                               \
+          py::arg("_fa"),                                                            \
+          py::arg("inp"),                                                            \
+          py::arg("registered_input"));                                              \
     m.def("reduce_scatter",                                                          \
           &aiter::reduce_scatter,                                                    \
           py::arg("_fa"),                                                            \
@@ -1623,6 +1638,54 @@ namespace py = pybind11;
           py::arg("device"),                             \
           py::arg("stream"));
 
+#define MQA_TOPK_BF16_PYBIND                             \
+    m.def("mqa_topk_bf16_instances",                     \
+          &mqa_topk_bf16_instances,                      \
+          py::arg("device_id"),                          \
+          py::arg("out"));                               \
+    m.def("mqa_topk_bf16_workspace_bytes",               \
+          &mqa_topk_bf16_workspace_bytes,                \
+          py::arg("rows"),                               \
+          py::arg("keys"),                               \
+          py::arg("cap_row"),                            \
+          py::arg("fb_slots"));                          \
+    m.def("mqa_topk_bf16_launch",                        \
+          &mqa_topk_bf16_launch,                         \
+          py::arg("q"),                                  \
+          py::arg("k"),                                  \
+          py::arg("weights"),                            \
+          py::arg("row_starts"),                         \
+          py::arg("row_ends"),                           \
+          py::arg("indices"),                            \
+          py::arg("values"),                             \
+          py::arg("workspace"),                          \
+          py::arg("workspace_bytes"),                    \
+          py::arg("rows"),                               \
+          py::arg("keys"),                               \
+          py::arg("topk"),                               \
+          py::arg("cap_row"),                            \
+          py::arg("chunk_keys"),                         \
+          py::arg("fb_slots"),                           \
+          py::arg("relu"),                               \
+          py::arg("instance"),                           \
+          py::arg("device"),                             \
+          py::arg("stream"));                            \
+    m.def("mqa_logits_bf16_launch",                      \
+          &mqa_logits_bf16_launch,                       \
+          py::arg("q"),                                  \
+          py::arg("k"),                                  \
+          py::arg("weights"),                            \
+          py::arg("row_starts"),                         \
+          py::arg("row_ends"),                           \
+          py::arg("out"),                                \
+          py::arg("rows"),                               \
+          py::arg("keys"),                               \
+          py::arg("chunk_keys"),                         \
+          py::arg("relu"),                               \
+          py::arg("instance"),                           \
+          py::arg("device"),                             \
+          py::arg("stream"));
+
 #define FMHA_FWD_BF16_OPUS_PYBIND                     \
     m.def("fmha_fwd_bf16_opus_fwd",                   \
           &fmha_fwd_bf16_opus_fwd,                    \
@@ -2083,7 +2146,28 @@ namespace py = pybind11;
           py::arg("k_scale")           = std::nullopt, \
           py::arg("v_scale")           = std::nullopt, \
           py::arg("asm_layout")        = false,        \
-          py::arg("skip_index_branch") = false)
+          py::arg("skip_index_branch") = false);        \
+    m.def("fused_qknorm_nvfp4_raw",                   \
+          &aiter::fused_qknorm_nvfp4_raw,             \
+          py::arg("qkv"), \
+          py::arg("q_out"), \
+          py::arg("index_q_out"), \
+          py::arg("q_norm_weight"), \
+          py::arg("k_norm_weight"), \
+          py::arg("index_q_norm_weight"), \
+          py::arg("index_k_norm_weight"), \
+          py::arg("cos_sin_cache"), \
+          py::arg("positions"), \
+          py::arg("slot_mapping"), \
+          py::arg("index_slot_mapping"), \
+          py::arg("kv_cache"), \
+          py::arg("index_cache"), \
+          py::arg("k_scale"), \
+          py::arg("v_scale"), \
+          py::arg("num_tokens"), \
+          py::arg("kv_page_stride_bytes"), \
+          py::arg("eps"), \
+          py::arg("stream"))
 
 #define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND                           \
     m.def("fused_qk_norm_rope_cache_quant_shuffle",                    \
@@ -2301,6 +2385,22 @@ namespace py = pybind11;
           py::arg("num_groups"),                       \
           py::arg("quant_group_size") = 128,           \
           py::arg("scale_layout")     = 0);
+
+#define MLA_NVFP4_DECODE_PREP_PYBIND                 \
+    m.def("mla_nvfp4_decode_prep",                   \
+          &aiter::mla_nvfp4_decode_prep,             \
+          py::arg("q_rope"),                         \
+          py::arg("q_aux"),                          \
+          py::arg("ring"),                           \
+          py::arg("req_ids"),                        \
+          py::arg("k_nope"),                         \
+          py::arg("k_rope"),                         \
+          py::arg("positions"),                      \
+          py::arg("slots"),                          \
+          py::arg("kv_nope"),                        \
+          py::arg("kv_aux"),                         \
+          py::arg("cos_cache") = std::nullopt,       \
+          py::arg("sin_cache") = std::nullopt);
 
 #define SMOOTHQUANT_PYBIND                      \
     m.def("smoothquant_fwd", &smoothquant_fwd); \
@@ -3043,3 +3143,47 @@ namespace py = pybind11;
           py::arg("TotalCuCount") = 256,  \
           py::arg("clean_logits") = true, \
           py::arg("reverse_rows") = -1);
+
+#define KPOOL_COMPRESS_PYBIND                                                                 \
+    m.def("kpool_compress_insert",                                                            \
+          &aiter::kpool_compress_insert,                                                      \
+          "GLM-5.3-Flash indexer kpool prefill insert (bit-exact with the vLLM Triton path)", \
+          py::arg("kv_cache"),                                                                \
+          py::arg("k"),                                                                       \
+          py::arg("gate_score"),                                                              \
+          py::arg("ape"),                                                                     \
+          py::arg("slot_mapping"),                                                            \
+          py::arg("pool_size"),                                                               \
+          py::arg("round_scale")    = true,                                                   \
+          py::arg("lanes_per_pool") = 0);                                                     \
+    m.def("kpool_decode_update",                                                              \
+          &aiter::kpool_decode_update,                                                        \
+          "GLM-5.3-Flash indexer kpool decode update (tail ring stash + pool close)",         \
+          py::arg("kv_cache"),                                                                \
+          py::arg("tail_kv_cache"),                                                           \
+          py::arg("tail_slot_mapping"),                                                       \
+          py::arg("key"),                                                                     \
+          py::arg("slot_score"),                                                              \
+          py::arg("ape"),                                                                     \
+          py::arg("slot_mapping"),                                                            \
+          py::arg("positions"),                                                               \
+          py::arg("pool_size"),                                                               \
+          py::arg("round_scale") = true);                                                     \
+    m.def("kpool_mixed_write",                                                                \
+          &aiter::kpool_mixed_write,                                                          \
+          "GLM-5.3-Flash indexer kpool insert + tail seed + decode in one launch",            \
+          py::arg("kv_cache"),                                                                \
+          py::arg("ape"),                                                                     \
+          py::arg("pool_size"),                                                               \
+          py::arg("round_scale")               = true,                                        \
+          py::arg("lanes_per_pool")            = 0,                                           \
+          py::arg("prefill_k")                 = py::none(),                                  \
+          py::arg("prefill_gate")              = py::none(),                                  \
+          py::arg("prefill_slot_mapping")      = py::none(),                                  \
+          py::arg("prefill_tail_slot_mapping") = py::none(),                                  \
+          py::arg("tail_kv_cache")             = py::none(),                                  \
+          py::arg("decode_tail_slot_mapping")  = py::none(),                                  \
+          py::arg("decode_key")                = py::none(),                                  \
+          py::arg("decode_gate")               = py::none(),                                  \
+          py::arg("decode_slot_mapping")       = py::none(),                                  \
+          py::arg("decode_positions")          = py::none());

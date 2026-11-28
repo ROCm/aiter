@@ -119,4 +119,29 @@ void mhc_post_pre_gram_gfx950(aiter_tensor_t& post,          // (m, 4, 1)
                               float norm_eps,
                               float post_mult,
                               int parts = 4); // hidden segments of a row in the finisher
+// gfx950 packed prefill route of mhc_fused_post_pre (mhc_post_pre_gfx950.cu). All
+// buffers are owned by the current call.
+void mhc_post_project_gfx950(aiter_tensor_t& projection,
+                             aiter_tensor_t& sq,
+                             aiter_tensor_t& next_residual,
+                             aiter_tensor_t& x,
+                             aiter_tensor_t& residual,
+                             aiter_tensor_t& packed_fn,
+                             aiter_tensor_t& post_mix,
+                             aiter_tensor_t& comb_mix);
+void mhc_finalize_gfx950(aiter_tensor_t& post,
+                         aiter_tensor_t& comb,
+                         aiter_tensor_t& out,
+                         aiter_tensor_t& projection,
+                         aiter_tensor_t& sq,
+                         aiter_tensor_t& scale,
+                         aiter_tensor_t& base,
+                         aiter_tensor_t& residual,
+                         aiter_tensor_t& weight,
+                         float rms_eps,
+                         float pre_eps,
+                         float sink_eps,
+                         float norm_eps,
+                         float post_mult,
+                         int repeats);
 } // namespace aiter
