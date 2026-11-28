@@ -32,6 +32,7 @@ from flydsl.expr.typing import ReductionOp, T
 
 from ..pa_decode_plan import ARRIVAL_COUNTER_STRIDE
 from ..utils import rcp_f32
+from .op_mxfp8 import E8M0_ONE, GROUP, MxFp8Groups, group_code, lane_masks
 from .traits import LOG2E
 
 # Partition bound of a merged sequence; each one is an unrolled load per row.
@@ -235,7 +236,17 @@ class Gfx1250PartitionMerge:
                 target = fx.add_offset(
                     output, self.output_offset(row_ids[i], lane_elem)
                 )
-                if const_expr(rows % t.NWARP):
+                if const_expr(t.quant_mx):
+                    # Rows are wave-uniform, so the group shuffles stay whole.
+                    _store_mx(
+                        ctx.quant,
+                        row_ids[i] < rows if rows % t.NWARP else None,
+                        [acc.to(t.q_dtype)],
+                        [self.output_offset(row_ids[i], lane_elem)],
+                        output if t.store_output else None,
+                        lane_masks(GROUP // elems),
+                    )
+                elif const_expr(rows % t.NWARP):
                     if row_ids[i] < rows:
                         fx.ptr_store(acc.to(t.q_dtype), target)
                 else:
@@ -408,6 +419,32 @@ def _store_values(quant, values, offsets, output, inv_scale):
             fx.ptr_store(value, fx.add_offset(output, offset))
         if inv_scale is not None:
             quant._store_fp8(value, offset, inv_scale)
+
+
+def _store_mx_values(quant, values, offsets, output, masks):
+    for value, offset in zip(values, offsets):
+        if output is not None:
+            fx.ptr_store(value, fx.add_offset(output, offset))
+    quant.groups.store(values, offsets, masks, quant.t.WAVE)
+
+
+@flyc.jit
+def _store_mx(quant, valid, values, offsets, output, masks):
+    """MXFP8 (and, with ``output``, BF16/FP16) rows of ``valid`` (None: every
+    row; a wave-uniform condition, so a group's lanes agree)."""
+    # Runtime branches call module functions: objects whose methods they call
+    # would become branch state.
+    if const_expr(valid is None):
+        _store_mx_values(quant, values, offsets, output, masks)
+    else:
+        if valid:
+            _store_mx_values(quant, values, offsets, output, masks)
+
+
+@flyc.jit
+def _store_word(target, value, valid):
+    if valid:
+        fx.ptr_store(value, target)
 
 
 class Gfx1250OutputQuant:
@@ -639,3 +676,99 @@ class Gfx1250OutputQuant:
             index = i * t.BLOCK_THREADS + tid
             if index < tokens:
                 scales[token + index] = scale
+
+
+class Gfx1250OutputMxQuant:
+    """MXFP8 output (``op_mxfp8``): E4M3 values and an E8M0 scale per 32
+    elements of a token's row, from the final values in registers.
+
+    Groups are lane-local, so every output mode stores them where it stores
+    the BF16/FP16 output, without a barrier: the NVFP4 wave tile's rows
+    (``store_cta``), merged rows (``store_cluster`` and the last-arriver
+    merge), and empty and padded tokens (``store_empty``). Scales are indexed
+    by element offset / 32: the output is contiguous.
+    """
+
+    group_local = True
+
+    def __init__(self, t, quantized_output, output_scale):
+        self.t = t
+        self.groups = MxFp8Groups(quantized_output, output_scale)
+
+    @flyc.jit
+    def store_cta(self, mem, seq, lane, part, parts, tiles, output):
+        """The NVFP4 wave tile's rows: lane (row, half) of wave ``part`` holds
+        dims 32 part + 16 vh + 8 half + [0, 8), so a group is the lane pair
+        (row, 0), (row, 1) of one wave."""
+        t = self.t
+        for row, values, offsets in tiles:
+            _store_mx(
+                self,
+                row < t.rows if t.rows % 16 else None,
+                values,
+                offsets,
+                output if t.store_output else None,
+                (16,),
+            )
+
+    @flyc.jit
+    def store_cluster(self, seq, lane, row_maxima, rows, output):
+        """Merged rows, ``head_dim / WAVE`` consecutive values a lane: a group
+        spans ``GROUP / elems`` adjacent lanes. No cluster barrier."""
+        t = self.t
+        masks = lane_masks(GROUP // (t.head_dim // t.WAVE))
+        for _, valid, value, offset in rows:
+            _store_mx(
+                self,
+                valid,
+                [value],
+                [offset],
+                output if t.store_output else None,
+                masks,
+            )
+
+    def sync(self):
+        """Group-local: no barrier to match."""
+
+    @flyc.jit
+    def store_empty(self, token, tokens, scale, stride_row, stride_head):
+        """Zero values for ``tokens`` tokens from ``token`` on, with the scale
+        a separate quant gives them (that of the amax floor) for an empty
+        sequence (``scale`` 0), and E8M0 1.0 for padded tokens (``scale`` 1),
+        which a consumer of the whole padded height reads as inert rows."""
+        t, token = self.t, fx.Int32(token)
+        g, tid = t.query_group_size, fx.Int32(gpu.thread_id("x"))
+        size = tokens * g * t.head_dim
+        zeros = fx.Vector.from_elements(
+            [fx.Int32(0).ir_value() for _ in range_constexpr(4)], dtype=fx.Int32
+        )
+        for i in range_constexpr(-(-size // (t.BLOCK_THREADS * 16))):
+            # 16 values per thread and store, within one row as 16 | head_dim.
+            index = (i * t.BLOCK_THREADS + tid) * 16
+            row = index // t.head_dim
+            offset = (
+                fx.Int64(token + row // g) * stride_row
+                + (row % g) * stride_head
+                + index % t.head_dim
+            )
+            target = fx.recast_iter(
+                fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Global, 4),
+                fx.add_offset(self.groups.quantized, offset),
+            )
+            if const_expr(size % (t.BLOCK_THREADS * 16)):
+                _store_word(target, zeros, index < size)
+            else:
+                fx.ptr_store(zeros, target)
+        code = (fx.Float32(scale) == fx.Float32(0.0)).select(
+            group_code(fx.Float32(0.0)), fx.Int32(E8M0_ONE)
+        )
+        byte = fx.Vector.from_elements([code.to(fx.Int8)])
+        groups = size // GROUP
+        first = fx.Int64(token) * stride_row // GROUP
+        for i in range_constexpr(-(-groups // t.BLOCK_THREADS)):
+            index = i * t.BLOCK_THREADS + tid
+            target = fx.add_offset(self.groups.scales, first + fx.Int64(index))
+            if const_expr(groups % t.BLOCK_THREADS):
+                _store_word(target, byte, index < groups)
+            else:
+                fx.ptr_store(byte, target)

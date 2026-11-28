@@ -324,6 +324,8 @@ def test_pa_decode_reduce_split_groups(device, head_size, dtype, with_sinks):
             ptr_arg(reduce_info, fx.Int32),
             -(-(1 << 30) // rows),
             -(-(1 << 30) // (rows * kv_heads)),
+            flyc.from_c_void_p(fx.Uint8, 0),
+            flyc.from_c_void_p(fx.Uint8, 0),
             torch.cuda.current_stream(),
         )
         return out
