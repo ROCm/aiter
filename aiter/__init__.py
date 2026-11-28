@@ -181,6 +181,11 @@ else:
         fused_qknorm_idxrqknorm,
     )
     from .ops.fused_qk_norm_rope_cache_quant import *
+    from .ops.gfx1201_gemm_a8w8 import (  # noqa: F401
+        gemm_a8w8_bpreshuffle_gfx1201,
+        gemm_a8w8_bpreshuffle_gfx1201_supported,
+        shuffle_weight_gfx1201,
+    )
     from .ops.fused_qk_rmsnorm_group_quant import *
     from .ops.inverse_rope_group_quant import *
     from .ops.groupnorm import *

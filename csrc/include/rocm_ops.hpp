@@ -3187,3 +3187,12 @@ namespace py = pybind11;
           py::arg("decode_gate")               = py::none(),                                  \
           py::arg("decode_slot_mapping")       = py::none(),                                  \
           py::arg("decode_positions")          = py::none());
+
+#define GFX1201_GEMM_A8W8_PYBIND                                    \
+    m.def("gfx1201_gemm_a8w8_bpreshuffle_hip",                      \
+          &gfx1201_gemm_a8w8_bpreshuffle_hip,                       \
+          py::arg("XQ"),                                            \
+          py::arg("WQ"),                                            \
+          py::arg("x_scale"),                                       \
+          py::arg("w_scale"),                                       \
+          py::arg("Y"));
