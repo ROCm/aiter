@@ -399,6 +399,10 @@ KNOB_CASES = (
 RELAY_CALLS = 4
 DEFAULT_RELAY = (2, 3)
 DEFAULT_RELAY_FRACTION = (3, 8)
+DEFAULT_RELAY_K2 = ((2, 4), (3, 5))
+DEFAULT_RELAY_K3 = ((2, 4, 6), (3, 5, 7))
+DEFAULT_TP4_RELAY = (4, 5, 6, 7)
+DEFAULT_TP4_RELAY_FRACTION = ((1, 4), (3, 8))
 # (tokens, hidden, codec, graph, fraction, super_tile, grid_cap, block)
 RELAY_CASES = (
     (8, 1024, "int4", False, DEFAULT_RELAY_FRACTION, None, None, None),
@@ -407,6 +411,24 @@ RELAY_CASES = (
     (8191, 5120, "fp16", False, DEFAULT_RELAY_FRACTION, None, None, None),
     (64, 1024, "int4", False, (1, 1), 1, 8, 64),
     (64, 1024, "int4", True, (1, 1), 1, 8, 64),
+)
+# Additional TP2 multi-relay rows (K=2, 3), run when >= 8 GPUs are visible.
+# (tokens, hidden, codec, graph, fraction, super_tile, grid_cap, block, relay_devices)
+TP2_MULTIRELAY_CASES = (
+    (8191, 5120, "int4", True, (5, 8), None, None, None, DEFAULT_RELAY_K2),
+    (8191, 5120, "int4", False, (3, 4), None, None, None, DEFAULT_RELAY_K3),
+    (8191, 5120, "int4", True, (3, 4), None, None, None, DEFAULT_RELAY_K3),
+    (8191, 5120, "fp16", False, (3, 4), None, None, None, DEFAULT_RELAY_K3),
+    (64, 1024, "int4", True, (1, 1), 1, 8, 64, DEFAULT_RELAY_K3),
+)
+# TP4 sender-owned relay rows, run when --tp 4 and >= 8 GPUs are visible.
+TP4_RELAY_CASES = (
+    (8191, 5120, "int4", False, DEFAULT_TP4_RELAY_FRACTION, None, None, None),
+    (8191, 5120, "int4", True, DEFAULT_TP4_RELAY_FRACTION, None, None, None),
+    (8191, 5120, "int4", True, (1, 4), None, None, None),
+    (8191, 5120, "fp16", False, DEFAULT_TP4_RELAY_FRACTION, None, None, None),
+    (64, 1024, "int4", True, (1, 1), 1, 8, 64),
+    (64, 1024, "int4", True, ((1, 2), (1, 1)), 1, 8, 64),
 )
 EXTENDED_RELAY_CASES = (
     (1024, 5120, "int5", False, DEFAULT_RELAY_FRACTION, None, None, None),
@@ -1968,10 +1990,12 @@ def _relay_key(
     grid_cap=None,
     min_bytes=0,
     block=None,
+    tp=2,
+    relay_devices=DEFAULT_RELAY,
 ) -> tuple:
     kw = {
         "algorithm": "mesh",
-        "relay_devices": DEFAULT_RELAY,
+        "relay_devices": relay_devices,
         "relay_fraction": tuple(relay_fraction),
     }
     if min_bytes is not None:
@@ -1984,7 +2008,7 @@ def _relay_key(
         kw["grid_cap"] = grid_cap
     if block is not None:
         kw["block"] = block
-    return _key(2, **kw)
+    return _key(tp, **kw)
 
 
 def _relay_case(tokens: int, hidden: int, codec: str, graph: bool, calls: int) -> tuple:
@@ -2004,20 +2028,31 @@ def test_quick_allreduce_relay(
     min_bytes=0,
     expect_relay=True,
     calls=RELAY_CALLS,
+    tp=2,
+    relay_devices=DEFAULT_RELAY,
 ):
-    """TP2 relay against its direct twin on the same inputs (correctness)."""
+    """TP2/TP4 relay against its direct twin on the same inputs (correctness)."""
     exact = codec == "fp16"
     rows = _result(
-        _relay_key(relay_fraction, codec, super_tile, grid_cap, min_bytes, block),
+        _relay_key(
+            relay_fraction,
+            codec,
+            super_tile,
+            grid_cap,
+            min_bytes,
+            block,
+            tp=tp,
+            relay_devices=relay_devices,
+        ),
         _relay_case(tokens, hidden, codec, graph, calls),
     )
     nbytes = tokens * hidden * 2
     label = (
-        f"tp=2 relay={DEFAULT_RELAY} f={tuple(relay_fraction)} {codec} "
+        f"tp={tp} relay={relay_devices} f={tuple(relay_fraction)} {codec} "
         f"{tokens}x{hidden} st={super_tile} grid_cap={grid_cap} block={block} "
         f"graph={graph}"
     )
-    expected_st = super_tile or _shipping_st(rows, nbytes, "mesh", 2)
+    expected_st = super_tile or _shipping_st(rows, nbytes, "mesh", tp)
     if exact:
         _check(
             label,
@@ -4258,17 +4293,17 @@ def _verify(args, tps, algos, dts, link) -> None:
         )
 
     relay = []
-    if (
-        2 in tps
-        and "mesh" in algos
-        and dts
-        and link == "xgmi"
-        and torch.cuda.device_count() >= 4
-    ):
+    n_visible = torch.cuda.device_count()
+    if 2 in tps and "mesh" in algos and dts and link == "xgmi" and n_visible >= 4:
         base_relay = list(RELAY_CASES)
         if args.extended:
             base_relay += list(EXTENDED_RELAY_CASES)
-        relay += [(*row, 0, True, RELAY_CALLS) for row in base_relay]
+        relay += [(*row, 0, True, RELAY_CALLS, 2, DEFAULT_RELAY) for row in base_relay]
+        if n_visible >= 8:
+            relay += [
+                (*row[:-1], 0, True, RELAY_CALLS, 2, row[-1])
+                for row in TP2_MULTIRELAY_CASES
+            ]
         default_cutoff = MESH_RELAY_DEFAULTS.get((link, 2, ARCH))
         if default_cutoff is not None:
             hidden = 5120
@@ -4286,6 +4321,40 @@ def _verify(args, tps, algos, dts, link) -> None:
                     None,
                     used,
                     calls,
+                    2,
+                    DEFAULT_RELAY,
+                )
+                for tokens, used, calls in (
+                    (at - 1, False, RELAY_CALLS),
+                    (at, True, RELAY_CALLS),
+                    (at + 16, True, RELAY_CALLS),
+                    (at - 1, False, 1),
+                )
+            ]
+    if 4 in tps and "mesh" in algos and dts and link == "xgmi" and n_visible >= 8:
+        relay += [
+            (*row, 0, True, RELAY_CALLS, 4, DEFAULT_TP4_RELAY)
+            for row in TP4_RELAY_CASES
+        ]
+        default_cutoff = MESH_RELAY_DEFAULTS.get((link, 4, ARCH))
+        if default_cutoff is not None:
+            hidden = 5120
+            at = default_cutoff[0] // (hidden * 2)
+            relay += [
+                (
+                    tokens,
+                    hidden,
+                    "int4",
+                    False,
+                    default_cutoff[1],
+                    None,
+                    None,
+                    None,
+                    None,
+                    used,
+                    calls,
+                    4,
+                    DEFAULT_TP4_RELAY,
                 )
                 for tokens, used, calls in (
                     (at - 1, False, RELAY_CALLS),
@@ -4306,9 +4375,20 @@ def _verify(args, tps, algos, dts, link) -> None:
         floor,
         _expect,
         calls,
+        tp,
+        rdevs,
     ) in relay:
         _register(
-            _relay_key(fraction, codec, st, grid_cap, floor, block),
+            _relay_key(
+                fraction,
+                codec,
+                st,
+                grid_cap,
+                floor,
+                block,
+                tp=tp,
+                relay_devices=rdevs,
+            ),
             _relay_case(tokens, hidden, codec, graph, calls),
         )
 
@@ -4382,12 +4462,16 @@ def _verify(args, tps, algos, dts, link) -> None:
         ],
     )
     _summarize(
-        "flydsl quick allreduce TP2 relay",
+        "flydsl quick allreduce relay",
         [test_quick_allreduce_relay(*row) for row in relay],
     )
     _summarize(
         "flydsl quick allreduce TP2 relay on one rank only",
-        [test_quick_allreduce_relay_mixed()] if relay else [],
+        (
+            [test_quick_allreduce_relay_mixed()]
+            if any(row[11] == 2 for row in relay)
+            else []
+        ),
     )
     _summarize(
         "flydsl quick allreduce engine setup failure",

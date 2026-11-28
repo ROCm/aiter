@@ -25,7 +25,7 @@ The host classes are in `aiter/ops/flydsl/`:
 |---|---|
 | `one_shot_allreduce.py` | `OneShotAllReduce` and `OneShotAllReduceRMSNorm`, the host classes for the one-shot kernel. |
 | `quick_allreduce.py` | `FlyQuickAllReduce` and `FlyQuickAllReduceRMSNorm`, the host classes for the mesh and the ring (and, fused only, the pull). |
-| `quick_allreduce_relay.py` | Uncached IPC bounce buffers on lending GPUs for the TP2 mesh relay. |
+| `quick_allreduce_relay.py` | Uncached IPC bounce buffers on lending GPUs for the TP2/TP4 mesh relay. |
 | `pull_allreduce_rmsnorm.py` | `PullAllReduceRMSNorm`, the engine behind `FlyQuickAllReduceRMSNorm(algorithm="pull")`. |
 | `allreduce_policy.py` | The limits and the values each kernel can build, the policy records, and the tables: the payload-size boundaries between the three kernels and the tuning ladders, for the plain and the fused all-reduce. |
 | `comm_collectives_host_shared.py` | IPC inbox setup, link detection and other host helpers. |
@@ -63,17 +63,29 @@ wire format. The default is INT4 with one E5M2 scale for each group of 16
 values. INT5 and INT6 use the same scale and add more bits for each value. FP16
 sends the values without quantization and is used in testing.
 
-At TP2 on xGMI, `FlyQuickAllReduce(..., relay_devices=(r01, r10))` is an opt-in
+At TP2 and TP4 on xGMI, `FlyQuickAllReduce(..., relay_devices=...)` is an opt-in
 path (never enabled by production dispatch) that routes `b % den < num` blocks
-through uncached IPC bounce buffers on lending GPUs (`r01 == r10` uses one GPU
-for both directions). On `gfx950` it defaults to `3/8` from 480 KiB up
-(1.37–1.56× faster than direct at 5–120 MiB); `3/8` fills whole XCDs and keeps
-slowdown to concurrent work on the lending GPUs low. Relay stores are system
-scope (`sc0 sc1 nt`) so `vmcnt(0)` orders them before the peer's inbox flag;
-relay reads use plain loads behind a per-tile agent-scope `buffer_inv sc1`
-after the first tile (L1 retains uncached lines on `gfx950`, while bypassing L1
-slows concurrent GEMMs on the lending GPU). Allocating a bounce from a TP
-process initializes a HIP context (~490 MB) on each lending GPU.
+through uncached IPC bounce buffers on lending GPUs:
+- **TP2 (`K = 1..3` relays per direction):** `relay_devices=(r01, r10)` (`K=1`,
+  `r01 == r10` uses one GPU for both directions) or
+  `((r0_0, ...), (r1_0, ...))` (`K=2, 3`). On `gfx950`, `K=1` defaults to `3/8`
+  from 480 KiB up (1.37–1.56× faster than direct at 5–120 MiB); `K=3` at `3/4`
+  reaches 3.14× solo and 2.97× under full `4×TP2` link-disjoint contention
+  (even relays for forward, odd relays for reverse).
+- **TP4 (1 sender-owned relay per rank):** `relay_devices=(r0, r1, r2, r3)`
+  (for `2×TP4`, `(4, 5, 6, 7)` and `(0, 1, 2, 3)` are 100% link-disjoint). Each
+  rank allocates its own outgoing bounce on `relay_devices[rank]` (1× ~490 MB
+  HIP context per lending GPU) and all-gather multicasts once into that bounce
+  for all three peers to read. Supports asymmetric `relay_fraction=((num_rs,
+  den_rs), (num_ag, den_ag))`; on `gfx950` it defaults to `((1, 4), (3, 8))`
+  from 480 KiB up (1.18–1.47× faster than direct, <1% lending-GPU GEMM impact).
+
+Relay stores are system scope (`sc0 sc1 nt`) so `vmcnt(0)` orders them before
+the peer's inbox flag; relay reads use plain loads behind a per-tile
+agent-scope `buffer_inv sc1` after the first tile (at reduce-scatter for
+relay-both blocks, or at all-gather for hybrid direct-RS / relay-AG blocks).
+Allocating a bounce from a TP process initializes a HIP context (~490 MB) on
+each lending GPU it allocates on.
 
 ### Ring
 
