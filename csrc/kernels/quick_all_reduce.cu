@@ -25,6 +25,13 @@ void validate_qr_rank(int64_t rank, int64_t world_size)
         throw std::invalid_argument("invalid rank passed in");
 }
 
+// The FP codec moves two bytes per value either way, so bf16 skips the fp16 cast there and is
+// accumulated in f32 instead.
+bool cast_bf16_to_fp16(bool cast_bf2half, int quant_level)
+{
+    return cast_bf2half && quant_level != QuickReduceQuantLevel::F16;
+}
+
 } // namespace
 
 fptr_t init_custom_qr(int64_t rank,
@@ -107,7 +114,7 @@ void qr_all_reduce(fptr_t _fa,
     }
     else if(out.dtype() == AITER_DTYPE_bf16)
     {
-        if(cast_bf2half)
+        if(cast_bf16_to_fp16(cast_bf2half, validated_quant_level))
         {
             fa->allreduce<half, true>(reinterpret_cast<half*>(inp.data_ptr()),
                                       reinterpret_cast<half*>(out.data_ptr()),
@@ -180,7 +187,7 @@ void qr_all_reduce_rmsnorm(fptr_t _fa,
     }
     else if(out.dtype() == AITER_DTYPE_bf16)
     {
-        if(cast_bf2half)
+        if(cast_bf16_to_fp16(cast_bf2half, validated_quant_level))
         {
             fa->allreduce_rmsnorm<__hip_bfloat16, half, true>(
                 reinterpret_cast<__hip_bfloat16*>(inp.data_ptr()),
@@ -241,7 +248,6 @@ INSTANTIATE_FOR_WORLDSIZE(__hip_bfloat16, CodecQ4, false)
 INSTANTIATE_FOR_WORLDSIZE(__hip_bfloat16, CodecQ6, false)
 INSTANTIATE_FOR_WORLDSIZE(__hip_bfloat16, CodecFP8, false)
 INSTANTIATE_FOR_WORLDSIZE_TP2_ONLY(__hip_bfloat16, CodecQ3, false)
-INSTANTIATE_FOR_WORLDSIZE(__hip_bfloat16, CodecFP, true)
 INSTANTIATE_FOR_WORLDSIZE(__hip_bfloat16, CodecQ4, true)
 INSTANTIATE_FOR_WORLDSIZE(__hip_bfloat16, CodecQ6, true)
 INSTANTIATE_FOR_WORLDSIZE(__hip_bfloat16, CodecFP8, true)

@@ -99,16 +99,19 @@ buffer_store_dwordx4(int32x4_t data,
                      int32_t soffset,
                      int32_t aux) __asm("llvm.amdgcn.raw.buffer.store.v4i32");
 
+// MODE.FP16_OVFL (MODE[23]) clamps overflowing fp16 results, f32 -> f16 conversions included, to
+// +/-MAX_FP16 instead of inf. The memory clobber keeps loads, and the conversions that depend on
+// them, below the s_setreg.
 __quickreduce_device_inline__ static void set_fp16_ovfl(bool const value)
 {
-#if defined(__gfx942__)
+#if defined(__gfx942__) || defined(__gfx950__)
     if(value)
     {
-        asm volatile("s_setreg_imm32_b32 0xdc1, 1;" ::);
+        asm volatile("s_setreg_imm32_b32 0x5c1, 1;" ::: "memory");
     }
     else
     {
-        asm volatile("s_setreg_imm32_b32 0xdc1, 0;" ::);
+        asm volatile("s_setreg_imm32_b32 0x5c1, 0;" ::: "memory");
     }
 #endif
 }
@@ -117,6 +120,41 @@ union bf162_int_union
     int i;
     nv_bfloat162 bf2;
 };
+
+// bf16 is the upper half of an f32, so widening each lane is a shift or a mask.
+template <int kNumAtoms>
+__quickreduce_device_inline__ void accumulate_bf16_in_f32(float (&acc)[kNumAtoms][8],
+                                                          int32x4_t const* data)
+{
+#pragma unroll
+    for(int i = 0; i < kNumAtoms; i++)
+    {
+#pragma unroll
+        for(int j = 0; j < 4; j++)
+        {
+            uint32_t const w = static_cast<uint32_t>(data[i][j]);
+            acc[i][2 * j] += __uint_as_float(w << 16);
+            acc[i][2 * j + 1] += __uint_as_float(w & 0xffff0000u);
+        }
+    }
+}
+
+template <int kNumAtoms>
+__quickreduce_device_inline__ void round_f32_to_bf16(int32x4_t* data,
+                                                     float const (&acc)[kNumAtoms][8])
+{
+#pragma unroll
+    for(int i = 0; i < kNumAtoms; i++)
+    {
+#pragma unroll
+        for(int j = 0; j < 4; j++)
+        {
+            bf162_int_union r;
+            r.bf2      = __float22bfloat162_rn(make_float2(acc[i][2 * j], acc[i][2 * j + 1]));
+            data[i][j] = r.i;
+        }
+    }
+}
 
 template <typename T>
 __quickreduce_device_inline__ void packed_assign_add(int32x4_t* A, int32x4_t* B);
