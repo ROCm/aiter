@@ -914,7 +914,6 @@ def _bwd_dkdv_inner(
     dropout_p,
     philox_seed,
     batch_philox_offset,
-    dropout_offset,
     alibi_slope,
     seqlen_q,
     seqlen_k,  # max sequence length for q and k
@@ -1126,7 +1125,6 @@ def _bwd_dq_inner(
     dropout_p,
     philox_seed,
     batch_philox_offset,
-    dropout_offset,
     alibi_slope,
     # Filled in by the wrapper.
     start_m,
@@ -1441,7 +1439,6 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
     seqused_k,  # Add seqused parameters
     max_seqlen_q,
     max_seqlen_k,
-    Dropout_mask,
     dropout_p,
     rng_state,
     Alibi_slopes,
@@ -1683,16 +1680,10 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
             else:
                 alibi_slope = None
 
-            # batch_philox_offset is the ACTUALLY dropout offset
-            # dropout_offset is for debug purpose and will be removed later
             batch_philox_offset = 0
-            dropout_offset = 0
             if ENABLE_DROPOUT:
                 batch_philox_offset = (
                     philox_offset_base + bid * stride_dropoutb + hqid * stride_dropouth
-                )
-                dropout_offset = (
-                    Dropout_mask + bid * stride_dropoutb + hqid * stride_dropouth
                 )
 
             if IS_FP8:
@@ -1745,7 +1736,6 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
                 dropout_p,
                 philox_seed,
                 batch_philox_offset,
-                dropout_offset,
                 alibi_slope,
                 seqlen_q,
                 seqlen_k,  # max sequence length for q and k
@@ -1818,7 +1808,6 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
                 dropout_p,
                 philox_seed,
                 batch_philox_offset,
-                dropout_offset,
                 alibi_slope,
                 seqlen_q,
                 seqlen_k,  # max sequence length for q and k
@@ -1899,16 +1888,10 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
             else:
                 alibi_slope = None
 
-            # batch_philox_offset is the ACTUALLY dropout offset
-            # dropout_offset is for debug purpose and will be removed later
             batch_philox_offset = 0
-            dropout_offset = 0
             if ENABLE_DROPOUT:
                 batch_philox_offset = (
                     philox_offset_base + bid * stride_dropoutb + hqid * stride_dropouth
-                )
-                dropout_offset = (
-                    Dropout_mask + bid * stride_dropoutb + hqid * stride_dropouth
                 )
             q = tl.load(Q + adj_q + offs_q, mask=mask_q, other=0.0)
             do = tl.load(DO + adj_do + offs_do, mask=mask_do, other=0.0)
@@ -1960,7 +1943,6 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
                 dropout_p,
                 philox_seed,
                 batch_philox_offset,
-                dropout_offset,
                 alibi_slope,
                 start_m,
                 start_n,
@@ -2032,7 +2014,6 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
                 dropout_p,
                 philox_seed,
                 batch_philox_offset,
-                dropout_offset,
                 alibi_slope,
                 start_m,
                 start_n,
@@ -2128,7 +2109,6 @@ def bwd_kernel_fused_noncausal(
     seqused_k,  # Add seqused parameters
     max_seqlen_q,
     max_seqlen_k,
-    Dropout_mask,
     dropout_p,
     rng_state,
     Alibi_slopes,
@@ -2308,16 +2288,10 @@ def bwd_kernel_fused_noncausal(
             else:
                 alibi_slope = None
 
-            # batch_philox_offset is the ACTUALLY dropout offset
-            # dropout_offset is for debug purpose and will be removed later
             batch_philox_offset = 0
-            dropout_offset = 0
             if ENABLE_DROPOUT:
                 batch_philox_offset = (
                     philox_offset_base + bid * stride_dropoutb + hqid * stride_dropouth
-                )
-                dropout_offset = (
-                    Dropout_mask + bid * stride_dropoutb + hqid * stride_dropouth
                 )
 
             if IS_FP8:
@@ -2371,7 +2345,6 @@ def bwd_kernel_fused_noncausal(
                 dropout_p,
                 philox_seed,
                 batch_philox_offset,
-                dropout_offset,
                 alibi_slope,
                 seqlen_q,
                 seqlen_k,  # max sequence length for q and k
@@ -2439,16 +2412,10 @@ def bwd_kernel_fused_noncausal(
             else:
                 alibi_slope = None
 
-            # batch_philox_offset is the ACTUALLY dropout offset
-            # dropout_offset is for debug purpose and will be removed later
             batch_philox_offset = 0
-            dropout_offset = 0
             if ENABLE_DROPOUT:
                 batch_philox_offset = (
                     philox_offset_base + bid * stride_dropoutb + hqid * stride_dropouth
-                )
-                dropout_offset = (
-                    Dropout_mask + bid * stride_dropoutb + hqid * stride_dropouth
                 )
 
             q = tl.load(Q + adj_q + offs_q, mask=mask_q, other=0.0)
@@ -2512,7 +2479,6 @@ def bwd_kernel_fused_noncausal(
                 dropout_p,
                 philox_seed,
                 batch_philox_offset,
-                dropout_offset,
                 alibi_slope,
                 start_m,
                 start_n,
@@ -2922,20 +2888,12 @@ def attention_backward_triton_impl(
     if DEBUG:
         print("delta:", delta, delta.shape)
 
-    # dropout mask tensor for debugging. We dump the dropout mask created in
-    #   the kernel for testing
-    dropout_mask = None
-    stride_dropoutb, stride_dropouth, stride_dropoutm, stride_dropoutn = (0, 0, 0, 0)
-    if use_dropout:
-        dropout_mask = torch.zeros(
-            (batch, nheads_q, max_seqlen_q, max_seqlen_k),
-            device=q.device,
-            dtype=torch.float32,
-        )
-
-        stride_dropoutb, stride_dropouth, stride_dropoutm, stride_dropoutn = (
-            dropout_mask.stride()
-        )
+    # The dropout random numbers are indexed as in a contiguous
+    # (batch, nheads_q, max_seqlen_q, max_seqlen_k) tensor, as the forward indexes them.
+    stride_dropoutn = 1
+    stride_dropoutm = max_seqlen_k
+    stride_dropouth = max_seqlen_q * max_seqlen_k
+    stride_dropoutb = nheads_q * stride_dropouth
 
     seqlen = max(max_seqlen_q, max_seqlen_k)
 
@@ -3015,7 +2973,6 @@ def attention_backward_triton_impl(
             seqused_k,  # Pass seqused tensors
             max_seqlen_q,
             max_seqlen_k,
-            dropout_mask,
             dropout_p,
             rng_state,
             alibi_slopes,
@@ -3105,7 +3062,6 @@ def attention_backward_triton_impl(
             seqused_k,  # Pass seqused tensors
             max_seqlen_q,
             max_seqlen_k,
-            dropout_mask,
             dropout_p,
             rng_state,
             alibi_slopes,

@@ -35,6 +35,8 @@ def fwd(
     softcap: float,
     return_softmax: bool,
     gen_: torch.Tensor | None = None,
+    softmax_lse: torch.Tensor | None = None,
+    sd_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
 
     # Reject FP8 tensors (FA2 AMD path does not support FP8)
@@ -99,40 +101,22 @@ def fwd(
     nheads_k = k.shape[2]
     assert (nheads_q % nheads_k) == 0
 
-    # Create output tensors based on shape expectations
-    if SHAPE_EXPECTATIONS == "rounded":
+    # The caller can pass softmax_lse and sd_mask. Otherwise make them in FA2's shapes.
+    rounded = SHAPE_EXPECTATIONS == "rounded"
+    seqlen_q_out = round_multiple(max_seqlen_q, 128) if rounded else max_seqlen_q
+    seqlen_k_out = round_multiple(max_seqlen_k, 128) if rounded else max_seqlen_k
+    if softmax_lse is None:
         softmax_lse = torch.zeros(
-            (batch, nheads_q, round_multiple(max_seqlen_q, 128)),
-            device=q.device,
-            dtype=torch.float32,
+            (batch, nheads_q, seqlen_q_out), device=q.device, dtype=torch.float32
         )
-        if dropout_p > 0.0 or return_softmax:
-            sd_mask = torch.zeros(
-                (
-                    batch,
-                    nheads_q,
-                    round_multiple(max_seqlen_q, 128),
-                    round_multiple(max_seqlen_k, 128),
-                ),
-                device=q.device,
-                dtype=torch.float32,
-            )
-        else:
-            sd_mask = None
-    else:
-        softmax_lse = torch.zeros(
-            (batch, nheads_q, max_seqlen_q),
+    if not return_softmax:
+        sd_mask = None
+    elif sd_mask is None:
+        sd_mask = torch.zeros(
+            (batch, nheads_q, seqlen_q_out, seqlen_k_out),
             device=q.device,
-            dtype=torch.float32,
+            dtype=q.dtype,
         )
-        if dropout_p > 0.0 or return_softmax:
-            sd_mask = torch.zeros(
-                (batch, nheads_q, max_seqlen_q, max_seqlen_k),
-                device=q.device,
-                dtype=torch.float32,
-            )
-        else:
-            sd_mask = None
 
     # call implementation
     if DEBUG:
@@ -212,9 +196,7 @@ def fwd(
             ), f"[fwd] sd_mask leading dims {sd_mask.shape[:3]} mismatch (B,Hq,Sq) {(q.shape[0], q.shape[2], q.shape[1])}"
 
     # FlashAttention's fake ops declare sd_mask in q's dtype, and empty when not requested.
-    if return_softmax:
-        sd_mask = sd_mask.to(q.dtype)
-    else:
+    if not return_softmax:
         sd_mask = torch.empty((0,), dtype=q.dtype, device=q.device)
     return out, softmax_lse, sd_mask, rng_state
 
@@ -369,6 +351,8 @@ def varlen_fwd(
     return_softmax: bool,
     gen_: torch.Tensor | None = None,
     num_splits: int = 0,
+    softmax_lse: torch.Tensor | None = None,
+    sd_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
 
     if str(q.dtype).startswith("torch.float8"):
@@ -421,31 +405,26 @@ def varlen_fwd(
     batch = len(cu_seqlens_q) - 1
     total_q, nheads_q, _ = q.shape
 
-    # Create softmax_lse tensor - varlen always uses exact shape (Hq, Total_Q)
-    softmax_lse = torch.zeros((nheads_q, total_q), device=q.device, dtype=torch.float32)
-
-    # Create sd_mask tensor if needed
-    if return_softmax:
-        # sd_mask: (B, Hq, Sq, Sk) - shape based on expectations
-        if SHAPE_EXPECTATIONS == "rounded":
-            sd_mask = torch.zeros(
-                (
-                    batch,
-                    nheads_q,
-                    round_multiple(max_seqlen_q, 128),
-                    round_multiple(max_seqlen_k, 128),
-                ),
-                device=q.device,
-                dtype=q.dtype,
-            )
-        else:
-            sd_mask = torch.zeros(
-                (batch, nheads_q, max_seqlen_q, max_seqlen_k),
-                device=q.device,
-                dtype=q.dtype,
-            )
-    else:
+    # The caller can pass softmax_lse and sd_mask. Otherwise make them in FA2's shapes:
+    # softmax_lse is always the exact (Hq, total_q), sd_mask (B, Hq, Sq, Sk) can be rounded.
+    if softmax_lse is None:
+        softmax_lse = torch.zeros(
+            (nheads_q, total_q), device=q.device, dtype=torch.float32
+        )
+    rounded = SHAPE_EXPECTATIONS == "rounded"
+    if not return_softmax:
         sd_mask = None
+    elif sd_mask is None:
+        sd_mask = torch.zeros(
+            (
+                batch,
+                nheads_q,
+                round_multiple(max_seqlen_q, 128) if rounded else max_seqlen_q,
+                round_multiple(max_seqlen_k, 128) if rounded else max_seqlen_k,
+            ),
+            device=q.device,
+            dtype=q.dtype,
+        )
 
     if alibi_slopes is not None:
         if alibi_slopes.dim() == 1:

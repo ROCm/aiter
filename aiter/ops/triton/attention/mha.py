@@ -716,8 +716,13 @@ def _flash_attn_forward(
         sink is not None and sink.dim() == 1 and sink.shape[0] == num_q_heads
     ), "Sink must be 1D and have one element per query head."
 
-    # softmax_lse [batch, num_q_heads, seqlen_q]
-    if is_varlen:
+    # softmax_lse [batch, num_q_heads, seqlen_q]. Varlen: [total_q, num_q_heads], and
+    # FA2's [num_q_heads, total_q] for dao_ai.
+    if is_varlen and implementation == "dao_ai":
+        softmax_lse = torch.zeros(
+            (num_q_heads, q.shape[0]), device=q.device, dtype=torch.float32
+        )
+    elif is_varlen:
         softmax_lse = torch.zeros(
             (q.shape[0], num_q_heads), device=q.device, dtype=torch.float32
         )
@@ -753,10 +758,11 @@ def _flash_attn_forward(
         1,
     )
     if return_softmax:
+        # dao_ai returns the scores in q's dtype, as FA2 does.
         s_dmask = torch.zeros(
             (batch, num_q_heads, max_seqlen_q, max_seqlen_k),
             device=q.device,
-            dtype=torch.float32,
+            dtype=q.dtype if implementation == "dao_ai" else torch.float32,
         )
     else:
         s_dmask = None
@@ -794,6 +800,8 @@ def _flash_attn_forward(
                 window_size_right=window_size_right,
                 softcap=0.0,
                 return_softmax=return_softmax,
+                softmax_lse=softmax_lse,
+                sd_mask=s_dmask,
             )
         else:
             o, softmax_lse, s_dmask, rng_state = flash_attn_2.fwd(
@@ -809,19 +817,9 @@ def _flash_attn_forward(
                 window_size_right=window_size_right,
                 softcap=0.0,
                 return_softmax=return_softmax,
+                softmax_lse=softmax_lse,
+                sd_mask=s_dmask,
             )
-        # Verify softmax_lse shape contract:
-        #   non-varlen: (batch, nheads_q, seqlen_q)
-        #   varlen:     (nheads_q, total_q)  -- transposed vs default impl
-        if is_varlen:
-            assert softmax_lse.shape == (
-                num_q_heads,
-                q.shape[0],
-            ), f"dao_ai varlen softmax_lse shape {softmax_lse.shape} != expected ({num_q_heads}, {q.shape[0]})"
-        else:
-            assert (
-                softmax_lse.shape[0] == batch and softmax_lse.shape[1] == num_q_heads
-            ), f"dao_ai softmax_lse shape {softmax_lse.shape} != expected (batch={batch}, nheads={num_q_heads}, ...)"
     else:
         if config is None:
             config = _get_config(
