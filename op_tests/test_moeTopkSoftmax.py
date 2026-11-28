@@ -396,6 +396,7 @@ def test_grouped_topk_stable(
         "all_nan": 4,
         "masked_scores": 5,
         "all_zero_sigmoid": 6,
+        "thirty_two_way_tie": 7,
     }[pattern]
     torch.manual_seed(
         5632 + token * 17 + expert * 3 + topk + mode_id * 1009 + pattern_id * 101
@@ -405,9 +406,9 @@ def test_grouped_topk_stable(
     if pattern == "all_equal":
         gating.zero_()
         bias.zero_()
-    elif pattern == "sixteen_way_tie":
+    elif pattern in ("sixteen_way_tie", "thirty_two_way_tie"):
         gating.fill_(-4)
-        gating[:, -16:] = 0
+        gating[:, -(16 if pattern == "sixteen_way_tie" else 32) :] = 0
         bias.zero_()
     elif pattern == "one_finite":
         gating.zero_()
@@ -510,9 +511,13 @@ def test_grouped_topk_stable(
     else:
         if num_expert_group != 1:
             raise AssertionError("the padded legacy reference needs one expert group")
-        legacy_gating = torch.full((token, expert + 4), -torch.inf, dtype=dtype)
+        # Pad until ceil(E / 64) leaves AITER_TOPK_REG_LAUNCH_EPLS, so the reference is LDS.
+        padded = expert + 4
+        while -(-padded // 64) in (2, 3, 4, 6, 8, 14, 16, 32):
+            padded += 4
+        legacy_gating = torch.full((token, padded), -torch.inf, dtype=dtype)
         legacy_gating[:, :expert] = gating
-        legacy_bias = torch.full((expert + 4,), -torch.inf, dtype=dtype)
+        legacy_bias = torch.full((padded,), -torch.inf, dtype=dtype)
         legacy_bias[:expert] = bias
         legacy_w = make_output(dtypes.fp32)
         legacy_ids = make_output(dtypes.i32)
@@ -1033,6 +1038,17 @@ stable_cases = [
     (1, 256, 8, dtypes.bf16, "biased", True, "all_equal", False),
     (1, 256, 8, dtypes.bf16, "biased", True, "sixteen_way_tie", False),
     (1, 256, 8, dtypes.bf16, "biased", False, "sixteen_way_tie", False),
+    (1, 256, 8, dtypes.fp32, "biased", True, "thirty_two_way_tie", True),
+    (1, 256, 8, dtypes.fp32, "biased", False, "thirty_two_way_tie", False),
+    # topk > 8 with n_cand == 16: the unrolled rank tier, serial renorm loop.
+    (1, 256, 16, dtypes.bf16, "biased", True, "sixteen_way_tie", False),
+    # EPL == 8 (E=512), the BALLOT_SLOTS boundary, with a 32-way tie.
+    (1, 512, 8, dtypes.fp32, "biased", True, "thirty_two_way_tie", False),
+    # topk == AITER_TOPK_REG_MIN_TOPK, so n_cand < 8 leaves dead lanes in the rank and renorm.
+    (1, 256, 4, dtypes.bf16, "biased", True, "random", False),
+    # Odd EPL with a tail (E=192) and a masked last round (E=200).
+    (1, 192, 8, dtypes.bf16, "biased", True, "random", False),
+    (1, 200, 8, dtypes.bf16, "biased", True, "random", False),
     (1, 256, 8, dtypes.bf16, "sigmoid", True, "random", False),
     (1, 256, 8, dtypes.bf16, "sigmoid", True, "sixteen_way_tie", False),
     (1, 256, 8, dtypes.bf16, "sigmoid", False, "sixteen_way_tie", False),
