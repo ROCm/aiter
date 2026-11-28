@@ -1085,12 +1085,26 @@ def include_paths(cuda: bool = False) -> list[str]:
         paths.append(os.path.join(lib_include, "THH"))
         rocm_include = _join_rocm_home("include")
         paths.append(rocm_include)
+
+        # The hipccl directory holds libhipcxx, rocprim, hipCUB, rocThrust.
+        # In newer versions of ROCm, hipCUB and rocThrust require libhipcxx,
+        # which is only provided via hipccl.
+        rocm_hipccl_include = os.path.join(rocm_include, "hipccl")
+        if os.path.exists(rocm_hipccl_include):
+            paths.append(rocm_hipccl_include)
+
         # ROCM_HOME may point at the runtime-only `_rocm_sdk_core` tree, which
         # lacks the dev headers (thrust, hipcub, ...) that torch's headers pull
         # in. Add the `_rocm_sdk_devel` include tree so they resolve.
         devel_include = _find_rocm_devel_include()
         if devel_include is not None and devel_include != rocm_include:
             paths.append(devel_include)
+
+            # same as above
+            devel_hipccl_include = os.path.join(devel_include, "hipccl")
+            if os.path.exists(devel_hipccl_include):
+                paths.append(devel_hipccl_include)
+
     return paths
 
 
