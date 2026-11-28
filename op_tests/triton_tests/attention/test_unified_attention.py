@@ -2661,3 +2661,358 @@ def test_unified_attn_split_rebalance_reduce_configs_k4v8(
     )
     assert not new[live].isnan().any()
     assert torch.equal(old[live].view(torch.int16), new[live].view(torch.int16))
+
+
+def _kv_ring_lens(q_len, batch, ctx=8192):
+    return [(q_len, ctx + q_len + (37 * i) % 513) for i in range(batch)]
+
+
+def _kv_ring_run(
+    seq_lens,
+    sliding_window,
+    seq_lens_dtype=torch.int32,
+    long_max_seqlen_k=False,
+    use_sinks=False,
+    num_blocks=8192,
+):
+    """Run unified_attention (gluon, shuffled KV, page 64, 16 / 2 heads, head 64) and
+    return (2D kernel launches, output, reference). long_max_seqlen_k passes
+    max_seqlen_k = 131072 and a block table that wide, as a CUDA-graph caller does;
+    seqused_k keeps the real lengths."""
+    from aiter.ops.triton.attention import unified_attention as ua_mod
+
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        *_,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=num_blocks,
+        block_size=64,
+        head_size=64,
+        num_heads=(16, 2),
+        sliding_window=sliding_window,
+        shuffled_kv_cache=True,
+        device="cuda",
+    )
+    block_table = block_tables
+    max_seqlen_k = max_kv_len
+    if long_max_seqlen_k:
+        max_seqlen_k = 131072
+        block_table = torch.zeros(
+            (len(seq_lens), max_seqlen_k // 64 + 1),
+            dtype=block_tables.dtype,
+            device=block_tables.device,
+        )
+        block_table[:, : block_tables.shape[1]] = block_tables
+    launched = []
+    kernel_2d = ua_mod._unified_attention_kernel_2d_gfx1250
+
+    def hook(*args, **kwargs):
+        launched.append(
+            {
+                k: kwargs.get(k)
+                for k in ("LOOP_VARIANT", "NUM_SPLITS", "waves_per_eu", "BLOCK_M")
+            }
+        )
+
+    kernel_2d.add_pre_run_hook(hook)
+    try:
+        unified_attention(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            out=output,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=kv_lens.to(seq_lens_dtype),
+            max_seqlen_q=max_query_len,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window_size,
+            block_table=block_table,
+            softcap=0,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            sinks=sinks if use_sinks else None,
+            shuffled_kv_cache=True,
+            backend="gluon",
+        )
+    finally:
+        kernel_2d.pre_run_hooks.remove(hook)
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=[x[0] for x in seq_lens],
+        kv_lens=[x[1] for x in seq_lens],
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        sliding_window=sliding_window,
+        sinks=sinks if use_sinks else None,
+    )
+    return launched, output, ref_output
+
+
+@pytest.mark.parametrize(
+    "seq_lens, expect_lv3",
+    [
+        ([(8192, 8192)], False),  # prefill
+        ([(1024, 9216), (1000, 9000), (17, 4113)], False),
+        (
+            [(4, 4100 + 33 * i) for i in range(16)],
+            False,
+        ),  # 4 query rows: loop variant 0
+        (_kv_ring_lens(8, 32), True),  # speculative-decode verify
+        (_kv_ring_lens(7, 32), True),  # speculative-decode draft
+        (_kv_ring_lens(8, 16), True),  # split-KV: 6 splits (full) / 3 (window)
+        (_kv_ring_lens(8, 64, ctx=4096), True),  # split-KV: 3 splits (full)
+        ([(8, 9 + 61 * i) for i in range(24)], True),  # short contexts, kv_len % 64
+        ([(8, 9 + 97 * i) for i in range(16)], True),  # empty splits (< 3 tiles each)
+        ([(16, 9000), (5, 5003), (9, 7009), (1, 4001), (12, 8012)] * 4, True),
+    ],
+)
+@pytest.mark.parametrize("sliding_window", [None, 2048])
+@pytest.mark.parametrize("seq_lens_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("long_max_seqlen_k", [False, True])
+@torch.inference_mode()
+def test_gluon_unified_attn_kv_ring(
+    seq_lens, expect_lv3, sliding_window, seq_lens_dtype, long_max_seqlen_k
+):
+    """gfx1250 Gluon 2D loop variant 3 (K / V TDM ring): the attn_2d table selects it
+    for short queries (bf16, shuffled KV, page 64, head 64, GQA group 8). Up to 64
+    sequences it splits the KV walk (fp32 partials + merge kernel), and full
+    attention takes the 2D kernel instead of the 3D split. Covers mixed query
+    lengths, int64 seqused_k and max_seqlen_k far above the real lengths."""
+    if DEVICE_ARCH != "gfx1250" or not _is_gluon_available():
+        pytest.skip("gfx1250 Gluon only")
+    from aiter.ops.triton.utils import unified_attention_utils as ua_utils
+
+    max_q = max(x[0] for x in seq_lens)
+    max_k = 131072 if long_max_seqlen_k else max(x[1] for x in seq_lens)
+    lv = ua_utils._get_unified_attention_config_cached(
+        "attn_2d",
+        64,
+        max_q,
+        max_k,
+        sliding_window or 0,
+        True,
+        torch.bfloat16,
+        torch.bfloat16,
+        64,
+        1,
+        "gluon",
+        None,
+        8,
+    )["LOOP_VARIANT"]
+    if max_q > 4:
+        assert (lv == 3) == expect_lv3
+    launched, output, ref_output = _kv_ring_run(
+        seq_lens, sliding_window, seq_lens_dtype, long_max_seqlen_k
+    )
+    n = len(seq_lens)
+    if expect_lv3:
+        assert launched and launched[0]["LOOP_VARIANT"] == 3
+        if sliding_window:
+            expect_splits = 3 if n <= 16 else 1
+        else:
+            expect_splits = 6 if n <= 16 else 3
+        assert launched[0]["NUM_SPLITS"] == expect_splits
+        if not sliding_window and 32 < n <= 64:
+            assert launched[0]["waves_per_eu"] == 2
+        if sliding_window and 16 < n <= 32:
+            assert launched[0]["BLOCK_M"] == 32
+    elif launched:
+        assert launched[0]["LOOP_VARIANT"] != 3
+        assert launched[0]["NUM_SPLITS"] in (None, 1)
+    assert not torch.isnan(output).any()
+    torch.testing.assert_close(
+        output.to(torch.float32), ref_output.to(torch.float32), atol=1.5e-2, rtol=1e-2
+    )
+
+
+@pytest.mark.parametrize("sliding_window", [None, 128, 2048])
+@torch.inference_mode()
+def test_gluon_unified_attn_kv_ring_sinks(sliding_window):
+    """Loop variant 3 entries with attention sinks: sliding-window batches keep the
+    2D kernel without split-KV, full attention keeps the 3D split."""
+    if DEVICE_ARCH != "gfx1250" or not _is_gluon_available():
+        pytest.skip("gfx1250 Gluon only")
+    launched, output, ref_output = _kv_ring_run(
+        _kv_ring_lens(8, 16), sliding_window, use_sinks=True
+    )
+    if sliding_window:
+        assert launched and launched[0]["NUM_SPLITS"] in (None, 1)
+    else:
+        assert not launched
+    assert not torch.isnan(output).any()
+    torch.testing.assert_close(
+        output.to(torch.float32), ref_output.to(torch.float32), atol=1.5e-2, rtol=1e-2
+    )
+
+
+@pytest.mark.parametrize("num_splits", [13, 19, 96])
+@pytest.mark.parametrize("sliding_window", [None, 2048])
+@torch.inference_mode()
+def test_gluon_unified_attn_kv_ring_many_splits(
+    num_splits, sliding_window, monkeypatch
+):
+    """Loop variant 3 split-KV with a forced large split count: the partials, the
+    neutral M / L of the empty splits and the merge kernel at any NUM_SPLITS."""
+    if DEVICE_ARCH != "gfx1250" or not _is_gluon_available():
+        pytest.skip("gfx1250 Gluon only")
+    from aiter.ops.triton.attention import unified_attention as ua_mod
+
+    monkeypatch.setattr(
+        ua_mod,
+        "_gfx1250_kv_ring_split",
+        lambda params, lv, ring_d: (
+            (num_splits, ring_d, 0, True) if lv == 3 else (1, ring_d, 0, False)
+        ),
+    )
+    monkeypatch.setattr(ua_mod, "_GFX1250_2D_KV_RING_SPLIT", False)
+    # 312 / 78 / 5 tiles: all, some and almost no splits get tiles
+    seq_lens = [(8, 20000), (8, 5000), (7, 300)]
+    launched, output, ref_output = _kv_ring_run(seq_lens, sliding_window)
+    assert launched and launched[0]["LOOP_VARIANT"] == 3
+    assert launched[0]["NUM_SPLITS"] == num_splits
+    assert not torch.isnan(output).any()
+    torch.testing.assert_close(
+        output.to(torch.float32), ref_output.to(torch.float32), atol=1.5e-2, rtol=1e-2
+    )
+
+
+@pytest.mark.parametrize("sliding_window", [None, 2048])
+@pytest.mark.parametrize("batch, num_pad", [(16, 0), (13, 3), (61, 3)])
+@torch.inference_mode()
+def test_gluon_unified_attn_kv_ring_equal_seqlen_q(sliding_window, batch, num_pad):
+    """Loop variant 3 with equal_seqlen_q and trailing pad sequences (no query rows,
+    seqused_k == 0): the real rows match the reference and no row past them is
+    written."""
+    if DEVICE_ARCH != "gfx1250" or not _is_gluon_available():
+        pytest.skip("gfx1250 Gluon only")
+    query_len, head_size, num_heads = 8, 64, (16, 2)
+    seq_lens = _kv_ring_lens(query_len, batch, ctx=3000)
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        _sinks,
+        _output,
+        cu_query_lens,
+        kv_lens,
+        max_seqlen_q,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        *_,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=batch * (4000 // 64 + 1) + 64,
+        block_size=64,
+        head_size=head_size,
+        num_heads=num_heads,
+        sliding_window=sliding_window,
+        shuffled_kv_cache=True,
+        device="cuda",
+    )
+    num_tokens = batch * query_len
+    cu_seqlens_q = torch.cat([cu_query_lens, cu_query_lens[-1:].repeat(num_pad)])
+    seqused_k = torch.cat(
+        [kv_lens, torch.zeros(num_pad, dtype=kv_lens.dtype, device=kv_lens.device)]
+    )
+    block_table = torch.cat([block_tables, block_tables[:1].repeat(num_pad, 1)])
+    sentinel = 7.0
+    out_buf = torch.full(
+        (num_tokens + (num_pad + 1) * query_len, num_heads[0], head_size),
+        sentinel,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    output = out_buf[:num_tokens]
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=seqused_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_table,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        sinks=None,
+        shuffled_kv_cache=True,
+        equal_seqlen_q=True,
+        backend="gluon",
+    )
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=[q for q, _ in seq_lens],
+        kv_lens=[k for _, k in seq_lens],
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        sliding_window=sliding_window,
+    )
+    assert not output.isnan().any()
+    torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
+    assert (out_buf[num_tokens:] == sentinel).all(), "wrote past the real tokens"
+
+
+@pytest.mark.parametrize(
+    "num_seqs, ctx",
+    [(1, 30000), (2, 20000), (4, 60000), (5, 3500), (8, 131000), (16, 12000)],
+)
+@pytest.mark.parametrize("q_len", [7, 8])
+@pytest.mark.parametrize("sliding_window", [None, 2048])
+@pytest.mark.parametrize("long_max_seqlen_k", [False, True])
+@torch.inference_mode()
+def test_gluon_unified_attn_kv_ring_long_ctx(
+    num_seqs, ctx, q_len, sliding_window, long_max_seqlen_k
+):
+    """Loop variant 3 split-KV for long contexts and a few sequences: the split count
+    follows the CU count, the grid follows max_seqlen_k (also 131072 with shorter
+    real lengths), and full attention merges only each row's live splits."""
+    if DEVICE_ARCH != "gfx1250" or not _is_gluon_available():
+        pytest.skip("gfx1250 Gluon only")
+    seq_lens = [(q_len, ctx - (977 * i) % (ctx // 2)) for i in range(num_seqs)]
+    max_k = max(k for _, k in seq_lens)
+    launched, output, ref_output = _kv_ring_run(
+        seq_lens,
+        sliding_window,
+        long_max_seqlen_k=long_max_seqlen_k,
+        num_blocks=num_seqs * (max_k // 64 + 1) + 64,
+    )
+    assert launched and launched[0]["LOOP_VARIANT"] == 3
+    if not sliding_window or 4 <= num_seqs <= 8:
+        assert launched[0]["NUM_SPLITS"] > 1
+    assert not torch.isnan(output).any()
+    torch.testing.assert_close(
+        output.to(torch.float32), ref_output.to(torch.float32), atol=1.5e-2, rtol=1e-2
+    )

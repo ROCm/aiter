@@ -15,6 +15,25 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 float8_info = torch.finfo(e4m3_dtype)
 
 _MAX_PROPAGATE_NAN_ALL = gl.constexpr(PropagateNan.ALL)
+# Loop variant 3, full-attention split builds: extra tiles for split 0, whose first K / V go out with the seq_len load
+FULL_SPLIT_HEAD0 = gl.constexpr(2)
+
+
+@gluon.constexpr_function
+def _kv_slots(cfg):
+    # LDS slots per K and per V: RING_D for loop variant 3 (the K / V TDM ring), NUM_BUFFERS otherwise.
+    if cfg.LOOP_VARIANT == 3:
+        return cfg.RING_D
+    return cfg.NUM_BUFFERS
+
+
+@gluon.jit
+def _drain_kv_ring(cfg):
+    # Loop variant 3 with RING_D > 3 leaves its clamped (redundant) tail prefetches in flight; they target only K / V
+    # slots the epilogue no longer reads. Drain them right before the output store reuses LDS / the program exits.
+    if cfg.LOOP_VARIANT == 3 and cfg.RING_D > 3:
+        gl.amd.gfx1250.tdm.async_wait(0)
+
 
 # True if tdm.async_gather takes a column argument (its third parameter is not "dst").
 _GATHER_TAKES_COL = gl.constexpr(
@@ -155,6 +174,7 @@ class AttentionConfig:
     NUM_MASKED_TILES: gl.constexpr
     NUM_BUFFERS: gl.constexpr
     LOOP_VARIANT: gl.constexpr
+    RING_D: gl.constexpr
 
     num_blocks: gl.constexpr
     stride_k_cache_0: gl.constexpr
@@ -203,7 +223,9 @@ class AttentionConfig:
         Q_NVFP4=False,
         KV_NVFP4=False,
         V_NVFP4=None,
+        RING_D=2,
     ):
+        self.RING_D = gl.constexpr(RING_D)
         self.HEAD_SIZE = gl.constexpr(HEAD_SIZE)
         self.BLOCK_SIZE = gl.constexpr(BLOCK_SIZE)
         self.BLOCK_M = gl.constexpr(BLOCK_M)
@@ -592,15 +614,16 @@ class TDMKVLoader:
                 layout=kv_cfg.shared_v_layout,
             )
 
+            KV_SLOTS: gl.constexpr = _kv_slots(cfg)
             if cfg.SHUFFLED_KV_CACHE:
                 k_shared = gl.allocate_shared_memory(
                     key_cache_ptr.type.element_ty,
-                    [cfg.NUM_BUFFERS, 1, cfg.BLOCK_SIZE * cfg.HEAD_SIZE],
+                    [KV_SLOTS, 1, cfg.BLOCK_SIZE * cfg.HEAD_SIZE],
                     layout=kv_cfg.shared_k_layout,
                 )
                 v_shared = gl.allocate_shared_memory(
                     value_cache_ptr.type.element_ty,
-                    [cfg.NUM_BUFFERS, 1, cfg.BLOCK_SIZE * cfg.HEAD_SIZE],
+                    [KV_SLOTS, 1, cfg.BLOCK_SIZE * cfg.HEAD_SIZE],
                     layout=kv_cfg.shared_v_layout,
                 )
             else:
@@ -725,7 +748,7 @@ class TDMKVLoader:
         )
 
     @gluon.jit
-    def load_k_to_shared(self, k_offset, buffer_id=0):
+    def load_k_to_shared(self, k_offset, buffer_id=0, pred=None):
         if self.cfg.SHUFFLED_KV_CACHE:
             offsets = [
                 (k_offset * self.cfg.NUM_KV_HEADS + self.kv_head_idx).to(gl.int32),
@@ -736,16 +759,24 @@ class TDMKVLoader:
                 (k_offset * (self.cfg.BLOCK_SIZE)).to(gl.int32),
                 (self.kv_head_idx * self.cfg.stride_k_cache_2).to(gl.int32),
             ]
-        gl.amd.gfx1250.tdm.async_load(
-            self.k_desc, offsets, self.k_shared.index(buffer_id)
-        )
+        if pred is None:
+            gl.amd.gfx1250.tdm.async_load(
+                self.k_desc, offsets, self.k_shared.index(buffer_id)
+            )
+        else:
+            gl.amd.gfx1250.tdm.async_load(
+                self.k_desc,
+                offsets,
+                self.k_shared.index(buffer_id),
+                pred=pred.to(gl.int32),
+            )
         if self.cfg.KV_NVFP4:
             gl.amd.gfx1250.tdm.async_load(
                 self.k_scales_desc, offsets, self.k_scales_shared.index(buffer_id)
             )
 
     @gluon.jit
-    def load_v_to_shared(self, v_offset, buffer_id=0):
+    def load_v_to_shared(self, v_offset, buffer_id=0, pred=None):
         if self.cfg.SHUFFLED_KV_CACHE:
             offsets = [
                 (v_offset * self.cfg.NUM_KV_HEADS + self.kv_head_idx).to(gl.int32),
@@ -756,9 +787,17 @@ class TDMKVLoader:
                 (v_offset * (self.cfg.BLOCK_SIZE)).to(gl.int32),
                 (self.kv_head_idx * self.cfg.stride_v_cache_2).to(gl.int32),
             ]
-        gl.amd.gfx1250.tdm.async_load(
-            self.v_desc, offsets, self.v_shared.index(buffer_id)
-        )
+        if pred is None:
+            gl.amd.gfx1250.tdm.async_load(
+                self.v_desc, offsets, self.v_shared.index(buffer_id)
+            )
+        else:
+            gl.amd.gfx1250.tdm.async_load(
+                self.v_desc,
+                offsets,
+                self.v_shared.index(buffer_id),
+                pred=pred.to(gl.int32),
+            )
         if self.cfg.V_NVFP4:
             gl.amd.gfx1250.tdm.async_load(
                 self.v_scales_desc, offsets, self.v_scales_shared.index(buffer_id)
@@ -855,7 +894,14 @@ class TDMKVLoader:
             )
 
     @gluon.jit
-    def load_block_ids(self, i):
+    def load_block_ids(self, i, last_tile=None, bt_hi=None):
+        # last_tile: clamp prefetches past the program's last tile onto that tile (stays in the sequence's pages)
+        # bt_hi: optional precomputed min(last_tile, block_table_stride - 1) (window ring prologue): the same clamp
+        # value as the two separate clamps, as one scalar min per call instead of a VALU min3 + readfirstlane.
+        if bt_hi is not None and not self.kv_cfg.REMOVE_INDIRECT_ACCESS:
+            return gl.load(self.block_tables_ptr_shifted + gl.minimum(i, bt_hi))
+        if last_tile is not None:
+            i = gl.minimum(i, last_tile)
         if self.kv_cfg.REMOVE_INDIRECT_ACCESS:
             return i
         else:
@@ -1079,7 +1125,7 @@ class TDMGatherKVLoader:
             )
 
     @gluon.jit
-    def load_k_to_shared(self, k_offset, buffer_id=0):
+    def load_k_to_shared(self, k_offset, buffer_id=0, pred=None):
         src_row_indices = (k_offset * self.cfg.NUM_KV_HEADS + self.kv_head_idx).to(
             gl.int32
         )
@@ -1092,7 +1138,7 @@ class TDMGatherKVLoader:
             )
 
     @gluon.jit
-    def load_v_to_shared(self, v_offset, buffer_id=0):
+    def load_v_to_shared(self, v_offset, buffer_id=0, pred=None):
         src_row_indices = (v_offset * self.cfg.NUM_KV_HEADS + self.kv_head_idx).to(
             gl.int32
         )
@@ -1241,6 +1287,7 @@ class AttentionProgram:
     context_len_q_pos_qk: gl.tensor
     QK_scale: gl.tensor
     out_scale: gl.tensor
+    num_splits_eff: gl.tensor
 
     @gluon.constexpr_function
     def __init__(
@@ -1258,6 +1305,7 @@ class AttentionProgram:
         QK_scale,
         out_scale,
         q_scales=None,
+        num_splits_eff=None,
     ):
         self.cfg = cfg
         self.q = q
@@ -1272,6 +1320,7 @@ class AttentionProgram:
         self.context_len_q_pos_qk = context_len_q_pos_qk
         self.QK_scale = QK_scale
         self.out_scale = out_scale
+        self.num_splits_eff = num_splits_eff if num_splits_eff is not None else 1
 
     @gluon.jit
     def initialize(
@@ -1297,6 +1346,8 @@ class AttentionProgram:
         split_idx=0,
         NUM_SPLITS: gl.constexpr = 1,
         q_scales=None,
+        LONG_W64: gl.constexpr = 0,
+        HEAD0: gl.constexpr = 0,
     ):
         num_tiles = (max_seq_prefix_len + cfg.TILE_SIZE - 1) // cfg.TILE_SIZE
         tile_start = 0
@@ -1337,14 +1388,50 @@ class AttentionProgram:
             )[:, None]
             query_mask_qk = gl.convert_layout(query_mask, cfg.qk_layout)
 
-        # Split-KV: carve [tile_start, tile_end) into NUM_SPLITS contiguous
-        # split_idx==0 / NUM_SPLITS==1 is a no-op
-        if NUM_SPLITS > 1:
-            active_tiles = tile_end - tile_start
+        # Split-KV, loop variant 3: carve [tile_start, tile_end) into S_eff = min(NUM_SPLITS, active // 3)
+        # contiguous pieces, so with S_eff >= 2 every piece holds >= 3 tiles and the 3-tile floor of the pipelined
+        # loop never extends a piece into the next one. Splits with split_idx >= S_eff get an empty range.
+        active_tiles = tile_end - tile_start
+        num_splits_eff = active_tiles * 0 + 1
+        if NUM_SPLITS > 1 and cfg.LOOP_VARIANT != 3:
+            # Split-KV: carve [tile_start, tile_end) into NUM_SPLITS contiguous pieces
             tiles_per_split = (active_tiles + NUM_SPLITS - 1) // NUM_SPLITS
             split_start = tile_start + split_idx * tiles_per_split
             tile_end = gl.minimum(split_start + tiles_per_split, tile_end)
             tile_start = split_start
+        elif NUM_SPLITS > 1:
+            num_splits_eff = gl.maximum(gl.minimum(active_tiles // 3, NUM_SPLITS), 1)
+            if NUM_SPLITS == 2 and LONG_W64 > 0 and cfg.SLIDING_WINDOW == 0:
+                # Uneven two-piece carving (full layers): split 0 takes ~LONG_W64/64 of the tiles (>= 3 each);
+                # with S_eff == 1 split 0 owns everything and split 1 is empty.
+                b = tile_start + gl.minimum(
+                    gl.maximum((active_tiles * LONG_W64) // 64, 3), active_tiles - 3
+                )
+                b = gl.where(num_splits_eff > 1, b, tile_end)
+                split_lo = gl.where(split_idx == 0, tile_start, b)
+                split_hi = gl.where(split_idx == 0, b, tile_end)
+            elif HEAD0 > 0:
+                # Split 0 starts its KV stream next to the seq_len load (full split builds): it takes HEAD0 extra
+                # tiles first, the rest is carved evenly (every split keeps >= 3 tiles).
+                h0 = gl.where(
+                    (num_splits_eff > 1) & (active_tiles - HEAD0 >= 3 * num_splits_eff),
+                    HEAD0,
+                    0,
+                )
+                rem0 = active_tiles - h0
+                split_lo = tile_start + gl.where(
+                    split_idx == 0, 0, h0 + (split_idx * rem0) // num_splits_eff
+                )
+                split_hi = tile_start + h0 + ((split_idx + 1) * rem0) // num_splits_eff
+            else:
+                split_lo = tile_start + (split_idx * active_tiles) // num_splits_eff
+                split_hi = (
+                    tile_start + ((split_idx + 1) * active_tiles) // num_splits_eff
+                )
+            split_lo = gl.where(split_idx < num_splits_eff, split_lo, tile_end)
+            split_hi = gl.where(split_idx < num_splits_eff, split_hi, tile_end)
+            tile_start = split_lo
+            tile_end = split_hi
 
         safe_tile_end = gl.minimum(safe_tile_end, tile_end - 1)
         safe_tile_end = gl.maximum(safe_tile_end, tile_start)
@@ -1377,6 +1464,7 @@ class AttentionProgram:
             QK_scale,
             out_scale,
             q_scales,
+            num_splits_eff,
         )
 
     @gluon.jit
@@ -1495,9 +1583,8 @@ class AttentionProgram:
         output_stride_0,
         output_stride_1,
         USE_TDM: gl.constexpr = False,
+        o_staged=None,
     ):
-        casted_out = out.to(self.output_ptr.dtype.element_ty)
-
         if USE_TDM and (
             self.cfg.ARCH_NAME == "gfx1250" or self.cfg.ARCH_NAME == "gfx1250-strict"
         ):
@@ -1505,12 +1592,17 @@ class AttentionProgram:
             o_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(
                 vec=1, per_phase=1, max_phase=1, order=[1, 0]
             )
-            o_smem = gl.allocate_shared_memory(
-                self.output_ptr.dtype.element_ty,
-                [self.cfg.BLOCK_Q, STORE_COLS],
-                layout=o_smem_layout,
-            )
-            o_smem.reshape([self.cfg.BLOCK_M, self.cfg.HEAD_SIZE]).store(casted_out)
+            if o_staged is not None:
+                # the caller already staged the (cast) output in this LDS buffer
+                o_smem = o_staged
+            else:
+                casted_out = out.to(self.output_ptr.dtype.element_ty)
+                o_smem = gl.allocate_shared_memory(
+                    self.output_ptr.dtype.element_ty,
+                    [self.cfg.BLOCK_Q, STORE_COLS],
+                    layout=o_smem_layout,
+                )
+                o_smem.reshape([self.cfg.BLOCK_M, self.cfg.HEAD_SIZE]).store(casted_out)
 
             o_base = (
                 cur_batch_in_all_start_index.to(gl.int64) * output_stride_0
@@ -1529,7 +1621,7 @@ class AttentionProgram:
                 o_smem,
             )
         else:
-
+            casted_out = out.to(self.output_ptr.dtype.element_ty)
             layout: gl.constexpr = self.cfg.pv_layout
             offs_m_out = gl.arange(
                 0, self.cfg.BLOCK_M, layout=gl.SliceLayout(1, layout)
@@ -1723,10 +1815,15 @@ class AttentionProgram:
         kv_head_idx,
         cur_batch_query_len,
         NUM_SPLITS: gl.constexpr,
+        num_splits_eff=None,
     ):
         """Split-KV partials: store the *un-reduced* M (raw row max), L (exp sum)
         and acc (un-normalized PV accumulator) for this split. The cross-split
         reduction (flash rescale by exp2((M_s - max_s M)*QK_scale)) is done later.
+        Loop variant 3 stores the split's normalized output acc / L instead of acc,
+        and with num_splits_eff given, split 0 also writes the neutral M=-inf, L=0
+        into the slots of the empty splits (s >= num_splits_eff), which store
+        nothing; the merge then gives their (stale) acc weight 0.
 
         Buffers are contiguous:
             partial_acc : [num_tokens, NUM_QUERY_HEADS, NUM_SPLITS, HEAD_SIZE]
@@ -1734,6 +1831,11 @@ class AttentionProgram:
         """
         cfg: gl.constexpr = self.cfg
         layout: gl.constexpr = cfg.pv_layout
+        # Loop variant 3: the acc store below goes through an LDS layout conversion whose scratch may alias a K / V ring
+        # slot, so the ring's in-flight tail prefetches are drained first.
+        ROW_STORE: gl.constexpr = cfg.LOOP_VARIANT == 3
+        if ROW_STORE:
+            _drain_kv_ring(cfg)
         offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, layout))
         offs_d = gl.arange(0, cfg.HEAD_SIZE, layout=gl.SliceLayout(0, layout))
         query_pos = q_block_local_idx * cfg.BLOCK_Q + offs_m // cfg.NUM_QUERIES_PER_KV
@@ -1754,13 +1856,54 @@ class AttentionProgram:
             + split_idx * cfg.HEAD_SIZE
             + offs_d[None, :]
         )
-        gl.store(partial_acc_ptr + acc_offs, acc, mask=row_mask[:, None])
+        if ROW_STORE:
+            # The partial holds the split's normalized output acc / L (|o| <= max |v|); the merge re-weights it by L.
+            l_safe = gl.where(L > 0.0, L, 1.0)
+            o_part = acc * (1.0 / l_safe)[:, None]
+            # whole 256 B partial rows per store instruction (16 lanes x 16 B per row) instead of 16 B pieces spread
+            # over many rows in the WMMA accumulator layout
+            st_layout: gl.constexpr = gl.BlockedLayout(
+                [1, 4], [2, 16], [cfg.NUM_WARPS, 1], [1, 0]
+            )
+            o_st = gl.convert_layout(
+                o_part.to(partial_acc_ptr.dtype.element_ty), st_layout
+            )
+            offs_m_st = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, st_layout))
+            offs_d_st = gl.arange(0, cfg.HEAD_SIZE, layout=gl.SliceLayout(0, st_layout))
+            query_pos_st = (
+                q_block_local_idx * cfg.BLOCK_Q + offs_m_st // cfg.NUM_QUERIES_PER_KV
+            )
+            query_offset_1_st = (
+                kv_head_idx * cfg.NUM_QUERIES_PER_KV
+                + offs_m_st % cfg.NUM_QUERIES_PER_KV
+            )
+            row_mask_st = (query_pos_st < cur_batch_query_len) & (
+                query_offset_1_st < cfg.NUM_QUERY_HEADS
+            )
+            acc_offs_st = (
+                (cur_batch_in_all_start_index + query_pos_st)[:, None] * acc_stride_0
+                + query_offset_1_st[:, None] * acc_stride_1
+                + split_idx * cfg.HEAD_SIZE
+                + offs_d_st[None, :]
+            )
+            gl.store(partial_acc_ptr + acc_offs_st, o_st, mask=row_mask_st[:, None])
+        else:
+            gl.store(partial_acc_ptr + acc_offs, acc, mask=row_mask[:, None])
 
         # M, L: [BLOCK_M]
         ml_stride_0: gl.constexpr = cfg.NUM_QUERY_HEADS * NUM_SPLITS
         ml_offs = query_offset_0 * ml_stride_0 + query_offset_1 * NUM_SPLITS + split_idx
         gl.store(partial_m_ptr + ml_offs, M, mask=row_mask)
         gl.store(partial_l_ptr + ml_offs, L, mask=row_mask)
+        if num_splits_eff is not None:
+            m_neutral = gl.full_like(M, float("-inf"))
+            l_neutral = gl.full_like(L, 0.0)
+            ml_base = query_offset_0 * ml_stride_0 + query_offset_1 * NUM_SPLITS
+            # only split 0, and only the empty splits' slots (a runtime loop: no NUM_SPLITS masked stores per program)
+            if split_idx == 0:
+                for s in range(num_splits_eff, NUM_SPLITS):
+                    gl.store(partial_m_ptr + ml_base + s, m_neutral, mask=row_mask)
+                    gl.store(partial_l_ptr + ml_base + s, l_neutral, mask=row_mask)
 
     @gluon.jit
     def compute_qk_subtile(self, k, k_scales=None):
@@ -1804,11 +1947,18 @@ class AttentionProgram:
                 0, self.cfg.TILE_SIZE // 2, layout=gl.SliceLayout(0, self.cfg.qk_layout)
             )[None, :]
         )
-        seq_mask = seq_offset < (self.context_len_q_pos_qk + 1)
-        if self.cfg.SLIDING_WINDOW > 0:
-            seq_mask = seq_mask & (
-                (self.context_len_q_pos_qk - seq_offset) < self.cfg.SLIDING_WINDOW
-            )
+        if self.cfg.LOOP_VARIANT == 3 and self.cfg.SLIDING_WINDOW > 0:
+            # 0 <= ctx - pos < W as one unsigned compare (one v_sub + v_cmp per element instead of two compares and an
+            # and): the loop variant 3 window builds are bound by cold instruction fetch, so code bytes count.
+            seq_mask = (self.context_len_q_pos_qk - seq_offset).to(gl.int32).to(
+                gl.uint32, bitcast=True
+            ) < self.cfg.SLIDING_WINDOW
+        else:
+            seq_mask = seq_offset < (self.context_len_q_pos_qk + 1)
+            if self.cfg.SLIDING_WINDOW > 0:
+                seq_mask = seq_mask & (
+                    (self.context_len_q_pos_qk - seq_offset) < self.cfg.SLIDING_WINDOW
+                )
         S = gl.where(seq_mask, S, float("-inf"))
         return S
 
@@ -2487,6 +2637,404 @@ def attention_loop_tensor_subtile_split(
 
 
 @gluon.jit
+def attention_loop_tensor_subtile_ring(
+    pgm,
+    kv_loader,
+    q,
+    M,
+    L,
+    acc0,
+    acc1,
+    D: gl.constexpr,
+    q_smem=None,
+    EARLY_KV0: gl.constexpr = False,
+    SPLIT_BUILD: gl.constexpr = False,
+    win_mask_end=0,
+):
+    """LOOP_VARIANT 3: the LOOP_VARIANT 2 compute schedule with a D-slot K / V TDM prefetch ring (D >= 3).
+
+    Tile t lives in K slot and V slot (t - tile_start) % D. TDM issue stream (in order):
+        prologue: K_s, K_s+1, V_s, (K_s+2, V_s+1) ... (K_s+D-1, V_s+D-2), then K_s+D, V_s+D-1
+        iter j:   K_j+D+1 (into K_j+1's slot, read last iter), V_j+D (into V_j's slot, read this iter)
+    At iter j entry the outstanding loads are V_j, (K_j+2, V_j+1), ..., (K_j+D, V_j+D-1), i.e. 2D-1, and the
+    register carry k holds K_j+1. Every prefetch past the program's last tile is clamped onto that tile
+    (in-bounds, redundant), so the wait counts are constant. The K_{j+2} LDS read and the V_{j+D} issue sit after
+    PV1, which keeps the K registers dead across S2 / S3.
+    """
+    cfg: gl.constexpr = pgm.cfg
+    gl.static_assert(D >= 3, "loop variant 3 needs RING_D >= 3")
+    QK_scale = pgm.QK_scale
+
+    s = pgm.tile_start
+    last_tile = pgm.tile_end - 1
+    tile_end = gl.maximum(s + 3, pgm.tile_end)
+    # Window layers use one TDM wait + barrier per tile instead of two: the wait at the top of iteration j drains
+    # V_j and K_{j+2}, then V_{j+D-1} is issued into V_{j-1}'s slot (drained by that barrier) instead of V_{j+D}
+    # into V_j's slot after the K_{j+2} wait. The TDM stream order is unchanged; only the V issue times move.
+    ONE_WAIT: gl.constexpr = cfg.SLIDING_WINDOW > 0
+    # TAIL_PRED (window builds only): see the prologue. Full builds were slower with it and keep clamped loads.
+    TAIL_PRED: gl.constexpr = ONE_WAIT
+
+    # ---- Prologue issues ----
+    # EARLY_KV0: the caller already issued K_s, V_s (s = 0) next to the seq_len load, so the stream starts
+    # K_s, V_s, K_s+1, (K_s+2, V_s+1) ...; only the K_s+1 wait below changes (2D-1 -> 2D-2).
+    if ONE_WAIT and not SPLIT_BUILD:
+        # unsplit window builds: one scalar clamp bound min(last_tile, block_table_stride - 1) for the prologue's
+        # block-table reads (the same values as the two clamps, less code before the loop)
+        bt_hi = gl.minimum(last_tile, kv_loader.block_table_stride - 1)
+    else:
+        bt_hi = None
+    if not EARLY_KV0:
+        bid0 = kv_loader.load_block_ids(s, last_tile, bt_hi)
+    bid1 = kv_loader.load_block_ids(s + 1, last_tile, bt_hi)
+    if not EARLY_KV0:
+        kv_loader.load_k_to_shared(bid0, buffer_id=0)
+    # Tail predicate: a prefetch of a tile index >= tile_end (never consumed) is issued with the TDM descriptor
+    # predicate off, a hardware no-op that still counts in TENSORcnt (as in AMD's gfx1250 Gluon examples), so
+    # every wait count stays as it is. Tiles < tile_end (s .. s+2 at least) keep the clamped load.
+    kv_loader.load_k_to_shared(bid1, buffer_id=1)
+    if not EARLY_KV0:
+        kv_loader.load_v_to_shared(bid0, buffer_id=0)
+    v_bid = bid1
+    for i in gl.static_range(D - 2):
+        kb = kv_loader.load_block_ids(s + 2 + i, last_tile, bt_hi)
+        kv_loader.load_k_to_shared(
+            kb, buffer_id=2 + i, pred=(s + 2 + i < tile_end) if TAIL_PRED else None
+        )
+        kv_loader.load_v_to_shared(
+            v_bid, buffer_id=1 + i, pred=(s + 1 + i < tile_end) if TAIL_PRED else None
+        )
+        v_bid = kb
+    # v_bid = id(s+D-1)
+    k_bid = kv_loader.load_block_ids(s + D, last_tile, bt_hi)
+
+    k = kv_loader.load_k_from_shared(
+        wait_count=2 * D - 2, buffer_id=0, target_dtype=q.dtype
+    )
+    if q_smem is not None:
+        # Deferred Q: its TDM was issued before every KV load, so the in-order wait above drained it too.
+        q = q_smem.reshape([cfg.BLOCK_M, cfg.HEAD_SIZE]).load(layout=cfg.q_layout)
+        pgm = AttentionProgram(
+            cfg,
+            q,
+            pgm.key_cache_ptr,
+            pgm.value_cache_ptr,
+            pgm.output_ptr,
+            pgm.tile_start,
+            pgm.tile_end,
+            pgm.safe_tile_end,
+            pgm.query_mask_qk,
+            pgm.context_len_q_pos_qk,
+            pgm.QK_scale,
+            pgm.out_scale,
+            pgm.q_scales,
+            pgm.num_splits_eff,
+        )
+    kv_loader.load_k_to_shared(
+        k_bid, buffer_id=0, pred=(s + D < tile_end) if TAIL_PRED else None
+    )
+    if ONE_WAIT:
+        # V_{s+D-1} is issued by the first loop iteration (or the epilogue), right after its wait's barrier.
+        # loop carry: v_bid = id(j+D-1), w_bid = id(j+D), k_bid = id(j+D+1)
+        w_bid = k_bid
+    else:
+        kv_loader.load_v_to_shared(v_bid, buffer_id=D - 1)
+        # loop carry: v_bid = id(j+D), k_bid = id(j+D+1)
+        v_bid = k_bid
+        w_bid = k_bid
+    k_bid = kv_loader.load_block_ids(s + D + 1, last_tile, bt_hi)
+
+    k0_s, k1_s = pgm.split_subtile(k)
+    qk0 = pgm.compute_qk_subtile(k0_s)
+    qk1 = pgm.compute_qk_subtile(k1_s)
+    if ONE_WAIT:
+        # Window build: one mask covers the causal and the window condition. Only the
+        # tiles below win_mask_end (a window start) and the causal tiles need it.
+        mask_s = pgm.tile_start < win_mask_end
+        if cfg.CAUSAL:
+            mask_s = mask_s | (pgm.tile_start >= pgm.safe_tile_end)
+        if mask_s:
+            qk0 = pgm.apply_mask_qk_subtile(qk0, pgm.tile_start, 0)
+            qk1 = pgm.apply_mask_qk_subtile(qk1, pgm.tile_start, 1)
+    elif cfg.CAUSAL and pgm.tile_start >= pgm.safe_tile_end:
+        qk0 = pgm.apply_mask_qk_subtile(qk0, pgm.tile_start, 0)
+        qk1 = pgm.apply_mask_qk_subtile(qk1, pgm.tile_start, 1)
+
+    qk0 = gl.convert_layout(qk0, cfg.pv_layout, assert_trivial=True)
+    qk1 = gl.convert_layout(qk1, cfg.pv_layout, assert_trivial=True)
+    qk = pgm.concat_subtile(qk0, qk1)
+    m = reduce_max_prop_nan(qk, -1)
+    m_ij = elementwise_max_prop_nan(M, m)
+    if cfg.SLIDING_WINDOW > 0:
+        # A row whose window starts in the next tile is all -inf here; shift
+        # by 0 so p and alpha are 0 instead of NaN, and keep M at -inf.
+        m_ij_scaled = gl.where(m_ij > float("-inf"), m_ij, 0.0) * QK_scale
+    else:
+        m_ij_scaled = m_ij * QK_scale
+    m_diff_scaled = M * QK_scale - m_ij_scaled
+    M = m_ij
+    alpha = gl.exp2(m_diff_scaled)
+
+    # ONE_WAIT: V_{s+D-1} is not issued yet, so one load fewer follows K_{s+1}.
+    k = kv_loader.load_k_from_shared(
+        wait_count=(2 * D - 2 if EARLY_KV0 else 2 * D - 1) - (1 if ONE_WAIT else 0),
+        buffer_id=1,
+        target_dtype=q.dtype,
+    )
+
+    qk0_shifted = qk0 * QK_scale - m_ij_scaled[:, None]
+    qk1_shifted = qk1 * QK_scale - m_ij_scaled[:, None]
+    p0 = gl.exp2(qk0_shifted)
+
+    # ---- Steady-state loop ----
+    # V_LATE (split-KV full builds only): the V_j LDS read moves from S1 to just before PV0 and p0 / p1 become
+    # bf16 before QK1 (same TDM stream and wait counts). It helps the split builds only, so the unsplit build
+    # keeps the old order.
+    V_LATE: gl.constexpr = SPLIT_BUILD and not ONE_WAIT
+    for j in range(s, tile_end - 3):
+        new_bid = kv_loader.load_block_ids(j + D + 2, last_tile)
+        # LDS slot indices must be int32; j is int64 when seq_lens is int64.
+        it = (j - s).to(gl.int32)
+        buf_cur = it % D
+        buf_next = (it + 1) % D
+        buf_next2 = (it + 2) % D
+
+        k0_s, k1_s = pgm.split_subtile(k)
+
+        # --- S1: QK sub 0 + SM1-A ---
+        qk0 = pgm.compute_qk_subtile(k0_s)
+        if ONE_WAIT:
+            # outstanding before this wait: V_j, K_{j+2}, V_{j+1}, ..., V_{j+D-2}, K_{j+D}
+            gl.amd.gfx1250.tdm.async_wait(2 * D - 4)
+            kv_loader.load_v_to_shared(
+                v_bid,
+                buffer_id=(it + D - 1) % D,
+                pred=(j + D - 1 < tile_end) if TAIL_PRED else None,
+            )
+        if V_LATE:
+            # only the wait (and its barrier, which guards K_{j+1}'s slot for the issue below) stays here
+            gl.amd.gfx1250.tdm.async_wait(2 * D - 2)
+        else:
+            v = kv_loader.load_v_from_shared(
+                wait_count=2 * D - 2,
+                buffer_id=buf_cur,
+                target_dtype=q.dtype,
+                skip_wait=ONE_WAIT,
+            )
+        p1 = gl.exp2(qk1_shifted)
+        acc0 = acc0 * alpha[:, None]
+        acc1 = acc1 * alpha[:, None]
+
+        if not V_LATE:
+            v0_s, v1_s = pgm.split_subtile(v)
+        # K_{j+D+1} into K_{j+1}'s slot (K_{j+1} was read into registers last iteration)
+        kv_loader.load_k_to_shared(
+            k_bid,
+            buffer_id=buf_next,
+            pred=(j + D + 1 < tile_end) if TAIL_PRED else None,
+        )
+
+        # --- S2: QK sub 1 + SM1-B ---
+        if V_LATE:
+            p = pgm.concat_subtile(p0, p1)
+            l_ij = gl.sum(p, 1)
+            L = L * alpha + l_ij
+            p = p.to(q.dtype)
+            qk1 = pgm.compute_qk_subtile(k1_s)
+            # V_j slot is refilled only after the S4 K wait's barrier, i.e. after PV1
+            v = kv_loader.load_v_from_shared(
+                wait_count=0, buffer_id=buf_cur, target_dtype=q.dtype, skip_wait=True
+            )
+            v0_s, v1_s = pgm.split_subtile(v)
+        else:
+            qk1 = pgm.compute_qk_subtile(k1_s)
+            p = pgm.concat_subtile(p0, p1)
+            l_ij = gl.sum(p, 1)
+            L = L * alpha + l_ij
+            p = p.to(q.dtype)
+
+        # --- S3: PV sub 0 + SM0-A ---
+        acc0 = pgm.compute_pv(p, v0_s, acc0)
+        if ONE_WAIT:  # noqa: SIM102
+            if j + 1 < win_mask_end:
+                qk0 = pgm.apply_mask_qk_subtile(qk0, j + 1, 0)
+                qk1 = pgm.apply_mask_qk_subtile(qk1, j + 1, 1)
+        qk0 = gl.convert_layout(qk0, cfg.pv_layout, assert_trivial=True)
+        qk1 = gl.convert_layout(qk1, cfg.pv_layout, assert_trivial=True)
+        qk = pgm.concat_subtile(qk0, qk1)
+        m = reduce_max_prop_nan(qk, -1)
+        m_ij = elementwise_max_prop_nan(M, m)
+        m_ij_scaled = m_ij * QK_scale
+        m_diff_scaled = M * QK_scale - m_ij_scaled
+        M = m_ij
+        alpha = gl.exp2(m_diff_scaled)
+
+        # --- S4: PV sub 1 + SM0-B ---
+        acc1 = pgm.compute_pv(p, v1_s, acc1)
+        # K_{j+2} is read only now; V_{j+D} refills V_j's slot after this wait's barrier (which drains every
+        # wave's LDS reads), i.e. after v1's last use.
+        k = kv_loader.load_k_from_shared(
+            wait_count=2 * D - 2,
+            buffer_id=buf_next2,
+            target_dtype=q.dtype,
+            skip_wait=ONE_WAIT,
+        )
+        if not ONE_WAIT:
+            kv_loader.load_v_to_shared(v_bid, buffer_id=buf_cur)
+        qk0_shifted = qk0 * QK_scale - m_ij_scaled[:, None]
+        qk1_shifted = qk1 * QK_scale - m_ij_scaled[:, None]
+        p0 = gl.exp2(qk0_shifted)
+
+        if ONE_WAIT:
+            v_bid, w_bid, k_bid = w_bid, k_bid, new_bid
+        else:
+            v_bid, k_bid = k_bid, new_bid
+
+    # ---- Epilogue (3 remaining tiles: L=tile_end-3, L+1, L+2) ----
+    epilogue_t_2 = tile_end - 2
+    epilogue_t_3 = tile_end - 1
+    it_l = (tile_end - 3 - s).to(gl.int32)
+    buf_l = it_l % D
+    buf_l1 = (it_l + 1) % D
+    buf_l2 = (it_l + 2) % D
+    # V_{L+2} was issued in the pair (K_{L+3}, V_{L+2}); only later pairs follow it.
+    K2_WAIT: gl.constexpr = 2 * D - 3
+    V1_WAIT: gl.constexpr = 2 * D - 4
+    V2_WAIT: gl.constexpr = 2 * D - 6
+
+    k0_s, k1_s = pgm.split_subtile(k)
+
+    # --- S1: QK sub 0 for L+1 + SM1-A for L ---
+    qk0 = pgm.compute_qk_subtile(k0_s)
+    p1 = gl.exp2(qk1_shifted)
+    acc0 = acc0 * alpha[:, None]
+    acc1 = acc1 * alpha[:, None]
+
+    if not ONE_WAIT:  # noqa: SIM102
+        if cfg.CAUSAL and epilogue_t_2 >= pgm.safe_tile_end:
+            qk0 = pgm.apply_mask_qk_subtile(qk0, epilogue_t_2, 0)
+    if ONE_WAIT:
+        # As in a loop iteration (also with zero loop iterations): drain V_L and K_{L+2}, then issue V_{L+D-1};
+        # the stream is then the two-wait schedule's, so the waits below hold.
+        gl.amd.gfx1250.tdm.async_wait(2 * D - 4)
+        # V_{L+D-1} = tile_end + D - 4: consumed only for D <= 3
+        kv_loader.load_v_to_shared(
+            v_bid,
+            buffer_id=(it_l + D - 1) % D,
+            pred=(tile_end + D - 4 < tile_end) if TAIL_PRED else None,
+        )
+    v = kv_loader.load_v_from_shared(
+        wait_count=2 * D - 2,
+        buffer_id=buf_l,
+        target_dtype=q.dtype,
+        skip_wait=ONE_WAIT,
+    )
+
+    # --- S2: QK sub 1 for L+1 + SM1-B for L ---
+    qk1 = pgm.compute_qk_subtile(k1_s)
+    if ONE_WAIT:
+        mask_e = epilogue_t_2 < win_mask_end
+        if cfg.CAUSAL:
+            mask_e = mask_e | (epilogue_t_2 >= pgm.safe_tile_end)
+        if mask_e:
+            qk0 = pgm.apply_mask_qk_subtile(qk0, epilogue_t_2, 0)
+            qk1 = pgm.apply_mask_qk_subtile(qk1, epilogue_t_2, 1)
+    elif cfg.CAUSAL and epilogue_t_2 >= pgm.safe_tile_end:
+        qk1 = pgm.apply_mask_qk_subtile(qk1, epilogue_t_2, 1)
+    p = pgm.concat_subtile(p0, p1)
+    l_ij = gl.sum(p, 1)
+    L = L * alpha + l_ij
+    p = p.to(q.dtype)
+
+    v0_s, v1_s = pgm.split_subtile(v)
+    k = kv_loader.load_k_from_shared(
+        wait_count=K2_WAIT, buffer_id=buf_l2, target_dtype=q.dtype, skip_wait=ONE_WAIT
+    )
+
+    # --- S3: PV sub 0 for L + SM0 for L+1 ---
+    acc0 = pgm.compute_pv(p, v0_s, acc0)
+    qk0 = gl.convert_layout(qk0, cfg.pv_layout, assert_trivial=True)
+    qk1 = gl.convert_layout(qk1, cfg.pv_layout, assert_trivial=True)
+    qk = pgm.concat_subtile(qk0, qk1)
+    m = reduce_max_prop_nan(qk, -1)
+    m_ij = elementwise_max_prop_nan(M, m)
+    m_ij_scaled = m_ij * QK_scale
+    m_diff_scaled = M * QK_scale - m_ij_scaled
+    M = m_ij
+    alpha = gl.exp2(m_diff_scaled)
+
+    # --- S4: PV sub 1 for L + SM0-B for L+1 ---
+    acc1 = pgm.compute_pv(p, v1_s, acc1)
+    qk0_shifted = qk0 * QK_scale - m_ij_scaled[:, None]
+    qk1_shifted = qk1 * QK_scale - m_ij_scaled[:, None]
+    p0_next = gl.exp2(qk0_shifted)
+
+    v = kv_loader.load_v_from_shared(
+        wait_count=V1_WAIT, buffer_id=buf_l1, target_dtype=q.dtype
+    )
+
+    k0_s, k1_s = pgm.split_subtile(k)
+
+    # --- S1: QK sub 0 for L+2 + SM1-A for L+1 ---
+    qk0 = pgm.compute_qk_subtile(k0_s)
+    acc0 = acc0 * alpha[:, None]
+    acc1 = acc1 * alpha[:, None]
+    p1_next = gl.exp2(qk1_shifted)
+    p = pgm.concat_subtile(p0_next, p1_next)
+
+    qk0 = pgm.apply_mask_qk_subtile(qk0, epilogue_t_3, 0)
+
+    # --- S2: QK sub 1 for L+2 + SM1-B for L+1 ---
+    qk1 = pgm.compute_qk_subtile(k1_s)
+    l_ij = gl.sum(p, 1)
+    L = L * alpha + l_ij
+    p = p.to(q.dtype)
+    qk1 = pgm.apply_mask_qk_subtile(qk1, epilogue_t_3, 1)
+
+    v0_s, v1_s = pgm.split_subtile(v)
+
+    # --- S3: PV sub 0 for L+1 + SM0 for L+2 ---
+    acc0 = pgm.compute_pv(p, v0_s, acc0)
+    qk0 = gl.convert_layout(qk0, cfg.pv_layout, assert_trivial=True)
+    qk1 = gl.convert_layout(qk1, cfg.pv_layout, assert_trivial=True)
+    qk = pgm.concat_subtile(qk0, qk1)
+    m = reduce_max_prop_nan(qk, -1)
+    m_ij = elementwise_max_prop_nan(M, m)
+    m_ij_scaled = m_ij * QK_scale
+    m_diff_scaled = M * QK_scale - m_ij_scaled
+    M = m_ij
+    alpha = gl.exp2(m_diff_scaled)
+
+    v = kv_loader.load_v_from_shared(
+        wait_count=V2_WAIT, buffer_id=buf_l2, target_dtype=q.dtype
+    )
+    # D > 3: the clamped tail prefetches are drained by the caller (_drain_kv_ring) right before the output store,
+    # so the drain overlaps the last PV and the normalization.
+    # --- S4: PV sub 1 for L+1 + SM0-B for L+2 ---
+    acc1 = pgm.compute_pv(p, v1_s, acc1)
+    qk0_shifted = qk0 * QK_scale - m_ij_scaled[:, None]
+    qk1_shifted = qk1 * QK_scale - m_ij_scaled[:, None]
+    p0_next = gl.exp2(qk0_shifted)
+    p1_next = gl.exp2(qk1_shifted)
+    p = pgm.concat_subtile(p0_next, p1_next)
+
+    # ---- Final SM1 + PV for L+2 ----
+    acc0 = acc0 * alpha[:, None]
+    l_ij = gl.sum(p, 1)
+    L = L * alpha + l_ij
+    p = p.to(q.dtype)
+
+    v0_s, v1_s = pgm.split_subtile(v)
+    acc0 = pgm.compute_pv(p, v0_s, acc0)
+    acc1 = acc1 * alpha[:, None]
+
+    acc1 = pgm.compute_pv(p, v1_s, acc1)
+    acc = pgm.concat_subtile(acc0, acc1)
+
+    return M, L, acc
+
+
+@gluon.jit
 def load_q(
     cfg,
     query_ptr,
@@ -2498,6 +3046,7 @@ def load_q(
     q_block_local_idx,
     query_stride_0,
     USE_TDM_LOAD: gl.constexpr = False,
+    DEFER_WAIT: gl.constexpr = False,
 ):
     if USE_TDM_LOAD and (
         cfg.ARCH_NAME == "gfx1250" or cfg.ARCH_NAME == "gfx1250-strict"
@@ -2524,8 +3073,12 @@ def load_q(
             [(q_block_local_idx * cfg.BLOCK_Q).to(gl.int32), 0],
             q_smem,
         )
-        gl.amd.gfx1250.tdm.async_wait(0)
-        q = q_smem.reshape([cfg.BLOCK_M, cfg.HEAD_SIZE_Q]).load(layout=cfg.q_layout)
+        if DEFER_WAIT:
+            # the caller waits (in TDM issue order) and loads q from LDS itself
+            q = q_smem
+        else:
+            gl.amd.gfx1250.tdm.async_wait(0)
+            q = q_smem.reshape([cfg.BLOCK_M, cfg.HEAD_SIZE_Q]).load(layout=cfg.q_layout)
     else:
         q = gl.amd.cdna4.buffer_load(
             ptr=query_ptr,
@@ -2660,13 +3213,34 @@ def _unified_attention_gluon_kernel_2d(
     gate_ptr=None,
     gate_stride_0=None,
     GATE: gl.constexpr = False,
+    # LOOP_VARIANT 3: K / V TDM ring depth (LDS slots per K and per V)
+    RING_D: gl.constexpr = 2,
+    # LOOP_VARIANT 3, NUM_SPLITS 2, full attention: > 0 gives split 0 about LONG_W64 / 64 of the tiles (0 = even)
+    LONG_W64: gl.constexpr = 0,
+    # LOOP_VARIANT 3 split-KV: the split index is folded into grid axis 1 (pid1 = q_block * NUM_SPLITS + split)
+    # instead of grid axis 2
+    SPLITS_IN_AXIS1: gl.constexpr = False,
+    # > 0 (LOOP_VARIANT 3): grid axis 1 holds SEQ_Q_BLOCKS q blocks per sequence (see the index setup)
+    SEQ_Q_BLOCKS: gl.constexpr = 0,
+    # split-KV: split 0 writes the neutral M / L of the empty splits (False: the merge derives each row's split count
+    # from seq_lens itself and reads only the live splits)
+    SPLIT_NEUTRAL_ML: gl.constexpr = True,
+    # SEQ_Q_BLOCKS > 0: issue the seq_len load together with the cu_seqlens loads (before the q-block exit) and a
+    # one-lane load of the sequence's block-table row start, so the block-table entry load that follows seq_len finds
+    # its translation and line warm
+    EARLY_SEQ_LOADS: gl.constexpr = False,
 ):
     NUM_WARPS: gl.constexpr = gl.num_warps()
     kv_head_idx = gl.program_id(0)
     # q_block_global_idx = gl.program_id(1)
-    q_block_global_idx = gl.num_programs(1) - 1 - gl.program_id(1)
-    # program_id(2) is 0 for a 2d grid (NUM_SPLITS==1), so this is always safe.
-    split_idx = gl.program_id(2)
+    if SPLITS_IN_AXIS1:
+        pid1 = gl.num_programs(1) - 1 - gl.program_id(1)
+        q_block_global_idx = pid1 // NUM_SPLITS
+        split_idx = pid1 % NUM_SPLITS
+    else:
+        q_block_global_idx = gl.num_programs(1) - 1 - gl.program_id(1)
+        # program_id(2) is 0 for a 2d grid (NUM_SPLITS==1), so this is always safe.
+        split_idx = gl.program_id(2)
     Q_FP8: gl.constexpr = query_ptr.dtype.is_fp8()
     KV_FP8: gl.constexpr = key_cache_ptr.dtype.is_fp8()
 
@@ -2705,6 +3279,7 @@ def _unified_attention_gluon_kernel_2d(
         Q_NVFP4,
         KV_NVFP4,
         V_NVFP4,
+        RING_D,
     )
     if KV_NVFP4:
         # the wait sites of loop variants 0, 1 and 2 (two buffers) name their later loads
@@ -2718,7 +3293,27 @@ def _unified_attention_gluon_kernel_2d(
             "an NVFP4 V runs loop variant 0 with one page per tile",
         )
 
-    if SPEC_DECODE:
+    if SEQ_Q_BLOCKS > 0:
+        # Loop variant 3: sequence-major q-block numbering (SEQ_Q_BLOCKS = cdiv(max_seqlen_q, BLOCK_Q) blocks per
+        # sequence), so the sequence index needs no binary search over cu_seqlens; blocks past a sequence's own
+        # query length exit below.
+        seq_idx = q_block_global_idx // SEQ_Q_BLOCKS
+        q_block_local_idx = q_block_global_idx % SEQ_Q_BLOCKS
+        if EARLY_SEQ_LOADS:
+            seq_len_early = gl.load(seq_lens_ptr + seq_idx)
+            bt_warm_layout: gl.constexpr = gl.BlockedLayout([1], [32], [NUM_WARPS], [0])
+            bt_warm_offs = gl.arange(0, 32 * NUM_WARPS, layout=bt_warm_layout)
+            bt_row_warm = gl.load(
+                block_tables_ptr + seq_idx * block_table_stride + bt_warm_offs * 0,
+                mask=bt_warm_offs == 0,
+                other=0,
+            )
+        cur_batch_in_all_start_index = gl.load(query_start_len_ptr + seq_idx)
+        cur_batch_in_all_stop_index = gl.load(query_start_len_ptr + seq_idx + 1)
+        cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
+        if q_block_local_idx * cfg.BLOCK_Q >= cur_batch_query_len:
+            return
+    elif SPEC_DECODE:
         # Every seq holds SEQLEN_Q queries, so the launch has exactly
         # Q_BLOCKS_PER_SEQ blocks per seq and the program id alone locates the
         # seq and the query block: no binary search, and no empty blocks.
@@ -2777,18 +3372,44 @@ def _unified_attention_gluon_kernel_2d(
         + offs_d[None, :]
     )
 
-    q = load_q(
-        cfg,
-        query_ptr,
-        q_offs,
-        query_mask,
-        cur_batch_in_all_start_index,
-        kv_head_idx,
-        cur_batch_query_len,
-        q_block_local_idx,
-        query_stride_0,
-        USE_TDM_LOAD=USE_TDM_LOAD,
+    # Loop variant 3 issues the Q TDM now and waits for it inside the ring's first KV wait, so its round trip
+    # overlaps the seq_len / block-table loads and the first KV issues. q is a placeholder until then.
+    DEFER_Q: gl.constexpr = (
+        USE_TDM_LOAD
+        and (ARCH_NAME == "gfx1250" or ARCH_NAME == "gfx1250-strict")
+        and LOOP_VARIANT == 3
     )
+    if DEFER_Q:
+        q_smem = load_q(
+            cfg,
+            query_ptr,
+            q_offs,
+            query_mask,
+            cur_batch_in_all_start_index,
+            kv_head_idx,
+            cur_batch_query_len,
+            q_block_local_idx,
+            query_stride_0,
+            USE_TDM_LOAD=USE_TDM_LOAD,
+            DEFER_WAIT=True,
+        )
+        q = gl.zeros(
+            [BLOCK_M, HEAD_SIZE], dtype=query_ptr.dtype.element_ty, layout=cfg.q_layout
+        )
+    else:
+        q_smem = None
+        q = load_q(
+            cfg,
+            query_ptr,
+            q_offs,
+            query_mask,
+            cur_batch_in_all_start_index,
+            kv_head_idx,
+            cur_batch_query_len,
+            q_block_local_idx,
+            query_stride_0,
+            USE_TDM_LOAD=USE_TDM_LOAD,
+        )
 
     if KV_NVFP4:
         if Q_NVFP4:
@@ -2828,9 +3449,78 @@ def _unified_attention_gluon_kernel_2d(
     else:
         q_scales = None
 
-    seq_len = gl.load(seq_lens_ptr + seq_idx)
+    if EARLY_SEQ_LOADS and SEQ_Q_BLOCKS > 0:
+        seq_len = seq_len_early
+    else:
+        seq_len = gl.load(seq_lens_ptr + seq_idx)
+    if LOOP_VARIANT == 3:
+        # seq_lens may be int64: keep the ring's tile and LDS slot arithmetic in int32.
+        seq_len = seq_len.to(gl.int32)
     context_len = seq_len - cur_batch_query_len
     block_tables_ptr_shifted = block_tables_ptr + seq_idx * block_table_stride
+    # Loop variant 3, one split: K / V of the program's first tile are issued next to the seq_len load instead of
+    # after the setup. Full attention: tile_start is 0 and bt[0] is always one of the sequence's pages (seq_len >=
+    # q_len >= 1). Sliding window: the window's first tile, computed as AttentionProgram.initialize does
+    # (tile_start = max(0, first_allowed_key // TILE_SIZE) <= the last key, so bt[tile_start] is one of the pages).
+    EARLY_KV0: gl.constexpr = (
+        DEFER_Q
+        and (SLIDING_WINDOW == 0 or CAUSAL)
+        and (NUM_SPLITS == 1 or SLIDING_WINDOW > 0)
+        and not REMOVE_INDIRECT_ACCESS
+        and TILE_SIZE == BLOCK_SIZE
+    )
+    # Loop variant 3, full-attention split builds: split 0 always starts at tile 0, so its K_0 / V_0 are issued next
+    # to the seq_len load (bt[0] is one of the sequence's pages); the other splits issue their first tile as soon as
+    # the carving is known (below). Every program issues exactly one early K / V pair, so the ring's wait counts are
+    # those of EARLY_KV0. Split 0 also takes FULL_SPLIT_HEAD0 extra tiles for its head start.
+    EARLY_KV0_FS: gl.constexpr = (
+        DEFER_Q
+        and SLIDING_WINDOW == 0
+        and NUM_SPLITS > 1
+        and LONG_W64 == 0
+        and not REMOVE_INDIRECT_ACCESS
+        and TILE_SIZE == BLOCK_SIZE
+    )
+    HEAD0: gl.constexpr = FULL_SPLIT_HEAD0 if EARLY_KV0_FS else 0
+    if EARLY_KV0_FS:
+        kv_loader = TDMKVLoader.initialize(
+            cfg,
+            key_cache_ptr,
+            value_cache_ptr,
+            block_tables_ptr_shifted,
+            kv_head_idx,
+            block_table_stride,
+            REMOVE_INDIRECT_ACCESS,
+        )
+        if split_idx == 0:
+            bid0_fs = gl.load(block_tables_ptr_shifted)
+            kv_loader.load_k_to_shared(bid0_fs, buffer_id=0)
+            kv_loader.load_v_to_shared(bid0_fs, buffer_id=0)
+    if EARLY_KV0 and NUM_SPLITS == 1:
+        kv_loader = TDMKVLoader.initialize(
+            cfg,
+            key_cache_ptr,
+            value_cache_ptr,
+            block_tables_ptr_shifted,
+            kv_head_idx,
+            block_table_stride,
+            REMOVE_INDIRECT_ACCESS,
+        )
+        if SLIDING_WINDOW > 0:
+            first_allowed_key0 = (
+                seq_len
+                - cur_batch_query_len
+                + q_block_local_idx * cfg.BLOCK_Q
+                - SLIDING_WINDOW
+                + 1
+            )
+            tile_start0 = gl.maximum(0, first_allowed_key0 // TILE_SIZE)
+            bid0_early = gl.load(block_tables_ptr_shifted + tile_start0)
+        else:
+            bid0_early = gl.load(block_tables_ptr_shifted)
+        kv_loader.load_k_to_shared(bid0_early, buffer_id=0)
+        kv_loader.load_v_to_shared(bid0_early, buffer_id=0)
+
     if CAUSAL:
         max_seq_prefix_len = (
             context_len
@@ -2841,6 +3531,58 @@ def _unified_attention_gluon_kernel_2d(
         max_seq_prefix_len = gl.maximum(1, gl.minimum(max_seq_prefix_len, seq_len))
     else:
         max_seq_prefix_len = seq_len
+
+    if EARLY_KV0 and NUM_SPLITS > 1:
+        # Window split builds: issue K / V of this split's first tile as soon as its index is known. The carving repeats
+        # AttentionProgram.initialize expression for expression, so it equals pgm.tile_start (the ring's slot-0
+        # tile). An empty split (index >= S_eff) issues the window's first tile instead (one of the sequence's
+        # pages) and drains it in its early exit.
+        kv_loader = TDMKVLoader.initialize(
+            cfg,
+            key_cache_ptr,
+            value_cache_ptr,
+            block_tables_ptr_shifted,
+            kv_head_idx,
+            block_table_stride,
+            REMOVE_INDIRECT_ACCESS,
+        )
+        num_tiles_e = (max_seq_prefix_len + TILE_SIZE - 1) // TILE_SIZE
+        if SLIDING_WINDOW > 0:
+            qpos_lo_e = q_block_local_idx * cfg.BLOCK_Q
+            qpos_hi_e = gl.minimum(
+                qpos_lo_e + (BLOCK_M - 1) // cfg.NUM_QUERIES_PER_KV,
+                cur_batch_query_len - 1,
+            )
+            tile_start_e = gl.maximum(
+                0, (context_len + qpos_lo_e - SLIDING_WINDOW + 1) // TILE_SIZE
+            )
+            tile_end_e = gl.minimum(
+                ((context_len + qpos_hi_e) // TILE_SIZE) + 1, num_tiles_e
+            )
+        else:
+            tile_start_e = 0
+            tile_end_e = num_tiles_e
+        active_e = tile_end_e - tile_start_e
+        s_eff_e = gl.maximum(gl.minimum(active_e // 3, NUM_SPLITS), 1)
+        split_lo_e = tile_start_e + (split_idx * active_e) // s_eff_e
+        split_lo_e = gl.where(split_idx < s_eff_e, split_lo_e, tile_start_e)
+        bid0_early = gl.load(block_tables_ptr_shifted + split_lo_e)
+        kv_loader.load_k_to_shared(bid0_early, buffer_id=0)
+        kv_loader.load_v_to_shared(bid0_early, buffer_id=0)
+
+    if EARLY_KV0_FS:  # noqa: SIM102
+        if split_idx != 0:
+            # repeats AttentionProgram.initialize's HEAD0 carving expression for expression (= pgm.tile_start); an
+            # empty split (index >= S_eff) issues tile 0 and drains it in its early exit.
+            active_f = (max_seq_prefix_len + TILE_SIZE - 1) // TILE_SIZE
+            s_eff_f = gl.maximum(gl.minimum(active_f // 3, NUM_SPLITS), 1)
+            h0_f = gl.where((s_eff_f > 1) & (active_f - HEAD0 >= 3 * s_eff_f), HEAD0, 0)
+            rem_f = active_f - h0_f
+            lo_f = h0_f + (split_idx * rem_f) // s_eff_f
+            lo_f = gl.where(split_idx < s_eff_f, lo_f, 0)
+            bid_f = gl.load(block_tables_ptr_shifted + lo_f)
+            kv_loader.load_k_to_shared(bid_f, buffer_id=0)
+            kv_loader.load_v_to_shared(bid_f, buffer_id=0)
 
     pgm = AttentionProgram.initialize(
         cfg,
@@ -2865,6 +3607,8 @@ def _unified_attention_gluon_kernel_2d(
         split_idx,
         NUM_SPLITS,
         q_scales,
+        LONG_W64=LONG_W64,
+        HEAD0=HEAD0,
     )
 
     if GATE:
@@ -2877,11 +3621,58 @@ def _unified_attention_gluon_kernel_2d(
             cur_batch_query_len,
         )
 
-    # This split owns no tiles (more splits than active tiles). The partial
-    # buffers are pre-filled with neutral values (M=-inf, L=0, acc=0) so the
-    # later reduction simply ignores it.
+    # This split owns no tiles (more splits than active tiles) and stores
+    # nothing. Without the in-kernel merge, split 0 (which always owns >= 1
+    # tile) writes the neutral M=-inf, L=0 into the empty splits' slots in its
+    # epilogue, so the separate merge kernel needs no seq_len / S_eff
+    # recomputation. (A store here, before the loop, makes LLVM treat the
+    # ring's block-table reads as possibly clobbered and turns their s_loads
+    # into vector loads.)
     if NUM_SPLITS > 1 and pgm.tile_start >= pgm.tile_end:
+        if DEFER_Q:
+            # do not exit with the deferred Q (and early K / V) TDM loads still in flight
+            gl.amd.gfx1250.tdm.async_wait(0)
         return
+
+    # Window ring: warm the program's whole block-table range [tile_start, tile_end) into the caches with one
+    # masked vector load (every address is one of this sequence's pages), so the ring's per-tile scalar loads of
+    # later block-table lines hit instead of stalling an iteration on a cold miss. The value is consumed by a
+    # non-pure no-op at the end of the kernel only to keep the load alive.
+    BT_WARM: gl.constexpr = (
+        LOOP_VARIANT == 3
+        and SLIDING_WINDOW > 0
+        and not REMOVE_INDIRECT_ACCESS
+        and TILE_SIZE == BLOCK_SIZE
+    )
+    if BT_WARM:
+        warm_layout: gl.constexpr = gl.BlockedLayout([1], [32], [NUM_WARPS], [0])
+        warm_offs = pgm.tile_start + gl.arange(0, 32 * NUM_WARPS, layout=warm_layout)
+        warm_mask = (warm_offs < pgm.tile_end) & (warm_offs < block_table_stride)
+        bt_warm = gl.load(block_tables_ptr_shifted + warm_offs, mask=warm_mask, other=0)
+        # scalar-cache warm: one scalar load per later 64 B block-table line (clamped onto the last tile)
+        warm_last = pgm.tile_end - 1
+        bt_sw1 = gl.load(
+            block_tables_ptr_shifted + gl.minimum(pgm.tile_start + 16, warm_last)
+        )
+        bt_sw2 = gl.load(
+            block_tables_ptr_shifted + gl.minimum(pgm.tile_start + 32, warm_last)
+        )
+    # Full-attention split builds: the same masked vector warm of [tile_start, tile_end) only (no scalar warm loads:
+    # they would join the prologue's s_wait_kmcnt). A 2-warp program covers 64 tiles in one load.
+    BT_WARM_FULL: gl.constexpr = (
+        LOOP_VARIANT == 3
+        and SLIDING_WINDOW == 0
+        and NUM_SPLITS > 1
+        and not REMOVE_INDIRECT_ACCESS
+        and TILE_SIZE == BLOCK_SIZE
+    )
+    if BT_WARM_FULL:
+        fwarm_layout: gl.constexpr = gl.BlockedLayout([1], [32], [NUM_WARPS], [0])
+        fwarm_offs = pgm.tile_start + gl.arange(0, 32 * NUM_WARPS, layout=fwarm_layout)
+        fwarm_mask = (fwarm_offs < pgm.tile_end) & (fwarm_offs < block_table_stride)
+        bt_fwarm = gl.load(
+            block_tables_ptr_shifted + fwarm_offs, mask=fwarm_mask, other=0
+        )
 
     # Pick the KV loader based on TILE_SIZE and LOOP_VARIANT
     if TILE_SIZE == BLOCK_SIZE:
@@ -2889,15 +3680,16 @@ def _unified_attention_gluon_kernel_2d(
     else:
         KVLoader: gl.constexpr = TDMGatherKVLoader
 
-    kv_loader = KVLoader.initialize(
-        cfg,
-        key_cache_ptr,
-        value_cache_ptr,
-        block_tables_ptr_shifted,
-        kv_head_idx,
-        block_table_stride,
-        REMOVE_INDIRECT_ACCESS,
-    )
+    if not (EARLY_KV0 or EARLY_KV0_FS):
+        kv_loader = KVLoader.initialize(
+            cfg,
+            key_cache_ptr,
+            value_cache_ptr,
+            block_tables_ptr_shifted,
+            kv_head_idx,
+            block_table_stride,
+            REMOVE_INDIRECT_ACCESS,
+        )
 
     if not USE_SINKS:
         M = gl.full(
@@ -2955,7 +3747,7 @@ def _unified_attention_gluon_kernel_2d(
         acc = gl.zeros([BLOCK_M, HEAD_SIZE], dtype=gl.float32, layout=cfg.pv_layout)
         M, L, acc = attention_loop_reordered(pgm, kv_loader, q, M, L, acc)
 
-    else:
+    elif LOOP_VARIANT == 2:
         gl.static_assert(
             (NUM_BUFFERS == 2) | (NUM_BUFFERS == 3),
             "For loop variant 3, NUM_BUFFERS should be 2 or 3",
@@ -2983,22 +3775,129 @@ def _unified_attention_gluon_kernel_2d(
             acc1,
         )
 
-    if NUM_SPLITS > 1:
-        # Split-KV: emit un-reduced partials; the reduction happens separately.
-        pgm.store_partial(
+    else:
+        gl.static_assert(LOOP_VARIANT == 3, "LOOP_VARIANT must be 0, 1, 2 or 3")
+        gl.static_assert(
+            (NUM_BUFFERS == 2) & (RING_D >= 3),
+            "loop variant 3 needs NUM_BUFFERS 2 and RING_D >= 3",
+        )
+        gl.static_assert(
+            (TILE_SIZE == BLOCK_SIZE) & SHUFFLED_KV_CACHE,
+            "loop variant 3 needs one page per tile and the shuffled KV cache",
+        )
+        gl.static_assert(not GATE, "loop variant 3 has no TDM slot for the output gate")
+        if cfg.CAUSAL and not cfg.ALL_DECODE:
+            gl.static_assert(
+                cfg.NUM_MASKED_TILES <= 2,
+                "loop variant 3 handles <=2 masked tiles; use loop variant 0",
+            )
+        acc0 = gl.zeros(
+            [BLOCK_M, HEAD_SIZE // 2], dtype=gl.float32, layout=cfg.pv_layout
+        )
+        acc1 = gl.zeros(
+            [BLOCK_M, HEAD_SIZE // 2], dtype=gl.float32, layout=cfg.pv_layout
+        )
+        if SLIDING_WINDOW > 0:
+            # tiles below win_mask_end hold the window start of a query row of this block
+            last_q = gl.minimum(
+                q_block_local_idx * BLOCK_Q + (BLOCK_M - 1) // cfg.NUM_QUERIES_PER_KV,
+                cur_batch_query_len - 1,
+            )
+            win_mask_end = (
+                gl.maximum(context_len + last_q - SLIDING_WINDOW + 1, 0) + TILE_SIZE - 1
+            ) // TILE_SIZE
+        else:
+            win_mask_end = 0
+        M, L, acc = attention_loop_tensor_subtile_ring(
+            pgm,
+            kv_loader,
+            q,
             M,
             L,
-            acc,
-            partial_m_ptr,
-            partial_l_ptr,
-            partial_acc_ptr,
-            split_idx,
-            q_block_local_idx,
-            cur_batch_in_all_start_index,
-            kv_head_idx,
-            cur_batch_query_len,
-            NUM_SPLITS,
+            acc0,
+            acc1,
+            RING_D,
+            q_smem,
+            EARLY_KV0 or EARLY_KV0_FS,
+            NUM_SPLITS > 1,
+            win_mask_end,
         )
+
+    if EARLY_SEQ_LOADS and SEQ_Q_BLOCKS > 0:
+        # keeps the block-table row load alive; an asm before the loop would turn the ring's scalar block-table loads
+        # into vector loads
+        gl.inline_asm_elementwise(
+            "; bt row warm keep-alive $0 $1",
+            "=v,v",
+            [bt_row_warm],
+            dtype=gl.int32,
+            is_pure=False,
+            pack=1,
+        )
+
+    if NUM_SPLITS > 1:
+        # Split-KV: emit un-reduced partials; the reduction happens separately.
+        # The stores touch no LDS, so the ring's tail drain follows them.
+        if SPLIT_NEUTRAL_ML:
+            pgm.store_partial(
+                M,
+                L,
+                acc,
+                partial_m_ptr,
+                partial_l_ptr,
+                partial_acc_ptr,
+                split_idx,
+                q_block_local_idx,
+                cur_batch_in_all_start_index,
+                kv_head_idx,
+                cur_batch_query_len,
+                NUM_SPLITS,
+                pgm.num_splits_eff,
+            )
+        else:
+            pgm.store_partial(
+                M,
+                L,
+                acc,
+                partial_m_ptr,
+                partial_l_ptr,
+                partial_acc_ptr,
+                split_idx,
+                q_block_local_idx,
+                cur_batch_in_all_start_index,
+                kv_head_idx,
+                cur_batch_query_len,
+                NUM_SPLITS,
+                None,
+            )
+        if BT_WARM:
+            # keep the block-table warm loads alive in the split build too (otherwise dead-code eliminated)
+            gl.inline_asm_elementwise(
+                "; bt warm keep-alive $0 $1",
+                "=v,v",
+                [bt_warm],
+                dtype=gl.int32,
+                is_pure=False,
+                pack=1,
+            )
+            gl.inline_asm_elementwise(
+                "; bt swarm keep-alive $0 $1 $2",
+                "=s,s,s",
+                [bt_sw1, bt_sw2],
+                dtype=gl.int32,
+                is_pure=False,
+                pack=1,
+            )
+        if BT_WARM_FULL:
+            gl.inline_asm_elementwise(
+                "; bt fwarm keep-alive $0 $1",
+                "=v,v",
+                [bt_fwarm],
+                dtype=gl.int32,
+                is_pure=False,
+                pack=1,
+            )
+        # (store_partial drained the ring before its LDS layout conversion)
         return
 
     # Normalize and store output
@@ -3024,6 +3923,48 @@ def _unified_attention_gluon_kernel_2d(
         acc = gl.minimum(acc, FP8_MAX)
         acc = gl.maximum(acc, FP8_MIN)
 
+    # Window builds: stage the output in the (dead after the ring prologue) deferred-Q LDS buffer. It is not a K / V
+    # ring slot, so no in-flight tail prefetch can target it.
+    E1_STAGE: gl.constexpr = (
+        DEFER_Q
+        and SLIDING_WINDOW > 0
+        and USE_TDM_STORE
+        and output_ptr.dtype.element_ty == query_ptr.dtype.element_ty
+    )
+    if E1_STAGE:
+        q_smem.reshape([BLOCK_M, HEAD_SIZE]).store(acc.to(output_ptr.dtype.element_ty))
+    if BT_WARM:
+        gl.inline_asm_elementwise(
+            "; bt warm keep-alive $0 $1",
+            "=v,v",
+            [bt_warm],
+            dtype=gl.int32,
+            is_pure=False,
+            pack=1,
+        )
+        gl.inline_asm_elementwise(
+            "; bt swarm keep-alive $0 $1 $2",
+            "=s,s,s",
+            [bt_sw1, bt_sw2],
+            dtype=gl.int32,
+            is_pure=False,
+            pack=1,
+        )
+    if E1_STAGE:
+        _drain_kv_ring(cfg)
+        pgm.store_output(
+            acc,
+            q_block_local_idx,
+            cur_batch_in_all_start_index,
+            kv_head_idx,
+            cur_batch_query_len,
+            output_stride_0,
+            output_stride_1,
+            USE_TDM=USE_TDM_STORE,
+            o_staged=q_smem,
+        )
+        return
+    _drain_kv_ring(cfg)
     pgm.store_output(
         acc,
         q_block_local_idx,
