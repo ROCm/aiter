@@ -13,6 +13,19 @@ from fractions import Fraction
 CPU_CORE_COUNT_UTILIZATION = 0.80
 # Approximate peak RSS observed per AOT worker, rounded up to 1.5 GB.
 EST_WORKER_RSS_BYTES = 1_500_000_000
+# A FlyDSL AOT worker is forked from a replay process that has torch, aiter and
+# the jobs loaded, and shares those pages with it: its RSS (about 0.8 GB) counts
+# them again, its private memory does not. Measured private peaks per worker:
+# p90 0.11 GB (MoE), 0.22 GB (GEMM), 0.26 GB (MegaMoE); the largest single
+# worker 0.49 GB (GEMM). A pool holds the sum, so 0.5 GB each is about twice
+# what its workers hold together.
+EST_FORK_WORKER_BYTES = 500_000_000
+# Set aside for what a fork pool holds besides its workers: the driver and the
+# replay processes of the target archs, about 0.5 GB private each. A fixed
+# allowance for three archs side by side, not scaled by their number. A
+# process that is already running when it asks is counted twice, as available
+# memory already excludes it.
+EST_FORK_POOL_RESERVE_BYTES = 2_000_000_000
 # Concurrent GPU-executing workers allowed per visible device. Tasks that run
 # kernels during AITER compilation are bounded by device contexts and device
 # memory rather than by host CPU or RAM.
@@ -291,6 +304,7 @@ def _maybe_log_cgroup_memory_diagnostic(
     memory_budget: int,
     configured_ceiling: int | None,
     observation: dict[str, object] | None,
+    worker_bytes: int = EST_WORKER_RSS_BYTES,
 ) -> None:
     """Report significant cgroup throttling, with bounded repeat warnings."""
     global _memory_diagnostic_last_time, _memory_diagnostic_last_budget
@@ -351,13 +365,20 @@ def _maybe_log_cgroup_memory_diagnostic(
         limit_gib,
         usage_text,
         remaining_gib,
-        EST_WORKER_RSS_BYTES / 1024**3,
+        worker_bytes / 1024**3,
         stat_text,
         unreadable_text,
     )
 
 
-def _automatic_worker_snapshot() -> tuple[int, int, dict[str, object] | None]:
+def _automatic_worker_snapshot(
+    worker_bytes: int = EST_WORKER_RSS_BYTES, reserve_bytes: int = 0
+) -> tuple[int, int, dict[str, object] | None]:
+    """Return the CPU budget, the memory budget and the cgroup bound behind it.
+
+    The memory budget is what ``reserve_bytes`` leaves of the available memory,
+    in workers of ``worker_bytes``.
+    """
     cpu_budget = get_cpu_worker_budget()
     host_available = _host_available_memory_bytes()
     cgroup_remaining, observation = _cgroup_memory_bound()
@@ -366,7 +387,7 @@ def _automatic_worker_snapshot() -> tuple[int, int, dict[str, object] | None]:
         if cgroup_remaining is None
         else min(host_available, cgroup_remaining)
     )
-    memory_budget = max(1, available_memory // EST_WORKER_RSS_BYTES)
+    memory_budget = max(1, (available_memory - reserve_bytes) // worker_bytes)
     if cgroup_remaining is None or cgroup_remaining > host_available:
         observation = None
     return cpu_budget, memory_budget, observation
@@ -440,15 +461,22 @@ def _get_legacy_worker_limit() -> int | None:
     return value if value is not None and value > 0 else None
 
 
-def _get_worker_count(*, honor_legacy_max_jobs: bool) -> int:
+def _get_worker_count(
+    *,
+    honor_legacy_max_jobs: bool,
+    worker_bytes: int = EST_WORKER_RSS_BYTES,
+    reserve_bytes: int = 0,
+) -> int:
     """Apply AITER's explicit ceiling to the current automatic worker budget."""
-    cpu_budget, memory_budget, observation = _automatic_worker_snapshot()
+    cpu_budget, memory_budget, observation = _automatic_worker_snapshot(
+        worker_bytes, reserve_bytes
+    )
     if os.environ.get(_WORKER_ENV) is None and honor_legacy_max_jobs:
         configured_limit = _get_legacy_worker_limit()
     else:
         configured_limit = _env_ceiling(_WORKER_ENV)
     _maybe_log_cgroup_memory_diagnostic(
-        cpu_budget, memory_budget, configured_limit, observation
+        cpu_budget, memory_budget, configured_limit, observation, worker_bytes
     )
     automatic_workers = max(1, min(cpu_budget, memory_budget))
     return min(automatic_workers, configured_limit or automatic_workers)
@@ -475,7 +503,28 @@ def get_worker_count_for(work_count: int, explicit: int | None = None) -> int:
     ``explicit`` is an optional caller-supplied ceiling, such as a CLI
     ``--jobs`` value; non-positive values select a single worker.
     """
-    budget = _cap_worker_count(get_worker_count(), work_count)
+    return _cap_to_work(get_worker_count(), work_count, explicit)
+
+
+def get_fork_worker_count_for(work_count: int, explicit: int | None = None) -> int:
+    """:func:`get_worker_count_for` for a pool of workers forked from a loaded
+    parent, as the FlyDSL AOT replays run.
+
+    Such a worker adds its private memory only (``EST_FORK_WORKER_BYTES``), and
+    the processes it shares the rest with are set aside once
+    (``EST_FORK_POOL_RESERVE_BYTES``). CPU limits and ``AITER_MAX_JOBS`` apply
+    as they do to every pool.
+    """
+    budget = _get_worker_count(
+        honor_legacy_max_jobs=False,
+        worker_bytes=EST_FORK_WORKER_BYTES,
+        reserve_bytes=EST_FORK_POOL_RESERVE_BYTES,
+    )
+    return _cap_to_work(budget, work_count, explicit)
+
+
+def _cap_to_work(budget: int, work_count: int, explicit: int | None) -> int:
+    budget = _cap_worker_count(budget, work_count)
     if explicit is None:
         return budget
     return _cap_worker_count(budget, explicit)

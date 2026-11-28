@@ -372,6 +372,25 @@ Example:
 AITER_MAX_JOBS=16 python -m aiter.aot.flydsl.moe
 ```
 
+`run_aot` (the `setup.py` build) runs the modules as stages of one build
+rather than one after another. It takes the worker budget once, and the
+stages replay side by side, one per eight workers of it (so in turn below
+sixteen). Their pools share the budget worker by worker: each worker holds
+one of the budget's slots while it runs (a locked file under
+`AITER_FLYDSL_AOT_SLOTS`, which `run_aot` sets for its replay processes), so
+a stage or arch that finishes leaves its workers to the others. The MoE stage
+starts alone, because it first builds the C++ modules every replay imports;
+the others start once it has. A stage that fails does not stop the others:
+`run_aot` reports every failure after all have run. A module run on its own
+(`python -m aiter.aot.flydsl.<module>`) shares its own budget the same way
+between its archs.
+
+The slots are budgeted once, when the build starts: unlike a pool that sizes
+itself as it starts, a later stage does not see memory that has run short
+since. Workers end with the replay process that supervises them, and replay
+processes with the build that started them (`PR_SET_PDEATHSIG`), so a killed
+process leaves no worker running without a deadline, holding a slot.
+
 An explicit `AITER_MAX_JOBS` always takes precedence. Legacy adoption copies
 the positive value without changing `MAX_JOBS`; without either setting, worker
 selection is fully automatic.
