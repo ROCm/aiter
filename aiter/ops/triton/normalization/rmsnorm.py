@@ -127,6 +127,17 @@ def _rmsnorm_forward_gluon(x: torch.Tensor, weight: torch.Tensor, epsilon: float
     return y, rsigma
 
 
+@torch.compiler.assume_constant_result
+def _rmsnorm_fwd_num_warps(blk_size: int) -> int | None:
+    # torch.compile uses the result as a constant and does not trace the file
+    # read. An arch without this file uses the Triton default.
+    config = load_config_json(
+        f"{resolve_config_dir('normalization', 'RMSNORM')}/DEFAULT.json",
+        required=False,
+    )
+    return select_leq_config(config, blk_size)["num_warps"] if config else None
+
+
 def _rmsnorm_forward(x: torch.Tensor, weight: torch.Tensor, epsilon: float):
 
     if _use_gluon_rmsnorm(x, weight):
@@ -141,6 +152,9 @@ def _rmsnorm_forward(x: torch.Tensor, weight: torch.Tensor, epsilon: float):
     USE_BLOCKED = use_blocked(x)
     num_prgms = num_programs_fwd(x)
 
+    num_warps = _rmsnorm_fwd_num_warps(blk_size)
+    launch_kwargs = {} if num_warps is None else {"num_warps": num_warps}
+
     grid = lambda meta: (num_prgms,)
     _rms_norm_kernel[grid](
         x,
@@ -154,6 +168,7 @@ def _rmsnorm_forward(x: torch.Tensor, weight: torch.Tensor, epsilon: float):
         epsilon,
         blk_size,
         USE_BLOCKED,
+        **launch_kwargs,
     )
 
     return y, rsigma
