@@ -2533,7 +2533,7 @@ def test_flydsl_decode_split_reuse():
 
 
 def test_flydsl_decode_gates():
-    """Each FlyDSL decode gate of this arch routes there and matches torch.topk.
+    """Each FlyDSL decode gate of this device routes there and matches torch.topk.
 
     Walks the gate table itself, at each gate's smallest width and its row
     limit, so narrowing the sweep shapes cannot leave a gate untested.
@@ -2543,8 +2543,11 @@ def test_flydsl_decode_gates():
         print("[flydsl_decode_gates] FlyDSL decode not served here; skipping")
         return
     torch.set_default_device("cuda:0")
-    for stable, gates in _FLYDSL_TOPK_DECODE_GATES[arch].items():
-        for min_width, max_width, num_rows in gates:
+    cu_count = get_cu_num_device(0)
+    for stable in (False, True):
+        for min_width, max_width, num_rows in G.flydsl_topk_decode_gates(
+            arch, cu_count, stable
+        ):
             for k in T._FLYDSL_TOPK_DECODE_KS:
                 # At least 2k wide, so each row selects rather than copies.
                 width = max(min_width, 2 * k)
@@ -2565,6 +2568,42 @@ def test_flydsl_decode_gates():
                     logits, indices, ref, row_starts, seq_lens, k, stable=stable
                 ), f"flydsl decode gate mismatch: {what}"
     print("[flydsl_decode_gates] PASS: every gate routes and matches torch.topk")
+
+
+def test_flydsl_decode_gate_per_device():
+    """A device's own single-launch bands replace its arch's for the emit mode
+    they name, at that CU count only; no kernel runs."""
+
+    def backend(arch, cu, stable, width, rows, k=2048):
+        return G._decode_backend(arch, cu, stable, width, rows, k, True, None)
+
+    single, default = G.BACKEND_SINGLE, G.BACKEND_DEFAULT
+    for (arch, cu), per_emit in G._FLYDSL_TOPK_DECODE_GATES_BY_DEVICE.items():
+        for stable in (False, True):
+            own = per_emit.get(stable, _FLYDSL_TOPK_DECODE_GATES[arch][stable])
+            assert G.flydsl_topk_decode_gates(arch, cu, stable) == own, (arch, cu)
+            for (lo, hi, rows), k in itertools.product(own, G._FLYDSL_TOPK_DECODE_KS):
+                assert backend(arch, cu, stable, lo, rows, k) == single, (lo, rows)
+                if hi is not None:
+                    assert backend(arch, cu, stable, hi, rows, k) == single, (hi, rows)
+    # MI300X and MI325X take the multi-block kernel from 20,001 wide up to
+    # 1,024 rows; other gfx942 parts keep the arch's bands.
+    for width, rows, want in (
+        (20_001, 1_024, single),
+        (1 << 24, 1_024, single),
+        (20_000, 1_024, default),
+        (20_001, 1_025, default),
+    ):
+        assert backend("gfx942", 304, False, width, rows) == want, (width, rows)
+        assert backend("gfx942", 304, False, width, rows, k=256) == default
+    for cu in (80, 228):
+        assert backend("gfx942", cu, False, 262_144, 256) == default, cu
+        assert backend("gfx942", cu, False, 524_288, 32) == single, cu
+    for cu in (80, 228, 304):
+        assert backend("gfx942", cu, True, 131_072, 16) == single, cu
+        assert backend("gfx942", cu, True, 131_072, 17) == default, cu
+    assert backend("gfx950", 304, False, 131_072, 33) == default
+    print("[flydsl_decode_gate_per_device] PASS")
 
 
 def test_mb_workspace_reuse():
@@ -2915,6 +2954,7 @@ _REGRESSIONS = {
     "mb-workspace-reuse": test_mb_workspace_reuse,
     "flydsl-decode-split-reuse": test_flydsl_decode_split_reuse,
     "flydsl-decode-gates": test_flydsl_decode_gates,
+    "flydsl-decode-gate-per-device": test_flydsl_decode_gate_per_device,
     "flydsl-one-block-long-rows": test_flydsl_one_block_long_rows,
     "sampled-routing": test_prefill_sampled_routing,
     "sampled-layout": test_sampled_layout_contract,
