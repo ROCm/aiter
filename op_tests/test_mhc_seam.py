@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Delayed mHC seam (``mhc_fused_post_pre_delayed``) against aiter's own mHC ops and
-torch references.
+"""Delayed mHC seam: the ASM op (``mhc_fused_post_pre_delayed``) and the FlyDSL op
+(``aiter.ops.flydsl.flydsl_mhc_seam``) against aiter's own mHC ops and torch references.
 
-The op runs ASM kernels on gfx942 with 4 residual streams and hidden_size 5120 and has
-no other path; on other archs this test is skipped. Per case (checkAllclose; the err
-columns are its mismatch ratios):
+Both run on gfx942 only; on other archs this test is skipped. The ASM op takes 4
+residual streams and hidden_size 5120 with the post block; the FlyDSL op also runs
+without it (mode no_post) and at the other hidden sizes (--hidden), where the ASM
+columns are left out. Per ASM case (checkAllclose; the err columns are its mismatch
+ratios):
 
   residual_out  bit-exact (atol = rtol = 0) against ``aiter.mhc_post`` (same fp32
                 order, bf16 truncation)
@@ -35,6 +37,17 @@ reference of the same w-column slice sums (w = 128 or 512): |err| <= 5e-5 of the
 sum of |terms| (fp32 accumulation), columns 25..31 zero, and a guard band after part
 untouched.
 
+Per FlyDSL case: residual_out within FLY_RES_TOL of the post block in fp32 rounded to
+bf16, layer_input within FLY_LAYER_INPUT_TOL of its fp32 collapse and RMSNorm
+(``flydsl_ref``), the gates within FLY_GATE_ATOL of the fp64 gates of the op's own
+residual_out; eager and after capture in a CUDA graph and two replays, with the post
+block into a preallocated NaN residual_out.
+Also for FlyDSL: m = 0 in every mode; each RMSNorm path (fused, separate) at its policy
+config; a graph after an in-place update of fn, and after a write through fn.data with
+an explicit fn_packed refreshed. Per hidden size: two seams sharing one fn on two
+streams, builds the launch policy does not reach, forced, and invalid inputs, which
+raise ValueError or TypeError.
+
 Launch split, graphs and compile: T = 65536 + 37 (two launches, byte offsets past 2^31)
 with carried and identity pre gate against the same references; CUDA graphs captured at
 16 and 128 tokens replay bit-exact after that larger eager call (which must not free a
@@ -51,6 +64,7 @@ loader and raises RuntimeError (the process continues).
 """
 
 import argparse
+import itertools
 import sys
 
 import torch
@@ -58,7 +72,7 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.benchmark_reporting import print_json_table
-from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 HC = 4
@@ -270,9 +284,181 @@ TRITON_TOL = 1e-2
 TRITON_ERR_RATIO = 0.05
 
 
+# The FlyDSL seam (aiter.ops.flydsl.flydsl_mhc_seam) folds the RMSNorm of layer_input,
+# also runs without the post block, and takes other hidden sizes than the ASM seam.
+# Modes:
+#   post          the post block mixes sublayer_out into the residual streams; the
+#                 carried pre_mix collapses them
+#   identity_pre  the post block, then pre_mix=None: the collapse is stream 0
+#   no_post       no post block: the residual passes through as residual_out; the
+#                 carried pre_mix collapses it
+MODES = ("post", "identity_pre", "no_post")
+
+# (rtol, atol) of the FlyDSL seam against flydsl_ref. residual_out: its fp32 post block
+# sums in another order, then rounds to bf16. layer_input: a bf16 rounding difference
+# in residual_out carries into the collapse.
+FLY_RES_TOL = (1.6e-2, 1e-5)
+FLY_LAYER_INPUT_TOL = (1e-2, 2e-2)
+# The FlyDSL gates against the fp64 gates of its own residual_out, as the ASM gates are
+# checked: fp32 split-K sums, well within this. Dropping the low bf16 limb of the
+# packed fn moves them by over 3e-4.
+FLY_GATE_ATOL = 1e-5
+
+
+def flydsl_ref(inp, mode):
+    """residual_out and layer_input of the FlyDSL seam in torch: the post block in fp32
+    rounded to bf16, then its fp32 collapse rounded to bf16 and RMSNorm (eps RMS_EPS) in
+    fp32 rounded to bf16."""
+    residual = inp["residual"]
+    m = residual.shape[0]
+    res = residual
+    if mode != "no_post":
+        mixed = torch.einsum(
+            "tij,tih->tjh", inp["comb_res_mix"].float(), residual.float()
+        )
+        post = inp["post_layer_mix"].float().view(m, HC, 1)
+        res = (mixed + post * inp["sublayer_out"].float().unsqueeze(1)).to(dtypes.bf16)
+    pre = identity_gate(m) if mode == "identity_pre" else inp["pre_mix"]
+    x = collapse_ref(res, pre).float()
+    x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + RMS_EPS)
+    return res, (x * inp["norm_weight"].float()).to(dtypes.bf16)
+
+
+def seam_flydsl(inp, mode, **kw):
+    """The FlyDSL seam as the model calls it, as (call, activations): with the post
+    block it writes into a preallocated residual_out (NaN, so an unwritten element
+    fails). fn stays bound in call, since run_perftest deep-copies the arguments it
+    rotates and the seam would repack a copied fn on every call."""
+    from aiter.ops.flydsl import flydsl_mhc_seam
+
+    post = mode != "no_post"
+
+    def call(residual, sublayer_out, post_mix, comb_mix, pre_mix, residual_out):
+        return flydsl_mhc_seam(
+            residual,
+            inp["fn"],
+            inp["hc_scale"],
+            inp["hc_base"],
+            RMS_EPS,
+            HC_PRE_EPS,
+            HC_SINKHORN_EPS,
+            POST_MULT,
+            SINKHORN,
+            pre_mix,
+            sublayer_out,
+            post_mix,
+            comb_mix,
+            inp["norm_weight"],
+            RMS_EPS,
+            residual_out=residual_out,
+            **kw,
+        )
+
+    args = (
+        inp["residual"],
+        inp["sublayer_out"] if post else None,
+        inp["post_layer_mix"] if post else None,
+        inp["comb_res_mix"] if post else None,
+        None if mode == "identity_pre" else inp["pre_mix"],
+        torch.full_like(inp["residual"], float("nan")) if post else None,
+    )
+    return call, args
+
+
+def check_flydsl(out, inp, mode, tag):
+    """checkAllclose mismatch ratios of the FlyDSL seam's outputs on inp: residual_out
+    and layer_input against flydsl_ref, the gates against the fp64 gates of the op's own
+    residual_out. Without the post block residual_out is the input itself and is not
+    compared."""
+    residual_out, post_mix, comb_mix, layer_input, next_pre = out
+    res_ref, layer_input_ref = flydsl_ref(inp, mode)
+    g_ref = gates_ref(residual_out, inp["fn"], inp["hc_scale"], inp["hc_base"])
+    checks = [
+        ("residual_out", residual_out, res_ref, FLY_RES_TOL, "fp32 reference"),
+        ("post", post_mix, g_ref[0], (0, FLY_GATE_ATOL), "fp64 gates"),
+        ("comb", comb_mix, g_ref[1], (0, FLY_GATE_ATOL), "fp64 gates"),
+        (
+            "layer_input",
+            layer_input,
+            layer_input_ref,
+            FLY_LAYER_INPUT_TOL,
+            "fp32 reference",
+        ),
+        ("pre", next_pre, g_ref[2], (0, FLY_GATE_ATOL), "fp64 gates"),
+    ]
+    err = {}
+    for name, o, r, (rtol, atol), against in checks:
+        if name == "residual_out" and mode == "no_post":
+            continue
+        err[f"flydsl {name} err"] = checkAllclose(
+            r.float(),
+            o.float(),
+            rtol=rtol,
+            atol=atol,
+            tol_err_ratio=0.0,
+            msg=f"{tag}flydsl {name} vs {against} ",
+        )
+    return err
+
+
+def flydsl_graph_err(call, args, inp, mode, tag):
+    """The seam captured in a CUDA graph after an eager call, replayed twice; the worst
+    mismatch ratio of the replays against the reference."""
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        call(*args)
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = call(*args)
+    errs = []
+    for i in range(2):
+        graph.replay()
+        torch.cuda.synchronize()
+        err = check_flydsl(out, inp, mode, f"{tag}graph replay {i} ")
+        errs.append(max(err.values()))
+    return max(errs)
+
+
+def flydsl_bytes_moved(m, hidden_size, mode):
+    """Bytes the FlyDSL seam must move, in bf16 rows of hidden_size per token: read the
+    residual's HC rows and write layer_input, plus with the post block read
+    sublayer_out and write residual_out's HC rows."""
+    rows = HC + 1 if mode == "no_post" else 2 * HC + 2
+    return m * hidden_size * 2 * rows
+
+
 @benchmark()
-def test_mhc_fused_post_pre_delayed(m, hidden_size=5120, identity_pre=False, seed=0):
+def test_mhc_fused_post_pre_delayed(m, hidden_size=5120, mode="post", seed=0):
     inp = make_inputs(m, hidden_size, seed=seed)
+    ret = {"gfx": get_gfx_runtime()}
+    ok = True
+    # ASM, Triton and aiter's unfused ops: hidden_size 5120 with the post block only.
+    if mode != "no_post" and aiter.mhc_fused_post_pre_delayed_asm_supported(
+        hidden_size, HC
+    ):
+        asm = asm_candidates(inp, m, hidden_size, mode == "identity_pre")
+        ok = asm.pop("ok")
+        ret.update(asm)
+
+    call, args = seam_flydsl(inp, mode)
+    _, us = run_perftest(call, *args)
+    tag = f"m={m} H={hidden_size} {mode} "
+    err = check_flydsl(call(*args), inp, mode, tag)
+    graph_err = flydsl_graph_err(call, args, inp, mode, tag)
+    ret["flydsl us"] = us
+    ret["flydsl TFLOPS"] = perf(m, hidden_size, us)[0]
+    ret["flydsl TB/s"] = flydsl_bytes_moved(m, hidden_size, mode) / us / 1e6
+    ret.update(err)
+    ret["flydsl graph err"] = graph_err
+    ret["ok"] = ok and graph_err == 0 and all(e == 0 for e in err.values())
+    return ret
+
+
+def asm_candidates(inp, m, hidden_size, identity_pre):
+    """The ASM seam, the ASM seam + aiter.rms_norm, the Triton rmsnorm seam and aiter's
+    unfused ops on one input set: timings and checks."""
     args = [inp[k] for k in SEAM_ARGS + GATE_ARGS]
     w = inp["norm_weight"]
     pre_mix = None if identity_pre else inp["pre_mix"]
@@ -322,7 +508,6 @@ def test_mhc_fused_post_pre_delayed(m, hidden_size=5120, identity_pre=False, see
     tflops_n, tbs_n = perf(m, hidden_size, norm_us)
     tflops_t, tbs_t = perf(m, hidden_size, triton_us)
     return {
-        "gfx": get_gfx(),
         "us": us,
         "TFLOPS": tflops,
         "TB/s": tbs,
@@ -385,7 +570,7 @@ def test_mhc_seam_fused_part(m, kernel="fused", seed=0):
     guard = bool((buf[n:] == -7.0).all())
     tflops, tbs = perf(m, hidden_size, us)
     return {
-        "gfx": get_gfx(),
+        "gfx": get_gfx_runtime(),
         "kernel": kernel,
         "us": us,
         "TFLOPS": tflops,
@@ -776,10 +961,246 @@ def check_compile(seed):
     return failed
 
 
+def check_flydsl_empty():
+    """FlyDSL with no tokens, in every mode: empty results of the right shapes, and
+    without the post block the input residual itself. Returns the failure count."""
+    failed = 0
+    for mode in MODES:
+        inp = make_inputs(0, 5120)
+        call, args = seam_flydsl(inp, mode)
+        out = call(*args)
+        got = [tuple(t.shape) for t in out]
+        want = [(0, HC, 5120), (0, HC, 1), (0, HC, HC), (0, 5120), (0, HC)]
+        if got != want or (mode == "no_post" and out[0] is not inp["residual"]):
+            aiter.logger.error("flydsl m=0 %s: shapes %s", mode, got)
+            failed += 1
+    return failed
+
+
+def check_flydsl_norm_paths(seed):
+    """FlyDSL with the RMSNorm in its finish pass (fused) and as aiter.rms_norm after
+    it (separate), each at its own policy config, eager and replayed from a CUDA graph.
+    Returns the failure count."""
+    from aiter.jit.utils.chip_info import get_cu_num
+    from aiter.ops.flydsl.mhc_seam_kernels import get_mhc_seam_config
+
+    failed = 0
+    for m in (37, 333, 1024):
+        for norm in ("fused", "separate"):
+            cfg = get_mhc_seam_config(
+                m, 5120, get_gfx_runtime(), get_cu_num(), norm=norm
+            )
+            inp = make_inputs(m, 5120, seed=seed + m)
+            call, args = seam_flydsl(inp, "post", config=dict(cfg, NORM=norm))
+            tag = f"m={m} NORM={norm} "
+            err = check_flydsl(call(*args), inp, "post", tag)
+            failed += any(e != 0 for e in err.values())
+            failed += flydsl_graph_err(call, args, inp, "post", tag) != 0
+    return failed
+
+
+def check_flydsl_weight_update(seed):
+    """A FlyDSL graph follows an in-place update of fn after one eager call, and, with
+    an explicit fn_packed, a write through fn.data once the caller repacks into it;
+    on both RMSNorm paths. Checked against the reference of the updated fn: a stale
+    pack would leave the eager call stale too. Returns the failure count."""
+    from aiter.ops.flydsl import flydsl_mhc_seam_pack_fn
+
+    def capture(call, args):
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            call(*args)
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = call(*args)
+        return graph, out
+
+    failed = 0
+    for norm in ("fused", "separate"):
+        inp = make_inputs(256, 5120, seed=seed + 11)
+        call, args = seam_flydsl(inp, "post", config={"NORM": norm})
+        graph, out = capture(call, args)
+        inp["fn"].mul_(2)
+        call(*args)  # the eager call that repacks
+        graph.replay()
+        torch.cuda.synchronize()
+        err = check_flydsl(out, inp, "post", f"weight update in place {norm} ")
+        failed += any(e != 0 for e in err.values())
+
+        packed = flydsl_mhc_seam_pack_fn(inp["fn"])
+        call, args = seam_flydsl(inp, "post", config={"NORM": norm}, fn_packed=packed)
+        graph, out = capture(call, args)
+        inp["fn"].data.copy_(inp["fn"] * 0.5)
+        packed.copy_(flydsl_mhc_seam_pack_fn(inp["fn"]))
+        graph.replay()
+        torch.cuda.synchronize()
+        err = check_flydsl(out, inp, "post", f"fn_packed refresh {norm} ")
+        failed += any(e != 0 for e in err.values())
+    return failed
+
+
+def flydsl_config_error(m, hidden_size, mode, config):
+    """Returns the error message the FlyDSL seam raises for this explicit config in
+    `mode`, or None if the config is legal. Like the op, it merges config over
+    MHC_SEAM_DEFAULTS and calls mhc_seam.check_config, so the geometry rules stay only
+    in the kernel module."""
+    from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+    from aiter.ops.flydsl.kernels import mhc_seam
+    from aiter.ops.flydsl.mhc_seam_kernels import MHC_SEAM_DEFAULTS
+
+    cfg = {**MHC_SEAM_DEFAULTS, **config}
+    if cfg["NORM"] == "separate" and mode != "post":
+        return "NORM='separate' needs the post block and a carried pre_mix"
+    try:
+        mhc_seam.check_config(
+            m,
+            hidden_size,
+            HC,
+            cfg["BLOCK_M"],
+            cfg["CHUNK_C"],
+            cfg["SPLITS"],
+            lds_bytes=get_lds_capacity_bytes(get_gfx_runtime()),
+            fast_fp_math=cfg["FAST_FP_MATH"],
+            fast_narrow=cfg["FAST_NARROW"],
+        )
+    except ValueError as exc:
+        return str(exc)
+    return None
+
+
+def check_flydsl_streams(hidden_size, seed):
+    """Two FlyDSL seams with their own activations and one fn on two streams at once,
+    on both RMSNorm paths, with and without split-K; each against its own reference. A
+    SPLITS this hidden size does not divide into is skipped. Returns the failure
+    count."""
+    failed = 0
+    for m, splits, norm in itertools.product(
+        (1024, 4096), (1, 10), ("fused", "separate")
+    ):
+        config = {"SPLITS": splits, "NORM": norm}
+        why = flydsl_config_error(m, hidden_size, "post", config)
+        if why:
+            aiter.logger.info(
+                "skipping streams m=%d H=%d %s: %s", m, hidden_size, config, why
+            )
+            continue
+        failed += flydsl_stream_failures(m, hidden_size, config, seed)
+    return failed
+
+
+def flydsl_stream_failures(m, hidden_size, config, seed):
+    first = make_inputs(m, hidden_size, seed=seed + 21)
+    second = dict(make_inputs(m, hidden_size, seed=seed + 22), fn=first["fn"])
+    cases = [seam_flydsl(inp, "post", config=config) for inp in (first, second)]
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    for s in streams:
+        s.wait_stream(torch.cuda.current_stream())
+    outs = [None, None]
+    for _ in range(20):
+        for i, (call, args) in enumerate(cases):
+            with torch.cuda.stream(streams[i]):
+                outs[i] = call(*args)
+    torch.cuda.synchronize()
+    failed = 0
+    for i, inp in enumerate((first, second)):
+        tag = f"stream {i} m={m} H={hidden_size} {config} "
+        err = check_flydsl(outs[i], inp, "post", tag)
+        failed += any(e != 0 for e in err.values())
+    return failed
+
+
+def check_flydsl_forced_configs(hidden_size, seed):
+    """FlyDSL builds the launch policy does not reach at 128 tokens, forced; each
+    against the reference. A build this hidden size cannot take is skipped. Returns the
+    failure count."""
+    cases = [
+        ("no_post", {"STAGE_NT": True}),
+        ("post", {"NORM": "fused", "STAGE_NT": True, "GATE_STEP": False}),
+        # The policy prefetches at every size here; force the load-then-use loop.
+        ("post", {"PREFETCH": False}),
+        ("no_post", {"BLOCK_M": 32, "CHUNK_C": 64, "PREFETCH": False}),
+        # Two chunks per segment and two slots per thread, which the policy leaves off.
+        ("post", {"NORM": "separate", "SPLITS": hidden_size // 512, "PREFETCH": True}),
+    ]
+    failed = 0
+    for mode, config in cases:
+        why = flydsl_config_error(128, hidden_size, mode, config)
+        if why:
+            aiter.logger.info(
+                "skipping forced H=%d %s %s: %s", hidden_size, mode, config, why
+            )
+            continue
+        inp = make_inputs(128, hidden_size, seed=seed + 31)
+        call, args = seam_flydsl(inp, mode, config=config)
+        tag = f"forced H={hidden_size} {mode} {config} "
+        err = check_flydsl(call(*args), inp, mode, tag)
+        failed += any(e != 0 for e in err.values())
+    return failed
+
+
+def check_flydsl_input_errors(hidden_size):
+    """Invalid FlyDSL calls raise the documented exception type. Returns the failure
+    count."""
+    m = 4
+    inp = make_inputs(m, hidden_size, seed=3)
+
+    def call(mode="post", config=None, **over):
+        kw = {} if config is None else {"config": config}
+        f, args = seam_flydsl({**inp, **over}, mode, **kw)
+        return lambda: f(*args)
+
+    # The illegal SPLITS comes from the validator, on the tile the policy picks for this
+    # hidden size: the default tile may not fit it, which would raise for the tile.
+    from aiter.jit.utils.chip_info import get_cu_num
+    from aiter.ops.flydsl.mhc_seam_kernels import get_mhc_seam_config
+
+    policy = get_mhc_seam_config(m, hidden_size, get_gfx_runtime(), get_cu_num())
+    tile = {"BLOCK_M": policy["BLOCK_M"], "CHUNK_C": policy["CHUNK_C"]}
+    bad_splits = next(
+        sp
+        for sp in range(2, hidden_size + 1)
+        if flydsl_config_error(m, hidden_size, "post", dict(tile, SPLITS=sp))
+    )
+    cases = {
+        "fp32 residual": (TypeError, call(residual=inp["residual"].float())),
+        "hc_mult 2": (ValueError, call(residual=inp["residual"][:, :2].contiguous())),
+        "fn shape": (ValueError, call(fn=inp["fn"][:, :-32].contiguous())),
+        "fn bf16": (TypeError, call(fn=inp["fn"].to(dtypes.bf16))),
+        "no norm_weight": (ValueError, call(norm_weight=None)),
+        "post without comb": (ValueError, call(comb_res_mix=None)),
+        "unknown knob": (ValueError, call(config={"TILE_K": 64})),
+        "unknown norm": (ValueError, call(config={"NORM": "post"})),
+        "illegal chunk": (ValueError, call(config={"CHUNK_C": 96})),
+        "splits not dividing": (
+            ValueError,
+            call(config=dict(tile, SPLITS=bad_splits)),
+        ),
+        "chunk lanes not 2^k": (ValueError, call(config={"CHUNK_C": 320})),
+        "block_m above block": (ValueError, call(config={"BLOCK_M": 512})),
+    }
+    failed = 0
+    for name, (exc_type, fn) in cases.items():
+        try:
+            fn()
+        except exc_type as exc:
+            aiter.logger.info("flydsl input check ok: %s raises: %s", name, exc)
+            continue
+        except Exception as exc:  # noqa: BLE001
+            aiter.logger.error(
+                "flydsl input check %s: %s: %s", name, type(exc).__name__, exc
+            )
+        else:
+            aiter.logger.error("flydsl input check %s: no error raised", name)
+        failed += 1
+    return failed
+
+
 def main():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
-        description="delayed mHC seam (mhc_fused_post_pre_delayed)",
+        description="delayed mHC seam: ASM (mhc_fused_post_pre_delayed) and FlyDSL",
     )
     parser.add_argument(
         "-m",
@@ -805,26 +1226,33 @@ def main():
         help="""Token counts.
     e.g.: -m 16384""",
     )
+    parser.add_argument(
+        "--hidden",
+        type=int,
+        nargs="*",
+        default=[5120, 4096, 7168],
+        help="""Hidden sizes. The ASM seam runs at 5120 only, the FlyDSL seam at each.""",
+    )
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
-    if get_gfx() != "gfx942":
+    if get_gfx_runtime() != "gfx942":
         aiter.logger.warning(
-            "mhc_fused_post_pre_delayed runs on gfx942 only, skipping on %s",
-            get_gfx(),
+            "the ASM and FlyDSL delayed seams run on gfx942 only, skipping on %s",
+            get_gfx_runtime(),
         )
         return 0
 
     from aiter.ops import mhc as aiter_mhc
 
-    df = []
-    for m in args.m:
-        for identity_pre in (False, True):
-            df.append(
-                test_mhc_fused_post_pre_delayed(
-                    m=m, identity_pre=identity_pre, seed=args.seed + m
-                )
-            )
+    df = [
+        test_mhc_fused_post_pre_delayed(
+            m=m, hidden_size=hidden_size, mode=mode, seed=args.seed + m
+        )
+        for hidden_size in args.hidden
+        for m in args.m
+        for mode in MODES
+    ]
     print_json_table("mhc_fused_post_pre_delayed summary", df)
     failed = sum(not r["ok"] for r in df)
 
@@ -856,6 +1284,13 @@ def main():
     failed += check_compile(args.seed)
     failed += check_graph_cold_identity(aiter_mhc, args.seed)
     failed += check_graphs_and_launch_split(aiter_mhc, args.seed)
+    failed += check_flydsl_empty()
+    failed += check_flydsl_norm_paths(args.seed)
+    failed += check_flydsl_weight_update(args.seed)
+    for hidden_size in args.hidden:
+        failed += check_flydsl_streams(hidden_size, args.seed)
+        failed += check_flydsl_forced_configs(hidden_size, args.seed)
+        failed += check_flydsl_input_errors(hidden_size)
     aiter.logger.info("test_mhc_seam: %d failure(s)", failed)
     return 1 if failed else 0
 
