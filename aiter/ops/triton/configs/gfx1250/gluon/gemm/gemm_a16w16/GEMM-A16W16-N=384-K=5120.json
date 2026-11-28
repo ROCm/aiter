@@ -16,6 +16,8 @@
         736,
         768,
         1024,
+        1344,
+        1536,
         2048,
         4096,
         8192
@@ -160,6 +162,24 @@
         "BLOCK_N": 32,
         "BLOCK_K": 128,
         "NUM_BUFFERS": 7,
+        "num_warps": 4,
+        "kernel_type": "bandwidth_bound",
+        "waves_per_eu": 0
+    },
+    "M_LEQ_1344": {
+        "BLOCK_M": 32,
+        "BLOCK_N": 64,
+        "BLOCK_K": 256,
+        "NUM_BUFFERS": 4,
+        "num_warps": 4,
+        "kernel_type": "bandwidth_bound",
+        "waves_per_eu": 0
+    },
+    "M_LEQ_1536": {
+        "BLOCK_M": 64,
+        "BLOCK_N": 64,
+        "BLOCK_K": 256,
+        "NUM_BUFFERS": 4,
         "num_warps": 4,
         "kernel_type": "bandwidth_bound",
         "waves_per_eu": 0
