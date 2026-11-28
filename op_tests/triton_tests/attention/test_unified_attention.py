@@ -1041,6 +1041,57 @@ def test_triton_unified_attn_sw_split_no_sinks(seq_lens, num_heads, block_size):
 
 
 @pytest.mark.parametrize(
+    "seq_lens, num_heads",
+    [
+        ([(17, 16384)], (16, 2)),
+        ([(63, 16384)], (8, 1)),
+        ([(42, 16384)] * 4 + [(1, 16384)] * 19, (32, 2)),
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_short_prefill_split(seq_lens, num_heads):
+    # head-256 queries of 17-63 tokens span several 128-row query blocks
+    if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
+        pytest.skip("gfx950 gluon split dispatch")
+
+    block_size = 16
+    query_lens = [q for q, _ in seq_lens]
+    kv_lens = [kv for _, kv in seq_lens]
+    q, k, v, _, _, _, out, cu_q, kv_lens_t, max_q, max_k, scale, window, table = (
+        generate_data(
+            seq_lens,
+            num_blocks=len(seq_lens) * -(-max(kv_lens) // block_size),
+            block_size=block_size,
+            head_size=256,
+            num_heads=num_heads,
+        )[:14]
+    )
+    ref = ref_paged_attn(
+        q, k, v, query_lens, kv_lens, table, scale, torch.bfloat16
+    ).float()
+
+    unified_attention(
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        cu_seqlens_q=cu_q,
+        max_seqlen_q=max_q,
+        seqused_k=kv_lens_t,
+        max_seqlen_k=max_k,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window,
+        block_table=table,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+    )
+    torch.testing.assert_close(out.float(), ref, atol=1.5e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
     "seq_lens",
     [
         [(1, 1328)],

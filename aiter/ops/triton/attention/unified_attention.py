@@ -292,12 +292,27 @@ def _gfx950_gluon_supported(params: _UAParams):
     )
 
 
-def _gfx950_split_params(params: _UAParams):
+def _gfx950_prefill_config(params: _UAParams, config):
+    """Apply the PREFILL_WIDE geometry to a split prefill over at least min_kv keys."""
+    wide = config.pop("PREFILL_WIDE", None)
+    if (
+        wide
+        and params.max_seqlen_k >= wide["min_kv"]
+        and params.num_tokens
+        >= params.num_seqs * (wide["config"]["BLOCK_M"] // params.num_queries_per_kv)
+    ):
+        config.update(wide["config"])
+    return config
+
+
+def _gfx950_split_params(params: _UAParams, prefill_wide: bool = True):
     """Size the split by the gluon grid when a sequence spans several query blocks."""
     q_rows = params.max_seqlen_q * params.num_queries_per_kv
     if params.all_decode or (q_rows <= 128 and params.sliding_window <= 0):
         return params
     config = get_unified_attention_config("attn_3d", params, backend="gluon")
+    if q_rows > 128 and prefill_wide:
+        config = _gfx950_prefill_config(params, config)
     block_m = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
     if q_rows <= 128:
         block_m = max(block_m, triton.next_power_of_2(q_rows))
@@ -368,9 +383,9 @@ def _gfx950_split_grid(params: _UAParams):
         and params.max_seqlen_q * params.num_queries_per_kv <= 128
     ):
         return False
-    # unsplit, the 2d grid is faster
+    # unsplit, the 2d grid is faster; PREFILL_WIDE widens only calls that split anyway
     config = get_unified_attention_config(
-        "kv_split", _gfx950_split_params(params), backend="gluon"
+        "kv_split", _gfx950_split_params(params, prefill_wide=False), backend="gluon"
     )
     return config["NUM_SEGMENTS"] > 1
 
@@ -1802,9 +1817,11 @@ def _unified_attention_3d_gfx950(
     """
 
     config = get_unified_attention_config("attn_3d", params, backend="gluon")
+    q_rows = triton.next_power_of_2(params.max_seqlen_q * params.num_queries_per_kv)
+    if not params.all_decode and q_rows > 128:
+        config = _gfx950_prefill_config(params, config)
     MFMA_DIM = config["MFMA_DIM"]
     BLOCK_M = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
-    q_rows = triton.next_power_of_2(params.max_seqlen_q * params.num_queries_per_kv)
     if not params.all_decode and q_rows <= 128:
         # short queries: one block covers the sequence
         BLOCK_M = max(BLOCK_M, q_rows)
