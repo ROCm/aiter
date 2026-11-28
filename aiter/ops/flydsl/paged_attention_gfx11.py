@@ -45,8 +45,11 @@ _TUNE = {
     "decode_skew_rows": None,  # V^T skew period in rows, 0 / 4 / 8 / 16 (None = rule)
     "decode_s_slots": 0,  # partial-S exchange slots, 1 or 2 (0 = rule)
     # prefill tile override: None = the rule, else (num_waves, block_n,
-    # vt_rows, d_split, double_buffer[, q_reload[, waves_per_eu]])
+    # vt_rows, d_split, double_buffer[, q_reload, waves_per_eu[, vt_pad,
+    # skew_rows]])
     "prefill_tile": None,
+    "prefill_lds_prefetch": None,  # LDS operands fetched n WMMAs ahead (None = rule)
+    "prefill_lds_sched": None,  # scheduling groups for that order (None = off)
     "target_wgs": 160,  # decode workgroups the segments aim for
     "max_segments": 32,  # KV segments per sequence at most
     # decode rows of a mixed batch: KV segments + merge (True) or one segment
@@ -71,6 +74,9 @@ def _prefill_kernel(
     double_buffer,
     q_reload,
     waves_per_eu,
+    lds_prefetch,
+    lds_sched,
+    vt_layout,
     head_group,
 ):
     # device_index intentionally participates in the cache key.
@@ -86,6 +92,10 @@ def _prefill_kernel(
         vt_rows=vt_rows,
         d_split=d_split,
         q_reload=q_reload,
+        lds_prefetch=lds_prefetch,
+        lds_sched=lds_sched,
+        vt_pad=vt_layout[0],
+        skew_rows=vt_layout[1],
         double_buffer=double_buffer,
         head_group=head_group,
         waves_per_eu=waves_per_eu,
@@ -194,24 +204,29 @@ def _prefill_tile(arch, max_q, max_k, H, D, batch, total_q):
     of short sequences 64-row, 64-key tiles (4 waves: six short sequences
     1.13x instead of 0.94x), contexts of 2048 keys and up the 256-row tile
     again, the rest the varlen rule."""
+    pad = (8, 16)  # V^T layout (vt_pad, skew_rows)
     if _TUNE["prefill_tile"] is not None:
         nw, bn, vt, ds, db, *rest = _TUNE["prefill_tile"]
         qr = bool(rest[0]) if rest else False
         wpe = int(rest[1]) if len(rest) > 1 and rest[1] else None
-        return int(nw), int(bn), int(vt), int(ds), bool(db), qr, wpe, None
+        if len(rest) > 3:
+            pad = (int(rest[2]), int(rest[3]))
+        return int(nw), int(bn), int(vt), int(ds), bool(db), qr, wpe, pad, None
     if D > 128:
         if (total_q <= 768 or max_k <= 512) and D % 32 == 0:
-            return 8, 16, 8, 2, True, False, None, None
+            return 8, 16, 8, 2, True, False, None, pad, None
     elif max_k >= 4096:
-        return 16, 64, 8, 1, True, False, None, None
+        return 16, 64, 8, 1, True, False, None, pad, None
     elif max_q <= 256:
-        return 4, 64, 8, 1, True, False, None, None
+        # 4 waves x 32 keys, single buffer, padless V^T: 6 short sequences
+        # 1.47x instead of 1.18x
+        return 4, 32, 8, 1, False, False, None, (0, 4), None
     elif max_k >= 2048:
-        return 16, 64, 8, 1, True, False, None, None
+        return 16, 64, 8, 1, True, False, None, pad, None
     num_waves, block_n, head_group, vt_rows = _gfx11_varlen_config(
         arch, max_q, max_k, H, D, batch, True
     )
-    return num_waves, block_n, vt_rows, 1, True, False, None, head_group
+    return num_waves, block_n, vt_rows, 1, True, False, None, pad, head_group
 
 
 def _num_segments(batch, HKV, max_seqlen_k, block_n):
@@ -327,8 +342,8 @@ def flydsl_unified_attention_gfx11(
 
     if max_q > short:
         # The long sequences (prefill chunks): the kernel skips the short ones.
-        num_waves, block_n, vt_rows, pds, dbuf, pqr, wpe, head_group = _prefill_tile(
-            arch, max_q, max_k, H, D, batch, total_q
+        num_waves, block_n, vt_rows, pds, dbuf, pqr, wpe, lay, head_group = (
+            _prefill_tile(arch, max_q, max_k, H, D, batch, total_q)
         )
         exe = _prefill_kernel(
             dev,
@@ -345,6 +360,19 @@ def flydsl_unified_attention_gfx11(
             dbuf,
             pqr,
             wpe,
+            # LDS operands fetched this many WMMAs ahead: deeper at head_dim
+            # 256, where the tile spills anyway and depth 2 only adds pressure
+            (
+                (4 if D > 128 else 2)
+                if _TUNE["prefill_lds_prefetch"] is None
+                else int(_TUNE["prefill_lds_prefetch"])
+            ),
+            (
+                False
+                if _TUNE["prefill_lds_sched"] is None
+                else bool(_TUNE["prefill_lds_sched"])
+            ),
+            lay,
             head_group,
         )
         exe(

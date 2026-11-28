@@ -71,6 +71,10 @@ def build_flash_attn_paged_module_gfx11(
     vt_rows=2,
     d_split=1,
     q_reload=False,
+    lds_prefetch=2,
+    lds_sched=False,
+    vt_pad=8,
+    skew_rows=16,
     double_buffer=True,
     head_group=None,
     waves_per_eu=None,
@@ -106,6 +110,11 @@ def build_flash_attn_paged_module_gfx11(
         q_reload: read the Q operand from the (cached) global tensor on every
             tile instead of keeping it in VGPRs: 16 x head_dim bf16 per wave
             of registers freed, one more workgroup per WGP at head_dim 128.
+        lds_prefetch: WMMA operands fetched from LDS this many steps ahead of
+            the WMMA using them (0 = right before it); lds_sched adds the
+            scheduling groups that keep that order.
+        vt_pad, skew_rows: the V^T layout in LDS (see the V_ROW comment): 8 / 16,
+            or padless 0 / 8 (16-key tiles) and 0 / 4 (32-key tiles).
         double_buffer: ping-pong the K/V^T tile in LDS (one barrier per tile).
             Dropped automatically when two buffers do not fit in LDS.
         head_group: heads walked together by consecutive workgroups (divides
@@ -173,16 +182,22 @@ def build_flash_attn_paged_module_gfx11(
     S_SLOT = S_LANE * WAVE_SIZE  # fp32 per wave
     S_ELEMS = num_waves * S_SLOT * 2 if DS > 1 else 0
     S_BYTES = S_ELEMS * 2
+    LDS_PF = max(0, int(lds_prefetch))  # LDS operands fetched this far ahead
     K_ROW = DP + LDS_PAD
-    V_ROW = BLOCK_N + LDS_PAD
     K_SIZE = BLOCK_N * K_ROW
-    # V^T rows are skewed by 8 elements every 16 rows: the staging stores write
-    # 8-column blocks, i.e. rows 8 apart, which with a plain row pitch (8 rows
-    # = a multiple of 128 bytes) alternate between two bank groups - an 8-way
-    # conflict on every V^T store. Skewing per 16 rows spreads the stores over
-    # all bank groups while an operand read (16 consecutive rows) keeps one
-    # skew and stays conflict-free.
-    VT_SIZE = DP * V_ROW + (DP // 16) * 8
+    # V^T rows in LDS: pitch V_ROW, row r's keys starting at (r // SR) * 8.
+    # The staging stores write 8-column blocks, i.e. rows 8 apart, which with
+    # a plain pitch (8 rows = a multiple of 128 bytes) pile into one or two
+    # bank groups - an 8-way conflict on every V^T store. The skew spreads
+    # them; the operand reads (16 consecutive rows) stay conflict-free with
+    # the 8-element pad and a skew per 16 rows, or without the pad with a skew
+    # per 8 rows (16-key tiles) / 4 rows (32-key tiles). The padless layouts
+    # take 25% less LDS, which decides the workgroups per WGP.
+    if vt_pad not in (0, 8) or skew_rows not in (0, 4, 8, 16):
+        raise ValueError(f"unsupported vt_pad={vt_pad} / skew_rows={skew_rows}")
+    V_ROW = BLOCK_N + int(vt_pad)
+    SR = int(skew_rows)
+    VT_SIZE = DP * V_ROW + ((DP // SR) * 8 if SR else 0)
     BUF = K_SIZE + VT_SIZE
     if BUF * 2 + S_BYTES > LDS_LIMIT_BYTES:
         # A launch over the LDS limit leaves the HIP context unusable; refuse here.
@@ -307,6 +322,7 @@ def build_flash_attn_paged_module_gfx11(
             l16 = lane % 16
             hh = lane // 16
             is_h0 = hh == 0
+            lskew = (l16 // SR) * 8 if SR else 0  # the lane's V^T operand-row skew
             # Row group and head-dim slice of this wave (DS waves per group).
             rg = wave // DS
             dw = wave % DS
@@ -545,14 +561,10 @@ def build_flash_attn_paged_module_gfx11(
                             lo_w.append((a & 0xFFFF) | (b << 16))
                             hi_w.append(a.shrui(fx.Int32(16)) | (b & fx.Int32(-65536)))
                         for half, ws in ((0, lo_w), (1, hi_w)):
-                            # row d0 + 2t + half, skewed by 8 per 16 rows (d0 / 16)
-                            dst = (
-                                bb
-                                + K_SIZE
-                                + (d0 + 2 * t + half) * V_ROW
-                                + ((blk % DBLKS) // 2) * 8
-                                + krow0
-                            )
+                            # row d0 + 2t + half, skewed by 8 per SR rows
+                            dst = bb + K_SIZE + (d0 + 2 * t + half) * V_ROW + krow0
+                            if const_expr(SR > 0):
+                                dst = dst + ((d0 + (2 * t + half)) // SR) * 8
                             lds_view(dst, vt_rows).store(
                                 Vec.from_elements(ws, fx.Int32).bitcast(elem)
                             )
@@ -641,6 +653,27 @@ def build_flash_attn_paged_module_gfx11(
                 store_tile(gload_tile(fx.Int32(0)), 0)
             _lds_barrier()
 
+            def pipelined(ops, load, consume):
+                """WMMA chain with its LDS operands fetched LDS_PF steps ahead: as
+                emitted, the compiler waits for each operand right before its
+                WMMA (lgkmcnt(0) per step), serializing the LDS latency; here the
+                loads of step i + LDS_PF go out before the WMMA of step i, and
+                the scheduling groups keep the pattern (2 ds_reads per operand)."""
+                n = len(ops)
+                pf = min(LDS_PF, n)
+                pend = [load(*ops[i]) for i in range_constexpr(pf)]
+                for i in range_constexpr(n):
+                    a = pend.pop(0)
+                    if i + pf < n:
+                        pend.append(load(*ops[i + pf]))
+                    consume(a, *ops[i])
+                if const_expr(lds_sched and pf > 0):
+                    fx.rocdl.sched_dsrd(2 * pf)
+                    for i in range_constexpr(n):
+                        fx.rocdl.sched_mfma(1)
+                        if i + pf < n:
+                            fx.rocdl.sched_dsrd(2)
+
             def tile_step(j32, state, mask_tail):
                 """One KV tile: S^T, online softmax, O^T update, next tile into LDS.
                 mask_tail (compile-time): mask keys at or past seq_kv; only the last
@@ -676,10 +709,16 @@ def build_flash_attn_paged_module_gfx11(
                 # ---- S^T = K Q^T over this wave's columns; c outer so consecutive
                 # WMMAs hit independent accs ----
                 s_accs = [zero8 for _ in range_constexpr(NK)]
-                for c in range_constexpr(NDW):
-                    for kb in range_constexpr(NK):
-                        a = lds_v16(cur + (kb * 16 + l16) * K_ROW + col0 + 16 * c)
-                        s_accs[kb] = _wmma(a, qv[c], s_accs[kb])
+
+                def k_operand(c, kb):
+                    return lds_v16(cur + (kb * 16 + l16) * K_ROW + col0 + 16 * c)
+
+                def s_step(a, c, kb):
+                    s_accs[kb] = _wmma(a, qv[c], s_accs[kb])
+
+                pipelined(
+                    [(c, kb) for c in range(NDW) for kb in range(NK)], k_operand, s_step
+                )
                 if const_expr(DS > 1):
                     s_accs = exchange_s(s_accs)
 
@@ -717,6 +756,7 @@ def build_flash_attn_paged_module_gfx11(
                     for o in o_acc
                 ]
 
+                p_vecs = []
                 for kb in range_constexpr(NK):
                     own = []
                     for si in range_constexpr(8):
@@ -739,18 +779,24 @@ def build_flash_attn_paged_module_gfx11(
                         dwords.append(
                             fx.Int32(fx.rocdl.perm_b32(partp[j2], ownp[j2], sel_odd))
                         )
-                    p_vec = Vec.from_elements(dwords, fx.Int32).bitcast(elem)
-                    for dc in range_constexpr(NDW):
-                        # row col0 + 16 dc + l16, skewed by 8 per 16 rows
-                        a = lds_v16(
-                            cur
-                            + K_SIZE
-                            + (col0 + dc * 16 + l16) * V_ROW
-                            + col0 // 2
-                            + dc * 8
-                            + kb * 16
-                        )
-                        o_acc[dc] = Vec(_wmma(a, p_vec, o_acc[dc]))
+                    p_vecs.append(Vec.from_elements(dwords, fx.Int32).bitcast(elem))
+
+                # ---- O^T += V^T P^T, the V^T operands from LDS ----
+                def v_operand(kb, dc):
+                    # row col0 + 16 dc + l16, skewed by 8 per SR rows
+                    off = cur + K_SIZE + (col0 + dc * 16 + l16) * V_ROW + kb * 16
+                    if const_expr(SR > 0):
+                        off = off + ((col0 + dc * 16) // SR) * 8 + lskew
+                    return lds_v16(off)
+
+                def o_step(a, kb, dc):
+                    o_acc[dc] = Vec(_wmma(a, p_vecs[kb], o_acc[dc]))
+
+                pipelined(
+                    [(kb, dc) for kb in range(NK) for dc in range(NDW)],
+                    v_operand,
+                    o_step,
+                )
 
                 if const_expr(double_buffer):
                     # The other buffer was last read in iteration j-1 and every wave has
