@@ -172,7 +172,13 @@ def test_fmoe(
     gate_up_layout: bool | None = None,
     expected_kernel1: str | None = None,
 ):
-    if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
+    # a16wi4 also runs on gfx942; the other per_1x32 kernels are gfx950-only.
+    is_gfx942_a16wi4 = get_gfx() == "gfx942" and WQDType == dtypes.i4x2
+    if (
+        get_gfx() not in ["gfx950"]
+        and qType in [aiter.QuantType.per_1x32]
+        and not is_gfx942_a16wi4
+    ):
         return
     if actType == aiter.ActivationType.Situv2:
         beta = DEFAULT_SITUV2_BETA if beta is None else float(beta)
@@ -1576,7 +1582,7 @@ def _iter_legacy_cases():
                         )
         elif triple == _PER1X32_BF16_I4:
             for m in args.tokenNum:
-                yield _kw(
+                kw = _kw(
                     dtype,
                     m,
                     model_dim,
@@ -1588,7 +1594,11 @@ def _iter_legacy_cases():
                     aiter.ActivationType.Silu,
                     disable_stage1_bias=not stage1_bias,
                     disable_stage2_bias=not stage2_bias,
-                ), extras
+                )
+                # gfx942 a16wi4 is only covered here, so fail on NaN / mismatch.
+                if get_gfx() == "gfx942":
+                    kw["strict_accuracy"] = True
+                yield kw, extras
         else:
             for act_type in args.act:
                 # SiTUv2 only routes to FlyDSL on per_1x32 + fp4/fp8; skip it for
