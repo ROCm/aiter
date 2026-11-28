@@ -5,14 +5,16 @@
 
 """AOT pre-compilation for the MegaMoE A8W4 and A4W4 deployment profiles.
 
-Each job builds the runtime's own ``MegaMoEV2`` for one rank of a deployment
-profile and calls its ``preload_aot_bundles()``. The runtime derives the bundle
-plan, sizes its buffers and loads every production Stage1/prepare, Stage2 and
-combine variant itself; inside :func:`aiter.aot.flydsl.dry_run.dry_run` those
-kernels are compiled into the cache instead of launched. mori shmem, through
-which the runtime allocates symmetric buffers and exchanges peer pointers, hands
-out FakeTensors and fake addresses, so no GPU or process group is needed. This
-module only owns the deployment profiles.
+Each job builds the runtime's own ``MegaMoEV2`` for a deployment profile and
+calls its ``preload_aot_bundles()``. The kernels take the rank at launch, so
+rank 0's instance builds the kernels of every rank. The runtime derives the
+bundle plan, sizes its buffers and loads every production Stage1/prepare,
+Stage2 and combine variant itself; inside
+:func:`aiter.aot.flydsl.dry_run.dry_run` those kernels are compiled into the
+cache instead of launched. mori shmem, through which the runtime allocates
+symmetric buffers and exchanges peer pointers, hands out FakeTensors and fake
+addresses, so no GPU or process group is needed. This module only owns the
+deployment profiles.
 
 aiter fixes some arch-dependent values at import (e.g. ``dtypes.fp8``), so like
 the MoE replay this one runs in a process of its own, started with
@@ -78,16 +80,15 @@ K3_INTER_DIM = 3072
 K3_ACT = "situv2"
 K3_SITU_BETA = 4.0
 K3_SITU_LINEAR_BETA = 25.0
-# DeepSeek-V4.1-Flash EP4 deployment profile (epr96, d5120 / i2304, a8w4 only:
-# the fused routes are a8w4). Its MTPRs are those of ATOM's instances: decode
-# (128: staged + small-input 256) and prefill (8192 and 16384: staged +
-# small-input + large-input; the EP4 large-input route exists only there).
+# DeepSeek-V4.1-Flash EP4 deployment profile (epr96, d5120 / i2304). Its MTPRs
+# are those of ATOM's instances: decode (128: staged + small-input 256) and
+# prefill (8192, 16384 and 32768: staged + small-input + large-input, for a8w4
+# and a4w4).
 V41_FLASH_WORLD_SIZE = 4
 V41_FLASH_EXPERTS_PER_RANKS = (96,)
 V41_FLASH_MODEL_DIM = 5120
 V41_FLASH_INTER_DIM = 2304
-V41_FLASH_MTPRS = (128, 8192, 16384)
-V41_FLASH_QUANTS = ("a8w4",)
+V41_FLASH_MTPRS = (128, 8192, 16384, 32768)
 # DeepSeek-V4.1-Flash EP2 deployment profile (epr192, the EP4 shape and MTPRs).
 V41_FLASH_EP2_WORLD_SIZE = 2
 V41_FLASH_EP2_EXPERTS_PER_RANKS = (192,)
@@ -115,8 +116,8 @@ def default_jobs(
     situ_beta=1.0,
     situ_linear_beta=1.0,
 ):
-    """One job per rank of every (max tokens per rank, experts per rank) pair;
-    rank is a compile-time parameter of the kernels."""
+    """One job per (max tokens per rank, experts per rank, quant); the kernels
+    take the rank at launch, so one job serves every rank."""
     shape_suffix = ""
     if (world_size, topk, model_dim, inter_dim) != (
         WORLD_SIZE,
@@ -130,12 +131,11 @@ def default_jobs(
         {
             "kernel_name": (
                 f"mega_moe_{quant}_mtpr{mtpr}_epr{experts_per_rank}"
-                f"_rank{rank}{shape_suffix}{act_suffix}"
+                f"{shape_suffix}{act_suffix}"
             ),
             "quant": quant,
             "mtpr": mtpr,
             "experts_per_rank": experts_per_rank,
-            "rank": rank,
             "world_size": world_size,
             "topk": topk,
             "model_dim": model_dim,
@@ -148,7 +148,6 @@ def default_jobs(
         for mtpr in mtprs
         for experts_per_rank in experts_per_ranks
         for quant in quants
-        for rank in range(world_size)
     ]
 
 
@@ -161,7 +160,7 @@ def production_jobs(
     v41_flash_mtprs=V41_FLASH_MTPRS,
 ):
     """Every geometry the service ships: V4-Pro (default shape), Kimi-K3 and
-    V4.1-Flash EP4 / EP2 / EP8 (``v41_flash_mtprs``, a8w4 in ``quants`` only).
+    V4.1-Flash EP4 / EP2 / EP8 (``v41_flash_mtprs``).
 
     Used by the default build so every profile is AOT-covered and none
     triggers an online JIT compile at serving time.
@@ -190,7 +189,7 @@ def production_jobs(
         jobs += default_jobs(
             v41_flash_mtprs,
             flash_experts_per_ranks,
-            quants=tuple(q for q in quants if q in V41_FLASH_QUANTS),
+            quants=quants,
             world_size=flash_world_size,
             model_dim=V41_FLASH_MODEL_DIM,
             inter_dim=V41_FLASH_INTER_DIM,
@@ -257,13 +256,13 @@ def _weights(job: dict, device) -> dict:
 
 
 def compile_one_config(**job):
-    """Build one rank of a profile and leave its production kernels in the cache."""
+    """Build a profile and leave its production kernels in the cache."""
     from aiter.aot.flydsl.dry_run import dry_run
 
     result = {**job, "compile_time": None}
     started = time.time()
     try:
-        device = torch.device("cuda", job["rank"])
+        device = torch.device("cuda", 0)
         with (
             dry_run(ARCH, NUM_CU, name=DEVICE_NAME),
             _fake_shmem(device),
@@ -272,7 +271,7 @@ def compile_one_config(**job):
             from aiter.ops.flydsl.kernels.mega_moe.mega_moe_v2 import MegaMoEV2
 
             moe = MegaMoEV2(
-                rank=job["rank"],
+                rank=0,
                 world_size=job["world_size"],
                 model_dim=job["model_dim"],
                 inter_dim=job["inter_dim"],

@@ -14,9 +14,11 @@ each call's route picked by forward(max_tokens=...). Accuracy against the fp32
 reference and the pinned staged route (uneven, idle, padded ranks), per-layer
 weight rebinding with interleaved staged calls, the 32-bit epoch wrap with zero
 rows, CUDA graph replay against eager, and paired timing against the staged route.
-The fused routes need an a8w4 layout of FUSED_LAYOUTS (mega_moe_config.py) on an
+The fused routes need a layout of FUSED_LAYOUTS (mega_moe_config.py) on an
 8-XCD gfx950: DeepSeek-V4-Pro (--network v4_pro) on 8 ranks, or DeepSeek-V4.1-Flash
 (--network v41_flash) on the rank counts listed there (EP8: 8 ranks, EP4: 4 ranks, EP2: 2 ranks).
+With --quant a4w4 the instance has the same routes; its fused routes write an FP8 GEMM1 output where the
+staged route writes FP4, so a fused route matches the staged one to --rtol (0.25), not bit for bit.
 
     torchrun --nproc-per-node 8 test_mega_moe_v2.py --bs-list 1,64,128
     torchrun --nproc-per-node 8 test_mega_moe_v2.py --max-tok-per-rank 8192 \
@@ -25,6 +27,9 @@ The fused routes need an a8w4 layout of FUSED_LAYOUTS (mega_moe_config.py) on an
     # every timed route also checked against the reference:
     torchrun --nproc-per-node 4 test_mega_moe_v2.py --suite routes --network v41_flash --check-time-acc
     torchrun --nproc-per-node 2 test_mega_moe_v2.py --suite routes --network v41_flash --check-time-acc
+    torchrun --nproc-per-node 8 test_mega_moe_v2.py --suite routes --network v41_flash --quant a4w4
+    torchrun --nproc-per-node 8 test_mega_moe_v2.py --max-tok-per-rank 16384 --quant a4w4 \
+        --expect-large-m --compare-main --bs-list 513,4096,8192,16384 --accuracy-max-bs 16384
     # against a same-MTPR staged route, timing only:
     torchrun --nproc-per-node 8 test_mega_moe_v2.py --suite routes \
         --mtpr 256 --small-m-mtprs 256 --time-only --time-bs 140,168,196,224,252
@@ -155,6 +160,17 @@ def _rel_l2(output, reference):
     if not reference_sq.item():
         return -1.0
     return float(torch.sqrt(error_sq / reference_sq))
+
+
+def _mismatched_rows(output, reference, frac=0.5):
+    """Rows, over all ranks, whose error norm exceeds ``frac`` of the reference row's norm: a corrupted row (a
+    wrong token, expert or scale) fails this even when the tensor's relative L2 passes.
+    """
+    reference = reference.float()
+    diff = output.float() - reference
+    bad = (diff.norm(dim=-1) > frac * reference.norm(dim=-1)).sum().to(torch.int64)
+    dist.all_reduce(bad)
+    return int(bad.item())
 
 
 def _all_ranks(flag, device):
@@ -459,11 +475,8 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
     if args.compare_main:
         if not args.expect_large_m:
             raise ValueError("--compare-main requires --expect-large-m")
-        moe.set_large_m_enabled(False)
-        try:
-            main_output = _fwd(moe, x, weights, ids)[:tokens].clone()
-        finally:
-            moe.set_large_m_enabled(True)
+        # Without max_tokens the call takes main's staged route.
+        main_output = moe.forward(x, weights, ids)[:tokens].clone()
         _barrier()
     output = _fwd(moe, x, weights, ids)[:tokens]
     if args.expect_large_m:
@@ -498,9 +511,14 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
             raise AssertionError(
                 f"large-M vs main relL2={main_rel_l2:.6f} exceeds {args.rtol}"
             )
+        main_bad_rows = _mismatched_rows(output, main_output)
+        if main_bad_rows:
+            raise AssertionError(
+                f"large-M vs main: {main_bad_rows} rows off by more than half their norm"
+            )
         if rank == 0:
             print(
-                f"[LARGE-M] main_relL2={main_rel_l2:.6f} PASS",
+                f"[LARGE-M] main_relL2={main_rel_l2:.6f} mismatched_rows=0 PASS",
                 flush=True,
             )
     active_config = getattr(moe, "_active_config", None)
@@ -767,7 +785,7 @@ def _check_large_m_edges(
         "inter_dim": moe.inter_dim,
         "experts": moe.experts,
         "topk": moe.topk,
-        "quant": "a8w4",
+        "quant": "a4w4" if moe._a_dtype == "fp4" else "a8w4",
         "swiglu_limit": moe.swiglu_limit,
     }
     if not fused_layout_supported(**layout) or fused_layout_supported(
@@ -872,11 +890,13 @@ def _run_layer_slot_stress(moe, x, weights, ids, slots, cycles, rank, rtol):
     # A few slots per cycle, covering both layers, are checked against the main path on the same
     # binding. With the default fused knobs (EP8 V4-Pro) the large-M path matches it bit for bit; a
     # tuned layout (EP4 V4.1-Flash: FP8 combine rows, BF16 head tokens) sums in another order, so it
-    # is held to rtol, far below the error of a stale binding (layer B doubles W2).
+    # is held to rtol, far below the error of a stale binding (layer B doubles W2). So is A4W4, whose
+    # large-M GEMM1 output is FP8 where the main path's is FP4.
     config = moe._large_m._select_config(tokens)
     exact = (
         config.fused_stage1 == FusedStage1Knobs()
         and config.fused_stage2 == FusedStage2Knobs()
+        and moe._a_dtype == "fp8"
     )
     checked_slots = {0, 1, slots - 1}
     checked = 0
@@ -897,11 +917,7 @@ def _run_layer_slot_stress(moe, x, weights, ids, slots, cycles, rank, rtol):
             if slot not in checked_slots:
                 continue
             output = output.clone()
-            moe.set_large_m_enabled(False)
-            try:
-                reference = _fwd(moe, x, route_weights, route_ids)[:tokens].clone()
-            finally:
-                moe.set_large_m_enabled(True)
+            reference = moe.forward(x, route_weights, route_ids)[:tokens].clone()
             finite = torch.isfinite(output).all().to(torch.int64)
             dist.all_reduce(finite, op=dist.ReduceOp.MIN)
             if exact:
@@ -1001,12 +1017,13 @@ def _run_skewed_route_switch(moe, x, weights, ids, rounds, seed, rank, world):
     _barrier()
     # The large-M kernels of a layout without fused-knob tuning (V4-Pro EP8) run main's arithmetic and match
     # it bit-for-bit; a tuned layout (V4.1-Flash EP8) sends other bytes (one row per token and destination,
-    # int8 transport), so there only rows off by a sizable part of their own norm count as corrupted.
+    # int8 transport), so there only rows off by a sizable part of their own norm count as corrupted. So does
+    # A4W4: its large-M GEMM1 output is FP8, main's FP4.
     config = moe._large_m._active_config
     exact = (config.fused_stage1, config.fused_stage2) == (
         FusedStage1Knobs(),
         FusedStage2Knobs(),
-    )
+    ) and moe._a_dtype == "fp8"
     worst = 0.0
     failures = []
     for round_idx in range(rounds):
@@ -1029,11 +1046,7 @@ def _run_skewed_route_switch(moe, x, weights, ids, rounds, seed, rank, world):
         dist.all_reduce(hazard)
         if not int(hazard.item()):
             raise AssertionError("skewed route did not exceed four payload producers")
-        moe.set_large_m_enabled(False)
-        try:
-            main_output = _fwd(moe, x, route_weights, route_ids)[:tokens].clone()
-        finally:
-            moe.set_large_m_enabled(True)
+        main_output = moe.forward(x, route_weights, route_ids)[:tokens].clone()
         _barrier()
         output = _fwd(moe, x, route_weights, route_ids)[:tokens].float()
         diff = output - main_output.float()
@@ -1204,9 +1217,9 @@ def _check_epoch_wrap_and_zero_rows(moe, bind, case, large_case, device):
     for base in (2**31 - 2, 2**32 - 2):
         _barrier()
         for runtime in moe._small_m_runtimes:
-            # generation = entry_count // (2 * CUs); the next launches cross the wrap.
-            runtime._s1_dispatch_workspace["entry_count"].fill_(
-                base * 2 * runtime._s1_num_cu
+            # The last launch's epoch (i32); the next launches cross the wrap.
+            runtime._s1_dispatch_workspace["launch_epoch"].fill_(
+                (base + 2**31) % 2**32 - 2**31
             )
         if moe._large_m is not None:
             large = moe._large_m
@@ -1242,7 +1255,7 @@ def _routes_instance(args, rank, world, device):
     moe = MegaMoEV2(
         rank=rank,
         world_size=world,
-        quant="a8w4",
+        quant=args.quant,
         w1=packs[0][0],
         w1_scale=packs[0][1],
         w2=packs[0][2],
@@ -1256,7 +1269,7 @@ def _routes_instance(args, rank, world, device):
     if moe.small_m_mtpr != max(args.small_m_mtprs):
         raise AssertionError(
             f"small-input route not built (small_m_mtpr={moe.small_m_mtpr}); it needs a fused "
-            "a8w4 layout of FUSED_LAYOUTS (DeepSeek-V4-Pro on 8 ranks, DeepSeek-V4.1-Flash on 8, 4 or 2 ranks) "
+            "layout of FUSED_LAYOUTS (DeepSeek-V4-Pro on 8 ranks, DeepSeek-V4.1-Flash on 8, 4 or 2 ranks) "
             "on an 8-XCD gfx950"
         )
     x, w, ids = _make_inputs(
@@ -1345,16 +1358,25 @@ def _routes_accuracy(ctx, args):
                 ref = _moe_reference(moe, xi[rows], wi[rows], ii[rows], ctx.refw[which])
                 rel_ref = _rel_l2(out_g[rows], ref)
                 rel_staged = _rel_l2(out_g[rows], out_m[rows])
+            # A4W4 (fused FP8 GEMM1 output vs staged FP4) matches the staged route only to --rtol; a row off by
+            # more than half its norm is a corrupted row, not quantization error.
+            bad_rows = _mismatched_rows(out_g[rows], out_m[rows])
             # Padded rows are discarded by the caller; they only must not be
             # NaN/Inf. Whether they are exactly zero is reported, not gated.
             pad_ok = _all_ranks(torch.isfinite(out_g).all(), device)
             pad_zero = _all_ranks((out_g[real:] == 0).all(), device) if pad else True
             outputs[(name, which)] = (xi, wi, ii, out_g, real, max_tokens)
-            ok = rel_ref < args.rtol and rel_staged < args.rtol and pad_ok
+            ok = (
+                rel_ref < args.rtol
+                and rel_staged < args.rtol
+                and not bad_rows
+                and pad_ok
+            )
             if rank == 0:
                 print(
                     f"[ACC] {name:10s} w{which} tpr={tpr} pad={pad} relL2_vs_ref={rel_ref:.6f} "
-                    f"relL2_vs_staged={rel_staged:.6f} finite={pad_ok} pad_rows_zero={pad_zero} "
+                    f"relL2_vs_staged={rel_staged:.6f} mismatched_rows={bad_rows} finite={pad_ok} "
+                    f"pad_rows_zero={pad_zero} "
                     f"{'PASS' if ok else 'FAIL'}",
                     flush=True,
                 )
@@ -1605,7 +1627,7 @@ def _run_routes(args, rank, world, device):
     moe = ctx.moe
     if rank == 0:
         print(
-            f"[SETUP] network={args.network} mtpr={moe.mtpr} small_m_mtpr={moe.small_m_mtpr} "
+            f"[SETUP] network={args.network} quant={args.quant} mtpr={moe.mtpr} small_m_mtpr={moe.small_m_mtpr} "
             f"large_m={ctx.large_m} world={world}",
             flush=True,
         )
@@ -1716,7 +1738,7 @@ def _run_sizes(args, rank, world, device):
                 stage2_p2p_quant=args.stage2_p2p_quant,
                 large_m_state_slots=args.large_m_state_slots,
                 # Pin the plan: the staged route unless --expect-large-m.
-                large_m_enabled=args.expect_large_m,
+                routed=args.expect_large_m,
                 small_m_mtprs=(),
                 **network,
             )
@@ -1780,7 +1802,7 @@ def main():
     parser.add_argument(
         "--rtol",
         type=float,
-        help="relL2 gate; default 0.10 (0.25 for a4w4) in the size suite, 0.08 in the routes suite",
+        help="relL2 gate; default 0.10 in the size suite, 0.08 in the routes suite (0.25 for a4w4 in both)",
     )
     parser.add_argument(
         "--max-tok-per-rank",
@@ -1858,12 +1880,11 @@ def main():
                 f"[SKIP] the small- and large-input routes need gfx950, got {get_gfx()}"
             )
             return
-        if args.network not in ("v4_pro", "v41_flash") or args.quant != "a8w4":
-            raise ValueError(
-                "--suite routes needs --network v4_pro or v41_flash and --quant a8w4"
-            )
+        if args.network not in ("v4_pro", "v41_flash"):
+            raise ValueError("--suite routes needs --network v4_pro or v41_flash")
         args.seed = 7 if args.seed is None else args.seed
-        args.rtol = 0.08 if args.rtol is None else args.rtol
+        if args.rtol is None:
+            args.rtol = 0.25 if args.quant == "a4w4" else 0.08
         if args.max_tok_per_rank is None:
             args.max_tok_per_rank = 8192
         if args.large_m_state_slots is None:

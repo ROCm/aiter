@@ -41,16 +41,17 @@ def _token_offset(srcmap_word, row_units, token_base):
 class TileScheduler:
     """Per-tile expert / gate-base-row resolver (flat persistent loop + XCD swizzle live in kernel body)."""
 
-    def __init__(self, *, expert_rsrc, inter_dim, expert_offset=0):
+    def __init__(self, *, expert_rsrc, inter_dim, experts_per_rank=0):
         self._expert_rsrc = expert_rsrc
         self._inter_dim = inter_dim
-        # Dispatch emits global expert IDs while W1 is rank-local.
-        self._expert_offset = int(expert_offset)
+        # Dispatch emits global expert IDs while W1 is rank-local: a rank's IDs
+        # modulo its expert count are its W1 indices.
+        self._experts_per_rank = int(experts_per_rank)
 
     def expert_of(self, m_tile_i32):
         g = self._expert_rsrc[m_tile_i32]
-        if const_expr(self._expert_offset != 0):
-            return g - fx.Int32(self._expert_offset)
+        if const_expr(self._experts_per_rank != 0):
+            return g % fx.Int32(self._experts_per_rank)
         return g
 
     def gate_base_row(self, expert_i32):
@@ -96,8 +97,8 @@ class ATileLoader:
         if const_expr(self._async_copy):
             assert total_threads % 64 == 0
             total_chunks = sort_block_m * (k_step_bytes // 16)
+            # Whole waves per copy round; the last round may leave waves idle (an FP4 fold tile of 160 rows).
             assert total_chunks % 64 == 0
-            assert total_chunks < total_threads or total_chunks % total_threads == 0
             assert row_bytes % 16 == 0 and k_step_bytes % 16 == 0
             # async_lds: the A copies are async LDS DMA, which the compiler does not make an LDS read wait for, so
             # the K-step's A reads do not drain this step's copy into the other buffer (a read of either buffer
@@ -112,19 +113,17 @@ class ATileLoader:
                 128,
             )
 
-    def for_tile(self, tile_row_base_i32, valid_rows_i32=None, row_map=None, srcs=None):
+    def for_tile(self, tile_row_base_i32, row_map=None, srcs=None):
         """Precompute LDS and tile-local global offsets for one M tile.
 
-        ``valid_rows_i32`` clamps the tile descriptor's num_records, so padding
-        rows read back as zero without touching memory.
         ``row_map`` (fused dedup_rows dispatch) with ``srcs = load_row_map()``: tile
         row r reads token row ``srcmap[tile_row_base + r] & 0xFFFFFF`` of the region
         at byte ``row_map["x_token"]`` of x; offsets from ``row_map["x_bytes"]`` on
-        are out of bounds. Without ``valid_rows_i32``, rows whose source slot is not
-        below ``row_map["rows"]`` are the padding.
+        are out of bounds. Rows whose source slot is not below ``row_map["rows"]``
+        are the padding.
         """
         if const_expr(row_map is not None):
-            assert not self._indexed_input and not self._is_fp4
+            assert not self._indexed_input
             input_iter = fx.get_iter(self._x_tensor)
             input_view = fx.Tensor(
                 fx.make_view(
@@ -150,9 +149,6 @@ class ATileLoader:
             num_records = row_map["x_bytes"]
         else:
             num_records = input_bytes
-            if valid_rows_i32 is not None:
-                assert not self._indexed_input
-                num_records = fx.Int32(valid_rows_i32) * fx.Int32(self._row_bytes)
         self._tile_rsrc = ptr_buf_tensor(
             fx.get_iter(input_view),
             fx.Int32,
@@ -182,10 +178,7 @@ class ATileLoader:
                 # Padding rows point past the buffer and read back as 0.
                 src = srcs[len(self._chunks)]
                 mapped_byte = _token_offset(src, self._row_bytes, row_map["x_token"])
-                if const_expr(valid_rows_i32 is None):
-                    real = (src & fx.Int32(0xFFFFFF)) < fx.Int32(row_map["rows"])
-                else:
-                    real = row < valid_rows_i32
+                real = (src & fx.Int32(0xFFFFFF)) < fx.Int32(row_map["rows"])
                 mapped_byte = real.select(mapped_byte, num_records)
                 self._dma_rows.append(mapped_byte)
             source_row = row
@@ -219,16 +212,21 @@ class ATileLoader:
         self._group_chunks = row_map is not None
 
     def load_row_map(self, tile_row_base_i32, srcmap_rsrc):
-        """The srcmap words of this thread's chunk rows (``for_tile`` row_map; ``srcmap_rsrc`` is ``ptr_buf_tensor(srcmap, fx.Int32)``)."""
+        """The srcmap words of this thread's chunk rows (``for_tile`` row_map; ``srcmap_rsrc`` is ``ptr_buf_tensor(srcmap, fx.Int32)``).
+
+        With a partial copy round, the rows of its idle threads past the tile read its last row.
+        """
         chunks_per_row = self._k_step_bytes // 16
-        return [
-            srcmap_rsrc[
-                tile_row_base_i32 + (fx.Int32(c) + self._tx) // fx.Int32(chunks_per_row)
-            ]
-            for c in range_constexpr(
-                0, self._sort_block_m * chunks_per_row, self._total_threads
-            )
-        ]
+        total_chunks = self._sort_block_m * chunks_per_row
+        out = []
+        for c in range_constexpr(0, total_chunks, self._total_threads):
+            row = (fx.Int32(c) + self._tx) // fx.Int32(chunks_per_row)
+            if const_expr(total_chunks % self._total_threads):
+                row = (row < fx.Int32(self._sort_block_m)).select(
+                    row, fx.Int32(self._sort_block_m - 1)
+                )
+            out.append(srcmap_rsrc[tile_row_base_i32 + row])
+        return out
 
     def load_regs(self, k_step_byte_off):
         """Read this K-step's 16-B chunks gmem->reg (VMEM); only the K-step offset varies. Returns (lds_off, vec4)."""
@@ -272,15 +270,16 @@ class ATileLoader:
         )
         chunks_per_row = self._k_step_bytes // 16
         total_chunks = self._sort_block_m * chunks_per_row
-        copy_waves = min(total_chunks, self._total_threads) // 64
         for round_base in range_constexpr(
             0,
             total_chunks,
             self._total_threads,
         ):
+            # A partial round (fewer chunks left than threads) runs on its leading waves only.
+            remaining = total_chunks - round_base
             copy_active = (
-                self._wave < fx.Int32(copy_waves)
-                if const_expr(total_chunks < self._total_threads)
+                self._wave < fx.Int32(remaining // 64)
+                if const_expr(remaining < self._total_threads)
                 else fx.Boolean(True)
             )
 
@@ -438,21 +437,14 @@ class BScaleLoader:
         lane = fx.thread_idx.x % 64
         self._lane_off = lane
 
-    def load_step(self, base_row_i32, kstep_i32, cache_modifier=0):
+    def load_step(self, base_row_i32, kstep_i32):
         base_group = base_row_i32 // fx.Int32(32)
         kterm = kstep_i32 * fx.Int32(64)
         lane = fx.Int32(self._lane_off)
         out = []
         for g in range_constexpr(self._n_groups):
             off = (base_group + fx.Int32(g)) * fx.Int32(self._row_stride) + kterm + lane
-            if const_expr(cache_modifier == 0):
-                out.append(self._rsrc[off])
-            else:
-                out.append(
-                    buf_copy_load(
-                        self._rsrc, off, fx.Int32, cache_modifier=cache_modifier
-                    )
-                )
+            out.append(self._rsrc[off])
         return out
 
 
@@ -491,7 +483,6 @@ class AScaleLoader:
         lds_ascale,
         tile_row_base_i32,
         row_map=None,
-        valid_rows_i32=None,
         srcs=None,
     ):
         """Copy this tile's E8M0 scale block from global memory to LDS.
@@ -560,10 +551,7 @@ class AScaleLoader:
                 lin = fx.Int32(c) + self._tx
                 row = lin // fx.Int32(row_chunks)
                 row_group = _token_offset(srcs[i], row_chunks, row_map["scale_token"])
-                if const_expr(valid_rows_i32 is None):
-                    real = (srcs[i] & fx.Int32(0xFFFFFF)) < fx.Int32(row_map["rows"])
-                else:
-                    real = row < valid_rows_i32
+                real = (srcs[i] & fx.Int32(0xFFFFFF)) < fx.Int32(row_map["rows"])
                 copy_mapped(
                     lin,
                     real.select(row_group, fx.Int32(0))
@@ -834,6 +822,21 @@ def _e8m0_scale(amax):
     return e8m0, quant_scale
 
 
+def _silu_f32(g, fast=False):
+    if const_expr(fast):
+        return g * sigmoid_f32(g)
+    emu = (g * fx.Float32(-LOG2E)).exp2()
+    return g * (fx.Float32(1.0) / (fx.Float32(1.0) + emu))
+
+
+def silu_mul_f32(g, u, swiglu_limit=0.0, fast=False):
+    """silu(g) * u; with ``swiglu_limit`` > 0, g is clamped above and u to +-swiglu_limit first."""
+    if swiglu_limit <= 0:
+        return _silu_f32(g, fast) * u
+    limit = fx.Float32(swiglu_limit)
+    return _silu_f32(-(-g).maximumf(-limit), fast) * fx.clampf(u, -limit, limit)
+
+
 class SiluQuantEpilogue:
     """silu(gate)*up -> fp8/fp4 + per-32 E8M0 out-scale."""
 
@@ -879,8 +882,8 @@ class SiluQuantEpilogue:
         # so Stage1's evec=8 never routes FP4 to the FP8 store path (which would
         # write FP8 words into the Int8 FP4 buffer).
         self._evec = 2 if self._is_fp4 else evec
-        # fused_v8: the fused kernels' evec 8 store pass (_store_quant_vec8_fused: valid rows, a store cache policy,
-        # tile_rows); lean (fused_v8 only): bit 0 = that pass without serial waits, bit 1 = fast SiLU.
+        # fused_v8: the fused kernels' evec 8 store pass (_store_quant_vec8_fused: a store cache policy, tile_rows);
+        # lean (fused_v8 only): bit 0 = that pass without serial waits, bit 1 = fast SiLU.
         assert not (fused_v8 and self._evec == 8) or out_tensor is not None
         assert not lean or (fused_v8 and self._evec == 8)
         self._fused_v8 = fused_v8
@@ -891,12 +894,6 @@ class SiluQuantEpilogue:
         self._out_cache_modifier = int(out_cache_modifier)
         self._lane = fx.thread_idx.x % 64
         self._sorted_scale_cols_i32 = (inter_dim // 32 + 7) // 8 * 8
-
-    def _silu(self, g):
-        if const_expr(self._fast_silu):
-            return g * sigmoid_f32(g)
-        emu = (g * fx.Float32(-LOG2E)).exp2()
-        return g * (fx.Float32(1.0) / (fx.Float32(1.0) + emu))
 
     def _combine(self, acc):
         gui_n = self._num_acc_n // _PACK
@@ -926,14 +923,7 @@ class SiluQuantEpilogue:
                 for i in range_constexpr(4)
             ]
             return Vec.from_elements(elems, fx.Float32)
-        if self._swiglu_limit <= 0:
-            elems = [self._silu(gv[i]) * uv[i] for i in range_constexpr(4)]
-            return Vec.from_elements(elems, fx.Float32)
-        limit = fx.Float32(self._swiglu_limit)
-        elems = [
-            self._silu(-(-gv[i]).maximumf(-limit)) * fx.clampf(uv[i], -limit, limit)
-            for i in range_constexpr(4)
-        ]
+        elems = [silu_mul_f32(gv[i], uv[i], self._swiglu_limit, self._fast_silu) for i in range_constexpr(4)]
         return Vec.from_elements(elems, fx.Float32)
 
     def _tile_out(self, tile_i32, elem, unit_elems=1):
@@ -967,14 +957,9 @@ class SiluQuantEpilogue:
             out_row_base = slot * fx.Int32(self._inter_dim)
         return row_g, valid, out_row_base
 
-    def store(self, acc, tile_i32, tile_row_base_i32, n_tile_base_i32, valid_rows_i32=None, store_cm=None):
-        """Quantize and store one tile.
-
-        ``valid_rows_i32`` drops the output and scale stores of padding rows;
-        ``store_cm`` overrides the constructor's store cache policy.
-        """
-        if store_cm is None:
-            store_cm = self._out_cache_modifier
+    def store(self, acc, tile_i32, tile_row_base_i32, n_tile_base_i32):
+        """Quantize and store one tile."""
+        store_cm = self._out_cache_modifier
         combined = self._combine(acc)
         n_per = len(combined) // self._m_repeat
         out_elem = fx.Int8 if const_expr(self._is_fp4) else fx.Int16
@@ -987,11 +972,7 @@ class SiluQuantEpilogue:
             out_rsrc = ptr_buf_tensor(
                 fx.get_iter(tile_view),
                 out_elem,
-                num_records_bytes=(
-                    self._sort_block_m * self._out_row_bytes
-                    if valid_rows_i32 is None
-                    else valid_rows_i32 * fx.Int32(self._out_row_bytes)
-                ),
+                num_records_bytes=self._sort_block_m * self._out_row_bytes,
             )
         else:
             out_rsrc = self._out_rsrc
@@ -1018,10 +999,10 @@ class SiluQuantEpilogue:
         gpu.barrier()
 
         if const_expr(self._evec == 8 and self._fused_v8):
-            self._store_quant_vec8_fused(cptr, tile_i32, n_tile_base_i32, cbase, valid_rows_i32, store_cm)
+            self._store_quant_vec8_fused(cptr, tile_i32, n_tile_base_i32, cbase)
             return
         if const_expr(self._evec == 8):
-            assert valid_rows_i32 is None and store_cm == 0
+            assert store_cm == 0
             self._store_quant_vec8(tile_i32, tile_row_base_i32, n_tile_base_i32, cbase, cptr, cs_tile_n)
             return
 
@@ -1051,8 +1032,6 @@ class SiluQuantEpilogue:
                 tok = self._sorted_rsrc[slot]
                 valid = tok < fx.Int32(self._tokens)
                 out_row_base = slot * fx.Int32(self._out_row_bytes)
-            if const_expr(valid_rows_i32 is not None):
-                valid = valid & (row < valid_rows_i32)
             for nr in range_constexpr(n_reps):
                 col0 = fx.Int32(nr * NLANE * EVEC) + nlane * fx.Int32(EVEC)
                 idx = row * fx.Int32(cs_tile_n) + col0
@@ -1098,8 +1077,6 @@ class SiluQuantEpilogue:
 
                 col_s = gcol >> fx.Int32(5)
                 is_writer = (gcol & fx.Int32(31)) == fx.Int32(0)
-                if const_expr(valid_rows_i32 is not None):
-                    is_writer = is_writer & (row < valid_rows_i32)
                 d0 = row_g >> fx.Int32(5)
                 d1 = (row_g >> fx.Int32(4)) & fx.Int32(1)
                 d2 = row_g & fx.Int32(15)
@@ -1173,12 +1150,11 @@ class SiluQuantEpilogue:
             self._out_scale_rsrc[byte_off] = e8m0_v.to(fx.Int8)
         wait_lds_barrier()
 
-    def _store_quant_vec8_fused(self, cptr, tile_i32, n_tile_base_i32, cbase, valid_rows_i32, store_cm):
+    def _store_quant_vec8_fused(self, cptr, tile_i32, n_tile_base_i32, cbase):
         """The fused kernels' store pass with 8 columns per lane: 4 lanes share a 32-column scale group.
 
-        Unlike _store_quant_vec8 it drops padding rows past ``valid_rows_i32``,
-        takes the store cache policy and stores only the tile's leading
-        ``tile_rows`` rows.
+        Unlike _store_quant_vec8 it applies the output cache policy and stores only
+        the tile's leading ``tile_rows`` rows.
         """
         tx = fx.thread_idx.x
         if const_expr(self._lean):
@@ -1202,11 +1178,7 @@ class SiluQuantEpilogue:
             tile_iter,
             fx.Int32,
             unit_elems=2,
-            num_records_bytes=(
-                fx.Int32(self._sort_block_m * self._inter_dim)
-                if valid_rows_i32 is None
-                else valid_rows_i32 * fx.Int32(self._inter_dim)
-            ),
+            num_records_bytes=fx.Int32(self._sort_block_m * self._inter_dim),
         )
         col0 = nlane * fx.Int32(8)
         gcol = n_tile_base_i32 // fx.Int32(2) - cbase + col0
@@ -1240,11 +1212,9 @@ class SiluQuantEpilogue:
                 lo = rocdl.cvt_pk_fp8_f32(T.i32, v[4 * w] * quant_scale, v[4 * w + 1] * quant_scale, fx.Int32(0), False)
                 words.append(fx.Int32(rocdl.cvt_pk_fp8_f32(
                     T.i32, v[4 * w + 2] * quant_scale, v[4 * w + 3] * quant_scale, lo, True)))
-            valid = fx.Boolean(True) if valid_rows_i32 is None else row < valid_rows_i32
-            out_byte = valid.select(row * fx.Int32(self._inter_dim) + gcol, fx.Int32(0x40000000))
+            out_byte = row * fx.Int32(self._inter_dim) + gcol
             buf_copy_store(out_vec, out_byte // fx.Int32(8), Vec.from_elements(words, fx.Int32), fx.Int32,
-                unit_elems=2, cache_modifier=store_cm)
-            writer = is_writer if valid_rows_i32 is None else is_writer & (row < valid_rows_i32)
+                unit_elems=2, cache_modifier=self._out_cache_modifier)
             d0 = row_g >> fx.Int32(5)
             d1 = (row_g >> fx.Int32(4)) & fx.Int32(1)
             d2 = row_g & fx.Int32(15)
@@ -1252,6 +1222,6 @@ class SiluQuantEpilogue:
             d4 = (col_s >> fx.Int32(2)) & fx.Int32(1)
             d5 = col_s & fx.Int32(3)
             byte_off = d0 * n32 + d3 * fx.Int32(256) + d5 * fx.Int32(64) + d2 * fx.Int32(4) + d4 * fx.Int32(2) + d1
-            byte_off = writer.select(byte_off, fx.Int32(0x40000000))
-            buf_copy_store(self._out_scale_rsrc, byte_off, e8m0_v.to(fx.Int8), fx.Int8, cache_modifier=store_cm)
+            byte_off = is_writer.select(byte_off, fx.Int32(0x40000000))
+            buf_copy_store(self._out_scale_rsrc, byte_off, e8m0_v.to(fx.Int8), fx.Int8, cache_modifier=self._out_cache_modifier)
         wait_lds_barrier()

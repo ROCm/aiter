@@ -61,6 +61,11 @@ def _validate_fixed_slot_geometry(
         raise ValueError("fixed-slot dispatch requires the direct EP8/EPR48 layout")
 
 
+def _dispatch_dtype(a_dtype: str) -> torch.dtype:
+    """Payload row dtype of the GEMM1 A dtype (the fused routes' GEMM1 output and GEMM2 stay FP8 for both)."""
+    return torch.float4_e2m1fn_x2 if a_dtype == "fp4" else torch.float8_e4m3fn
+
+
 def stage1_output_nbytes(rows, inter_dim, a_dtype="fp8"):
     """Bytes of the GEMM1 output for ``rows`` routed rows and of its scale buffer."""
     out = rows * (inter_dim // 2 if a_dtype == "fp4" else inter_dim)
@@ -115,7 +120,7 @@ def _validate_dispatch_capacity(
 # fmt: off
 @functools.cache
 def compile_mega_moe_stage1(
-    *, model_dim: int, inter_dim: int, rank: int, experts_per_rank: int, fuse_npes: int, fuse_topk: int,
+    *, model_dim: int, inter_dim: int, experts_per_rank: int, fuse_npes: int, fuse_topk: int,
     fuse_cap: int, fuse_mtpr: int, fuse_scale_dim: int, fixed_slot_dispatch: bool, sort_block_m: int = 32,
     tile_n: int = 256, tile_k: int = 256, num_waves: int = 4, grid_mult: int = 8,
     pipe_weights: bool = True, mfma_amajor: bool = False, swizzle_a: bool = True,
@@ -202,7 +207,7 @@ def compile_mega_moe_stage1(
     n_scale_bytes = sort_block_m * (model_dim // 32)
 
     fz_npes, fz_epr, fz_k = int(fuse_npes), int(experts_per_rank), int(fuse_topk)
-    fz_cap, fz_mtpr, fz_rank = int(fuse_cap), int(fuse_mtpr), int(rank)
+    fz_cap, fz_mtpr = int(fuse_cap), int(fuse_mtpr)
     if fz_npes * fz_mtpr > 1 << 24:
         raise ValueError("MegaMoE v2 source-token encoding exceeds 24 bits")
     if fz_k > 1 << 8:
@@ -300,7 +305,7 @@ def compile_mega_moe_stage1(
         sorted_token_ids: fx.Tensor, expert_ids: fx.Tensor, num_valid_ids: fx.Tensor, out_scale: fx.Tensor,
         tokens: fx.Int32, addr_disp: fx.Int64, i32_cur_tok: fx.Int32, addr_in_tok: fx.Int64,
         addr_in_idx: fx.Int64, addr_in_wts: fx.Int64, addr_in_sc: fx.Int64, addr_parity: fx.Int64,
-        addr_expected: fx.Int64,
+        addr_expected: fx.Int64, i32_rank: fx.Int32,
     ):
         tid = fx.thread_idx.x
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
@@ -385,12 +390,12 @@ def compile_mega_moe_stage1(
                     fx.rocdl.readfirstlane(T.i32, launch_epoch_lane)
                 )
                 if tid < fx.Int32(fz_npes):
-                    peer = (tid + fx.Int32(fz_rank)) % fx.Int32(fz_npes)
+                    peer = (tid + i32_rank) % fx.Int32(fz_npes)
                     comm_ops.fence_system_release()
                     launch_ready_table = ptr_buf_tensor(p_launch_ready, fx.Int64)
                     remote_launch_ready = launch_ready_table[peer]
                     comm_ops.store_i32_system(
-                        remote_launch_ready, fx.Int32(fz_rank), launch_epoch
+                        remote_launch_ready, i32_rank, launch_epoch
                     )
                     comm_ops.wait_i32_until_greater_than(
                         a_launch_ready + fx.Int64(peer) * 4,
@@ -446,7 +451,7 @@ def compile_mega_moe_stage1(
             if const_expr(fixed_slot_dispatch):
                 emit_direct_fixed_slot_payload(
                     num_waves=NUM_WAVES, fz_npes=fz_npes, fz_epr=fz_epr, fz_k=fz_k, fz_cap=fz_cap,
-                    fz_mtpr=fz_mtpr, fz_rank=fz_rank, fz_total_experts=fz_total_experts, fz_nbytes=fz_nbytes,
+                    fz_mtpr=fz_mtpr, rank=i32_rank, fz_total_experts=fz_total_experts, fz_nbytes=fz_nbytes,
                     fz_n_i32=fz_n_i32,
                     fz_scale_n_i32=fz_scale_n_i32, fz_enable_scales=fz_enable_scales, addr_disp=addr_disp,
                     addr_in_tok=addr_in_tok, addr_in_idx=addr_in_idx, addr_in_wts=addr_in_wts, addr_in_sc=addr_in_sc,
@@ -472,7 +477,7 @@ def compile_mega_moe_stage1(
                     fx.Int32,
                 )[producer_destination]
                 emit_dispatch_payload(
-                    num_waves=NUM_WAVES, fz_epr=fz_epr, fz_k=fz_k, fz_mtpr=fz_mtpr, fz_rank=fz_rank,
+                    num_waves=NUM_WAVES, fz_epr=fz_epr, fz_k=fz_k, fz_mtpr=fz_mtpr, rank=i32_rank,
                     fz_total_experts=fz_total_experts, fz_nbytes=fz_nbytes, fz_n_i32=fz_n_i32,
                     fz_scale_n_i32=fz_scale_n_i32,
                     fz_enable_scales=fz_enable_scales, addr_disp=addr_disp, addr_in_tok=addr_in_tok,
@@ -487,7 +492,7 @@ def compile_mega_moe_stage1(
         if const_expr(fixed_slot_dispatch):
             if is_owner:
                 emit_direct_fixed_slot_finalize(
-                    fz_npes=fz_npes, fz_epr=fz_epr, fz_cap=fz_cap, fz_mtpr=fz_mtpr, fz_rank=fz_rank,
+                    fz_npes=fz_npes, fz_epr=fz_epr, fz_cap=fz_cap, fz_mtpr=fz_mtpr, rank=i32_rank,
                     fz_tile_m=fz_tile_m, n_tiles=N_TILES, addr_disp=addr_disp, parity=payload_parity,
                     expected=payload_expected,
                 )
@@ -537,7 +542,7 @@ def compile_mega_moe_stage1(
             tile_n=tile_n, num_waves=NUM_WAVES, n_per_wave=n_per_wave, wave_id=wave_id,
             m_repeat=M_REPEAT, num_acc_n=NUM_ACC_N, a_k_step_bytes=A_K_STEP_BYTES,
             total_threads=TOTAL_THREADS, k_iters=K_ITERS, a_lds_i32=a_lds_i32,
-            n_tiles=N_TILES, expert_offset=fz_rank * fz_epr, b_cache_modifier=b_cache_modifier,
+            n_tiles=N_TILES, experts_per_rank=fz_epr, b_cache_modifier=b_cache_modifier,
             swizzle_a=swizzle_a, pipe_weights=pipe_weights, mfma_amajor=mfma_amajor,
             async_a_copy=async_a_copy, use_tile_resource=use_tile_resource,
             pair_k=PAIR_K, evec=EPI_EVEC,
@@ -553,7 +558,7 @@ def compile_mega_moe_stage1(
 
         if tid == fx.Int32(0):
             local_plan_ready = disp_rsrc[fx.Int32(int(DispatchSlot.PLAN_READY))]
-            ready_index = payload_parity * fx.Int32(fz_npes) + fx.Int32(fz_rank)
+            ready_index = payload_parity * fx.Int32(fz_npes) + i32_rank
             comm_ops.wait_i32_until_equals(
                 local_plan_ready + fx.Int64(ready_index) * 4, payload_expected)
             # PLAN_READY is published with a system-scope release after the
@@ -715,11 +720,12 @@ def compile_mega_moe_stage1(
         sorted_token_ids: fx.Tensor, expert_ids: fx.Tensor, num_valid_ids: fx.Tensor, out_scale: fx.Tensor,
         tokens: fx.Int32, addr_disp: fx.Int64, i32_cur_tok: fx.Int32, addr_in_tok: fx.Int64,
         addr_in_idx: fx.Int64, addr_in_wts: fx.Int64, addr_in_sc: fx.Int64, addr_parity: fx.Int64,
-        addr_expected: fx.Int64, stream: fx.Stream,
+        addr_expected: fx.Int64, i32_rank: fx.Int32, stream: fx.Stream,
     ):
         kernel(
             out, x, w, scale_x, scale_w, sorted_token_ids, expert_ids, num_valid_ids, out_scale, tokens,
             addr_disp, i32_cur_tok, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc, addr_parity, addr_expected,
+            i32_rank,
             value_attrs={
                 "rocdl.waves_per_eu": waves_per_eu_hint,
                 "rocdl.flat_work_group_size": f"{TOTAL_THREADS},{TOTAL_THREADS}",
@@ -738,7 +744,6 @@ def compile_mega_moe_stage1_bundle(
     *,
     model_dim: int,
     inter_dim: int,
-    rank: int,
     experts_per_rank: int,
     fuse_npes: int,
     fuse_topk: int,
@@ -763,7 +768,6 @@ def compile_mega_moe_stage1_bundle(
         compile_mega_moe_stage1(
             model_dim=model_dim,
             inter_dim=inter_dim,
-            rank=rank,
             experts_per_rank=experts_per_rank,
             fuse_npes=fuse_npes,
             fuse_topk=fuse_topk,
@@ -823,6 +827,7 @@ def compile_mega_moe_stage1_bundle(
         addr_in_sc: fx.Int64,
         addr_parity: fx.Int64,
         addr_expected: fx.Int64,
+        i32_rank: fx.Int32,
         variant_id: fx.Int32,
         stream: fx.Stream,
     ):
@@ -847,6 +852,7 @@ def compile_mega_moe_stage1_bundle(
                     addr_in_sc,
                     addr_parity,
                     addr_expected,
+                    i32_rank,
                     value_attrs={
                         "rocdl.waves_per_eu": waves_per_eu[index],
                         "rocdl.flat_work_group_size": (
@@ -899,7 +905,7 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
     a_dtype="fp8", out_dtype="fp8",
     swiglu_limit=0.0, act="silu", situ_beta=1.0, situ_linear_beta=1.0):
     launch = compile_mega_moe_stage1(
-        model_dim=model_dim, inter_dim=inter_dim, rank=rank, experts_per_rank=experts_per_rank,
+        model_dim=model_dim, inter_dim=inter_dim, experts_per_rank=experts_per_rank,
         fuse_npes=fuse_npes, fuse_topk=fuse_topk, fuse_cap=fuse_cap, fuse_mtpr=fuse_mtpr,
         fuse_scale_dim=fuse_scale_dim, fixed_slot_dispatch=fixed_slot_dispatch,
         sort_block_m=sort_block_m, tile_n=tile_n, tile_k=tile_k, num_waves=num_waves,
@@ -913,7 +919,7 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
     _run_compiled(
         launch, out, x, w, scale_x, scale_w, sorted_token_ids, expert_ids, num_valid_ids, out_scale,
         tokens, addr_disp, i32_cur_tok, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc,
-        addr_parity, addr_expected, stream,
+        addr_parity, addr_expected, fx.Int32(rank), stream,
     )
 
 
@@ -938,6 +944,8 @@ def run_mega_moe_stage1_bundle(
     addr_expected,
     variant_id,
     stream,
+    *,
+    rank,
     **compile_kw,
 ):
     variants = tuple(compile_kw["variants"])
@@ -964,6 +972,7 @@ def run_mega_moe_stage1_bundle(
         addr_in_sc,
         addr_parity,
         addr_expected,
+        fx.Int32(rank),
         fx.Int32(variant_id),
         stream,
     )
@@ -990,6 +999,8 @@ def preload_mega_moe_stage1_bundle(
     addr_expected,
     variant_id,
     stream,
+    *,
+    rank,
     **compile_kw,
 ):
     """Compile and load the complete Stage1 bundle without dispatching it."""
@@ -1014,6 +1025,7 @@ def preload_mega_moe_stage1_bundle(
         addr_in_sc,
         addr_parity,
         addr_expected,
+        fx.Int32(rank),
         fx.Int32(variant_id),
         stream,
     )

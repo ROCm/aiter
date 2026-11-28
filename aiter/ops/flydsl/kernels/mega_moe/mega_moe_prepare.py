@@ -476,7 +476,7 @@ def _ll_dest_issue(
     instruction covers two sources (lane half h -> source 2k + h).
     """
     src_lane = lane & fx.Int32(npes - 1)
-    own = destination == fx.Int32(rank)
+    own = destination == rank
     group_addr = own.select(
         addr_count_done + fx.Int64(src_lane) * fx.Int64(4),
         addr_count_matrix
@@ -544,9 +544,8 @@ def _ll_dest_finish(
     group_prefix = fx.Int32(0)
     for source in range_constexpr(npes):
         gc = fx.Int32(fx.rocdl.readlane(T.i32, meta_masked, source))
-        if const_expr(source < rank):
-            group_prefix = group_prefix + gc
         group_count = group_count + gc
+        group_prefix = (rank > fx.Int32(source)).select(group_count, group_prefix)
     tile_m = fx.Int32(fx.rocdl.readlane(T.i32, meta_masked, npes))
     packed = fx.Int32(fx.rocdl.readlane(T.i32, v, npes + 1))
     split = 2 if epr <= 32 else 1
@@ -563,7 +562,7 @@ def _ll_dest_finish(
         c = c & value_mask
         source = fx.Int32(split * k) + half
         part_count = part_count + c
-        part_prefix = part_prefix + (source < fx.Int32(rank)).select(c, fx.Int32(0))
+        part_prefix = (source < rank).select(part_count, part_prefix)
     if const_expr(split == 2):
         peer = (lane ^ fx.Int32(32)) * fx.Int32(4)
         part_count = part_count + fx.Int32(
@@ -600,16 +599,16 @@ def _ll_own_issue(
     """
     src_lane = lane & fx.Int32(npes - 1)
     group_addr = addr_count_done + fx.Int64(src_lane) * fx.Int64(4)
-    tile_addr = addr_count_done + fx.Int64(npes + rank) * fx.Int64(4)
-    pair_addr = addr_pair_config + fx.Int64(
-        parity * fx.Int32(npes) + fx.Int32(rank)
-    ) * fx.Int64(4)
+    tile_addr = addr_count_done + fx.Int64(fx.Int32(npes) + rank) * fx.Int64(4)
+    pair_addr = addr_pair_config + fx.Int64(parity * fx.Int32(npes) + rank) * fx.Int64(
+        4
+    )
     meta_addr = (lane < fx.Int32(npes)).select(
         group_addr, (lane == fx.Int32(npes)).select(tile_addr, pair_addr)
     )
     meta_val = fx.Int32(comm_ops.load_i32_acquire(meta_addr))
     safe_expert = (lane < fx.Int32(epr)).select(lane, fx.Int32(0))
-    ge = fx.Int32(rank * epr) + safe_expert
+    ge = rank * fx.Int32(epr) + safe_expert
     count_addrs = []
     count_vals = []
     for source in range_constexpr(npes):
@@ -965,7 +964,7 @@ def _plan_meta_warp(
     *,
     fz_npes,
     fz_epr,
-    fz_rank,
+    rank,
     fz_tile_m,
     fz_total_experts,
     fz_mtpr,
@@ -985,7 +984,7 @@ def _plan_meta_warp(
     local_expert = lane
     valid_expert = local_expert < fx.Int32(fz_epr)
     safe_expert = valid_expert.select(local_expert, fx.Int32(0))
-    ge = fx.Int32(fz_rank * fz_epr) + local_expert
+    ge = rank * fx.Int32(fz_epr) + local_expert
     # Same words as below in 1 + npes/2 wave loads (no separate pair
     # load + full wait): see _ll_dest_issue.
     meta_addr, meta_val, count_addrs, count_vals = _ll_dest_issue(
@@ -993,9 +992,9 @@ def _plan_meta_warp(
         addr_count_done,
         addr_pair_config,
         parity,
-        fx.Int32(fz_rank),
+        rank,
         lane,
-        rank=fz_rank,
+        rank=rank,
         npes=fz_npes,
         epr=fz_epr,
         total_experts=fz_total_experts,
@@ -1015,7 +1014,7 @@ def _plan_meta_warp(
         count_vals,
         lane,
         poll_tag,
-        rank=fz_rank,
+        rank=rank,
         npes=fz_npes,
         epr=fz_epr,
         tag_shift=tag_shift,
@@ -1178,7 +1177,7 @@ def _emit_plan(
     fz_epr,
     fz_k,
     fz_mtpr,
-    fz_rank,
+    rank,
     fz_tile_m,
     fz_total_experts,
     addr_disp,
@@ -1295,7 +1294,7 @@ def _emit_plan(
     if tid < fx.Int32(fz_npes):
         _store_i32_sys_relaxed(
             count_done_table[tid],
-            fx.Int32(8 + fz_rank),
+            fx.Int32(8) + rank,
             fx.Int32(fz_tile_m) | cur_tag_bits,
         )
     for segment in range(tid, total_segments, block_threads):
@@ -1319,14 +1318,14 @@ def _emit_plan(
         if segment >= fx.Int32(fz_total_experts):
             _store_i32_sys_relaxed(
                 count_done_table[segment - fx.Int32(fz_total_experts)],
-                fx.Int32(fz_rank),
+                rank,
                 segment_count | cur_tag_bits,
             )
         for destination in range_constexpr(fz_npes):
             own_group_column = segment == fx.Int32(fz_total_experts + destination)
             _store_i32_sys_relaxed(
                 remote_count_bases[destination],
-                fx.Int32(fz_rank * total_segments) + segment,
+                rank * fx.Int32(total_segments) + segment,
                 own_group_column.select(segment_count, segment_count | cur_tag_bits),
             )
     if const_expr(fused):  # noqa: SIM102 - preserve DSL staging
@@ -1370,7 +1369,7 @@ def _emit_plan(
             addr_pair_config,
             parity,
             lane,
-            rank=fz_rank,
+            rank=rank,
             npes=fz_npes,
             epr=fz_epr,
             total_segments=count_stride,
@@ -1577,7 +1576,7 @@ def _emit_plan(
                 a_cd,
                 fz_npes=fz_npes,
                 fz_epr=fz_epr,
-                fz_rank=fz_rank,
+                rank=rank,
                 fz_tile_m=fz_tile_m,
                 fz_total_experts=fz_total_experts,
                 fz_mtpr=fz_mtpr,
@@ -1596,7 +1595,7 @@ def _emit_plan(
             destinations,
             lane,
             poll_tag,
-            rank=fz_rank,
+            rank=rank,
             npes=fz_npes,
             epr=fz_epr,
             total_experts=fz_total_experts,
@@ -1636,7 +1635,7 @@ def _emit_plan(
         assert wt_owner
         if warp == fx.Int32(0):
             for source in range(lane, fz_npes, 64):
-                ready_index = parity * fx.Int32(fz_npes) + fx.Int32(fz_rank)
+                ready_index = parity * fx.Int32(fz_npes) + rank
                 _store_i32_sys_relaxed(peer_plan_ready, ready_index, expected)
             if lane == fx.Int32(0):
                 _store_i32_sys_relaxed(a_pair_ready, parity, expected)
@@ -3100,7 +3099,6 @@ def _m64_qdpp_for(i32_cur_tok, kwargs):
 @functools.cache
 def compile_mega_moe_prepare(
     *,
-    rank: int,
     experts_per_rank: int,
     fuse_npes: int,
     fuse_topk: int,
@@ -3126,7 +3124,6 @@ def compile_mega_moe_prepare(
     epr = int(experts_per_rank)
     topk = int(fuse_topk)
     mtpr = int(fuse_mtpr)
-    rank = int(rank)
     tile_m = int(sort_block_m)
     dispatch_blocks = int(num_dispatch_cu)
     prepare_blocks = int(num_prepare_cu)
@@ -3136,7 +3133,6 @@ def compile_mega_moe_prepare(
         raise ValueError(f"quant_mode must be fp4|fp8, got {quant_mode!r}")
     if _fast_prepare_supported(npes, epr, topk):
         return _compile_fast_mega_moe_prepare(
-            rank=rank,
             experts_per_rank=epr,
             fuse_npes=npes,
             fuse_topk=topk,
@@ -3204,6 +3200,7 @@ def compile_mega_moe_prepare(
         addr_quant_in: fx.Int64,
         addr_quant_out: fx.Int64,
         addr_quant_scale: fx.Int64,
+        i32_rank: fx.Int32,
     ):
         tid = fx.thread_idx.x
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
@@ -3359,7 +3356,7 @@ def compile_mega_moe_prepare(
                     fz_epr=epr,
                     fz_k=topk,
                     fz_mtpr=mtpr,
-                    fz_rank=rank,
+                    rank=i32_rank,
                     fz_tile_m=tile_m,
                     fz_total_experts=total_experts,
                     addr_disp=addr_disp,
@@ -3404,6 +3401,7 @@ def compile_mega_moe_prepare(
         addr_quant_in: fx.Int64,
         addr_quant_out: fx.Int64,
         addr_quant_scale: fx.Int64,
+        i32_rank: fx.Int32,
         stream: fx.Stream,
     ):
         kernel(
@@ -3415,6 +3413,7 @@ def compile_mega_moe_prepare(
             addr_quant_in,
             addr_quant_out,
             addr_quant_scale,
+            i32_rank,
         ).launch(
             grid=(launch_grid, 1, 1),
             block=(block_threads, 1, 1),
@@ -3426,7 +3425,6 @@ def compile_mega_moe_prepare(
 
 def _compile_fast_mega_moe_prepare(
     *,
-    rank: int,
     experts_per_rank: int,
     fuse_npes: int,
     fuse_topk: int,
@@ -3448,7 +3446,6 @@ def _compile_fast_mega_moe_prepare(
     epr = int(experts_per_rank)
     topk = int(fuse_topk)
     mtpr = int(fuse_mtpr)
-    rank = int(rank)
     tile_m = int(sort_block_m)
     dispatch_blocks = int(num_dispatch_cu)
     prepare_blocks = int(num_prepare_cu)
@@ -3541,6 +3538,7 @@ def _compile_fast_mega_moe_prepare(
         addr_quant_in: fx.Int64,
         addr_quant_out: fx.Int64,
         addr_quant_scale: fx.Int64,
+        i32_rank: fx.Int32,
     ):
         tid = fx.thread_idx.x
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
@@ -3960,7 +3958,7 @@ def _compile_fast_mega_moe_prepare(
                         fz_epr=epr,
                         fz_k=topk,
                         fz_mtpr=mtpr,
-                        fz_rank=rank,
+                        rank=i32_rank,
                         fz_tile_m=tile_m,
                         fz_total_experts=total_experts,
                         addr_disp=addr_disp,
@@ -3991,7 +3989,7 @@ def _compile_fast_mega_moe_prepare(
                         if tid < fx.Int32(npes):
                             _store_i32_sys_relaxed(
                                 peer_plan_ready,
-                                parity * fx.Int32(npes) + fx.Int32(rank),
+                                parity * fx.Int32(npes) + i32_rank,
                                 expected,
                             )
                         if tid == fx.Int32(0):
@@ -4097,7 +4095,7 @@ def _compile_fast_mega_moe_prepare(
                         fz_epr=epr,
                         fz_k=topk,
                         fz_mtpr=mtpr,
-                        fz_rank=rank,
+                        rank=i32_rank,
                         fz_tile_m=tile_m,
                         fz_total_experts=total_experts,
                         addr_disp=addr_disp,
@@ -4148,6 +4146,7 @@ def _compile_fast_mega_moe_prepare(
         addr_quant_in: fx.Int64,
         addr_quant_out: fx.Int64,
         addr_quant_scale: fx.Int64,
+        i32_rank: fx.Int32,
         stream: fx.Stream,
     ):
         kernel(
@@ -4159,6 +4158,7 @@ def _compile_fast_mega_moe_prepare(
             addr_quant_in,
             addr_quant_out,
             addr_quant_scale,
+            i32_rank,
         ).launch(
             grid=(launch_grid, 1, 1),
             block=(block_threads, 1, 1),
@@ -4178,6 +4178,8 @@ def run_mega_moe_prepare(
     addr_quant_out,
     addr_quant_scale,
     stream,
+    *,
+    rank,
     **kwargs,
 ):
     if _m64_qdpp_for(i32_cur_tok, kwargs):
@@ -4193,6 +4195,7 @@ def run_mega_moe_prepare(
         addr_quant_in,
         addr_quant_out,
         addr_quant_scale,
+        fx.Int32(rank),
         stream,
     )
 
@@ -4207,6 +4210,8 @@ def preload_mega_moe_prepare(
     addr_quant_out,
     addr_quant_scale,
     stream,
+    *,
+    rank,
     **kwargs,
 ):
     """Compile and load one prepare variant without dispatching it."""
@@ -4223,6 +4228,7 @@ def preload_mega_moe_prepare(
             addr_quant_in,
             addr_quant_out,
             addr_quant_scale,
+            fx.Int32(rank),
             stream,
         )
     launch = compile_mega_moe_prepare.lazy(**kwargs)
@@ -4236,5 +4242,6 @@ def preload_mega_moe_prepare(
         addr_quant_in,
         addr_quant_out,
         addr_quant_scale,
+        fx.Int32(rank),
         stream,
     )

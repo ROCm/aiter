@@ -165,7 +165,7 @@ def _pair_routewise_half_scatter(lds_a, lds_b, n_block_idx, wave, lane, *,
 @aot_factory("mega_moe_stage2_aligned_pair")
 @functools.cache
 def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
-    experts: int, topk: int, rank: int, npes: int, max_tok: int,
+    experts: int, topk: int, npes: int, max_tok: int,
     recv_cap: int, comb_inp_nbytes: int, BM: int = 32,
     SBM: int = 128, BN: int = 256, BK: int = 256, INTER_MAX: int = 8192,
     use_nt: bool = False, cu_num: int = 722, g2_bhoist=True,
@@ -216,7 +216,6 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
     if max_tok <= 0 or max_tok & (max_tok - 1):
         raise ValueError("max_tok must be a positive power of two")
     mask_max_tok = max_tok - 1
-    expert_offset = rank * experts
     total_experts = npes * experts
     total_segments = total_experts + npes
     k_bytes = inter_dim // a_pack
@@ -248,7 +247,7 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
         arg_expert_tile_end: fx.Int64, arg_count_matrix: fx.Int64,
         arg_pair_config: fx.Int64, arg_parity: fx.Int64,
         arg_p2p_comb_inp: fx.Int64, i32_max_m_blocks: fx.Int32,
-        i32_inter: fx.Int32, i32_hidden: fx.Int32):
+        i32_inter: fx.Int32, i32_hidden: fx.Int32, i32_rank: fx.Int32):
     # fmt: on
         tx = fx.thread_idx.x
         bx = fx.block_idx.x
@@ -266,7 +265,7 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
         parity_buf = ptr_buf_tensor(arg_parity, fx.Int32)
         active_parity = parity_buf[fx.Int32(0)]
         packed_pair = pair_config[
-            active_parity * fx.Int32(npes) + fx.Int32(rank)
+            active_parity * fx.Int32(npes) + i32_rank
         ]
         fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
         # Every lane loads the same entry; broadcasting a lane-0 SSA value
@@ -281,8 +280,6 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
         pair_enabled = fx.Int32(
             rocdl.readfirstlane(T.i32, pair_enabled_lane)
         )
-        global_a = fx.Int32(expert_offset) + pair_a_rt
-        global_b = fx.Int32(expert_offset) + pair_b_rt
         group_a_lane = fx.Int32(0)
         group_b_lane = fx.Int32(0)
         group_rows_lane = fx.Int32(0)
@@ -302,7 +299,7 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
                 prev_b, fx.Int32(0)
             )
             group_count = fx.Int32(0)
-            group_column = fx.Int32(total_experts + rank)
+            group_column = fx.Int32(total_experts) + i32_rank
             for source in range_constexpr(npes):
                 group_count = group_count + count_matrix[
                     fx.Int32(source * total_segments) + group_column
@@ -371,8 +368,8 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
                 INTER_MAX=INTER_MAX, aStages=a_stages, a_dtype=a_dtype, SBM=BM,
                 g2_bhoist=g2_bhoist, g2_b2stage=g2_b2stage,
                 g2_ascale_pf=g2_ascale_pf, g2_deep_a_pipeline=g2_deep_a_pipeline,
-                expert_offset=expert_offset, explicit_m_row=m_row_a,
-                explicit_n_block=n_block, explicit_expert=global_a)
+                explicit_m_row=m_row_a, explicit_n_block=n_block,
+                explicit_expert=pair_a_rt)
             # fmt: on
 
             _store_accumulator_tile(
@@ -388,8 +385,8 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
                 INTER_MAX=INTER_MAX, aStages=a_stages, a_dtype=a_dtype, SBM=BM,
                 g2_bhoist=g2_bhoist, g2_b2stage=g2_b2stage,
                 g2_ascale_pf=g2_ascale_pf, g2_deep_a_pipeline=g2_deep_a_pipeline,
-                expert_offset=expert_offset, explicit_m_row=m_row_b,
-                explicit_n_block=n_block, explicit_expert=global_b)
+                explicit_m_row=m_row_b, explicit_n_block=n_block,
+                explicit_expert=pair_b_rt)
             _store_accumulator_tile(
                 lds_compute_b, acc_b, wave, lane, BM=BM, BN=BN
             )
@@ -435,7 +432,7 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
         arg_expert_tile_end: fx.Int64, arg_count_matrix: fx.Int64,
         arg_pair_config: fx.Int64, arg_parity: fx.Int64,
         arg_p2p_comb_inp: fx.Int64, i32_max_m_blocks: fx.Int32,
-        i32_inter: fx.Int32, i32_hidden: fx.Int32, stream: fx.Stream):
+        i32_inter: fx.Int32, i32_hidden: fx.Int32, i32_rank: fx.Int32, stream: fx.Stream):
     # fmt: on
         grid_x = fx.Int32(cu_num) * (i32_hidden // fx.Int32(BN))
         kernel(
@@ -453,6 +450,7 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
             i32_max_m_blocks,
             i32_inter,
             i32_hidden,
+            i32_rank,
         ).launch(
             grid=(grid_x, 1, 1),
             block=(256, 1, 1),
@@ -466,7 +464,7 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
 def run_mega_moe_stage2_aligned_pair(arg_aq, arg_ascale, arg_bq, arg_bscale,
     arg_stids, arg_sweights, arg_expert_tile_end, arg_count_matrix,
     arg_pair_config, arg_parity, arg_p2p, row_capacity,
-    i32_inter, i32_hidden, stream, **compile_kw):
+    i32_inter, i32_hidden, stream, *, rank, **compile_kw):
 # fmt: on
     """Compile/cache and launch the aligned common-row Stage2 kernel."""
     launch = compile_mega_moe_stage2_aligned_pair.lazy(**compile_kw)
@@ -488,6 +486,7 @@ def run_mega_moe_stage2_aligned_pair(arg_aq, arg_ascale, arg_bq, arg_bscale,
         fx.Int32(max_m_blocks),
         fx.Int32(i32_inter),
         fx.Int32(i32_hidden),
+        fx.Int32(rank),
         stream,
     )
 
@@ -496,7 +495,7 @@ def run_mega_moe_stage2_aligned_pair(arg_aq, arg_ascale, arg_bq, arg_bscale,
 def preload_mega_moe_stage2_aligned_pair(arg_aq, arg_ascale, arg_bq, arg_bscale,
     arg_stids, arg_sweights, arg_expert_tile_end, arg_count_matrix,
     arg_pair_config, arg_parity, arg_p2p, row_capacity,
-    i32_inter, i32_hidden, stream, **compile_kw):
+    i32_inter, i32_hidden, stream, *, rank, **compile_kw):
 # fmt: on
     """Compile and load the aligned-pair Stage2 kernel without dispatching it."""
     launch = compile_mega_moe_stage2_aligned_pair.lazy(**compile_kw)
@@ -518,5 +517,6 @@ def preload_mega_moe_stage2_aligned_pair(arg_aq, arg_ascale, arg_bq, arg_bscale,
         fx.Int32(max_m_blocks),
         fx.Int32(i32_inter),
         fx.Int32(i32_hidden),
+        fx.Int32(rank),
         stream,
     )
