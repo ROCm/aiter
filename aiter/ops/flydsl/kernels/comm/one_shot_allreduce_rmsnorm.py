@@ -319,8 +319,10 @@ class OneShotRMSNormEpilogue:
         eps,
         xchg_ptr,
         wrap,
+        **_unused,
     ):
-        """*wrap* is the schedule's colour rotation, ``color mod n_colors``."""
+        """*wrap* is the schedule's colour rotation, ``color mod n_colors``.
+        Arguments of other fused builds (``**_unused``) are ignored."""
         return _BoundOneShotRMSNorm(
             self,
             wrap=wrap,
