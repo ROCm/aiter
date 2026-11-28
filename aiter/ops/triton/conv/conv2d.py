@@ -35,6 +35,7 @@ from aiter.ops.triton.conv._utils import (
     _prep_bias,
     _require_winograd_2d_eligible,
     _validate_conv_devices,
+    _validate_conv_groups,
 )
 from aiter.ops.triton.utils.conv_config_utils import (
     conv_config_uses_exact_routes,
@@ -142,7 +143,11 @@ def _resolve_route(
     K_out,
     layout,
     padding=(0, 0),
+    *,
+    groups=1,
 ):
+    if groups > 1:
+        return Route.GENERAL
     if _is_1x1_conv(R, S, dilation):
         return Route.ONE_X_ONE
     if _is_3x3_conv(R, S):
@@ -178,6 +183,8 @@ def conv2d(
     activation="none",
     layout="nchw",
     padding_mode="zeros",
+    *,
+    groups=1,
 ):
     """Forward 2-D conv on AMD ROCm via Triton. Drop-in for the forward of
     ``torch.nn.functional.conv2d`` (no backward).
@@ -193,7 +200,9 @@ def conv2d(
 
     Notes
     -----
-    - Only ``groups=1`` (depthwise/grouped raises ``AssertionError``).
+    - ``groups`` must be a positive integer that divides both channel counts.
+      Weights have shape ``(Cout, Cin // groups, R, S)``. Set ``groups=Cin``
+      for depthwise convolution.
     - ``padding_mode`` supports zeros, reflect, replicate, and circular.
       Nonzero modes explicitly pad once before routing; convolution receives
       the padded input and effective padding ``(0, 0)``.
@@ -209,7 +218,7 @@ def conv2d(
 
     _LOGGER.get_logger().info(
         "CONV2D: x=%s w=%s stride=%s padding=%s padding_mode=%s dilation=%s "
-        "layout=%s dtype=%s bias=%s act=%s",
+        "layout=%s dtype=%s bias=%s act=%s groups=%s",
         tuple(x.shape),
         tuple(w_oihw.shape),
         stride,
@@ -220,6 +229,7 @@ def conv2d(
         x.dtype,
         "yes" if bias is not None else "no",
         activation,
+        groups,
     )
 
     if layout == "nhwc":
@@ -232,6 +242,7 @@ def conv2d(
             dilation,
             activation,
             padding_mode=padding_mode,
+            groups=groups,
         )
     else:
         return conv2d_nchw(
@@ -243,6 +254,7 @@ def conv2d(
             dilation,
             activation,
             padding_mode=padding_mode,
+            groups=groups,
         )
 
 
@@ -410,17 +422,28 @@ def conv2d_general(
     block_k=BLOCK_K,
     layout="nchw",
     padding_mode="zeros",
+    *,
+    groups=1,
 ):
-    """NCHW/NHWC conv2d using general kernel with prepacked weights (5x5, 7x7, etc.).
+    """Compute forward Conv2d in NCHW or channels-last storage.
 
-    Supports the same padding modes as conv2d.
+    Each group reads Cin / groups input channels and produces Cout / groups
+    output channels. Weights have shape (Cout, Cin / groups, R, S).
+    Supports the same padding modes as conv2d. The result uses the requested layout.
     """
     _validate_conv_devices(x, w_oihw, bias, op="conv2d")
     stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
     x, padding = _prepare_conv_padding(x, padding, padding_mode, layout=layout)
-    N, C, H, W_in, K_out, R, S, P, Q = _conv_dims(x, w_oihw, stride, padding, dilation)
+    N, C, H, W_in = x.shape
+    K_out, Cw, R, S = w_oihw.shape
+    groups = _validate_conv_groups(groups, C, K_out, Cw, bias)
+    P, Q = _out_hw(H, W_in, R, S, stride, padding, dilation)
+    # PyTorch returns zero output channels when the input has zero channels.
+    y = _alloc_output(N, K_out if C else 0, P, Q, x, layout)
+    if y.numel() == 0:
+        return y
 
-    y = _alloc_output(N, K_out, P, Q, x, layout)
+    x = _ensure_layout(x, layout)
     bias = _prep_bias(bias)
     w_k, K_pad = get_or_make_weight_pack(w_oihw, block_k)
     _launch_general(
@@ -444,6 +467,7 @@ def conv2d_general(
         block_k,
         activation,
         layout=layout,
+        groups=groups,
     )
     return y
 
@@ -506,12 +530,14 @@ def _route_and_run(
     layout,
     *,
     padding_mode="zeros",
+    groups=1,
 ):
     """Resolve and execute one route, including required input preparation."""
     x, padding = _prepare_conv_padding(x, padding, padding_mode, layout=layout)
-    x = _ensure_layout(x, layout)
     N, C, H, W_in = x.shape
-    K_out, _, R, S = w_oihw.shape
+    K_out, Cw, R, S = w_oihw.shape
+    groups = _validate_conv_groups(groups, C, K_out, Cw, bias)
+    x = _ensure_layout(x, layout)
     route = _resolve_route(
         R,
         S,
@@ -524,6 +550,7 @@ def _route_and_run(
         K_out,
         layout,
         padding=padding,
+        groups=groups,
     )
 
     if route == Route.ONE_X_ONE:
@@ -594,6 +621,7 @@ def _route_and_run(
         activation,
         block_k,
         layout=layout,
+        groups=groups,
     )
 
 
@@ -607,11 +635,14 @@ def conv2d_nchw(
     activation="none",
     block_k=BLOCK_K,
     padding_mode="zeros",
+    *,
+    groups=1,
 ):
     """Route NCHW conv2d with zeros, reflect, replicate, or circular padding.
 
     Nonzero modes pre-pad once before routing and activation packing.
     Preparation and convolution run on the input tensor's device.
+    Grouped weights have shape (Cout, Cin // groups, R, S).
     """
     _validate_conv_devices(x, w_oihw, bias, op="conv2d")
     stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
@@ -627,6 +658,7 @@ def conv2d_nchw(
             block_k,
             layout="nchw",
             padding_mode=padding_mode,
+            groups=groups,
         )
 
 
@@ -640,6 +672,8 @@ def conv2d_nhwc(
     activation="none",
     block_k=BLOCK_K,
     padding_mode="zeros",
+    *,
+    groups=1,
 ):
     """Conv2d with NHWC (channels-last) input and output.
 
@@ -649,6 +683,7 @@ def conv2d_nhwc(
     Supports zeros, reflect, replicate, and circular padding; nonzero modes
     pre-pad once before routing and activation packing. Preparation and
     convolution run on the input tensor's device.
+    Grouped weights have shape (Cout, Cin // groups, R, S).
     """
     _validate_conv_devices(x, w_oihw, bias, op="conv2d")
     stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
@@ -664,6 +699,7 @@ def conv2d_nhwc(
             block_k,
             layout="nhwc",
             padding_mode=padding_mode,
+            groups=groups,
         )
 
 

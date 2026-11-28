@@ -53,14 +53,17 @@ def format_shape_key(
     pw: int,
     dh: int,
     dw: int,
+    *,
+    groups: int = 1,
 ) -> str:
     """Canonical string key for a user-visible conv2d call. Same format used by
     the loader and the kernel-side _get_config helpers.
     """
-    return (
+    key = (
         f"N={N},C={C},H={H},W={W},K={K},R={R},S={S},"
         f"sh={sh},sw={sw},ph={ph},pw={pw},dh={dh},dw={dw}"
     )
+    return key if groups == 1 else f"{key},G={groups}"
 
 
 def format_prepack_shape_key(N: int, C: int, H: int, W: int, CB: int) -> str:

@@ -105,14 +105,13 @@ def _kernel_activation(activation):
     return "gelu_tanh" if activation == "gelu" else activation
 
 
-def _make_mn_grid(M_total, K_out):
-    """Grid for the GEMM-style conv kernels (1x1, 3x3 nhwc/cblocked, general):
-    one program per (BLOCK_M tile of M_total) x (BLOCK_N tile of K_out)."""
+def _make_mn_grid(M_total, K_out, groups=1):
+    """Launch one program per spatial tile and output-channel tile in each group."""
 
     def grid(meta):
-        return (
-            triton.cdiv(M_total, meta["BLOCK_M"]) * triton.cdiv(K_out, meta["BLOCK_N"]),
-        )
+        m_tiles = triton.cdiv(M_total, meta["BLOCK_M"])
+        n_tiles = triton.cdiv(K_out // groups, meta["BLOCK_N"])
+        return (m_tiles * n_tiles * groups,)
 
     return grid
 
@@ -522,6 +521,8 @@ def _launch_general(
     block_k,
     activation,
     layout="nchw",
+    *,
+    groups=1,
 ):
     """Launch general conv kernel.
     layout: "nchw" or "nhwc" (case-insensitive).
@@ -546,6 +547,7 @@ def _launch_general(
         pw=pw,
         dh=dh,
         dw=dw,
+        groups=groups,
     )
     config = _get_config_general(
         shape_key=shape_key,
@@ -553,7 +555,7 @@ def _launch_general(
         variants=(layout,),
     )
 
-    _conv2d_general_kernel[_make_mn_grid(M_total, K_out)](
+    _conv2d_general_kernel[_make_mn_grid(M_total, K_out, groups)](
         x,
         w_k,
         bias_fp32,
@@ -578,6 +580,7 @@ def _launch_general(
         HAS_BIAS=bias_fp32 is not None,
         ACTIVATION=_kernel_activation(activation),
         LAYOUT=layout,
+        GROUPS=groups,
         **config,
     )
 

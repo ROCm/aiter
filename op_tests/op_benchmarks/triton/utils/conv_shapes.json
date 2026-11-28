@@ -2574,5 +2574,96 @@
                 "dilation_w": 1
             }
         ]
+    },
+    "resnext50_32x4d": {
+        "conv2d": [
+            {
+                "N": 1,
+                "C": 128,
+                "H": 56,
+                "W": 56,
+                "K": 128,
+                "R": 3,
+                "S": 3,
+                "pad_h": 1,
+                "pad_w": 1,
+                "groups": 32,
+                "bias": false
+            }
+        ]
+    },
+    "mobilenet_v2": {
+        "conv2d": [
+            {
+                "N": 1,
+                "C": 32,
+                "H": 112,
+                "W": 112,
+                "K": 32,
+                "R": 3,
+                "S": 3,
+                "pad_h": 1,
+                "pad_w": 1,
+                "groups": 32,
+                "bias": false
+            },
+            {
+                "N": 1,
+                "C": 96,
+                "H": 112,
+                "W": 112,
+                "K": 96,
+                "R": 3,
+                "S": 3,
+                "stride_h": 2,
+                "stride_w": 2,
+                "pad_h": 1,
+                "pad_w": 1,
+                "groups": 96,
+                "bias": false
+            }
+        ]
+    },
+    "convnext_tiny": {
+        "conv2d": [
+            {
+                "N": 1,
+                "C": 96,
+                "H": 56,
+                "W": 56,
+                "K": 96,
+                "R": 7,
+                "S": 7,
+                "pad_h": 3,
+                "pad_w": 3,
+                "groups": 96
+            }
+        ]
+    },
+    "synthetic-grouped-conv2d": {
+        "conv2d": [
+            {
+                "N": 1,
+                "C": 64,
+                "H": 56,
+                "W": 56,
+                "K": 128,
+                "R": 1,
+                "S": 1,
+                "groups": 4
+            },
+            {
+                "N": 1,
+                "C": 512,
+                "H": 56,
+                "W": 56,
+                "K": 512,
+                "R": 3,
+                "S": 3,
+                "pad_h": 1,
+                "pad_w": 1,
+                "groups": 2
+            }
+        ]
     }
 }

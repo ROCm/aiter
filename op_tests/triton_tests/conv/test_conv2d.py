@@ -25,6 +25,8 @@ op_tests/op_benchmarks/triton/bench_conv2d.py (and, for real-model
 shapes, in op_benchmarks/triton/model_benchmarking_tool/bench_models.py).
 """
 
+from unittest.mock import patch
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -151,6 +153,152 @@ def test_scalar_parameters_and_noncontiguous_input(layout):
         assert (
             y.is_contiguous()
         ), f"expected contiguous output, got strides={y.stride()}"
+
+
+@pytest.mark.parametrize(
+    "layout,width_step,memory_format",
+    [
+        pytest.param("nchw", 2, torch.contiguous_format, id="sliced-nchw"),
+        pytest.param("nhwc", 1, torch.channels_last, id="contiguous-nchw-to-nhwc"),
+    ],
+)
+def test_conv2d_general_input_layout(layout, width_step, memory_format):
+    x = torch.arange(96, device="cuda", dtype=torch.float16).reshape(1, 3, 4, 8)
+    x = x[..., ::width_step]
+    weight = torch.ones((2, 3, 2, 2), device="cuda", dtype=x.dtype)
+
+    actual = conv2d_module.conv2d_general(x, weight, layout=layout)
+    expected = F.conv2d(x.float(), weight.float()).to(x.dtype)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert actual.is_contiguous(
+        memory_format=memory_format
+    ), f"expected {layout} output, got strides={actual.stride()}"
+
+
+@pytest.mark.parametrize(
+    "cin,cout,groups,layout,dtype",
+    [
+        pytest.param(15, 21, 3, "nchw", torch.float16, id="grouped-nchw"),
+        pytest.param(8, 16, 8, "nhwc", torch.bfloat16, id="depthwise-nhwc"),
+    ],
+)
+def test_conv2d_general_group_isolation(cin, cout, groups, layout, dtype):
+    """Only the input group matching the batch index is active in each sample."""
+    torch.manual_seed(0)
+    channels = cin // groups
+    x = torch.zeros(groups, cin, 7, 9, device="cuda", dtype=dtype)
+    for group in range(groups):
+        x[group, group * channels : (group + 1) * channels].random_(1, 4)
+    weight = torch.empty(cout, channels, 3, 5, device="cuda", dtype=dtype).random_(1, 4)
+    bias = torch.zeros(cout, device="cuda", dtype=dtype)
+
+    kwargs = {"stride": (2, 1), "padding": (1, 2), "dilation": (1, 2), "groups": groups}
+    actual = conv2d_module.conv2d_general(x, weight, bias, layout=layout, **kwargs)
+    expected = F.conv2d(x.float(), weight.float(), bias.float(), **kwargs).to(dtype)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    memory_format = torch.channels_last if layout == "nhwc" else torch.contiguous_format
+    assert actual.is_contiguous(
+        memory_format=memory_format
+    ), f"expected {layout} output, got strides={actual.stride()}"
+
+
+@pytest.mark.parametrize(
+    "layout,dtype,groups,kernel_size,dilation",
+    [
+        pytest.param("nchw", torch.float16, 2, 1, 1, id="grouped-1x1"),
+        pytest.param("nhwc", torch.bfloat16, 4, 3, 2, id="depthwise-3x3"),
+    ],
+)
+def test_conv2d_routes_grouped_filters(layout, dtype, groups, kernel_size, dilation):
+    torch.manual_seed(0)
+    x = torch.randint(-3, 4, (2, 4, 7, 9), device="cuda", dtype=dtype)
+    weight = torch.randint(
+        -3, 4, (8, 4 // groups, kernel_size, kernel_size), device="cuda", dtype=dtype
+    )
+    bias = torch.arange(8, device="cuda", dtype=dtype)
+
+    actual = conv2d_module.conv2d(
+        x, weight, bias, 2, 1, dilation, "relu", layout, "reflect", groups=groups
+    )
+    padded = F.pad(x.float(), (1, 1, 1, 1), mode="reflect")
+    expected = F.conv2d(
+        padded, weight.float(), bias.float(), stride=2, dilation=dilation, groups=groups
+    ).relu()
+
+    torch.testing.assert_close(actual, expected.to(dtype), rtol=0, atol=0)
+    memory_format = torch.channels_last if layout == "nhwc" else torch.contiguous_format
+    assert actual.is_contiguous(
+        memory_format=memory_format
+    ), f"expected {layout} output, got strides={actual.stride()}"
+
+
+def test_conv2d_rejects_boolean_groups_on_dense_route():
+    x = torch.empty(1, 4, 3, 3, device="cuda", dtype=torch.float16)
+    weight = torch.empty(8, 4, 1, 1, device="cuda", dtype=x.dtype)
+    with pytest.raises(ValueError, match="groups must be a positive integer"):
+        conv2d_module.conv2d(x, weight, groups=True)
+
+
+def test_conv2d_general_grouped_zero_input_channels():
+    x = torch.empty(1, 0, 5, 7, device="cuda", dtype=torch.float16)
+    weight = torch.empty(8, 0, 3, 3, device="cuda", dtype=x.dtype)
+    actual = conv2d_module.conv2d_general(x, weight, groups=2, layout="nhwc")
+    expected = F.conv2d(x, weight, groups=2)
+    torch.testing.assert_close(actual, expected)
+    assert actual.is_contiguous(
+        memory_format=torch.channels_last
+    ), f"expected channels-last output, got strides={actual.stride()}"
+
+
+def test_conv2d_general_grouped_channel_tiles_and_weight_tail():
+    # Each group spans multiple output tiles. An unmasked load from the next
+    # input group or weight row can propagate a NaN through a zero multiply.
+    x = torch.ones(2, 4, 13, 17, device="cuda", dtype=torch.float16)
+    x[0, 2] = float("nan")
+    weight = torch.ones(130, 2, 1, 1, device="cuda", dtype=x.dtype)
+    weight[-1, 0] = float("nan")
+    bias = torch.arange(130, device="cuda", dtype=x.dtype)
+
+    actual = conv2d_module.conv2d_general(x, weight, bias, groups=2, block_k=1)
+    expected = F.conv2d(x.float(), weight.float(), bias.float(), groups=2).to(x.dtype)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+
+
+def test_conv2d_general_grouped_config_key():
+    x = torch.empty(1, 8, 7, 9, device="cuda", dtype=torch.float16)
+    weight = torch.empty(16, 2, 3, 5, device="cuda", dtype=x.dtype)
+    with patch.object(
+        padding_ops, "_get_config_general", wraps=padding_ops._get_config_general
+    ) as lookup:
+        conv2d_module.conv2d_general(x, weight, groups=4)
+
+    key = lookup.call_args.kwargs["shape_key"]
+    assert key.endswith(",G=4"), f"expected groups=4 in the tuning key, got {key!r}"
+
+
+@pytest.mark.parametrize(
+    "groups,cout,weight_channels,bias_shape,message",
+    [
+        (0, 8, 4, None, "groups must be a positive integer"),
+        (1.5, 8, 4, None, "groups must be a positive integer"),
+        (True, 8, 4, None, "groups must be a positive integer"),
+        (3, 6, 1, None, "input channels 4 must be divisible"),
+        (2, 5, 2, None, "output channels 5 must be a positive multiple"),
+        (2, 8, 4, None, "weight has 4 input channels per group, expected 2"),
+        (2, 8, 2, (7,), "bias must have shape"),
+        (2, 8, 2, (1, 8), "bias must have shape"),
+    ],
+)
+def test_conv2d_general_invalid_groups(
+    groups, cout, weight_channels, bias_shape, message
+):
+    x = torch.empty(1, 4, 3, 3, device="cuda", dtype=torch.float16)
+    weight = torch.empty(cout, weight_channels, 1, 1, device="cuda", dtype=x.dtype)
+    bias = None if bias_shape is None else x.new_empty(bias_shape)
+    with pytest.raises(ValueError, match=message):
+        conv2d_module.conv2d_general(x, weight, bias, groups=groups)
 
 
 def test_conv2d_weight_pack_cache_clear_is_scoped(monkeypatch):
