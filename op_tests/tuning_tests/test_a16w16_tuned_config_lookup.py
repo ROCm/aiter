@@ -63,6 +63,23 @@ class TestA16W16TunedConfigLookup(unittest.TestCase):
         self.assertIsNone(tuned_config)
         self.assertEqual(config["libtype"], "torch")
 
+    def test_untuned_shape_is_logged_once_unless_asked(self):
+        for flag, expected in ((0, 2), (1, 4)):
+            with self.subTest(AITER_LOG_TUNED_CONFIG=flag):
+                with (
+                    mock.patch.object(tuned, "AITER_LOG_TUNED_CONFIG", flag),
+                    mock.patch.object(tuned, "_UNTUNED_SHAPES_LOGGED", set()),
+                    self.assertLogs(tuned.logger, "INFO") as logs,
+                ):
+                    self._lookup({})
+                    tuned.get_GEMM_A16W16_config(M + 1, N, K, False, BF16, BF16)
+                    tuned.get_GEMM_A16W16_config(M, 2 * N, K, False, BF16, BF16)
+                    # _lookup clears the lru cache, so this repeat is an evicted M.
+                    _, config = self._lookup({})
+                self.assertEqual(config["libtype"], "torch")
+                untuned = [m for m in logs.output if "not found tuned config" in m]
+                self.assertEqual(len(untuned), expected)
+
 
 class TestGfx1250StrictOpusRow(unittest.TestCase):
     """A gfx1250-strict device reuses gfx1250 rows, but OPUS dispatch keeps

@@ -277,6 +277,9 @@ def get_GEMM_A16W16_tuned_config(
     return None
 
 
+_UNTUNED_SHAPES_LOGGED: set = set()
+
+
 @functools.lru_cache(maxsize=4096)
 def get_GEMM_A16W16_config(
     M: int,
@@ -348,9 +351,12 @@ def get_GEMM_A16W16_config(
             else:
                 default_config["libtype"] = "torch"
                 default_config["solidx"] = 0
-        logger.info(
-            f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, {bpreshuffle=}, not found tuned config in {AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE}, will use default config! using {default_config['libtype']} solution:{default_config['solidx']}"
-        )
+        shape = (N, K, bias, dtype, otype, scaleAB, bpreshuffle, gfx, cu_num)
+        if AITER_LOG_TUNED_CONFIG or shape not in _UNTUNED_SHAPES_LOGGED:
+            _UNTUNED_SHAPES_LOGGED.add(shape)
+            logger.info(
+                f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, {bpreshuffle=}, not found tuned config in {AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE}, will use default config! using {default_config['libtype']} solution:{default_config['solidx']}. Other untuned M of this shape are logged with AITER_LOG_TUNED_CONFIG=1."
+            )
         return default_config
 
     return config
