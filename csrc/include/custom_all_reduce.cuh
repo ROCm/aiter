@@ -2237,7 +2237,7 @@ __device__ __forceinline__ void ar_fusion_epilogue(A& in,
 //                             total token count `m` to stride between groups:
 //                             scale_out[group_id * m + tidx]
 // The column-major layout matches what gemm_a8w8_blockscale_preshuffle expects.
-template <typename P, typename A, typename T, typename OutT, int PACK_SIZE, bool GEMMA_NORM = false, bool TRANSPOSE_SCALE = false>
+template <typename P, typename A, typename T, typename OutT, int PACK_SIZE, bool GEMMA_NORM = false, bool TRANSPOSE_SCALE = false, bool MX_SCALE = false>
 __device__ __forceinline__ void ar_fusion_epilogue_per_group(
     A& in,
     P& weight,
@@ -2279,6 +2279,48 @@ __device__ __forceinline__ void ar_fusion_epilogue_per_group(
     int group_id          = threadIdx.x / threads_per_group;
     int lane_in_group     = threadIdx.x % threads_per_group;
     int num_groups        = hidden_dim / group_size;
+
+    if constexpr(MX_SCALE)
+    {
+        // MXFP8: one E8M0 scale per group of 32, written as bytes into
+        // scale_out (row-major (M, hidden_dim / 32)). The normed values are
+        // rounded to T first, so the bytes are those of quantizing the T
+        // output with aiter's per_1x32 MX quant: amax floored at kAmaxFloor,
+        // scale ceil_pow2(amax / fp8 max) (RoundUp), values times its
+        // reciprocal. No clamp: every |value| <= amax, so a scaled bf16/fp16
+        // value stays within the fp8 max, and a NaN element stays NaN.
+        static_assert(!TRANSPOSE_SCALE, "MX scales are row-major only");
+        constexpr MxDtype kMxFp8 =
+#if defined(__gfx942__)
+            MxDtype::FP8_E4M3_FNUZ;
+#else
+            MxDtype::FP8_E4M3;
+#endif
+        A rounded;
+        float local_amax = 0.f;
+#pragma unroll
+        for(int i = 0; i < PACK_SIZE; ++i)
+        {
+            rounded[i] = upcast_s(downcast_s<T>(out[i]));
+            local_amax = fmaxf(local_amax, fabsf(rounded[i]));
+        }
+        for(int stride = threads_per_group / 2; stride > 0; stride >>= 1)
+            local_amax = fmaxf(local_amax, __shfl_xor(local_amax, stride, threads_per_group));
+        const E8m0BlockScale bs = fp_f32_to_e8m0_block_scale<MxScaleRoundMode::RoundUp, kMxFp8>(
+            fmaxf(local_amax, kAmaxFloor));
+        const float inv_scale = bs.inv_scale();
+#pragma unroll
+        for(int i = 0; i < PACK_SIZE; ++i)
+            rounded[i] *= inv_scale;
+        OP out_quant = packQuant<opus::fp32_t, PACK_SIZE>(rounded, 1.0f);
+        if(active)
+        {
+            *reinterpret_cast<OP*>(output + idx) = out_quant;
+            if(lane_in_group == 0)
+                reinterpret_cast<uint8_t*>(scale_out)[tidx * num_groups + group_id] = bs.byte;
+        }
+        return;
+    }
 
     // Local abs-max across this thread's pack
     auto fn   = [](float a, float b) { return a > b ? a : b; };
@@ -2440,7 +2482,7 @@ __global__ void __launch_bounds__(1024, 1)
 
 // Per-group quant variant of the 1-stage fused allreduce+rmsnorm kernel.
 // scale_out shape: (m, hidden_dim / group_size) instead of (m, 1).
-template <typename T, typename OutT, int ngpus, bool GEMMA_NORM = false, bool TRANSPOSE_SCALE = false>
+template <typename T, typename OutT, int ngpus, bool GEMMA_NORM = false, bool TRANSPOSE_SCALE = false, bool MX_SCALE = false>
 __global__ void __launch_bounds__(1024, 1)
     allreduce_fusion_kernel_1stage_per_group(RankData* _dp,
                                              RankSignals sg,
@@ -2515,28 +2557,32 @@ __global__ void __launch_bounds__(1024, 1)
         int padded_block_size = (int)blockDim.x;
         // token_num == m == size / hidden_dim; the grid-stride loop reuses it as
         // the row count needed by the TRANSPOSE_SCALE (column-major) scale store.
-        ar_fusion_epilogue_per_group<P, A, T, OutT, pack_size, GEMMA_NORM, TRANSPOSE_SCALE>(
+        ar_fusion_epilogue_per_group<P, A, T, OutT, pack_size, GEMMA_NORM, TRANSPOSE_SCALE, MX_SCALE>(
             acc, weight_p, hidden_dim, eps, idx, tidx, padded_block_size,
             group_size, output, scale_out, active, bf16_output, token_num);
     }
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
-// Calls launch(TRANSPOSE_SCALE tag, GEMMA_NORM tag) with the two runtime flags
-// of the per-group quant launchers turned into compile-time constants.
+// Calls launch(TRANSPOSE_SCALE tag, GEMMA_NORM tag, MX_SCALE tag) with the
+// runtime flags of the per-group quant launchers turned into compile-time constants.
 template <typename Launch>
-inline void per_group_launch_flags(Launch&& launch, bool transpose_scale, bool gemma_norm)
+inline void
+per_group_launch_flags(Launch&& launch, bool transpose_scale, bool gemma_norm, bool mx_scale = false)
 {
-    auto by_gemma = [&](auto ts_tag) {
+    auto by_gemma = [&](auto ts_tag, auto mx_tag) {
         if(gemma_norm)
-            launch(ts_tag, std::true_type{});
+            launch(ts_tag, std::true_type{}, mx_tag);
         else
-            launch(ts_tag, std::false_type{});
+            launch(ts_tag, std::false_type{}, mx_tag);
     };
-    if(transpose_scale)
-        by_gemma(std::true_type{});
+    // MX scales are row-major only (the dispatcher rejects transpose_scale).
+    if(mx_scale)
+        by_gemma(std::false_type{}, std::true_type{});
+    else if(transpose_scale)
+        by_gemma(std::true_type{}, std::false_type{});
     else
-        by_gemma(std::false_type{});
+        by_gemma(std::false_type{}, std::false_type{});
 }
 
 template <typename T, typename OutT, int NGPUS>
@@ -2545,7 +2591,7 @@ void allreduce_fusion_kernel_1stage_per_group_launcher(
     T* residual_inp, T* residual_out, OutT* output, T* weight,
     float* scale_out, int size, int hidden_dim, int group_size,
     float eps, hipStream_t stream, T* bf16_output = nullptr,
-    bool transpose_scale = false, bool gemma_norm = false)
+    bool transpose_scale = false, bool gemma_norm = false, bool mx_scale = false)
 {
     auto pack_size  = 16 / sizeof(T);
     int block_size  = hidden_dim / pack_size;
@@ -2557,17 +2603,18 @@ void allreduce_fusion_kernel_1stage_per_group_launcher(
     dim3 grid(std::min(m, kMaxBlocks));
     // TRANSPOSE_SCALE and GEMMA_NORM picked once at the host so the scale-store
     // index math and the (1 + w) weight are resolved at compile time.
-    auto launch = [&](auto ts_tag, auto gn_tag) {
+    auto launch = [&](auto ts_tag, auto gn_tag, auto mx_tag) {
         constexpr bool TRANSPOSE_SCALE = decltype(ts_tag)::value;
         constexpr bool GEMMA_NORM      = decltype(gn_tag)::value;
-        allreduce_fusion_kernel_1stage_per_group<T, OutT, NGPUS, GEMMA_NORM, TRANSPOSE_SCALE>
+        constexpr bool MX_SCALE        = decltype(mx_tag)::value;
+        allreduce_fusion_kernel_1stage_per_group<T, OutT, NGPUS, GEMMA_NORM, TRANSPOSE_SCALE, MX_SCALE>
             <<<grid, block, 0, stream>>>(_dp, sg, self_sg, rank,
                                          residual_inp, residual_out,
                                          output, weight, scale_out,
                                          size, hidden_dim, group_size, eps,
                                          bf16_output);
     };
-    per_group_launch_flags(launch, transpose_scale, gemma_norm);
+    per_group_launch_flags(launch, transpose_scale, gemma_norm, mx_scale);
 }
 
 template <typename T, int ngpus, bool GEMMA_NORM = false, bool HADAMARD32 = false>
@@ -3303,7 +3350,7 @@ void allreduce_fusion_kernel_2stage_launcher(RankData* _dp,
 }
 
 // Per-group quant variant of the 2-stage kernel.
-template <typename T, typename OutT, int ngpus, bool GEMMA_NORM = false, bool TRANSPOSE_SCALE = false>
+template <typename T, typename OutT, int ngpus, bool GEMMA_NORM = false, bool TRANSPOSE_SCALE = false, bool MX_SCALE = false>
 __global__ void __launch_bounds__(1024, 1)
     allreduce_fusion_kernel_2stage_per_group(RankData* _dp,
                                              RankSignals sg,
@@ -3378,14 +3425,31 @@ __global__ void __launch_bounds__(1024, 1)
     {
         P vec = tmps[rank][idx / pack_size];
         P res = *reinterpret_cast<P*>(residual_inp + idx);
+        if constexpr(MX_SCALE)
+        {
+            // MX mode adds the residual in fp32 and normalizes that unrounded
+            // sum, as the 1-stage and the unquantized 2-stage kernels do, so its
+            // bytes track the unquantized AR + RMSNorm output; only
+            // residual_out is rounded to T. The fp32-scale mode keeps its
+            // rounded sum (unchanged numerics for its callers).
 #pragma unroll
-        for(int v = 0; v < pack_size; ++v)
-            vec[v] += res[v];
+            for(int v = 0; v < pack_size; ++v)
+                acc[v] = upcast_s(vec[v]) + upcast_s(res[v]);
+#pragma unroll
+            for(int v = 0; v < pack_size; ++v)
+                vec[v] = downcast_s<T>(acc[v]);
+        }
+        else
+        {
+#pragma unroll
+            for(int v = 0; v < pack_size; ++v)
+                vec[v] += res[v];
+#pragma unroll
+            for(int v = 0; v < pack_size; ++v)
+                acc[v] = upcast_s(vec[v]);
+        }
         *reinterpret_cast<P*>(residual_out + idx) = vec;
-#pragma unroll
-        for(int v = 0; v < pack_size; ++v)
-            acc[v] = upcast_s(vec[v]);
-        ar_fusion_epilogue_per_group<P, A, T, OutT, pack_size, GEMMA_NORM, TRANSPOSE_SCALE>(
+        ar_fusion_epilogue_per_group<P, A, T, OutT, pack_size, GEMMA_NORM, TRANSPOSE_SCALE, MX_SCALE>(
             acc, weight_p, hidden_dim, eps, idx, tidx, block_size,
             group_size, output, scale_out, /*active=*/true, bf16_output,
             m);
@@ -3398,7 +3462,7 @@ void allreduce_fusion_kernel_2stage_per_group_launcher(
     T* residual_inp, T* residual_out, OutT* output, T* weight,
     float* scale_out, int size, int hidden_dim, int group_size,
     float eps, hipStream_t stream, T* bf16_output = nullptr,
-    bool transpose_scale = false, bool gemma_norm = false)
+    bool transpose_scale = false, bool gemma_norm = false, bool mx_scale = false)
 {
     constexpr int PACK_SIZE = 16 / sizeof(T);
     int BLOCK_SIZE          = hidden_dim / PACK_SIZE;
@@ -3407,16 +3471,17 @@ void allreduce_fusion_kernel_2stage_per_group_launcher(
     token_num = std::min(token_num, kMaxBlocks);
     dim3 numBlocks(token_num);
     size_t smem_size = BLOCK_SIZE * sizeof(typename opus::vector_t<T, PACK_SIZE>);
-    auto launch = [&](auto ts_tag, auto gn_tag) {
+    auto launch = [&](auto ts_tag, auto gn_tag, auto mx_tag) {
         constexpr bool TRANSPOSE_SCALE = decltype(ts_tag)::value;
         constexpr bool GEMMA_NORM      = decltype(gn_tag)::value;
-        allreduce_fusion_kernel_2stage_per_group<T, OutT, NGPUS, GEMMA_NORM, TRANSPOSE_SCALE>
+        constexpr bool MX_SCALE        = decltype(mx_tag)::value;
+        allreduce_fusion_kernel_2stage_per_group<T, OutT, NGPUS, GEMMA_NORM, TRANSPOSE_SCALE, MX_SCALE>
             <<<numBlocks, threadsPerBlock, smem_size, stream>>>(
                 _dp, sg, self_sg, rank,
                 residual_inp, residual_out, output, weight, scale_out,
                 size, hidden_dim, group_size, eps, bf16_output);
     };
-    per_group_launch_flags(launch, transpose_scale, gemma_norm);
+    per_group_launch_flags(launch, transpose_scale, gemma_norm, mx_scale);
 }
 
 template <typename T, typename OutT, bool GEMMA_NORM = false>
@@ -3464,7 +3529,7 @@ __global__ void __launch_bounds__(1024, 1)
 }
 
 // Per-group quant variant of the naive local device load kernel.
-template <typename T, typename OutT, bool GEMMA_NORM = false, bool TRANSPOSE_SCALE = false>
+template <typename T, typename OutT, bool GEMMA_NORM = false, bool TRANSPOSE_SCALE = false, bool MX_SCALE = false>
 __global__ void __launch_bounds__(1024, 1)
     local_device_load_rmsnorm_quant_per_group_naive(RankSignals sg,
                                                     int rank,
@@ -3493,14 +3558,27 @@ __global__ void __launch_bounds__(1024, 1)
         A acc;
         P vec = tmps[idx / pack_size];
         P res = *reinterpret_cast<P*>(residual_inp + idx);
+        if constexpr(MX_SCALE)
+        {
+            // fp32 residual add in MX mode only (see the 2-stage kernel).
 #pragma unroll
-        for(int v = 0; v < pack_size; ++v)
-            vec[v] += res[v];
+            for(int v = 0; v < pack_size; ++v)
+                acc[v] = upcast_s(vec[v]) + upcast_s(res[v]);
+#pragma unroll
+            for(int v = 0; v < pack_size; ++v)
+                vec[v] = downcast_s<T>(acc[v]);
+        }
+        else
+        {
+#pragma unroll
+            for(int v = 0; v < pack_size; ++v)
+                vec[v] += res[v];
+#pragma unroll
+            for(int v = 0; v < pack_size; ++v)
+                acc[v] = upcast_s(vec[v]);
+        }
         *reinterpret_cast<P*>(residual_out + idx) = vec;
-#pragma unroll
-        for(int v = 0; v < pack_size; ++v)
-            acc[v] = upcast_s(vec[v]);
-        ar_fusion_epilogue_per_group<P, A, T, OutT, pack_size, GEMMA_NORM, TRANSPOSE_SCALE>(
+        ar_fusion_epilogue_per_group<P, A, T, OutT, pack_size, GEMMA_NORM, TRANSPOSE_SCALE, MX_SCALE>(
             acc, weight_p, hidden_dim, eps, idx, tidx, block_size,
             group_size, output, scale_out, /*active=*/true, bf16_output,
             m);
@@ -3524,7 +3602,8 @@ void allreduce_fusion_kernel_split_per_group_launcher(RankData* _dp,
                                                       hipStream_t stream,
                                                       T* bf16_output = nullptr,
                                                       bool transpose_scale = false,
-                                                      bool gemma_norm      = false)
+                                                      bool gemma_norm      = false,
+                                                      bool mx_scale        = false)
 {
     // step 1: reduce-scatter + allgather cross device store (same as per-token)
     dim3 block(512);
@@ -3554,15 +3633,16 @@ void allreduce_fusion_kernel_split_per_group_launcher(RankData* _dp,
     int nblocks             = size / hidden_dim;
     dim3 threadsPerBlock(BLOCK_SIZE);
     dim3 numBlocks(nblocks);
-    auto launch = [&](auto ts_tag, auto gn_tag) {
+    auto launch = [&](auto ts_tag, auto gn_tag, auto mx_tag) {
         constexpr bool TRANSPOSE_SCALE = decltype(ts_tag)::value;
         constexpr bool GEMMA_NORM      = decltype(gn_tag)::value;
-        local_device_load_rmsnorm_quant_per_group_naive<T, OutT, GEMMA_NORM, TRANSPOSE_SCALE>
+        constexpr bool MX_SCALE        = decltype(mx_tag)::value;
+        local_device_load_rmsnorm_quant_per_group_naive<T, OutT, GEMMA_NORM, TRANSPOSE_SCALE, MX_SCALE>
             <<<numBlocks, threadsPerBlock, 0, stream>>>(
                 sg, rank, residual_inp, residual_out, output, weight, scale_out,
                 size, hidden_dim, group_size, eps, bf16_output);
     };
-    per_group_launch_flags(launch, transpose_scale, gemma_norm);
+    per_group_launch_flags(launch, transpose_scale, gemma_norm, mx_scale);
 }
 
 template <typename T, typename OutT, int NGPUS, bool GEMMA_NORM = false>
@@ -6559,9 +6639,17 @@ void dispatchFusedAllReduceRMSNormQuantPerGroup(hipStream_t stream,
                                                 bool use_1stage,
                                                 T* bf16_output = nullptr,
                                                 bool transpose_scale = false,
-                                                bool gemma_norm      = false)
+                                                bool gemma_norm      = false,
+                                                bool mx_scale        = false)
 {
     auto d   = 16 / sizeof(T);
+    if(mx_scale && (group_size != 32 || transpose_scale))
+    {
+        throw std::runtime_error(
+            "MX-scale per-group quant requires group_size == 32 and row-major scales, got "
+            "group_size=" + std::to_string(group_size) +
+            " transpose_scale=" + std::to_string(transpose_scale));
+    }
     int size = m * n;
     if(size % d != 0)
     {
@@ -6636,7 +6724,7 @@ void dispatchFusedAllReduceRMSNormQuantPerGroup(hipStream_t stream,
         allreduce_fusion_kernel_1stage_per_group_launcher<T, QT, NGPUS>(                   \
             ptrs, sg_, self_sg_, rank_,                                                     \
             residual_inp, residual_out, output, weight, scale_out,                          \
-            size, n, group_size, eps, stream, bf16_output, transpose_scale, gemma_norm);   \
+            size, n, group_size, eps, stream, bf16_output, transpose_scale, gemma_norm, mx_scale);   \
         return;                                                                             \
     }                                                                                      \
     else if(n_constrain && (size * sizeof(T) <= 512 * 1024))                               \
@@ -6644,7 +6732,7 @@ void dispatchFusedAllReduceRMSNormQuantPerGroup(hipStream_t stream,
         allreduce_fusion_kernel_2stage_per_group_launcher<T, QT, NGPUS>(                   \
             ptrs, sg_, self_sg_, rank_,                                                     \
             residual_inp, residual_out, output, weight, scale_out,                          \
-            size, n, group_size, eps, stream, bf16_output, transpose_scale, gemma_norm);   \
+            size, n, group_size, eps, stream, bf16_output, transpose_scale, gemma_norm, mx_scale);   \
         return;                                                                             \
     }                                                                                      \
     else if(n_constrain)                                                                   \
@@ -6652,7 +6740,7 @@ void dispatchFusedAllReduceRMSNormQuantPerGroup(hipStream_t stream,
         allreduce_fusion_kernel_split_per_group_launcher<T, QT, NGPUS>(                    \
             ptrs, sg_, self_sg_, rank_,                                                     \
             residual_inp, residual_out, output, weight, scale_out,                          \
-            size, n, group_size, eps, stream, bf16_output, transpose_scale, gemma_norm);   \
+            size, n, group_size, eps, stream, bf16_output, transpose_scale, gemma_norm, mx_scale);   \
         return;                                                                             \
     }                                                                                      \
     else                                                                                   \
