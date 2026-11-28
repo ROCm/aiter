@@ -1,0 +1,10 @@
+{
+    "M_LEQ_64": {
+        "BLOCK_SIZE_N": 512,
+        "num_warps": 2
+    },
+    "any": {
+        "BLOCK_SIZE_N": 512,
+        "num_warps": 1
+    }
+}
