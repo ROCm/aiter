@@ -1,5 +1,16 @@
 {
     "shapes": {
+        "N=1,C=128,H=1024,W=1024,K=128,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
+            "BLOCK_K": 128,
+            "num_stages": 1,
+            "num_warps": 4
+        },
+        "N=1,C=128,H=1024,W=1024,K=3,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
+            "BLOCK_K": 32,
+            "num_stages": 1,
+            "num_warps": 1,
+            "waves_per_eu": 2
+        },
         "N=1,C=128,H=256,W=256,K=256,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
             "BLOCK_K": 256,
             "num_warps": 8,
@@ -32,8 +43,8 @@
         },
         "N=1,C=256,H=14,W=14,K=256,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
             "BLOCK_K": 128,
-            "num_warps": 4,
-            "num_stages": 1
+            "num_stages": 1,
+            "num_warps": 4
         },
         "N=1,C=256,H=256,W=256,K=256,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
             "BLOCK_K": 256,
@@ -61,9 +72,10 @@
             "num_stages": 1
         },
         "N=1,C=512,H=256,W=256,K=256,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
-            "BLOCK_K": 256,
-            "num_warps": 2,
-            "num_stages": 1
+            "BLOCK_K": 512,
+            "num_stages": 2,
+            "num_warps": 16,
+            "waves_per_eu": 2
         },
         "N=1,C=512,H=256,W=256,K=512,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
             "BLOCK_K": 256,
@@ -91,9 +103,30 @@
             "num_stages": 1
         },
         "N=1,C=64,H=56,W=56,K=64,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
-            "BLOCK_K": 128,
-            "num_warps": 4,
-            "num_stages": 1
+            "BLOCK_K": 32,
+            "num_stages": 2,
+            "num_warps": 2
+        },
+        "N=2,C=320,H=128,W=128,K=320,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
+            "BLOCK_K": 512,
+            "num_stages": 1,
+            "num_warps": 16
+        },
+        "N=2,C=4,H=128,W=128,K=320,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
+            "BLOCK_K": 512,
+            "num_stages": 2,
+            "num_warps": 16
+        },
+        "N=2,C=640,H=128,W=128,K=320,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
+            "BLOCK_K": 512,
+            "num_stages": 1,
+            "num_warps": 16
+        },
+        "N=2,C=640,H=128,W=128,K=640,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
+            "BLOCK_K": 256,
+            "num_stages": 1,
+            "num_warps": 8,
+            "waves_per_eu": 2
         }
     },
     "any": {
