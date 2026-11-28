@@ -50,8 +50,7 @@ from aiter.ops.flydsl.kernels.kernels_common import (
     set_slp_vectorize_once_used,
 )
 from aiter.ops.flydsl.kernels.mfma_preshuffle_pipeline import group_m_major
-from aiter.ops.flydsl.kernels.quant_utils import emit_mx_e8m0_scale
-from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
+from aiter.ops.flydsl.kernels.quant_utils import emit_mxfp8_group32_scale
 
 WAVE = 64
 MFMA_M = MFMA_N = 16
@@ -1192,13 +1191,7 @@ def launch_bmm_a8w8_mxscale(
                                 hi = (w & Int32(-65536)).bitcast(Float32)
                                 amax = fx.maxnumf(amax, abs(lo))
                                 amax = fx.maxnumf(amax, abs(hi))
-                            amax = fx.maxnumf(amax, Float32(1e-10))
-                            e8 = emit_mx_e8m0_scale(
-                                amax,
-                                mode=MxScaleRoundModeInt.RoundUp,
-                                dtype=MxDtypeInt.FP8_E4M3,
-                            )
-                            scale = (Int32(e8) << Int32(23)).bitcast(Float32)
+                            e8, scale = emit_mxfp8_group32_scale(amax)
                             # gfx950 v_cvt_scalef32_pk_fp8_bf16 divides a bf16
                             # pair by the power-of-two scale and RNE-packs two
                             # e4m3 bytes into one half of the dword.

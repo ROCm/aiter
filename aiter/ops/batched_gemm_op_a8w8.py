@@ -459,9 +459,9 @@ def batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant(
     to ``quantize_fp8`` of the unfused bf16 output. gfx1250 flydsl mxfp8_32 and
     gfx950 flydsl bmm (row-major x_scale); raises ``NotImplementedError``
     otherwise so a caller can fall back to the bf16 GEMM + ``quantize_fp8``.
-    On gfx950 the shape's flydsl tuned row, the one the bf16 entry runs,
-    picks the tile; an opus row or none leaves the choice to the runner, as
-    does every other arch. A gfx950 row the fused epilogue would run slower
+    On both arches the shape's flydsl tuned row, the one the bf16 entry runs,
+    picks the tile; an opus row, a gfx1250 compute-kernel row or no row leaves
+    the choice to the runner. A gfx950 row the fused epilogue would run slower
     (``_fused_quant_falls_back``) runs as bf16 plus the same quant instead.
     The quant is exact for the bf16 output of the kernel the fused call runs.
     Where that kernel or its K split differs from the bf16 entry's (an opus
@@ -518,13 +518,13 @@ def _fused_quant_tuned_kernel(
     g: int, m: int, n: int, k: int, w_scale_block: str, gfx: str, cu_num: int
 ) -> str | None:
     """The kernelName of the preshuffle table's flydsl row for this shape, the
-    row the bf16 entry runs, so both entries share the tuned tile, on gfx950.
-    None (the runner's own choice) when there is no row or the row is not a
-    flydsl one, and on every other arch: a gfx1250 32x32 table row may name a
-    compute kernel, which has no fused epilogue, so that runner keeps its own
-    pick there."""
-    if gfx != "gfx950":
-        return None
+    row the bf16 entry runs, so both entries share the tuned tile, on gfx950
+    and gfx1250 alike. None (the runner's own choice) when there is no row,
+    the row is not a flydsl one, or it names a gfx1250 compute kernel (the
+    fused entry does not run tuned compute rows yet; with no name the gfx1250
+    runner picks the tile, the compute kernel for prefill-sized M). Any other
+    name is passed through as is: a name the flydsl runner does not accept
+    raises there, as it does for the bf16 entry."""
     cfg = lookup_mxscale_bmm_config(
         g,
         m,
@@ -537,7 +537,12 @@ def _fused_quant_tuned_kernel(
     )
     if cfg is None or cfg["libtype"] != "flydsl":
         return None
-    return cfg["kernelName"]
+    name = cfg["kernelName"]
+    if gfx == "gfx950":
+        return name
+    from .flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import is_compute_wmma_kernel_name
+
+    return None if is_compute_wmma_kernel_name(name) else name
 
 
 def batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported(

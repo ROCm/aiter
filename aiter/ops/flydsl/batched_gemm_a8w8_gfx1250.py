@@ -60,9 +60,11 @@ _BMM_KERNEL_NAME_RE = re.compile(
     rf"^{re.escape(BMM_WMMA_NAME_PREFIX)}_{_SUFFIX_RE}(?P<preload>_pre)?$"
 )
 # mxfp8_32 has no whole-K scale preload: its scale panels are 4x (A) and 32x
-# (n32k4 B) the mxfp8_128 ones.
+# (n32k4 B) the mxfp8_128 ones. A trailing ``_pl`` selects the software-
+# pipelined K loop (see check_pipelined_k_loop); without it the kernel keeps
+# the single-fence loop.
 _BMM_MX32_KERNEL_NAME_RE = re.compile(
-    rf"^{re.escape(BMM_MX32_WMMA_NAME_PREFIX)}_{_SUFFIX_RE}$"
+    rf"^{re.escape(BMM_MX32_WMMA_NAME_PREFIX)}_{_SUFFIX_RE}(?P<pipelined>_pl)?$"
 )
 
 _launch_gemm_a8w8 = None
@@ -106,8 +108,11 @@ def _parse_bmm_mx32_kernel_name_cached(name: str) -> dict[str, int] | None:
     match = _BMM_MX32_KERNEL_NAME_RE.fullmatch(name)
     if match is None:
         return None
-    cfg = {key: int(value) for key, value in match.groupdict().items()}
+    groups = match.groupdict()
+    pipelined = groups.pop("pipelined")
+    cfg = {key: int(value) for key, value in groups.items()}
     cfg["preload"] = 0
+    cfg["pipelined"] = int(pipelined is not None)
     return cfg
 
 
@@ -414,8 +419,10 @@ def _check_bmm_operands(
     """Shared operand checks of the batched runners; returns (m, b, n, k, out).
 
     ``fused_fp8_out``: the GEMM quantizes its C tile to e4m3 in the epilogue, so
-    ``Out`` is a 1-byte fp8 buffer. The C staging is still bf16 (what the quant
-    reads), so the returned out name stays ``bf16``.
+    ``Out`` is a 1-byte fp8 buffer. The returned out name stays ``bf16``: the
+    quant reads values rounded to bf16, either from a bf16 C tile staged in LDS
+    or, on the accumulator branch, from the accumulators rounded to bf16 in
+    registers (no bf16 staging there).
     """
     if get_gfx() not in ("gfx1250", "gfx1250-strict"):
         raise RuntimeError(
@@ -446,7 +453,7 @@ def _check_bmm_operands(
                 "[FlyDSL gfx1250 bmm] fused fp8 Out must be 1-byte e4m3 storage, "
                 f"got {Out.dtype}"
             )
-        out_dtype = "bf16"  # C staging dtype; the epilogue quantizes it to e4m3
+        out_dtype = "bf16"  # dtype the epilogue rounds C to before the e4m3 quant
     else:
         out_dtype = _OUT_DTYPE_NAME.get(Out.dtype)
         if out_dtype is None:
@@ -484,8 +491,8 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
     ``w_scale_32x32`` selects the raw ``[B, N//32, K//32]`` block scale; else
     w_scale is the n32k4-shuffled 1x32 ``[B, N, K//32]`` (see module doc).
 
-    ``y_scale_out``: when given, the GEMM quantizes its bf16 C tile to e4m3 in
-    the epilogue instead of writing bf16 -- ``Out`` is then the e4m3 ``[M,B,N]``
+    ``y_scale_out``: when given, the epilogue writes the output group-32
+    MXFP8-quantized (e4m3) instead of bf16 -- ``Out`` is then the e4m3 ``[M,B,N]``
     buffer and ``y_scale_out`` the row-major ``[M, (B*N)//32]`` e8m0 scale, the
     ``(x, x_scale)`` pair a downstream native-quant GEMM reads. Bit-matches a
     standalone ATOM ``quantize_fp8`` of the bf16 output.
@@ -600,6 +607,7 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
         bool(w_scale_32x32),
         k_tail,
         fused,  # fuse_quant_out
+        cfg["pipelined"],
     )
     # Cached CompiledFunction per constexpr set; see _run_compiled.
     _run_compiled(
@@ -637,6 +645,7 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
         k_tail,
         _ptr_arg(y_scale_out) if fused else _ptr_arg(Out),  # arg_scale_out
         fused,  # fuse_quant_out
+        cfg["pipelined"],
         specialization_key=bmm_spec,
     )
     return Out
