@@ -148,6 +148,10 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     w_scale_32x32: bool = False,
     batch: int = 1,
     y_scale_out: Tensor | None = None,
+    m_run_cap: int = 32,
+    c_vmem_store: bool = False,
+    xcd_swizzle: int = 0,
+    rotate_n: bool = False,
 ) -> Tensor:
     """Run the gfx1250 WMMA mxfp8_128 / mxfp8_32 bpreshuffle GEMM.
 
@@ -172,9 +176,59 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     epilogue quantizes C to group-32 MXFP8 instead of writing bf16. Out is then
     the e4m3 C and ``y_scale_out`` its row-major ``[M, Out.stride(0) // 32]``
     e8m0 scale.
+
+    ``m_run_cap`` (compute kernels, kernelName ``_mr<n>``): the most M tiles
+    one launch-grid row spans; 32 by default.
+
+    ``c_vmem_store`` (kernelName ``_cv``; compute, nb2, ``_ps``, batch 1): the
+    persistent C store goes through VMEM instead of TDM.
+
+    ``xcd_swizzle`` (kernelName ``_xcd<n>``; compute, split_k 1, batch 1):
+    remap launch tiles onto XCDs in contiguous blocks. ``n==1`` is that order
+    only; ``n>=cluster_m`` (multiple of ``cluster_m``) also M-major-groups by
+    ``n``.
+
+    ``rotate_n`` (kernelName ``_rn``; compute, ``_ps``, batch 1): each cluster
+    row starts its persistent N strip at a different tile.
     """
     compute_bound = is_compute_wmma_kernel_name(kernel_name)
     fuse_quant = y_scale_out is not None
+    if m_run_cap != 32 and not compute_bound:
+        raise RuntimeError(
+            "[FlyDSL gfx1250 mxfp8] m_run_cap (_mr) needs a compute-bound kernel"
+        )
+    if c_vmem_store and not (
+        compute_bound
+        and int(num_buffers) == 2
+        and persistent_n_tiles > 1
+        and batch == 1
+    ):
+        raise RuntimeError(
+            "[FlyDSL gfx1250 mxfp8] c_vmem_store (_cv) needs a compute-bound nb2 "
+            "persistent (_ps) kernel with batch 1"
+        )
+    if xcd_swizzle and not (
+        compute_bound
+        and int(split_k) == 1
+        and batch == 1
+        and (
+            xcd_swizzle == 1
+            or (
+                xcd_swizzle >= int(cluster_m)
+                and xcd_swizzle % int(cluster_m) == 0
+            )
+        )
+    ):
+        raise RuntimeError(
+            "[FlyDSL gfx1250 mxfp8] xcd_swizzle (_xcd) needs a compute-bound "
+            f"split_k=1 batch-1 kernel and either 1 or a multiple of "
+            f"cluster_m={cluster_m}"
+        )
+    if rotate_n and not (compute_bound and persistent_n_tiles > 1 and batch == 1):
+        raise RuntimeError(
+            "[FlyDSL gfx1250 mxfp8] rotate_n (_rn) needs a compute-bound "
+            "persistent (_ps) kernel with batch 1"
+        )
     mx32 = scale_block == MX32_BLOCK_K
     if not mx32 and scale_block != BLOCK_K:
         raise RuntimeError(
@@ -244,7 +298,14 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             f"[FlyDSL gfx1250 mxfp8] a gfx1250 cluster holds at most 16 "
             f"workgroups, got {cluster_m}x{cluster_n}"
         )
-    if N % (tile_n * cluster_n) != 0:
+    if N % (tile_n * cluster_n) != 0 and not cluster_n_pads(
+        N,
+        tile_n,
+        cluster_n,
+        split_k,
+        persistent_n_tiles,
+        compute_bound and w_scale_32x32,
+    ):
         raise RuntimeError(
             f"[FlyDSL gfx1250 mxfp8] N={N} must be a multiple of "
             f"tile_n*cluster_n={tile_n}*{cluster_n}={tile_n * cluster_n}"
@@ -460,6 +521,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             w_scale_32x32,
             batch > 1,
         )
+        tail = (fuse_quant, m_run_cap, c_vmem_store, xcd_swizzle, rotate_n)
         _run_compiled(
             _launch_gemm_a8w8_compute_bound,
             *runtime_args,
@@ -467,8 +529,8 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             cluster_m,
             *specialization,
             batch,
-            fuse_quant,
-            specialization_key=specialization + (fuse_quant,),
+            *tail,
+            specialization_key=specialization + tail,
         )
     else:
         specialization = constexpr_args + (
@@ -522,6 +584,10 @@ NAME_SUFFIX_RE = (
     BASE_NAME_SUFFIX_RE + r"(?P<fused_splitk>_fsk)?"
     r"(?P<a_preshuffle>_apre)?"
     r"(?:_ps(?P<persistent_n_tiles>\d+))?"
+    r"(?:_mr(?P<m_run_cap>\d+))?"
+    r"(?:_xcd(?P<xcd_swizzle>\d+))?"
+    r"(?P<c_vmem_store>_cv)?"
+    r"(?P<rotate_n>_rn)?"
 )
 MX32_NAME_SUFFIX_RE = NAME_SUFFIX_RE + r"(?P<a_scale_preshuffled>_aspre)?"
 _KERNEL_NAME_RE = re.compile(rf"^{re.escape(WMMA_NAME_PREFIX)}_{NAME_SUFFIX_RE}")
@@ -543,12 +609,20 @@ def _parse_name(match):
     a_preshuffle = groups.pop("a_preshuffle", None) is not None
     a_scale_preshuffled = groups.pop("a_scale_preshuffled", None) is not None
     fused_splitk = groups.pop("fused_splitk", None) is not None
+    c_vmem_store = groups.pop("c_vmem_store", None) is not None
+    rotate_n = groups.pop("rotate_n", None) is not None
     persistent_n_tiles = groups.pop("persistent_n_tiles", None)
+    m_run_cap = groups.pop("m_run_cap", None)
+    xcd_swizzle = groups.pop("xcd_swizzle", None)
     cfg = {key: int(value) for key, value in groups.items()}
     cfg["a_preshuffle"] = a_preshuffle
     cfg["a_scale_preshuffled"] = a_scale_preshuffled
     cfg["fused_splitk"] = fused_splitk
     cfg["persistent_n_tiles"] = int(persistent_n_tiles) if persistent_n_tiles else 1
+    cfg["m_run_cap"] = int(m_run_cap) if m_run_cap else 32
+    cfg["xcd_swizzle"] = int(xcd_swizzle) if xcd_swizzle else 0
+    cfg["c_vmem_store"] = c_vmem_store
+    cfg["rotate_n"] = rotate_n
     return cfg
 
 
@@ -584,6 +658,25 @@ def cluster_m_grid_ok(M: int, tile_m: int, cluster_m: int) -> bool:
         return False
     m_blocks = (M + tile_m - 1) // tile_m
     return m_blocks % cluster_m == 0
+
+
+def cluster_n_pads(
+    N: int,
+    tile_n: int,
+    cluster_n: int,
+    split_k: int,
+    persistent_n_tiles: int,
+    can_pad: bool,
+) -> bool:
+    """Whether grid.y is padded to whole cluster columns; padded workgroups
+    multicast their A, load zero B and store nothing (TDM clamps)."""
+    return (
+        can_pad
+        and split_k == 1
+        and persistent_n_tiles == 1
+        and cluster_n > 1
+        and N % tile_n == 0
+    )
 
 
 def resolve_cluster_m(M: int, tile_m: int, cluster_m: int) -> int | None:
@@ -668,6 +761,10 @@ def run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
         a_preshuffle=cfg["a_preshuffle"],
         fused_splitk=cfg["fused_splitk"],
         persistent_n_tiles=cfg["persistent_n_tiles"],
+        m_run_cap=cfg["m_run_cap"],
+        c_vmem_store=cfg["c_vmem_store"],
+        xcd_swizzle=cfg["xcd_swizzle"],
+        rotate_n=cfg["rotate_n"],
     )
 
 
@@ -716,6 +813,10 @@ def run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250(
         n_warp=cfg["n_warp"],
         fused_splitk=cfg["fused_splitk"],
         persistent_n_tiles=cfg["persistent_n_tiles"],
+        m_run_cap=cfg["m_run_cap"],
+        c_vmem_store=cfg["c_vmem_store"],
+        xcd_swizzle=cfg["xcd_swizzle"],
+        rotate_n=cfg["rotate_n"],
         scale_block=MX32_BLOCK_K,
         a_scale_preshuffled=a_scale_preshuffled,
         w_scale_32x32=w_scale_32x32,

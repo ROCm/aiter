@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import dataclasses
 import functools
 import math
 import operator
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -1723,6 +1725,7 @@ def _flydsl_mxfp8_fallback_kernel(
     tile_n must be a multiple of 32.
     """
     from ..ops.flydsl.gemm_tune.flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common import (
+        compute_grid_ctas,
         is_compute_kernel,
         kernel_fits_shape,
         kernels_list,
@@ -1742,17 +1745,51 @@ def _flydsl_mxfp8_fallback_kernel(
     want_tm = min(256, max(16, 1 << (m - 1).bit_length()))
     compute = [ki for ki in fits if is_compute_kernel(ki)]
     if compute:
-        return min(
+        # Prefer denser clusters. Fewer LDS buffers (nb2 over nb4) and
+        # non-persistent grids win on gfx1250 compute_wmma gemm-request
+        # shapes — extra buffers / ps>1 inflate the K / N pipeline.
+        best = min(
             compute,
             key=lambda x: (
                 abs(x.tile_m - want_tm),
                 -(x.cluster_m * x.cluster_n),
-                x.split_k,
                 x.persistent_n_tiles,
+                x.split_k,
                 -x.tile_n,
-                -x.num_buffers,
+                x.num_buffers,
             ),
         )
+        # Short-K mx32 nb2 is the exception: four tiles per CTA let the C store
+        # overlap the next tile's loads, while the grid still fills every CU.
+        # From N=32768 on, 4-tile M runs also beat 32 (16384x32768x1280: 260 ->
+        # 246 us); at N<=16384 they lose up to 5%. From N=32768 on, a VMEM C
+        # store (_cv) also frees the next tile from waiting on C
+        # (16384x32768x2048: 379 -> 323 us cold).
+        if (
+            mx32
+            and best.split_k == 1
+            and best.num_buffers == 2
+            and (k // best.tile_k <= 16)
+        ):
+            ps4 = dataclasses.replace(best, persistent_n_tiles=4)
+            if ps4 in compute and compute_grid_ctas(ps4, m, n) >= 2 * get_cu_num():
+                if n >= 32768:
+                    return dataclasses.replace(ps4, m_run_cap=4, c_vmem_store=True)
+                return ps4
+        # Long-K mx32: four one-K-tile slots keep more of K in flight than two
+        # two-K-tile slots, which hides the TDM latency the nb2 loop waits on.
+        # Below ~4 tiles per CU the deeper prologue is not amortized.
+        if (
+            mx32
+            and best.split_k == 1
+            and best.num_buffers == 2
+            and best.tile_n == 256
+            and k // best.tile_k >= 32
+        ):
+            nb4 = dataclasses.replace(best, num_buffers=4)
+            if nb4 in compute and compute_grid_ctas(nb4, m, n) >= 4 * get_cu_num():
+                return nb4
+        return best
     return min(fits, key=lambda x: (abs(x.tile_m - want_tm), -x.tile_n, -x.tile_k))
 
 
@@ -2154,9 +2191,10 @@ def _abpreshuffle_config_from_bpreshuffle(m: int, n: int, k: int, w_scale) -> di
     """Fall back to the bpreshuffle winner for a shape with no A-preshuffle row.
 
     The two kernel families differ only by an ``_apre`` marker, which sits before
-    any ``_ps<n>`` persistent-tile suffix. Those bpreshuffle rows are the e8m0
-    2D-GEMM rows of the mxscale table -- the very ones the non-A-preshuffled
-    gfx1250 path reads -- not the fp32 blockscale-bpreshuffle table.
+    any ``_ps<n>`` persistent-tile, ``_mr<n>`` M-run, ``_xcd<n>``, ``_cv`` and
+    ``_rn`` suffix. Those bpreshuffle rows are the e8m0 2D-GEMM rows of the mxscale
+    table -- the very ones the non-A-preshuffled gfx1250 path reads -- not the
+    fp32 blockscale-bpreshuffle table.
     """
     from .flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import is_compute_wmma_kernel_name
 
@@ -2165,9 +2203,13 @@ def _abpreshuffle_config_from_bpreshuffle(m: int, n: int, k: int, w_scale) -> di
     )
     borrowed = None
     if config is not None and config.get("libtype") == "flydsl":
-        name = str(config["kernelName"])
-        head, sep, tail = name.partition("_ps")
-        borrowed = dict(config, kernelName=head + "_apre" + sep + tail)
+        name = re.sub(
+            r"((?:_ps\d+)?(?:_mr\d+)?(?:_xcd\d+)?(?:_cv)?(?:_rn)?(?:_aspre)?)$",
+            r"_apre\1",
+            str(config["kernelName"]),
+            count=1,
+        )
+        borrowed = dict(config, kernelName=name)
         if is_compute_wmma_kernel_name(borrowed["kernelName"]):
             return borrowed
     ki = _flydsl_mxfp8_fallback_kernel(m, n, k, a_preshuffle=True)

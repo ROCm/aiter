@@ -29,7 +29,52 @@ from .splitk_fused_epilogue_gfx1250 import emit_fused_splitk_epilogue
 from .tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    buf_base_i64,
+    buf_copy_store,
+    ptr_buf_tensor,
 )
+
+# ── VGPR pins (mxfp4 partition; no env knobs) ───────────────────────────
+# Acc@512, A@0, B@256. Optional flydsl 0.4.2+ sched_vgpr; older wheels noop.
+try:
+    from flydsl.expr.rocdl.experimental import sched_vgpr as _sched_vgpr
+except ImportError:  # pragma: no cover
+    _sched_vgpr = None
+
+_HAS_SCHED_VGPR = _sched_vgpr is not None
+_ACC_VGPR_BASE = 512
+_A_VGPR_BASE = 0
+_B_VGPR_BASE = 256
+_FRAG_VGPRS = 16
+_ASM_SCALE_BASE = 196
+# Short-K / mid-K A-scale panel widths (measured defaults).
+_SA_PANEL_CLASS0 = 4
+_SA_PANEL_CLASS1 = 8
+
+
+def _pin_vgpr(raw_val, regnum: int):
+    if const_expr(not _HAS_SCHED_VGPR) or _sched_vgpr is None:
+        return raw_val
+    try:
+        return _sched_vgpr(raw_val, regnum, soft=False)
+    except TypeError:
+        return _sched_vgpr(raw_val, regnum)
+
+
+def _pin_acc_vec(raw_val, frag_idx: int):
+    return _pin_vgpr(raw_val, _ACC_VGPR_BASE + frag_idx * 8)
+
+
+def _pin_a_frag(raw_val, slot: int):
+    return _pin_vgpr(raw_val, _A_VGPR_BASE + slot * _FRAG_VGPRS)
+
+
+def _pin_b_frag(raw_val, slot: int):
+    return _pin_vgpr(raw_val, _B_VGPR_BASE + slot * _FRAG_VGPRS)
+
+
+def _pin_scale_word(raw_val, slot: int):
+    return _pin_vgpr(fx.Int32(raw_val), _ASM_SCALE_BASE + slot)
 
 
 @flyc.jit
@@ -69,11 +114,17 @@ def launch_gemm_a8w8_256x256(
     batched: Constexpr[bool] = False,
     batch: fx.Int32 = 1,
     fuse_quant_out: Constexpr[bool] = False,
+    m_run_cap: Constexpr[int] = 32,
+    c_vmem_store: Constexpr[bool] = False,
+    xcd_swizzle: Constexpr[int] = 0,
+    rotate_n: Constexpr[bool] = False,
 ):
     """A launch clusters ``i32_cm`` rows, the cluster_m that fits M, so no ``.cluster_dims`` is
     compiled in; ``use_cluster`` is False only for a launch of one workgroup.
 
-    N must be a multiple of ``tile_n * cluster_n``; M is unrestricted (a
+    N must be a multiple of ``tile_n`` (of ``tile_n * cluster_n`` when
+    ``persistent_n_tiles > 1``; otherwise grid.y is padded to whole cluster
+    columns); M is unrestricted (a
     multiple of 2 when ``a_preshuffle``); K must be divisible by 128 and at
     least 512 per split. ``k_tiles_class`` buckets the K-tiles per split:
     0 for <= 16, 1 for <= 64, 2 above; long K loops keep the early merge
@@ -84,7 +135,20 @@ def launch_gemm_a8w8_256x256(
     ``fuse_quant_out``: the C tile is group-32 MXFP8-quantized in the
     epilogue. ``arg_c`` is then the e4m3 C (same layout and ``ldc``) and
     ``arg_out`` the row-major ``[M, ldc // 32]`` e8m0 scale, bit-matching ATOM
-    ``quantize_fp8`` of the bf16 output."""
+    ``quantize_fp8`` of the bf16 output.
+    ``m_run_cap``: the most M tiles one grid.x run spans before the rest of M
+    moves to grid.z (a power of two; the M-tile count must split into runs).
+    ``c_vmem_store`` (persistent nb2 C relocation only): C leaves LDS through
+    ``ds_load`` + ``buffer_store`` instead of a TDM store.
+    ``xcd_swizzle`` (``_xcd<n>``; split_k 1, not batched): remap launch tiles
+    so each XCD owns a contiguous block (cluster-preserving). ``n==1`` is
+    that remap only; ``n>=cluster_m`` (multiple of ``cluster_m``) also
+    M-major-groups by ``n`` M tiles for L2 reuse.
+    ``rotate_n`` (``_rn``; persistent C relocation only): each cluster row
+    starts its N strip at a different tile, so concurrent clusters read
+    different B tiles instead of all waiting on the same cold ones. It also
+    gives mid-K nb2 persistent kernels the single-stage A-scale panel that C
+    relocation needs."""
 
     assert (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers) in (
         (256, 256, 128, 2, 2, 4),
@@ -96,11 +160,19 @@ def launch_gemm_a8w8_256x256(
     assert 1 <= cluster_n < 16, f"cluster_n must be 1..15, got {cluster_n}"
     assert split_k in (1, 2, 4, 8), f"split_k must be 1/2/4/8, got {split_k}"
     assert (
+        m_run_cap >= 1 and m_run_cap & (m_run_cap - 1) == 0
+    ), f"m_run_cap must be a power of two, got {m_run_cap}"
+    assert (
         persistent_n_tiles >= 1
     ), f"persistent_n_tiles must be >= 1, got {persistent_n_tiles}"
     assert (
         persistent_n_tiles == 1 or split_k == 1
     ), "persistent_n_tiles>1 requires split_k=1"
+    assert xcd_swizzle >= 0, f"xcd_swizzle must be >= 0, got {xcd_swizzle}"
+    # The launch checks that xcd_swizzle > 1 is a multiple of its cluster_m.
+    assert not xcd_swizzle or (
+        split_k == 1 and not batched
+    ), f"xcd_swizzle needs split_k=1 and no batching, got {xcd_swizzle}"
     cluster_splitk = fused_splitk and split_k > 1
     assert not fused_splitk or (
         split_k > 1 and tile_m % split_k == 0
@@ -110,7 +182,7 @@ def launch_gemm_a8w8_256x256(
         use_cluster or cluster_n * cluster_k == 1
     ), "a plain launch has no cluster_n or K splits"
     cluster_sync_revs = 8
-    m_run_max, m_run_min = 32, 8
+    m_run_max, m_run_min = m_run_cap, min(8, m_run_cap)
     WMMA_M = WMMA_N = 16
     WMMA_K = 128
     WAVE = 32
@@ -149,14 +221,45 @@ def launch_gemm_a8w8_256x256(
     KPAIR = 1 if num_buffers == 4 and tile_n == 256 else 2
     UNROLL = KPAIR * num_buffers
     SUPER_K = tile_k * KPAIR
+    # Short-K: panel=4 (persistent: 1, for c_relocate). Mid-K: panel=8
+    # (persistent with rotate_n: 1).
+    # Long-K / nb3 keep legacy 8/4. nb4 with one K-tile per slot takes panel=16:
+    # at panel=1 each stage is a 256-row x 4-byte A-scale TDM, and the A/B
+    # fragment reads of waves 0 and 2 stall on LDS (~1.9x slower at K=8192).
+    # Wider panels also cut the sectors wasted when the K/32-byte A-scale row
+    # pitch is not 32-byte aligned (K=4224: 132 bytes).
+    # The 32x4-preshuffled A-scale loads 8 x 128-byte rows and has no such cost.
     SA_PANEL_STAGES = (
-        (8 if num_buffers == 2 else 4 if num_buffers == 3 else 1)
+        (
+            1
+            if (k_tiles_class == 0 or (k_tiles_class == 1 and rotate_n))
+            and num_buffers == 2
+            and persistent_n_tiles > 1
+            else (
+                _SA_PANEL_CLASS0
+                if k_tiles_class == 0 and num_buffers == 2
+                else (
+                    _SA_PANEL_CLASS1
+                    if k_tiles_class == 1 and num_buffers == 2
+                    else (
+                        16
+                        if num_buffers == 4 and KPAIR == 1
+                        else (8 if num_buffers == 2 else 4 if num_buffers == 3 else 1)
+                    )
+                )
+            )
+        )
         if mx32 and not a_scale_preshuffled
         else 1
     )
     SA_PANEL_WIDTH = SA_PANEL_STAGES * (SUPER_K // 32)
     SA_PANEL_PAD = 4 if SA_PANEL_STAGES > 1 else 0
     SA_PANEL_ROW = SA_PANEL_WIDTH + SA_PANEL_PAD
+    # A-scale panel slots; a panel is loaded (SA_RING - 1) panels ahead of use.
+    SA_RING = 2 if SA_PANEL_STAGES >= 16 else num_buffers
+    # A panel spanning whole K-loop revolutions is read by every K-step of a
+    # revolution, so its slot, base address and refill state are per revolution.
+    SA_REV_PANEL = SA_PANEL_STAGES > 1 and SA_PANEL_STAGES % num_buffers == 0
     LDS_PAD_A = 16
     # A-preshuffle: A is shuffle_mxfp8fp4_a-tiled, [M, K] -> [M/2, K/128, 2, 128]
     A_PAIR = 2 if a_preshuffle else 1
@@ -175,14 +278,20 @@ def launch_gemm_a8w8_256x256(
         if mx32
         else SC_K * (((tile_m + 15) // 16) * 16)
     )
-    SB_ROW = SUPER_K // 32 if b_scale_32x32 else SUPER_K
+    # The row-major 32x32 B scale ([N/32, K/32]) is laid out like the A scale and
+    # rides its panel: per K-step it is an 8-row x 4-byte TDM that alone costs ~6%.
+    SB_PANEL = b_scale_32x32 and SA_PANEL_STAGES > 1
+    SB_ROW = (
+        SA_PANEL_WIDTH if SB_PANEL else (SUPER_K // 32 if b_scale_32x32 else SUPER_K)
+    )
+    SB_SLOTS = SA_RING if SB_PANEL else num_buffers
     STAGE_SB = SB_SUPERS * SB_ROW if mx32 else ((N_BLOCKS + 15) // 16) * 16
     # B first so it keeps a 64-KiB-aligned base; the rest packs behind it.
     PLANAR_B_BASE = 0
     PLANAR_A_BASE = PLANAR_B_BASE + num_buffers * STAGE_B
     PLANAR_SA_BASE = PLANAR_A_BASE + num_buffers * STAGE_A
-    PLANAR_SB_BASE = PLANAR_SA_BASE + num_buffers * STAGE_SA
-    PLANAR_END = PLANAR_SB_BASE + num_buffers * STAGE_SB
+    PLANAR_SB_BASE = PLANAR_SA_BASE + SA_RING * STAGE_SA
+    PLANAR_END = PLANAR_SB_BASE + SB_SLOTS * STAGE_SB
 
     partial_elem = (
         fx.Float32 if split_k > 1 else (fx.Float16 if out_is_f16 else fx.BFloat16)
@@ -244,8 +353,20 @@ def launch_gemm_a8w8_256x256(
         and Q_END <= lds_cap
         and q_fits
     )
+    assert not rotate_n or c_relocate, (
+        "rotate_n needs persistent C relocation (nb2/nb4 _ps, <= 64 K-tiles for nb2)"
+    )
     if c_relocate:
         ARENA_B = max(ARENA_B, Q_END)
+    # C goes LDS -> VGPR -> buffer_store, so the next tile's slot-1 refill waits
+    # only for the LDS reads, not for C to land in memory. Barriers on this path
+    # are raw s_barrier_signal/wait: gpu.barrier()'s fence would make every wave
+    # wait for its C stores.
+    C_VMEM = c_vmem_store
+    assert not C_VMEM or (
+        c_relocate and num_buffers == 2 and not batched
+    ), "c_vmem_store needs persistent nb2 C relocation without batching"
+    C_STORE_TH_NT = 1  # keeps C from evicting the next tile's A/B in L2
     # Drain K-steps whose freed slot takes the next tile's matching K-step, and how
     # many of those loads are already in flight when each drain K-step fences.
     DRAIN_PREF = [
@@ -275,6 +396,10 @@ def launch_gemm_a8w8_256x256(
         + ("_bs32x32" if b_scale_32x32 else "")
         + ("_mbn" if batched else "")
         + ("_fq" if fuse_quant_out else "")
+        + (f"_mr{m_run_cap}" if m_run_cap != 32 else "")
+        + (f"_xcd{xcd_swizzle}" if xcd_swizzle else "")
+        + ("_cv" if c_vmem_store else "")
+        + ("_rn" if rotate_n else "")
     )
 
     def _run_tile(
@@ -293,6 +418,9 @@ def launch_gemm_a8w8_256x256(
         i32_cm: fx.Int32,
         tile_idx=0,
     ):
+        # Allow back-to-back WMMA issue (SCHED_MODE bit 4). Other gfx1250 MX
+        # GEMMs already set this; omitting it leaves a stall between MFMA waves.
+        rocdl.disable_xdl_arb_stall()
         K_TILES = i32_k // (tile_k * split_k)
         k64 = fx.Int64(i32_k)
         lda64 = fx.Int64(i32_lda)
@@ -301,8 +429,6 @@ def launch_gemm_a8w8_256x256(
 
         tid = fx.Int32(fx.thread_idx.x)
         bid_x, bid_y, bid_z = fx.block_idx
-        if const_expr(persistent_n_tiles > 1):
-            bid_y = bid_y + tile_idx * fx.Int32(fx.grid_dim.y)
         if const_expr(split_k > 1):
             m_chunks = fx.Int32(fx.grid_dim.z) // split_k
             split_idx = bid_z // m_chunks
@@ -312,6 +438,61 @@ def launch_gemm_a8w8_256x256(
             split_idx = fx.Int32(0)
             m_chunk = fx.Int32(0) if const_expr(batched) else bid_z
             kt_base = fx.Int64(0)
+        cm_rt = i32_cm if const_expr(use_cluster) else fx.Int32(1)
+        # Remap launch tiles before the persistent N advance so one CTA keeps a
+        # contiguous N strip. Local (lx, ly) inside a hardware cluster is fixed
+        # so A/B multicast peers stay a contiguous cm x cn tile block.
+        if const_expr(xcd_swizzle > 0):
+            _NUM_XCDS = 8
+            _cm = cm_rt
+            _cn = fx.Int32(cluster_n)
+            _gx = fx.Int32(fx.grid_dim.x)
+            _gy = fx.Int32(fx.grid_dim.y)
+            _lx = bid_x % _cm
+            _ly = bid_y % _cn
+            _n_cx = _gx // _cm
+            _n_cy = _gy // _cn
+            _cx = bid_x // _cm
+            _cy = bid_y // _cn
+            _m_ct = fx.Int32(fx.grid_dim.z) * _n_cx
+            _m_crow = m_chunk * _n_cx + _cx
+            _flat = _m_crow * _n_cy + _cy
+            _num = _m_ct * _n_cy
+            _xcd = _flat % fx.Int32(_NUM_XCDS)
+            _intra = _flat // fx.Int32(_NUM_XCDS)
+            _base = _num // fx.Int32(_NUM_XCDS)
+            _extra = _num % fx.Int32(_NUM_XCDS)
+            _clip = (_xcd < _extra).select(_xcd, _extra)
+            _wgid = _xcd * _base + _clip + _intra
+            if const_expr(xcd_swizzle == 1):
+                # Contiguous XCD order only: decode row-major, no M-group.
+                _m_crow2 = _wgid // _n_cy
+                _cy2 = _wgid - _m_crow2 * _n_cy
+            else:
+                # M-major groups of xcd_swizzle M tiles (= n/cm cluster rows).
+                _g = fx.Int32(xcd_swizzle) // _cm
+                _num_in_grp = _g * _n_cy
+                _first_m = (_wgid // _num_in_grp) * _g
+                _rem_m = _m_ct - _first_m
+                _gsz = (_rem_m < _g).select(_rem_m, _g)
+                _in_grp = _wgid % _num_in_grp
+                _m_crow2 = _first_m + _in_grp % _gsz
+                _cy2 = _in_grp // _gsz
+            m_chunk = _m_crow2 // _n_cx
+            _cx2 = _m_crow2 - m_chunk * _n_cx
+            bid_x = _cx2 * _cm + _lx
+            bid_y = _cy2 * _cn + _ly
+        # Position of this tile in the CTA's N strip; with rotate_n the strip
+        # starts at the cluster row's index (cluster-uniform, so multicast
+        # peers stay on one tile block) and wraps.
+        tile_pos = tile_idx
+        if const_expr(persistent_n_tiles > 1):
+            if const_expr(rotate_n):
+                cluster_row = m_chunk * (
+                    fx.Int32(fx.grid_dim.x) // cm_rt
+                ) + bid_x // cm_rt
+                tile_pos = (tile_idx + cluster_row) % fx.Int32(persistent_n_tiles)
+            bid_y = bid_y + tile_pos * fx.Int32(fx.grid_dim.y)
         wave = rocdl.readfirstlane(T.i32, tid // WAVE)
         lane = tid % WAVE
         lane16 = lane % 16
@@ -340,6 +521,28 @@ def launch_gemm_a8w8_256x256(
         blk_n64 = fx.Int64(blk_n)
         mn_oob = i32_m - blk_m  # valid M rows (A / C)
         a_oob = (mn_oob + 1) >> 1 if const_expr(a_preshuffle) else mn_oob
+        # Workgroups past N pad the last cluster column: they still multicast
+        # their real A to the column's peers and store nothing. Their own B is
+        # discarded; unless M is padded too, they load the real tile one
+        # cluster column back (else the last tile), as all-out-of-bounds B
+        # loads stall the cluster for several us when B is cold. With padded
+        # M the mirror loads cost more than they save.
+        n_oob = i32_n - blk_n
+        blk_n_ld, n_oob_ld = blk_n, n_oob
+        if const_expr(cluster_n > 1 and persistent_n_tiles == 1):
+            mirror_n = blk_n - cluster_n * tile_n
+            last_n = (i32_n > tile_n).select(i32_n - tile_n, fx.Int32(0))
+            mirror_n = (mirror_n >= 0).select(mirror_n, last_n)
+            pad_ld = n_oob <= 0
+            if const_expr(use_cluster):
+                m_tiles = (i32_m + (tile_m - 1)) // tile_m
+                pad_ld = pad_ld & ((m_tiles % cm_rt) == 0)
+            blk_n_ld = pad_ld.select(mirror_n, blk_n)
+            n_oob_ld = i32_n - blk_n_ld
+        blk_n64_ld = fx.Int64(blk_n_ld)
+        b_oob = n_oob_ld // 16
+        sb_oob = n_oob_ld // (32 if const_expr(mx32) else 128)
+        c_rows = (n_oob > 0).select(mn_oob, fx.Int32(0))
         sa_oob = (
             (
                 (i32_m + 31) // 32 - blk_m // 32
@@ -375,7 +578,7 @@ def launch_gemm_a8w8_256x256(
 
         k_elem0 = kt_base * tile_k
         a_off0 = blk_m64 * lda64 + k_elem0 * A_PAIR
-        b_off0 = (blk_n64 // 16) * Kp16 + k_elem0 * 16
+        b_off0 = (blk_n64_ld // 16) * Kp16 + k_elem0 * 16
         if const_expr(mx32):
             sa_row64 = (
                 fx.Int64(i32_stride_ascale_k) if const_expr(batched) else k64 // 32
@@ -386,13 +589,13 @@ def launch_gemm_a8w8_256x256(
                 else blk_m64 * sa_row64 + k_elem0 // 32
             )
             sb_k64 = k64 // 32 if const_expr(b_scale_32x32) else k64
-            sb_off0 = (blk_n64 // 32) * sb_k64 + (
+            sb_off0 = (blk_n64_ld // 32) * sb_k64 + (
                 k_elem0 // 32 if const_expr(b_scale_32x32) else k_elem0
             )
         else:
             scale_k0 = kt_base * K_WS
             sa_off0 = blk_m64 + scale_k0 * fx.Int64(i32_stride_ascale_k)
-            sb_off0 = (blk_n64 // 128) * (k64 // 128) + scale_k0
+            sb_off0 = (blk_n64_ld // 128) * (k64 // 128) + scale_k0
         if const_expr(batched):
             bat = fx.Int64(bid_z)
             n64 = fx.Int64(i32_n)
@@ -416,6 +619,12 @@ def launch_gemm_a8w8_256x256(
             pref_on = fx.Int64(n_adv) * k64 + (
                 BB_SLOT if BB_OK else C_EARLY_SLOTS - 1
             ) * B_LDS_ROW < fx.Int64(2**32)
+            if const_expr(rotate_n):
+                # The wrap steps back (persistent_n_tiles - 1) N strides.
+                pref_on = pref_on & (
+                    fx.Int64(n_adv) * k64 * (persistent_n_tiles - 1)
+                    < fx.Int64(2**32)
+                )
 
         gA = _gv(gA_base, a_off0, (A_LDS_ROWS, A_PAIR * tile_k), (A_PAIR * tile_k, 1))
         gB = _gv(
@@ -479,7 +688,7 @@ def launch_gemm_a8w8_256x256(
                 stride, mask, bound, pad, early = (
                     i32_k * 16,
                     b_mask,
-                    None,
+                    b_oob,
                     0,
                     True,
                 )
@@ -507,7 +716,7 @@ def launch_gemm_a8w8_256x256(
                 stride, mask, bound, pad, early = (
                     sb_gstride,
                     b_mask,
-                    None,
+                    sb_oob,
                     0,
                     True,
                 )
@@ -588,9 +797,14 @@ def launch_gemm_a8w8_256x256(
         )
 
         def _prepare_tdm(slot, tile_delta, sa_panel=0, sa_refill=1):
+            # tile_delta may be (delta, base_hi) to override the address high word.
+            base_hi = tdm_base_hi
+            if const_expr(isinstance(tile_delta, tuple)):
+                tile_delta, base_hi = tile_delta
             if const_expr(SA_PANEL_STAGES > 1):
-                slot = (wave == 2).select(sa_panel % num_buffers, fx.Int32(slot))
-                tile_delta = (wave == 2).select(sa_panel * SA_PANEL_WIDTH, tile_delta)
+                panel_wave = (wave >= 2) if const_expr(SB_PANEL) else (wave == 2)
+                slot = panel_wave.select(sa_panel % SA_RING, fx.Int32(slot))
+                tile_delta = panel_wave.select(sa_panel * SA_PANEL_WIDTH, tile_delta)
             desc = tdm_ops.update_tensor_descriptor_2d_lds_addr(
                 tdm_desc,
                 tdm_base_lds + tdm_lds_step * fx.Int32(slot),
@@ -598,18 +812,18 @@ def launch_gemm_a8w8_256x256(
             desc = tdm_ops.update_tensor_descriptor_2d_addr64(
                 desc,
                 tdm_base_lo,
-                tdm_base_hi,
+                base_hi,
                 tile_delta,
             )
             if const_expr(SA_PANEL_STAGES > 1):
                 desc = tdm_ops.clamp_tensor_descriptor_2d_inner_extent(
                     desc,
                     i32_k // 32 - fx.Int32(k_elem0 // 32) - sa_panel * SA_PANEL_WIDTH,
-                    wave == 2,
+                    panel_wave,
                 )
                 desc = tdm_ops.update_tensor_descriptor_2d_pred(
                     desc,
-                    (wave == 2).select(fx.Int32(sa_refill), fx.Int32(1)),
+                    panel_wave.select(fx.Int32(sa_refill), fx.Int32(1)),
                 )
             return desc
 
@@ -642,16 +856,49 @@ def launch_gemm_a8w8_256x256(
                         c_frags[(qm * half_m + im) * wmma_n_rep + qn * half_n + jn] = (
                             fx.make_rmem_tensor(8, fx.Float32)
                         )
-        for cf in c_frags:
-            cf.store(fx.constant_vector(0.0, T.vec(8, T.f32)))
+        # Pin Acc@512 so A/B ping-pong owns the low half (mxfp4 partition).
+        acc_zero = None
+        if const_expr(persistent_n_tiles > 1 and _HAS_SCHED_VGPR):
+            # A constant zero is loop-invariant, so its pinned copies get hoisted
+            # out of the tile loop and spilled; an opaque zero keeps them per tile.
+            zf = fx.Float32(
+                llvm_dialect.inline_asm(
+                    T.f32, [], "s_mov_b32 $0, 0", "=s", has_side_effects=True
+                )
+            )
+            acc_zero = Vec.from_elements([zf] * 8, fx.Float32)
+        def _zero_accs():
+            for cf_i, cf in enumerate(c_frags):
+                z = (
+                    fx.constant_vector(0.0, T.vec(8, T.f32))
+                    if const_expr(acc_zero is None)
+                    else acc_zero
+                )
+                if const_expr(_HAS_SCHED_VGPR):
+                    z = _pin_acc_vec(z, cf_i)
+                cf.store(z)
 
-        def _rmem(n, v):
+        # A single tile zeroes its accumulators behind the prologue TDMs, while the
+        # TDM queue is full; left in place they land after the first-stage wait.
+        ZERO_IN_PROLOGUE = persistent_n_tiles == 1
+        if const_expr(not ZERO_IN_PROLOGUE):
+            _zero_accs()
+
+        def _rmem(n, v, *, kind=None, slot=0, phase=0):
+            del phase
+            if const_expr(_HAS_SCHED_VGPR and kind == "a"):
+                v = _pin_a_frag(v, slot)
+            elif const_expr(_HAS_SCHED_VGPR and kind == "b"):
+                v = _pin_b_frag(v, slot)
             t = fx.make_rmem_tensor(n, fx.Int32)
             t.store(v)
             return t
 
         def _mma_one(wm, wn, act, wt, sa_k, sb_k):
             idx = wm * wmma_n_rep + wn
+            # Acc window is pinned once at zero-init; avoid per-MMA load/store
+            # re-pins (they break the soft-pipeline). Tighten later via
+            # tied-srcC pin if RA drifts.
             fx.gemm(
                 wmma_atoms[wn % 2 if mx32 else 0][wm % 2],
                 c_frags[idx],
@@ -777,15 +1024,44 @@ def launch_gemm_a8w8_256x256(
         lds_load_b128, _ = make_lds_copy_ops(128)
 
         DS_PER_FRAG = 4  # ds_load_b128 per 16-dword fragment
+        # Mid/long-K: ASM-style DS/WMMA sched hints. mx32 short-K stays on plain
+        # `_quad` (full WAR soft-pipe regresses there).
+        ASM_PIPE_ACTIVE = const_expr(k_tiles_class > 0)
+        # Mid-K: consecutive DS parking + 1×b128 producers (best on 25600×6144).
+        # One b128 per thunk needs the 16 MMA slots of a 4x4 quadrant.
+        DENSE_MIDK = const_expr(
+            ASM_PIPE_ACTIVE and k_tiles_class == 1 and half_m == 4 and half_n == 4
+        )
+        BEAT_ACTIVE = const_expr(ASM_PIPE_ACTIVE)
+        # Scale pin helps huge-N mid-K; global pin regresses short-K (~2×).
+        PIN_SCALE_ACTIVE = const_expr(
+            _HAS_SCHED_VGPR and k_tiles_class == 1 and persistent_n_tiles > 1
+        )
+        # a4w4 WAR soft-pipe: non-mx short-K only (mx32 mid-K stays on `_quad`).
         WAR_SCHED = const_expr(
-            k_tiles_class == 0
-            and tile_m == 256
+            tile_m == 256
             and half_m == 4
             and half_n == 4
+            and k_tiles_class == 0
             and not mx32
         )
-        # Load windows (first, last WMMA position a load may follow) per quadrant.
-        WAR_Q0, WAR_Q1, WAR_Q2, WAR_Q3 = (4, 15), (0, 11), (4, 11), (3, 10)
+
+        def _asm_sched_hint(n_ds_bursts):
+            rocdl.sched_mfma(1)
+            rocdl.sched_dsrd(2)
+            for _ in range_constexpr(n_ds_bursts):
+                rocdl.sched_mfma(1)
+                rocdl.sched_dsrd(DS_PER_FRAG)
+            rocdl.sched_barrier(0)
+
+        def _asm_beat():
+            rocdl.sched_mfma(1)
+            rocdl.sched_dsrd(DS_PER_FRAG)
+
+        if const_expr(ASM_PIPE_ACTIVE):
+            WAR_Q0, WAR_Q1, WAR_Q2, WAR_Q3 = (4, 15), (0, 15), (4, 15), (3, 15)
+        else:
+            WAR_Q0, WAR_Q1, WAR_Q2, WAR_Q3 = (4, 15), (0, 11), (4, 11), (3, 10)
         WAR_WAIT_AT = 3
         WAR_PERM_AT = 11
 
@@ -806,12 +1082,11 @@ def launch_gemm_a8w8_256x256(
 
         def _stage_load_frag(kind, stage, idx):
             addr, row, span = _frag_geom(kind, stage)
-            return _join(
-                [
-                    Vec(lds_load_b128(addr, idx * row + span * j))
-                    for j in range_constexpr(DS_PER_FRAG)
-                ]
-            )
+            parts = []
+            for j in range_constexpr(DS_PER_FRAG):
+                v = Vec(lds_load_b128(addr, idx * row + span * j))
+                parts.append(v)
+            return _join(parts)
 
         def _bcast_byte(word, sel):
             """E8M0 byte -> all four bytes of an i32, so the atom's scale opsel is a no-op.
@@ -821,28 +1096,50 @@ def launch_gemm_a8w8_256x256(
             """
             return fx.Int32(rocdl.perm_b32(word, word, sel))
 
-        def _stage_load_sa_raw(stage, sm, sa_super):
+        # An A-scale K-step is (rev, local): K-step rev * num_buffers + local, with
+        # rev a runtime K-loop revolution and local a constant.
+        def _sa_next(sa_pos, inc):
+            rev, local = sa_pos
+            if const_expr(local + inc == num_buffers):
+                return rev + 1, 0
+            return rev, local + inc
+
+        def _sa_panel(sa_pos):
+            """(panel, runtime K-step in panel, constant K-step in panel)."""
+            rev, local = sa_pos
+            if const_expr(SA_REV_PANEL):
+                revs = SA_PANEL_STAGES // num_buffers
+                return rev // revs, (rev % revs) * num_buffers, local
+            flat = rev * num_buffers + local
+            return flat // SA_PANEL_STAGES, flat % SA_PANEL_STAGES, 0
+
+        def _panel_scale_addr(sa_pos, stage, plane, stride, lane_byte):
+            """LDS base of a panel scale read and its constant byte offset."""
+            panel, step, step_c = _sa_panel(sa_pos)
+            addr = (
+                _planar_base(plane, stride, fx.index_cast(T.index, panel % SA_RING))
+                + lane_byte
+                + fx.index_cast(T.index, step * (SUPER_K // 32))
+            )
+            return addr, step_c * (SUPER_K // 32) + (stage % KPAIR) * (tile_k // 32)
+
+        def _stage_load_sa_raw(stage, sm, sa_pos):
             if const_expr(mx32):
                 if const_expr(SA_PANEL_STAGES > 1):
-                    panel = sa_super // SA_PANEL_STAGES
-                    panel_slot = panel % num_buffers
-                    panel_k = (sa_super % SA_PANEL_STAGES) * (SUPER_K // 32)
-                    addr = (
-                        _planar_base(
-                            PLANAR_SA_BASE,
-                            STAGE_SA,
-                            fx.index_cast(T.index, panel_slot),
-                        )
-                        + sa_byte
-                        + fx.index_cast(T.index, panel_k)
-                        + (stage % KPAIR) * (tile_k // 32)
+                    addr, off = _panel_scale_addr(
+                        sa_pos, stage, PLANAR_SA_BASE, STAGE_SA, sa_byte
                     )
-                    return lds_load_b32(addr, sm * 32 * SA_PANEL_ROW)[0]
+                    return lds_load_b32(addr, off + sm * 32 * SA_PANEL_ROW)[0]
                 # sm advances 32 A rows: 32 * (SUPER_K/32) bytes in row-major LDS.
                 return lds_load_b32(stage_sa_addr[stage], sm * SUPER_K)[0]
             return lds_load_b32(stage_sa_addr[stage], sm * 32)[0]
 
-        def _stage_load_sb_raw(stage, sn):
+        def _stage_load_sb_raw(stage, sn, sa_pos):
+            if const_expr(SB_PANEL):
+                addr, off = _panel_scale_addr(
+                    sa_pos, stage, PLANAR_SB_BASE, STAGE_SB, sb_byte
+                )
+                return lds_load_b32(addr, off + sn * SB_ROW)[0]
             if const_expr(mx32):
                 return lds_load_b32(stage_sb_addr[stage], sn * SB_ROW)[0]
             return lds_load_b32(stage_sb_addr[stage], 0)[0]
@@ -867,23 +1164,20 @@ def launch_gemm_a8w8_256x256(
             for sm in range_constexpr(N_SA):
 
                 def _go_sa(sm=sm):
-                    seed_sa[sm].store(
-                        Vec.from_elements(
-                            [_stage_load_sa_raw(stage, sm, sa_super)],
-                            fx.Int32,
-                        )
-                    )
+                    # Optional pin of scale *load result* (not LDS address).
+                    w = _stage_load_sa_raw(stage, sm, sa_super)
+                    if const_expr(PIN_SCALE_ACTIVE):
+                        w = _pin_scale_word(w, sm)
+                    seed_sa[sm].store(Vec.from_elements([w], fx.Int32))
 
                 head.append(_go_sa)
             for sn in range_constexpr(N_SB):
 
                 def _go_sb(sn=sn):
-                    seed_sb[sn].store(
-                        Vec.from_elements(
-                            [_stage_load_sb_raw(stage, sn)],
-                            fx.Int32,
-                        )
-                    )
+                    w = _stage_load_sb_raw(stage, sn, sa_super)
+                    if const_expr(PIN_SCALE_ACTIVE):
+                        w = _pin_scale_word(w, N_SA + sn)
+                    seed_sb[sn].store(Vec.from_elements([w], fx.Int32))
 
                 head.append(_go_sb)
             a_thunks, b_thunks = [], []
@@ -952,17 +1246,24 @@ def launch_gemm_a8w8_256x256(
 
             def _prep():
                 if const_expr(SA_PANEL_STAGES > 1):
-                    sa_next_panel = sa_super // SA_PANEL_STAGES + num_buffers
-                    sa_refill = (sa_super % SA_PANEL_STAGES == SA_PANEL_STAGES - 1) & (
-                        sa_next_panel
-                        < (SUPERS + SA_PANEL_STAGES - 1) // SA_PANEL_STAGES
-                    )
+                    panel, step, step_c = _sa_panel(sa_super)
+                    sa_next_panel = panel + SA_RING
+                    if const_expr(SA_REV_PANEL and step_c != num_buffers - 1):
+                        sa_refill = fx.Int32(0)
+                    else:
+                        sa_refill = (
+                            (step + step_c == SA_PANEL_STAGES - 1)
+                            & (
+                                sa_next_panel
+                                < (SUPERS + SA_PANEL_STAGES - 1) // SA_PANEL_STAGES
+                            )
+                        ).select(fx.Int32(1), fx.Int32(0))
                     if const_expr(refill):
                         prep_box[0] = _prepare_tdm(
                             future_slot,
                             future_kt,
                             sa_next_panel,
-                            sa_refill.select(fx.Int32(1), fx.Int32(0)),
+                            sa_refill,
                         )
                 elif const_expr(refill):
                     prep_box[0] = _prepare_tdm(future_slot, future_kt)
@@ -982,26 +1283,48 @@ def launch_gemm_a8w8_256x256(
             ):
                 if const_expr(pre is not None):
                     pre()
-                last = const_expr(max(produce) if produce else -1)
+                # a4w4 / short-beat: delimit the quadrant as one sched region.
+                if const_expr(BEAT_ACTIVE):
+                    rocdl.sched_barrier(0)
+                lead_positions = sorted(produce)
+                n_lead = len(lead_positions)
+                last = const_expr(lead_positions[-1] if n_lead else -1)
                 for pos in range_constexpr(half_m * half_n):
-                    _mma_block_range(
-                        wm0,
-                        wn0,
-                        act,
-                        wt,
-                        sa_k,
-                        sb_k,
-                        pos,
-                        1,
-                        n_fast,
-                    )
-                    if const_expr(pos in produce):
-                        produce[pos]()
-                    if const_expr(pos == last):
-                        for _ in range_constexpr(2 * len(produce)):
-                            rocdl.sched_mfma(1)
-                            rocdl.sched_dsrd(DS_PER_FRAG // 2)
-                        rocdl.sched_barrier(0)
+                    do_load = const_expr(pos in produce)
+
+                    def _do_mma(pos=pos):
+                        _mma_block_range(
+                            wm0,
+                            wn0,
+                            act,
+                            wt,
+                            sa_k,
+                            sb_k,
+                            pos,
+                            1,
+                            n_fast,
+                        )
+
+                    def _do_load(do_load=do_load, pos=pos):
+                        if const_expr(do_load):
+                            produce[pos]()
+                            # Per-producer beat: 1 WMMA : 4 ds_load locally so
+                            # LLVM is less likely to emit va_vdst(0) between them.
+                            if const_expr(BEAT_ACTIVE):
+                                _asm_beat()
+
+                    # MMA then load: the load refills a pinned fragment slot that
+                    # this slot's WMMA may still read.
+                    _do_mma()
+                    _do_load()
+                    if const_expr(pos == last and n_lead):
+                        if const_expr(BEAT_ACTIVE):
+                            _asm_sched_hint(max(0, n_lead - 1))
+                        else:
+                            for _ in range_constexpr(2 * n_lead):
+                                rocdl.sched_mfma(1)
+                                rocdl.sched_dsrd(DS_PER_FRAG // 2)
+                            rocdl.sched_barrier(0)
                 if const_expr(post is not None):
                     post()
 
@@ -1016,18 +1339,21 @@ def launch_gemm_a8w8_256x256(
                 parts = {}
 
                 def _load(i, j):
-                    parts.setdefault(i, []).append(
-                        Vec(
-                            lds_load_b128(
-                                addr,
-                                (half * n + i) * row + span * j,
-                            )
+                    v = Vec(
+                        lds_load_b128(
+                            addr,
+                            (half * n + i) * row + span * j,
                         )
                     )
+                    parts.setdefault(i, []).append(v)
                     if const_expr(j == DS_PER_FRAG - 1):
-                        nxt[key][i] = _rmem(16, _join(parts[i]))
+                        nxt[key][i] = _rmem(16, _join(parts[i]), kind=kind, slot=i)
 
-                per = const_expr(DS_PER_FRAG if mx32 or tile_m != 256 else 1)
+                # Mid-K: split to one b128 per thunk (fills the quadrant; best
+                # absolute on 6144). Else one thunk = DS_PER_FRAG×b128 burst.
+                per = const_expr(
+                    1 if DENSE_MIDK else (DS_PER_FRAG if mx32 or tile_m != 256 else 1)
+                )
                 return [
                     (
                         lambda i=i, base=base: [
@@ -1086,8 +1412,12 @@ def launch_gemm_a8w8_256x256(
                 # Every fragment dies only in the last four WMMAs of a quadrant and
                 # every load issues at least four WMMAs after the latest death, so
                 # no ds_load overwrites VGPRs that an in-flight WMMA still reads.
-                a0 = [_rmem(16, t.load()) for t in seed_a]
-                b0 = [_rmem(16, t.load()) for t in seed_b]
+                a0 = [
+                    _rmem(16, t.load(), kind="a", slot=i) for i, t in enumerate(seed_a)
+                ]
+                b0 = [
+                    _rmem(16, t.load(), kind="b", slot=i) for i, t in enumerate(seed_b)
+                ]
                 frags = {}
 
                 def _frag_thunks(kind, stg, idx, dest):
@@ -1095,7 +1425,8 @@ def launch_gemm_a8w8_256x256(
                     parts = []
 
                     def _one(j):
-                        parts.append(Vec(lds_load_b128(addr, idx * row + span * j)))
+                        v = Vec(lds_load_b128(addr, idx * row + span * j))
+                        parts.append(v)
                         if const_expr(j == DS_PER_FRAG - 1):
                             dest(_join(parts))
 
@@ -1107,8 +1438,8 @@ def launch_gemm_a8w8_256x256(
                     out = []
                     for i in range_constexpr(n):
 
-                        def _set(v, i=i):
-                            frags[key][i] = _rmem(16, v)
+                        def _set(v, i=i, kind=kind):
+                            frags[key][i] = _rmem(16, v, kind=kind, slot=i)
 
                         out += _frag_thunks(kind, stage, n + i, _set)
                     return out
@@ -1128,23 +1459,37 @@ def launch_gemm_a8w8_256x256(
                     return out
 
                 def _seed_scales():
-                    sa_next = sa_super + int(stage % KPAIR == KPAIR - 1)
+                    sa_next = _sa_next(sa_super, int(stage % KPAIR == KPAIR - 1))
                     for sm in range_constexpr(N_SA):
-                        seed_sa[sm].store(
-                            Vec.from_elements(
-                                [_stage_load_sa_raw(next_stage, sm, sa_next)], fx.Int32
-                            )
-                        )
+                        w = _stage_load_sa_raw(next_stage, sm, sa_next)
+                        if const_expr(PIN_SCALE_ACTIVE):
+                            w = _pin_scale_word(w, sm)
+                        seed_sa[sm].store(Vec.from_elements([w], fx.Int32))
                     for sn in range_constexpr(N_SB):
-                        seed_sb[sn].store(
-                            Vec.from_elements(
-                                [_stage_load_sb_raw(next_stage, sn)], fx.Int32
-                            )
-                        )
+                        w = _stage_load_sb_raw(next_stage, sn, sa_next)
+                        if const_expr(PIN_SCALE_ACTIVE):
+                            w = _pin_scale_word(w, N_SA + sn)
+                        seed_sb[sn].store(Vec.from_elements([w], fx.Int32))
 
                 def _spread(thunks, lo, hi):
                     out = {}
                     if const_expr(len(thunks) == 0):
+                        return out
+                    # ASM: ~4× ds_load_b128 per WMMA as one burst. Default: park
+                    # bursts on spaced MMA slots in [lo, hi]. Mid-K dense: park
+                    # consecutive slots from ``lo`` (tighter WMMA↔DS packing).
+                    if const_expr(ASM_PIPE_ACTIVE):
+                        n = len(thunks)
+                        n_bursts = (n + DS_PER_FRAG - 1) // DS_PER_FRAG
+                        span = hi - lo + 1
+                        for b in range_constexpr(n_bursts):
+                            if const_expr(DENSE_MIDK):
+                                slot = min(lo + b, hi)
+                            else:
+                                slot = lo + (b * span) // n_bursts
+                            beg = b * DS_PER_FRAG
+                            end = min(beg + DS_PER_FRAG, n)
+                            out.setdefault(slot, []).extend(thunks[beg:end])
                         return out
                     pos = list(range(lo, hi + 1))
                     for t_i, t in enumerate(thunks):
@@ -1174,6 +1519,14 @@ def launch_gemm_a8w8_256x256(
                         pre()
                     if const_expr(head is not None):
                         head()
+                    # Producer slots that issue ≥1 ds thunk (a4w4-style n_lead).
+                    lead_positions = sorted(p for p, ts in loads.items() if ts)
+                    n_lead = len(lead_positions)
+                    last_lead = lead_positions[-1] if n_lead else -1
+                    # Delimit a sched region so `_asm_sched_hint` can partition
+                    # WMMA vs ds_load inside this quadrant (a4w4 pattern).
+                    if const_expr(ASM_PIPE_ACTIVE):
+                        rocdl.sched_barrier(0)
                     for pos in range_constexpr(len(order)):
                         i, j = order[pos]
                         _mma_one(wm0 + i, wn0 + j, act[i], wt[j], sa_k, sb_k)
@@ -1181,7 +1534,10 @@ def launch_gemm_a8w8_256x256(
                             at[pos]()
                         for t in loads.get(pos, []):
                             t()
-                        if const_expr(pos >= free - 1):
+                        # Closing a4w4-style region hint after the last producer.
+                        if const_expr(ASM_PIPE_ACTIVE and pos == last_lead and n_lead):
+                            _asm_sched_hint(max(0, n_lead - 1))
+                        elif const_expr((not ASM_PIPE_ACTIVE) and pos >= free - 1):
                             rocdl.sched_barrier(0)
 
                 def _perm_seeds():
@@ -1283,7 +1639,7 @@ def launch_gemm_a8w8_256x256(
                 _seed_thunks(
                     next_stage,
                     parity,
-                    sa_super + int(stage % KPAIR == KPAIR - 1),
+                    _sa_next(sa_super, int(stage % KPAIR == KPAIR - 1)),
                 )
                 if const_expr(has_next)
                 else ([], [])
@@ -1301,20 +1657,33 @@ def launch_gemm_a8w8_256x256(
             ), "tail seeds collide with the Q3 early seeds"
             q3.update(dict(zip(tail_at, tail)))
 
-            def _seq(thunks, extra=()):
-                out = {i: t for i, t in enumerate(thunks)}
+            def _seq(thunks, extra=(), start=0):
+                # ASM_PIPE Q0 uses start=4 (WAR gap). Mid-K may bump 0→1 for a
+                # leading pure WMMA when producers leave a free slot.
+                n_slots = half_m * half_n
+                if const_expr(
+                    DENSE_MIDK and start == 0 and (1 + len(thunks) <= n_slots)
+                ):
+                    start = 1
                 assert (
-                    len(thunks) <= half_m * half_n
+                    start + len(thunks) <= n_slots
                 ), "producer thunks overflow the quadrant"
+                out = {start + i: t for i, t in enumerate(thunks)}
                 for k in range_constexpr(len(extra)):
                     at = min(
-                        len(thunks) - 1,
-                        (len(thunks) // len(extra)) * (k + 1) - 1,
+                        start + len(thunks) - 1,
+                        start + (len(thunks) // len(extra)) * (k + 1) - 1,
                     )
                     out[at] = lambda p=out[at], q=extra[k]: (p(), q())
                 return out
 
             sched_fence = lambda: rocdl.sched_barrier(0)
+            # Mid-K: dense from slot 0. Else WAR gap (start=4) on 256/half=4.
+            q0_start = (
+                0
+                if const_expr(DENSE_MIDK)
+                else (4 if const_expr(ASM_PIPE_ACTIVE and half_m == 4) else 0)
+            )
             q1_fast = const_expr(parity == 0 if mx32 else parity == 1)
             if const_expr(parity == 0):
                 # (A0,B0) -> (A0,B1) -> (A1,B1) -> (A1,B0); produce b1 then a1.
@@ -1323,7 +1692,7 @@ def launch_gemm_a8w8_256x256(
                     0,
                     a0,
                     b0,
-                    _seq(_mk("b", 1, "b1")),
+                    _seq(_mk("b", 1, "b1"), start=q0_start),
                     False,
                 )
                 _quad(
@@ -1360,7 +1729,7 @@ def launch_gemm_a8w8_256x256(
                     0,
                     a0,
                     b0,
-                    _seq(_mk("a", 1, "a1")),
+                    _seq(_mk("a", 1, "a1"), start=q0_start),
                     True,
                 )
                 _quad(
@@ -1402,13 +1771,31 @@ def launch_gemm_a8w8_256x256(
             had_prev_tile = (tile_idx > 0) & pref_on
             n_pref = (drain_s < C_EARLY_SLOTS).select(drain_s, fx.Int32(C_EARLY_SLOTS))
             prev_pref = had_prev_tile.select(n_pref, fx.Int32(0))
+            pref_shift = tdm_tile_shift
+            if const_expr(rotate_n):
+                # The wrap steps back (persistent_n_tiles - 1) N strides: the
+                # negative delta goes in as its unsigned 32-bit value, and one is
+                # borrowed from the address high word to cancel the carry.
+                wrap = (tile_pos == fx.Int32(persistent_n_tiles - 1)) & (
+                    tdm_tile_shift != fx.Int32(0)
+                )
+                pref_shift = wrap.select(
+                    tdm_tile_shift * fx.Int32(1 - persistent_n_tiles), tdm_tile_shift
+                )
+                hi_borrow = (
+                    ((tdm_base_hi & fx.Int32(0x3FFFFFFF)) - fx.Int32(1))
+                    & fx.Int32(0x3FFFFFFF)
+                ) | (tdm_base_hi & fx.Int32(-0x40000000))
+                pref_hi = wrap.select(hi_borrow, tdm_base_hi)
             pref_delta = [
                 (fx.Int32(s) * tdm_global_step < last_delta).select(
                     fx.Int32(s) * tdm_global_step, last_delta
                 )
-                + tdm_tile_shift
+                + pref_shift
                 for s in range_constexpr(BB_SLOT + 1 if BB_OK else C_EARLY_SLOTS)
             ]
+            if const_expr(rotate_n):
+                pref_delta = [(d, pref_hi) for d in pref_delta]
         # bb_on: this K split has four drain K-steps and a steady loop. defer: this
         # tile's slots C_EARLY_SLOTS.. wait for the previous C store until its first
         # refill. pref_bb: this wave lands the next tile's K-tile 2 in the drain.
@@ -1428,13 +1815,22 @@ def launch_gemm_a8w8_256x256(
 
         for i in range_constexpr(num_buffers):
             if const_expr(c_relocate and i == C_EARLY_SLOTS):  # noqa: SIM102
-                # Slots from here on hold the previous tile's C until its TDM
-                # store, and every peer's, has read it out of LDS.
+                # Slots from here on hold the previous tile's C until its store
+                # (ds_load for C_VMEM, TDM otherwise), and every peer's, has read
+                # it out of LDS.
                 if tile_idx > 0:  # noqa: SIM102
                     if defer == 0:
                         rocdl.sched_barrier(0)
-                        tdm_ops.tensor_wait(0)
-                        workgroup_barrier(use_cluster=False)
+                        if const_expr(C_VMEM):
+                            rocdl.s_wait_dscnt(0)
+                            rocdl.s_barrier_signal(-1)
+                            rocdl.s_barrier_wait(-1)
+                            if const_expr(use_cluster):
+                                cluster.cluster_signal_once_per_wg()
+                                cluster.cluster_wait()
+                        else:
+                            tdm_ops.tensor_wait(0)
+                            workgroup_barrier(use_cluster=False)
             seed_delta = _seed_delta(i)
             if const_expr(c_relocate and i < C_EARLY_SLOTS):
                 if fx.Int32(i) >= prev_pref:
@@ -1443,15 +1839,28 @@ def launch_gemm_a8w8_256x256(
                 if defer == 0:
                     tdm_ops.tensor_load_2d(_prepare_tdm(i, seed_delta))
             elif const_expr(SA_PANEL_STAGES > 1):
-                sa_seed = (fx.Int32(i * SA_PANEL_STAGES) < SUPERS).select(
-                    fx.Int32(1), fx.Int32(0)
+                sa_seed = (
+                    (fx.Int32(i * SA_PANEL_STAGES) < SUPERS).select(
+                        fx.Int32(1), fx.Int32(0)
+                    )
+                    if const_expr(i < SA_RING)
+                    else fx.Int32(0)
                 )
                 tdm_ops.tensor_load_2d(
                     _prepare_tdm(i, seed_delta, fx.Int32(i), sa_seed)
                 )
             else:
                 tdm_ops.tensor_load_2d(_prepare_tdm(i, seed_delta))
-        pipeline_fence(outstanding=num_buffers - 1, use_cluster=False)
+            if const_expr(ZERO_IN_PROLOGUE and i == max(num_buffers - 2, 0)):
+                rocdl.sched_barrier(0)
+                _zero_accs()
+                rocdl.sched_barrier(0)
+        if const_expr(C_VMEM):
+            tdm_ops.tensor_wait(num_buffers - 1)
+            rocdl.s_barrier_signal(-1)
+            rocdl.s_barrier_wait(-1)
+        else:
+            pipeline_fence(outstanding=num_buffers - 1, use_cluster=False)
 
         def _deferred_slots():
             """First refill of a deferring tile: wait out every wave's C store in the
@@ -1466,7 +1875,7 @@ def launch_gemm_a8w8_256x256(
                 tdm_ops.tensor_load_2d(_prepare_tdm(s, _seed_delta(s)))
             rocdl.sched_barrier(0)
 
-        for group in _seed_thunks(0, 0, fx.Int32(0)):
+        for group in _seed_thunks(0, 0, (fx.Int32(0), 0)):
             for thunk in group:
                 thunk()
         if const_expr(WAR_SCHED):
@@ -1516,7 +1925,7 @@ def launch_gemm_a8w8_256x256(
                         True,
                         boundary,
                         owner_parity,
-                        rev * num_buffers + g // KPAIR,
+                        (rev, g // KPAIR),
                         first_hook=(
                             _first_refill if const_expr(BB_OK and g == 0) else None
                         ),
@@ -1560,7 +1969,7 @@ def launch_gemm_a8w8_256x256(
                     False,
                     g % KPAIR == KPAIR - 1,
                     0,
-                    n_full * num_buffers + g // KPAIR,
+                    (fx.Int32(n_full), g // KPAIR),
                     prefetch=const_expr(DRAIN_PREF[g] or (BB_OK and g == BB_SLOT)),
                     fence_extra=DRAIN_PREF_BEFORE[g],
                     pref_gate=pref_bb if const_expr(BB_OK and g == BB_SLOT) else None,
@@ -1572,7 +1981,11 @@ def launch_gemm_a8w8_256x256(
             for c in range_constexpr(C_EARLY_SLOTS + 1):
                 if n_out == c:
                     tdm_ops.tensor_wait(c)
-            workgroup_barrier(use_cluster=False)
+            if const_expr(C_VMEM):
+                rocdl.s_barrier_signal(-1)
+                rocdl.s_barrier_wait(-1)
+            else:
+                workgroup_barrier(use_cluster=False)
         else:
             pipeline_fence(outstanding=0, use_cluster=use_cluster)
         gC_base = fx.recast_iter(
@@ -1603,9 +2016,46 @@ def launch_gemm_a8w8_256x256(
                     )
             rocdl.s_wait_dscnt(0)
             rocdl.sched_barrier(0)
-            q_rows = mn_oob - wmb
+            q_rows = c_rows - wmb
             q_rows = (q_rows < warp_tile_m).select(q_rows, fx.Int32(warp_tile_m))
             q_rows = (q_rows > 0).select(q_rows, fx.Int32(0))
+            if const_expr(C_VMEM):
+                # Soft-pipe ds_load / buffer_store (depth 2): hide LDS latency
+                # without the store-burst backpressure of issuing all loads first.
+                row_b = Q_LDS_ROW * 2
+                c_base = buf_base_i64(arg_c) + (
+                    (blk_m64 + fx.Int64(wmb)) * ldc64 + blk_n64 + fx.Int64(wnb)
+                ) * fx.Int64(partial_bytes)
+                c_rec = fx.Int32(rocdl.readfirstlane(T.i32, q_rows)) * (
+                    i32_ldc * partial_bytes
+                )
+                cbuf = ptr_buf_tensor(
+                    c_base, elem=fx.Int32, unit_elems=4, num_records_bytes=c_rec
+                )
+                lrow, lc16 = lane // 16, lane % 16
+                q_lds = fx.index_cast(T.index, fx.ptrtoint(q_ptrs[0])) + fx.index_cast(
+                    T.index, lrow * row_b + lc16 * 16
+                )
+                ldc16 = i32_ldc * partial_bytes // 16
+                n_store = warp_tile_m // 2
+
+                def _c_store(it, v):
+                    buf_copy_store(
+                        cbuf,
+                        (fx.Int32(it * 2) + lrow) * ldc16 + lc16,
+                        v,
+                        elem=fx.Int32,
+                        unit_elems=4,
+                        cache_modifier=C_STORE_TH_NT,
+                    )
+
+                v0 = lds_load_b128(q_lds, 0)
+                for it in range_constexpr(1, n_store):
+                    v1 = lds_load_b128(q_lds, it * 2 * row_b)
+                    _c_store(it - 1, v0)
+                    v0 = v1
+                _c_store(n_store - 1, v0)
+        if const_expr(c_relocate and not C_VMEM):
             for part, row0, n_rows in (
                 (0, 0, Q_SPLIT),
                 (1, Q_SPLIT, warp_tile_m - Q_SPLIT),
@@ -1642,7 +2092,7 @@ def launch_gemm_a8w8_256x256(
                     atomQ, 0, fx.make_layout(1, 1), sQ, blkQ
                 )
                 fx.copy(atomQ, tQs[None, 0], tQg[None, 0])
-        elif const_expr(fuse_quant_out):
+        elif const_expr(not c_relocate and fuse_quant_out):
             # Group-32 MXFP8 quant straight from the accumulators. A lane holds
             # 8 consecutive columns of one row per 16x16 tile (kgrp*8), so a
             # 32-column group is two adjacent tiles across lanes l and l^16:
@@ -1717,7 +2167,7 @@ def launch_gemm_a8w8_256x256(
             # scale, so each row is a single small store.
             for rr in range_constexpr((tile_m + block - 1) // block):
                 srow_rel = fx.Int32(tid) + rr * block
-                if (srow_rel < tile_m) and (srow_rel < mn_oob):
+                if (srow_rel < tile_m) and (srow_rel < c_rows):
                     sv = fx.ptr_load(
                         fx.add_offset(lds8, fx.Int64(S8_OFF + srow_rel * GN)),
                         result_type=T.vec(GN, T.i8),
@@ -1729,7 +2179,7 @@ def launch_gemm_a8w8_256x256(
                         ),
                     )
             C8_TILE = (tile_m, C8_ROW)
-            gtC8 = _gv(gC8_base, c8_off, (mn_oob, tile_n), (ldc64, 1))
+            gtC8 = _gv(gC8_base, c8_off, (c_rows, tile_n), (ldc64, 1))
             atomC8, coordC8 = fx.rocdl.cdna5.make_tiled_tdm_atom(
                 fx.rocdl.TensorStore(),
                 gtC8,
@@ -1744,7 +2194,7 @@ def launch_gemm_a8w8_256x256(
             )
             fx.copy(atomC8, tC8s[None, 0], tC8g[None, 0])
             tdm_ops.tensor_wait(0)
-        else:
+        elif const_expr(not c_relocate):
             for wm in range_constexpr(wmma_m_rep):
                 row_rel = wmb + wm * 16 + lane16
                 if const_expr(cluster_splitk):
@@ -1785,12 +2235,12 @@ def launch_gemm_a8w8_256x256(
                     c_lds_row=C_LDS_ROW,
                     split_k=split_k,
                     split_idx=split_idx,
-                    mn_oob=mn_oob,
+                    mn_oob=c_rows,
                     flat_tile=_flat_tile,
                 )
             else:
                 c_tile = (tile_m, C_LDS_ROW)
-                gtC = _gv(gC_base, c_off_rt, (mn_oob, tile_n), (ldc64, 1))
+                gtC = _gv(gC_base, c_off_rt, (c_rows, tile_n), (ldc64, 1))
                 atomC, coordC = fx.rocdl.cdna5.make_tiled_tdm_atom(
                     fx.rocdl.TensorStore(),
                     gtC,
@@ -1855,6 +2305,8 @@ def launch_gemm_a8w8_256x256(
     cm = i32_cm if const_expr(use_cluster) else 1
     gx = (i32_m + (tile_m - 1)) // tile_m
     gy = (N + (tile_n - 1)) // tile_n
+    if const_expr(persistent_n_tiles == 1):
+        gy = ((gy + (cluster_n - 1)) // cluster_n) * cluster_n
     gx = (((gx > 0).select(gx, fx.Int32(1)) + (cm - 1)) // cm) * cm
     # Split gx exactly, so no workgroup is left over to recompute a duplicate tile.
     pow2 = gx & -gx
