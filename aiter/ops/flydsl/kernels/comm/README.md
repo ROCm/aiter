@@ -25,6 +25,7 @@ The host classes are in `aiter/ops/flydsl/`:
 |---|---|
 | `one_shot_allreduce.py` | `OneShotAllReduce` and `OneShotAllReduceRMSNorm`, the host classes for the one-shot kernel. |
 | `quick_allreduce.py` | `FlyQuickAllReduce` and `FlyQuickAllReduceRMSNorm`, the host classes for the mesh and the ring (and, fused only, the pull). |
+| `quick_allreduce_relay.py` | Uncached IPC bounce buffers on lending GPUs for the TP2 mesh relay. |
 | `pull_allreduce_rmsnorm.py` | `PullAllReduceRMSNorm`, the engine behind `FlyQuickAllReduceRMSNorm(algorithm="pull")`. |
 | `allreduce_policy.py` | The limits and the values each kernel can build, the policy records, and the tables: the payload-size boundaries between the three kernels and the tuning ladders, for the plain and the fused all-reduce. |
 | `comm_collectives_host_shared.py` | IPC inbox setup, link detection and other host helpers. |
@@ -61,6 +62,18 @@ lap. In each lap, each rank pushes to all `N-1` peers. Both laps use the same
 wire format. The default is INT4 with one E5M2 scale for each group of 16
 values. INT5 and INT6 use the same scale and add more bits for each value. FP16
 sends the values without quantization and is used in testing.
+
+At TP2 on xGMI, `FlyQuickAllReduce(..., relay_devices=(r01, r10))` is an opt-in
+path (never enabled by production dispatch) that routes `b % den < num` blocks
+through uncached IPC bounce buffers on lending GPUs (`r01 == r10` uses one GPU
+for both directions). On `gfx950` it defaults to `3/8` from 480 KiB up
+(1.37–1.56× faster than direct at 5–120 MiB); `3/8` fills whole XCDs and keeps
+slowdown to concurrent work on the lending GPUs low. Relay stores are system
+scope (`sc0 sc1 nt`) so `vmcnt(0)` orders them before the peer's inbox flag;
+relay reads use plain loads behind a per-tile agent-scope `buffer_inv sc1`
+after the first tile (L1 retains uncached lines on `gfx950`, while bypassing L1
+slows concurrent GEMMs on the lending GPU). Allocating a bounce from a TP
+process initializes a HIP context (~490 MB) on each lending GPU.
 
 ### Ring
 
@@ -321,7 +334,7 @@ the rung of the call itself. A capture at another payload size then finds every
 binary ready.
 
 Each of the three ways is a collective. It builds the engines, compiles and
-loads the binaries, and then ranks agree on success. In step 3, 
+loads the binaries, and then ranks agree on success. In step 3,
 `should_fly_fused_ar_rms` does this, before the dispatcher commits to
 the fused path.
 
@@ -335,8 +348,8 @@ the fused path.
 #### Memory per width
 
 Each (family, hidden size) builds one engine for each distinct config in its
-ladder. The mesh and the ring always also build the ST=1 engine, their fallback 
-for payloads with fewer tiles than the super-tile. Callers that use 
+ladder. The mesh and the ring always also build the ST=1 engine, their fallback
+for payloads with fewer tiles than the super-tile. Callers that use
 `allreduce_rmsnorm_mxfp4` directly get a second set of engines for the MXFP4
 variant.
 
