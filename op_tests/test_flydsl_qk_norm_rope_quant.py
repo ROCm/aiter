@@ -73,7 +73,7 @@ def _e8m0_encode_ref(amax_safe):
 
     Delegates the e8m0-byte derivation to the shared CPU helper
     ``fp4_utils.f32_to_mx_e8m0_scale(mode=MX_DEFAULT_ROUND_MODE,
-    dtype=FP8_E4M3)`` -- the single source the HIP / FlyDSL kernels mirror --
+    dtype=<device fp8>)`` -- the single source the HIP / FlyDSL kernels mirror --
     so the test follows the project-wide default instead of hard-coding
     RoundUp. (moe_sorting confirms this CPU helper matches the reciprocal-
     multiply HIP kernel byte-for-byte; qk_norm only compares dequant output
@@ -86,9 +86,14 @@ def _e8m0_encode_ref(amax_safe):
     from aiter.utility import fp4_utils
     from aiter.utility.mx_types import MX_DEFAULT_ROUND_MODE, MxDtype
 
+    mx_dtype = (
+        MxDtype.FP8_E4M3_FNUZ
+        if _FP8_DTYPE == torch.float8_e4m3fnuz
+        else MxDtype.FP8_E4M3
+    )
     e8m0_biased = (
         fp4_utils.f32_to_mx_e8m0_scale(
-            amax_safe.float(), mode=MX_DEFAULT_ROUND_MODE, dtype=MxDtype.FP8_E4M3
+            amax_safe.float(), mode=MX_DEFAULT_ROUND_MODE, dtype=mx_dtype
         )
         .view(torch.uint8)
         .to(torch.int64)
