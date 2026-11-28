@@ -21,6 +21,7 @@ from .conv3d_gfx950_utils import (
     CONV_COMPILE_HINTS,
     DEFAULT_TILE,
     LDG_VEC,
+    MFMA_M,
     TILES_PER_BARRIER,
     DynShapeArgs,
     LdsStager,
@@ -454,7 +455,19 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
         patch.bind_block(tid, m0)
         weights.bind_block(tid, blk.n_offset, blk.n_local)
         stager = LdsStager(cfg, elem_ty, tid)
-        a_offs = [patch.lane_offset(row) + col for row, col in mma.a_rows()]
+        # A wave's M atoms are wave_m * MFMA_M rows apart (the tiled MMA strides
+        # them by the wave grid). Derived from the lane's row instead, their
+        # offsets look unrelated to the compiler, which then keeps one address
+        # register per atom and tap: ~70 VGPRs at wave_m = 4.
+        a_rows = mma.a_rows()
+        row0, col0 = a_rows[0]
+        base_off = patch.lane_offset(row0) + col0
+        a_offs = []
+        for mi, (row, col) in enumerate(a_rows):
+            delta = patch.row_step_offset(mi * cfg.wave_m * MFMA_M)
+            a_offs.append(
+                base_off + delta if delta is not None else patch.lane_offset(row) + col
+            )
 
         def load_patch(g, rounds):
             kt_i, cc = KH_GROUPS[g]

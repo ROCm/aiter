@@ -12,6 +12,12 @@ to end, so the tables are tuned for that call. The table has no layout column:
 an NCDHW caller gets the same row, picked for the NDHWC-output kernel, and
 pays a pre-transpose on top that no tile choice affects.
 
+The timed call is the conv kernel alone: its operands are prepared once per
+shape (channel pad, packed weight, fp32 bias) the way a deployed layer holds
+them, so the tables' ``us`` leaves out the host-side work the entry point
+does per call. ``--run_config`` times that entry point and reports it next to
+the table's ``us``.
+
     python3 csrc/flydsl_conv3d/conv3d_tune.py \\
         -i aiter/configs/model_configs/qwenimage_vae_bf16_untuned_conv3d.csv \\
         -o aiter/configs/model_configs/qwenimage_vae_bf16_tuned_conv3d.csv
@@ -58,10 +64,13 @@ from aiter.ops.flydsl.conv_kernels import (
     TUNED_PIPELINE_COLUMNS,
     TUNED_RESULT_COLUMNS,
     _check_supported_arch,
+    _dispatch,
+    _dyn_hw_ok,
     _implicit_param_from_problem,
     _is_matmul_fast_path,
     _pad_channels,
     _parse_tuned_bool,
+    _prep_weight,
 )
 from aiter.ops.flydsl.kernels.conv.conv3d_gfx950_utils import (
     make_conv_geometry,
@@ -75,6 +84,9 @@ from aiter.ops.flydsl.kernels.conv.conv3d_gfx1250_utils import (
 from aiter.ops.flydsl.kernels.conv.conv3d_im2col import (
     make_im2col_plan,
     plan_lds_bytes,
+)
+from aiter.ops.flydsl.kernels.conv.conv3d_implicit_gfx950 import (
+    compile_conv3d_implicit,
 )
 from aiter.utility.base_tuner import TunerCommon
 from aiter.utility.mp_tuner import mp_tuner
@@ -270,6 +282,85 @@ def run_flydsl_conv3d_gfx1250(
     )
 
 
+def generate_data_kernel(
+    n, c, d, h, w, k, kt, kh, kw, groups, has_bias, out_shape, seed=0, device=None
+):
+    """``generate_data`` plus the operands the gfx950 kernel takes, prepared once.
+
+    The timed call gets them ready-made, as the GEMM and MoE tuners get their
+    quantized and shuffled operands, so ``us`` leaves out the per-call channel
+    pad, weight pack and bias cast; ``x``/``weight`` stay raw for the
+    reference. ``out`` is the NDHWC result buffer every candidate of the shape
+    writes into, preallocated so mp_tuner can NaN-fill it before each
+    candidate (``output_keys``): an output the op allocated itself can be
+    handed the previous candidate's correct result, which hides elements a
+    kernel never writes.
+    """
+    data = generate_data(n, c, d, h, w, k, kt, kh, kw, groups, has_bias, seed, device)
+    x = data["x"]
+    cg = c // groups
+    cgp = _pad_channels(cg)
+    if cgp != cg:
+        x_k = torch.nn.functional.pad(x.reshape(n, d, h, w, groups, cg), (0, cgp - cg))
+        x_k = x_k.reshape(n, d, h, w, groups * cgp).contiguous()
+    else:
+        x_k = x.contiguous()
+    w_packed = _prep_weight(data["weight"], k, kt, kh, kw, cg).clone()
+    bias_k = (
+        data["bias"].to(torch.float32).contiguous()
+        if has_bias
+        else torch.empty(1, device=x.device, dtype=torch.float32)
+    )
+    out = torch.empty(out_shape, device=x.device, dtype=dtypes.bf16)
+    data.update(x_k=x_k, w_packed=w_packed, bias_k=bias_k, out=out)
+    return data
+
+
+@functools.lru_cache(maxsize=1024)
+def _kernel_launcher(shape_key, params_key, has_bias, tile, wgm, splitk, block_rows):
+    """The compiled gfx950 conv3d the entry point would launch for this candidate."""
+    n, c, d, h, w, k, kt, kh, kw, groups = shape_key
+    stride, padding, dilation = params_key
+    npq = n
+    for size, pad, dil, ker, st in zip(
+        (d, h, w), padding, dilation, (kt, kh, kw), stride
+    ):
+        npq *= out_extent(size, pad, dil, ker, st)
+    dyn_hw = _dyn_hw_ok(n, groups * _pad_channels(c // groups), d, h, w, k, npq, tile)
+    return compile_conv3d_implicit(
+        _implicit_param_from_problem(
+            n, c, d, h, w, k, kt, kh, kw,
+            *stride, *padding, *dilation,
+            groups, has_bias, splitk, tile, wgm, True, "zeros", dyn_hw,
+            block_rows=block_rows,
+        )
+    )  # fmt: skip
+
+
+def run_flydsl_conv3d_kernel(
+    x_k, w_packed, bias_k, out, shape_key, params, has_bias, tile, wgm, splitk,
+    block_rows=1,
+):  # fmt: skip
+    """One launch of the gfx950 conv kernel on prepared operands; returns ``out``.
+
+    Split-K is not supported here: it accumulates into an fp32 staging buffer
+    the entry point converts afterwards, which is not the kernel alone. The
+    tuner only reaches this with ``splitk == 1`` (see ``_shape_tasks``).
+    """
+    assert splitk == 1, "kernel-only timing covers splitK=1 candidates"
+    exe = _kernel_launcher(
+        shape_key,
+        (params["stride"], params["padding"], params["dilation"]),
+        has_bias,
+        tuple(tile),
+        wgm,
+        splitk,
+        block_rows,
+    )
+    _dispatch(exe, out, x_k, w_packed, bias_k, stream=torch.cuda.current_stream())
+    return out
+
+
 def run_flydsl_conv3d(x, weight, bias, params, tile, wgm, splitk, block_rows=1):
     # splitk is pinned rather than re-derived by the dispatch, so the CSV column
     # is the value that was timed and AOT compiles the artifact the runtime asks
@@ -293,10 +384,12 @@ def conv3d_ref(x, weight, bias, params):
 
     Contiguous and in the candidate's own shape: mp_tuner reshapes a result
     whose shape differs from the reference by a flat view, which would compare
-    an NDHWC output against NCDHW memory without failing.
+    an NDHWC output against NCDHW memory without failing. The input is made
+    NCDHW-contiguous first: a channels-last fp32 input sends MIOpen into a
+    per-shape kernel build that takes minutes per new shape on gfx950.
     """
     y = F.conv3d(
-        x.permute(0, 4, 1, 2, 3).float(),
+        x.permute(0, 4, 1, 2, 3).float().contiguous(),
         weight.float(),
         bias=bias.float() if bias is not None else None,
         **params,
@@ -576,7 +669,7 @@ class Conv3dTuner(TunerCommon):
         ``(tile_m, tile_n, wave_m, wave_n, block_rows)``, replaces the policy's
         tile candidates (see ``--tiles_from``).
         """
-        from aiter.ops.flydsl.conv_kernels import _borrow_tuned_tile, _resolve_splitk
+        from aiter.ops.flydsl.conv_kernels import _borrow_tuned_tile
 
         kv = dict(zip(self.keys, keys))
         n, c, d, h, w = (int(kv[x]) for x in ("N", "C", "D", "H", "W"))
@@ -616,9 +709,8 @@ class Conv3dTuner(TunerCommon):
                     out_dhw[2],
                     num_cu=self.get_cu_num(),
                 )
-            return _resolve_splitk(
-                None, m_gemm, crs, k, None, tile, groups, num_cu=self.get_cu_num()
-            )
+            # gfx950 does not split K automatically (the runtime never does either).
+            return 1
 
         def plan_for(tile, block_rows):
             param = _implicit_param_from_problem(
@@ -773,15 +865,44 @@ class Conv3dTuner(TunerCommon):
                 base_name = tile_kernel_name(tile_m, tile_n, wave_m, wave_n, wgm) + (
                     f"_r{block_rows}" if block_rows > 1 else ""
                 )
-                gen, gen_args = generate_data, shape_args
-                fn, fn_keys = run_flydsl_conv3d, ["x", "weight", "bias"]
-                output_keys = None
                 variants = [(None, None, None, None)]
+                if sk == 1:
+                    # The kernel alone, on prepared operands into a NaN-filled buffer.
+                    gen = generate_data_kernel
+                    gen_args = (*shape_args, (n, *out_dhw, k))
+                    fn = run_flydsl_conv3d_kernel
+                    gfx950_fn_args = (
+                        ["x_k", "w_packed", "bias_k", "out"],
+                        (n, c, d, h, w, k, kt, kh, kw, groups),
+                        params,
+                        has_bias,
+                        tile,
+                        wgm,
+                        sk,
+                        block_rows,
+                    )
+                    output_keys = ("out",)
+                else:
+                    # Split-K stages through fp32 and a host-side convert, so it is
+                    # timed through the entry point (none of the shipped rows split).
+                    gen, gen_args = generate_data, shape_args
+                    fn = run_flydsl_conv3d
+                    gfx950_fn_args = (
+                        ["x", "weight", "bias"],
+                        params,
+                        tile,
+                        wgm,
+                        sk,
+                        block_rows,
+                    )
+                    output_keys = None
             for nb, unroll, tk, patch in variants:
                 kname = base_name
-                fn_args = (fn_keys, params, tile, wgm, sk, block_rows)
-                if is_1250:
-                    fn_args = (*fn_args, nb, unroll, tk, patch)
+                if not is_1250:
+                    fn_args = gfx950_fn_args
+                else:
+                    fn_args = (fn_keys, params, tile, wgm, sk, block_rows)
+                    fn_args += (nb, unroll, tk, patch)
                     if (nb, unroll) != (2, False):
                         kname += f"_b{nb}" + ("_u" if unroll else "")
                     if tk != CGP_ALIGN:
@@ -882,16 +1003,10 @@ class Conv3dTuner(TunerCommon):
     def calculate(self, results, bpes=(2, 2, 2)):
         """TFLOPS from implicit GEMM dims; bandwidth from tensor bytes (im2col reuse).
 
-        On gfx1250 the timed call gets prepared operands, so ``us`` is the
-        kernel alone. On gfx950 it is an end-to-end time: NDHWC in and out
-        leaves no layout transpose in it, but the entry point still runs two
-        steps outside the kernel: the weight repack, which run_perftest redoes
-        on every timed call because it rotates as many weight copies as it runs
-        iterations -- about 5.5us at the median, and up to ~40% of us on the
-        smallest rows -- and, where C/groups is not a multiple of LDG_VEC, a
-        channel pad that copies the whole input on every call -- the C=3 input
-        conv of both VAEs. Neither depends on the tile, so the ranking holds,
-        but there both figures are a floor on the kernel's own.
+        Both are derived from the kernel alone: the timed call gets prepared
+        operands (channel pad, packed weight, fp32 bias), so the per-call host
+        work of the entry point is not in ``us``. A gfx950 split-K candidate is
+        the exception, timed through the entry point with its fp32 convert.
         """
         info, time, _err = results
         if time == self.INVALID_TIME or time in (0, self.INF_TIME):
@@ -1069,7 +1184,7 @@ class Conv3dTuner(TunerCommon):
             params = _row_params(kv)
             shape = f"{n}x{c}x{d}x{h}x{w}->{k} {kt}x{kh}x{kw}"
             # With --run_config <tuned_csv> the row carries its tuned `us`, the
-            # kernel alone on gfx1250; reported next to e2e as the MoE tuner does.
+            # kernel alone; reported next to e2e as the MoE tuner does.
             kernel_us = None
             if "us" in row and pd.notna(row["us"]):
                 try:
@@ -1100,7 +1215,7 @@ class Conv3dTuner(TunerCommon):
                 # Strict pass/fail: historical CSV error cannot excuse a mismatch.
                 err_ratio = strict_compare(ref, out, msg=f"run_config {shape} ")
                 # e2e: run_perftest includes the host-side pads and the weight
-                # pack, which the gfx1250 tuned us leaves out.
+                # pack, which the tuned us leaves out.
                 status = (
                     "ok"
                     if err_ratio == 0
