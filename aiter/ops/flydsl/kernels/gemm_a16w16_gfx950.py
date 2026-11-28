@@ -2158,12 +2158,12 @@ def gemm_a16w16(
     param = make_gemm_a16w16_param_and_validate(m, n, k, kwargs)
     assert param is not None, "unsupported gemm_a16w16_gfx950 shape/config"
     semaphore, signal = get_split_k_buffers(stream, device, split_k)
-    workspace = get_split_k_workspace(stream, device) if use_split_k_workspace else out
     a_arg = _dynamic_tensor_arg(a, 0 if a_is_transposed else 1)
     b_arg = _dynamic_tensor_arg(b, 0 if b_is_transposed else 1)
     out_arg = _dynamic_tensor_arg(out, 1)
     if use_split_k_workspace:
         # No bias with a workspace: the bias slot passes the workspace.
+        workspace = get_split_k_workspace(stream, device)
         bias_arg = _dynamic_tensor_arg(workspace, 0)
     else:
         bias_arg = a_arg if bias is None else _dynamic_tensor_arg(bias, 0)

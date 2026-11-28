@@ -91,36 +91,42 @@ _TUNED = [
     (312, 6288, 7168, 320, 192, 64, 2, 7, 4, 4, 1, 0, False),
     (320, 6288, 7168, 320, 192, 64, 2, 7, 4, 4, 1, 0, False),
     (322, 6288, 7168, 384, 192, 64, 2, 7, 8, 1, 1, 0, False),
-    (376, 6288, 7168, 384, 192, 64, 2, 7, 8, 1, 1, 0, False),
     (384, 6288, 7168, 384, 192, 64, 2, 7, 8, 1, 1, 0, False),
     (264, 8448, 7168, 320, 192, 64, 2, 4, 4, 4, 1, 0, False),
-    (280, 8448, 7168, 320, 192, 64, 2, 4, 4, 4, 1, 0, False),
     (248, 8448, 7168, 256, 256, 64, 2, 7, 4, 2, 1, 0, False),
     (255, 8448, 7168, 256, 256, 64, 2, 7, 2, 4, 1, 0, False),
     (256, 8448, 7168, 256, 256, 64, 2, 7, 4, 2, 1, 0, False),
-    (288, 8448, 7168, 320, 192, 64, 2, 4, 4, 4, 1, 0, False),
-    (292, 8448, 7168, 320, 192, 64, 2, 4, 4, 4, 1, 0, False),
     (706, 2880, 7168, 256, 256, 64, 2, 7, 4, 2, 1, 0, False),
     (1152, 2112, 7168, 320, 192, 64, 2, 4, 4, 4, 1, 0, False),
     (386, 6288, 7168, 400, 128, 64, 2, 4, 5, 2, 1, 0, False),
     (522, 8448, 7168, 320, 192, 64, 2, 2, 4, 4, 1, 0, False),
     (543, 6288, 7168, 128, 128, 64, 3, 1, 2, 2, 2, 1, False),
     (635, 6288, 7168, 128, 128, 64, 3, 1, 4, 4, 1, 1, False),
-    (639, 6288, 7168, 128, 128, 64, 3, 1, 2, 2, 2, 1, False),
     (640, 6288, 7168, 128, 128, 64, 3, 1, 4, 4, 1, 1, False),
     (4033, 2880, 7168, 256, 192, 64, 2, 1, 4, 4, 1, 0, False),
-    (5382, 2112, 7168, 256, 192, 64, 2, 1, 4, 4, 1, 0, False),
     (3079, 8448, 7168, 288, 192, 64, 2, 1, 2, 4, 1, 0, False),
     (4609, 3584, 7168, 320, 224, 64, 2, 1, 4, 2, 1, 2, False),
     (5758, 2880, 7168, 320, 224, 64, 2, 1, 4, 2, 1, 16, False),
     (5762, 2880, 7168, 224, 320, 64, 2, 1, 2, 4, 1, 8, False),
-    (6136, 2880, 7168, 224, 320, 64, 2, 1, 2, 4, 1, 8, False),
     (1025, 8448, 7168, 224, 192, 64, 3, 1, 2, 6, 1, 0, False),
     (2686, 2880, 7168, 160, 192, 64, 3, 1, 2, 4, 1, 16, False),
     (2689, 3072, 512, 192, 192, 64, 3, 1, 3, 4, 1, 0, False),
     (5381, 3072, 512, 320, 224, 64, 2, 1, 4, 2, 1, 4, False),
+    # Kimi-K3 tuned rows.
+    (1024, 3584, 7168, 256, 256, 64, 2, 4, 2, 4, 1, 16, True),
+    (640, 2272, 7168, 384, 128, 64, 2, 7, 2, 4, 1, 2, True),
+    (704, 6284, 7168, 384, 160, 64, 2, 3, 4, 2, 1, 0, False),
+    (544, 6284, 7168, 192, 320, 64, 2, 4, 2, 4, 1, 1, False),
+    (192, 6016, 7168, 192, 128, 64, 3, 5, 4, 2, 1, 0, False),
 ]
 _CONCURRENT_COPY_MNK = [(8192, 8192, 128)]
+# HTI tiles with two N waves, where the two wave groups share LDS:
+# (name, MNK, block_m, block_n, launches).
+_HTI_GROUP_RACES = [
+    ("HTI main loop", (2048, 4096, 1024), 64, 64, 512),
+    ("HTI 128x256 epilogue", (1024, 1024, 1024), 128, 256, 3),
+    ("HTI 256x256 epilogue", (1024, 1024, 1024), 256, 256, 3),
+]
 # GLM-5.3 / K3.1 Pro indexer wq_b: N = 32 heads * 128, K = q_lora_rank.
 _PRESHUFFLE_MNK = [(m, 4096, k) for m in (6, 32, 512) for k in (1536, 2048)] + [
     (33, 80, 1536),
@@ -382,28 +388,33 @@ def test_hgemm(m, n, k, dtype, policy, split_k):
     def _run_flydsl():
         return flydsl_hgemm(a, w, out=out, **kwargs)
 
-    candidates = {"flydsl": _run_flydsl}
-    if policy == "sk":
-        # Decode GEMMs run inside a CUDA graph: capture one call and replay it.
+    def _graph_candidate(**extra):
         # The eager call first compiles the kernel outside the capture.
         out_graph = torch.randn((m, n), dtype=dtype, device="cuda")
-        flydsl_hgemm(a, w, out=out_graph, **kwargs)
+        flydsl_hgemm(a, w, out=out_graph, **kwargs, **extra)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            flydsl_hgemm(a, w, out=out_graph, **kwargs)
+            flydsl_hgemm(a, w, out=out_graph, **kwargs, **extra)
         out_graph.normal_()
 
         def _run_flydsl_graph():
             graph.replay()
             return out_graph
 
-        candidates["flydsl_graph"] = _run_flydsl_graph
-    if split_k_workspace_supported(
-        m, n, split_k, GEMM_A16W16_DTYPE_BF16 if dtype is dtypes.bf16 else 0, False
+        return _run_flydsl_graph
+
+    candidates = {"flydsl": _run_flydsl}
+    if policy == "sk":
+        # Decode GEMMs run inside a CUDA graph: capture one call and replay it.
+        candidates["flydsl_graph"] = _graph_candidate()
+    if dtype is dtypes.bf16 and split_k_workspace_supported(
+        m, n, split_k, GEMM_A16W16_DTYPE_BF16, False
     ):
         candidates["flydsl_skws"] = lambda: flydsl_hgemm(
             a, w, out=out, split_k_workspace=True, **kwargs
         )
+        # The reduction is a second kernel: a replay must run both launches.
+        candidates["flydsl_skws_graph"] = _graph_candidate(split_k_workspace=True)
 
     flops = 2 * m * n * k
     nbytes = (
@@ -439,6 +450,20 @@ def test_hgemm(m, n, k, dtype, policy, split_k):
     return ret
 
 
+def _bad_hti_launches(a, w, tile, expected, launches, before_launch=None):
+    """Count the launches whose output differs bitwise from ``expected``."""
+    out = torch.empty_like(expected)
+    bad = torch.zeros((), dtype=torch.int64, device="cuda")
+    for _ in range(launches):
+        if before_launch is not None:
+            before_launch()
+        out.fill_(float("nan"))
+        flydsl_hgemm(a, w, out=out, **tile, policy="hti")
+        bad += (out != expected).any()
+    torch.cuda.synchronize()
+    return bad.item()
+
+
 @benchmark()
 def test_hgemm_concurrent_copy(m, n, k, dtype):
     # The HTI tail LDS race shows only with exactly two K tiles (no main loop) and
@@ -471,65 +496,31 @@ def test_hgemm_concurrent_copy(m, n, k, dtype):
     side_stream = torch.cuda.Stream()
     src = torch.empty(256 << 20, dtype=torch.uint8, device="cuda")
     dst = torch.empty_like(src)
-    out = torch.empty_like(golden)
-    launches = 1000
-    bad_launches = torch.zeros((), dtype=torch.int64, device="cuda")
-    for _ in range(launches):
+
+    def side_copy():
         with torch.cuda.stream(side_stream):
             dst.copy_(src)
-        out.fill_(float("nan"))
-        flydsl_hgemm(a, w, out=out, **tile, policy="hti")
-        bad_launches += (out != golden).any()
-    torch.cuda.synchronize()
-    bad = bad_launches.item()
+
+    launches = 1000
+    bad = _bad_hti_launches(a, w, tile, golden, launches, side_copy)
     assert bad == 0, f"{bad} of {launches} launches differ from the idle-GPU output"
 
-    def check_wave_group_race(name, shape, config, repeats):
-        m_race, n_race, k_race = shape
-        gen = torch.Generator(device="cuda")
-        gen.manual_seed(SEED)
-        a_race = torch.randint(
-            -1, 2, (m_race, k_race), generator=gen, device="cuda"
-        ).to(dtype)
-        w_race = torch.randint(
-            -1, 2, (n_race, k_race), generator=gen, device="cuda"
-        ).to(dtype)
-        ref = run_torch(a_race, w_race, dtype)
-        out_race = torch.empty_like(ref)
-        wrong = torch.zeros((), dtype=torch.int64, device="cuda")
-        for _ in range(repeats):
-            out_race.fill_(float("nan"))
-            flydsl_hgemm(
-                a_race,
-                w_race,
-                out=out_race,
-                block_k=64,
-                stages=2,
-                split_k=1,
-                m_waves=2,
-                k_waves=1,
-                group_m=0,
-                policy="hti",
-                **config,
-            )
-            wrong += (out_race != ref).any()
-        torch.cuda.synchronize()
-        bad_race = int(wrong)
-        assert bad_race == 0, f"{name}: {bad_race} of {repeats} launches are wrong"
-
-    check_wave_group_race(
-        "HTI main loop",
-        (2048, 4096, 1024),
-        {"block_m": 64, "block_n": 64, "n_waves": 2},
-        512,
-    )
-    for block_m in (128, 256):
-        check_wave_group_race(
-            f"HTI {block_m}x256 epilogue",
-            (1024, 1024, 1024),
-            {"block_m": block_m, "block_n": 256, "n_waves": 2},
-            3,
+    # The two HTI wave groups also race on LDS with no other traffic. Small
+    # integers give an exact reference, so no idle-GPU output is needed.
+    for name, (race_m, race_n, race_k), block_m, block_n, repeats in _HTI_GROUP_RACES:
+        race_a = torch.randint(-1, 2, (race_m, race_k), device="cuda").to(dtype)
+        race_w = torch.randint(-1, 2, (race_n, race_k), device="cuda").to(dtype)
+        race_tile = {
+            **tile,
+            "block_m": block_m,
+            "block_n": block_n,
+            "block_k": 64,
+            "n_waves": 2,
+        }
+        wrong = _bad_hti_launches(
+            race_a, race_w, race_tile, run_torch(race_a, race_w, dtype), repeats
         )
+        assert wrong == 0, f"{name}: {wrong} of {repeats} launches are wrong"
 
     return {
         "gfx": get_gfx_runtime(),

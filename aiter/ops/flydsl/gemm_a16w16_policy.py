@@ -144,42 +144,43 @@ class GemmConfigPruner:
         kept = []
         for config, iou in zip(configs, ious):
             tiles = self._tiles(config)
+            hti = config.get("use_half_tile_interleaved", False)
+            hti_256 = hti and (
+                config["block_m"],
+                config["block_n"],
+                config["block_k"],
+                config["stages"],
+                config["m_waves"],
+                config["n_waves"],
+                config["k_waves"],
+            ) == (256, 256, 64, 2, 2, 4, 1)
+            # HTI tiles validated on Kimi-K3 shapes: 256x256 with no split-K,
+            # 256x256 with a workspace split-K, and 192x128x128 with Group-M 4.
             validated_half_tile = (
-                config.get("use_half_tile_interleaved", False)
-                and config["block_m"] == 256
-                and config["block_n"] == 256
-                and config["block_k"] == 64
-                and config["stages"] == 2
-                and config["split_k"] == 1
-                and config["m_waves"] == 2
-                and config["n_waves"] == 4
-                and config["k_waves"] == 1
-                and config["group_m"] in (0, 1, 2, 4, 8, 16)
-            )
-            validated_grouped_half_tile = (
-                config.get("use_half_tile_interleaved", False)
-                and config["group_m"] == 4
-                and (
-                    config["block_m"],
-                    config["block_n"],
-                    config["block_k"],
-                    config["m_waves"],
-                    config["n_waves"],
+                (
+                    hti_256
+                    and config["split_k"] == 1
+                    and config["group_m"] in (0, 1, 2, 4, 8, 16)
                 )
-                == (192, 128, 128, 2, 4)
-            )
-            validated_half_tile_workspace = (
-                config.get("use_half_tile_interleaved", False)
-                and config["block_m"] == 256
-                and config["block_n"] == 256
-                and config["block_k"] == 64
-                and config["stages"] == 2
-                and config["split_k"] > 1
-                and config["m_waves"] == 2
-                and config["n_waves"] == 4
-                and config["k_waves"] == 1
-                and config["group_m"] in (0, 4, 8, 16)
-                and config["split_k"] * self.m * self.n <= SPLIT_K_WORKSPACE_MAX_ELEMS
+                or (
+                    hti_256
+                    and config["split_k"] > 1
+                    and config["group_m"] in (0, 4, 8, 16)
+                    and config["split_k"] * self.m * self.n
+                    <= SPLIT_K_WORKSPACE_MAX_ELEMS
+                )
+                or (
+                    hti
+                    and config["group_m"] == 4
+                    and (
+                        config["block_m"],
+                        config["block_n"],
+                        config["block_k"],
+                        config["m_waves"],
+                        config["n_waves"],
+                    )
+                    == (192, 128, 128, 2, 4)
+                )
             )
             near_cu_rect = (
                 iou >= 0.90 and tiles * 4 >= num_cus * 3 and tiles * 4 <= num_cus * 5
@@ -190,20 +191,12 @@ class GemmConfigPruner:
                 else self._ceil_div(self.max_split_grid_rounds * num_cus, tiles)
             )
             if (
-                (
-                    iou >= min_iou
-                    or near_cu_rect
-                    or validated_half_tile
-                    or validated_grouped_half_tile
-                    or validated_half_tile_workspace
-                )
+                (iou >= min_iou or near_cu_rect or validated_half_tile)
                 and tiles <= max_tiles
                 and config["split_k"] <= max_split_k
                 and (
                     config["group_m"] == 0
                     or validated_half_tile
-                    or validated_grouped_half_tile
-                    or validated_half_tile_workspace
                     or (
                         config["block_m"],
                         config["block_n"],
@@ -413,9 +406,6 @@ def get_flydsl_a16w16_configs(
     dtype: torch.dtype,
     out_dtype: torch.dtype,
     has_bias: bool,
-    *,
-    use_large_gemm_fast_path: bool = True,
-    apply_policy_pruning: bool = True,
 ):
     """Generate and validate the shape-aware policy catalog used by tuning."""
 
@@ -461,192 +451,56 @@ def get_flydsl_a16w16_configs(
         for config in configs
         if config["block_m"] not in _WIDE_GRID_BLOCK_M
     }
-    for group_m in (1, 2, 8, 16):
-        configs.append(
-            {
-                "block_m": 256,
-                "block_n": 256,
-                "block_k": 64,
-                "stages": 2,
-                "split_k": 1,
-                "m_waves": 2,
-                "n_waves": 4,
-                "k_waves": 1,
-                "group_m": group_m,
-                "use_half_tile_interleaved": True,
-            }
-        )
-    for split_k in split_k_candidates[1:]:
-        if split_k * m * n <= SPLIT_K_WORKSPACE_MAX_ELEMS:
-            for group_m in (8, 16):
-                configs.append(
-                    {
-                        "block_m": 256,
-                        "block_n": 256,
-                        "block_k": 64,
-                        "stages": 2,
-                        "split_k": split_k,
-                        "m_waves": 2,
-                        "n_waves": 4,
-                        "k_waves": 1,
-                        "group_m": group_m,
-                        "use_half_tile_interleaved": True,
-                    }
-                )
+
+    def fits_workspace(split_k):
+        return split_k * m * n <= SPLIT_K_WORKSPACE_MAX_ELEMS
+
+    # Tiles outside the grid: (block_m, block_n, stages, split_k, m_waves,
+    # n_waves, k_waves, group_m, use_half_tile_interleaved), block_k 64.
+    added = [(256, 256, 2, 1, 2, 4, 1, group_m, True) for group_m in (1, 2, 8, 16)]
+    added += [
+        (256, 256, 2, split_k, 2, 4, 1, group_m, True)
+        for split_k in split_k_candidates[1:]
+        if fits_workspace(split_k)
+        for group_m in (8, 16)
+    ]
     if m <= 320 and k % 5 == 0:
-        configs.append(
-            {
-                "block_m": 320,
-                "block_n": 192,
-                "block_k": 64,
-                "stages": 2,
-                "split_k": 5,
-                "m_waves": 4,
-                "n_waves": 2,
-                "k_waves": 1,
-                "group_m": 0,
-                "use_half_tile_interleaved": False,
-            }
-        )
-    if k % 2 == 0 and 2 * m * n <= SPLIT_K_WORKSPACE_MAX_ELEMS:
-        configs.append(
-            {
-                "block_m": 320,
-                "block_n": 192,
-                "block_k": 64,
-                "stages": 2,
-                "split_k": 2,
-                "m_waves": 4,
-                "n_waves": 4,
-                "k_waves": 1,
-                "group_m": 0,
-                "use_half_tile_interleaved": False,
-            }
-        )
-    if k % 4 == 0 and 4 * m * n <= SPLIT_K_WORKSPACE_MAX_ELEMS:
-        configs.append(
-            {
-                "block_m": 320,
-                "block_n": 192,
-                "block_k": 64,
-                "stages": 2,
-                "split_k": 4,
-                "m_waves": 4,
-                "n_waves": 4,
-                "k_waves": 1,
-                "group_m": 0,
-                "use_half_tile_interleaved": False,
-            }
-        )
+        added.append((320, 192, 2, 5, 4, 2, 1, 0, False))
+    added += [
+        (320, 192, 2, split_k, 4, 4, 1, 0, False)
+        for split_k in (2, 4)
+        if k % split_k == 0 and fits_workspace(split_k)
+    ]
     if 384 < m <= 400 and k % 4 == 0:
-        configs.append(
-            {
-                "block_m": 400,
-                "block_n": 128,
-                "block_k": 64,
-                "stages": 2,
-                "split_k": 4,
-                "m_waves": 5,
-                "n_waves": 2,
-                "k_waves": 1,
-                "group_m": 0,
-                "use_half_tile_interleaved": False,
-            }
-        )
+        added.append((400, 128, 2, 4, 5, 2, 1, 0, False))
     if m <= 320 and k % 7 == 0:
-        configs.append(
-            {
-                "block_m": 320,
-                "block_n": 192,
-                "block_k": 64,
-                "stages": 2,
-                "split_k": 7,
-                "m_waves": 4,
-                "n_waves": 4,
-                "k_waves": 1,
-                "group_m": 0,
-                "use_half_tile_interleaved": False,
-            }
-        )
-    if k % 7 == 0 and 7 * m * n <= SPLIT_K_WORKSPACE_MAX_ELEMS:
-        for m_waves, n_waves in ((4, 2), (2, 4)):
-            configs.append(
-                {
-                    "block_m": 256,
-                    "block_n": 256,
-                    "block_k": 64,
-                    "stages": 2,
-                    "split_k": 7,
-                    "m_waves": m_waves,
-                    "n_waves": n_waves,
-                    "k_waves": 1,
-                    "group_m": 0,
-                    "use_half_tile_interleaved": False,
-                }
-            )
+        added.append((320, 192, 2, 7, 4, 4, 1, 0, False))
+    if k % 7 == 0 and fits_workspace(7):
+        added += [
+            (256, 256, 2, 7, 4, 2, 1, 0, False),
+            (256, 256, 2, 7, 2, 4, 1, 0, False),
+        ]
     if 320 < m <= 384 and k % 7 == 0:
-        configs.append(
-            {
-                "block_m": 384,
-                "block_n": 192,
-                "block_k": 64,
-                "stages": 2,
-                "split_k": 7,
-                "m_waves": 8,
-                "n_waves": 1,
-                "k_waves": 1,
-                "group_m": 0,
-                "use_half_tile_interleaved": False,
-            }
-        )
-    for block_m, block_n, stages, m_waves, n_waves, group_m in (
-        (256, 192, 2, 4, 4, 0),
-        (288, 192, 2, 2, 4, 0),
-        (320, 224, 2, 4, 2, 0),
-        (320, 224, 2, 4, 2, 2),
-        (320, 224, 2, 4, 2, 4),
-        (320, 224, 2, 4, 2, 16),
-        (224, 320, 2, 2, 4, 8),
-        (224, 192, 3, 2, 6, 0),
-        (160, 192, 3, 2, 4, 16),
-        (192, 192, 3, 3, 4, 0),
-    ):
-        configs.append(
-            {
-                "block_m": block_m,
-                "block_n": block_n,
-                "block_k": 64,
-                "stages": stages,
-                "split_k": 1,
-                "m_waves": m_waves,
-                "n_waves": n_waves,
-                "k_waves": 1,
-                "group_m": group_m,
-                "use_half_tile_interleaved": False,
-            }
-        )
-    for m_waves, n_waves, k_waves in ((2, 2, 2), (4, 4, 1)):
-        configs.append(
-            {
-                "block_m": 128,
-                "block_n": 128,
-                "block_k": 64,
-                "stages": 3,
-                "split_k": 1,
-                "m_waves": m_waves,
-                "n_waves": n_waves,
-                "k_waves": k_waves,
-                "group_m": 1,
-                "use_half_tile_interleaved": False,
-            }
-        )
-    is_large_gemm = (
-        apply_policy_pruning
-        and use_large_gemm_fast_path
-        and m >= 4096
-        and n >= 4096
-        and k >= 4096
-    )
+        added.append((384, 192, 2, 7, 8, 1, 1, 0, False))
+    added += [
+        (256, 192, 2, 1, 4, 4, 1, 0, False),
+        (288, 192, 2, 1, 2, 4, 1, 0, False),
+        (320, 224, 2, 1, 4, 2, 1, 0, False),
+        (320, 224, 2, 1, 4, 2, 1, 2, False),
+        (320, 224, 2, 1, 4, 2, 1, 4, False),
+        (320, 224, 2, 1, 4, 2, 1, 16, False),
+        (224, 320, 2, 1, 2, 4, 1, 8, False),
+        (224, 192, 3, 1, 2, 6, 1, 0, False),
+        (160, 192, 3, 1, 2, 4, 1, 16, False),
+        (192, 192, 3, 1, 3, 4, 1, 0, False),
+        (128, 128, 3, 1, 2, 2, 2, 1, False),
+        (128, 128, 3, 1, 4, 4, 1, 1, False),
+    ]
+    configs += [
+        dict(zip(selections, (block_m, block_n, 64, *fields)))
+        for block_m, block_n, *fields in added
+    ]
+    is_large_gemm = m >= 4096 and n >= 4096 and k >= 4096
     if is_large_gemm:
         configs = [
             config
@@ -664,7 +518,7 @@ def get_flydsl_a16w16_configs(
             )
         ]
     device_props = torch.cuda.get_device_properties(torch.cuda.current_device())
-    if apply_policy_pruning and not is_large_gemm:
+    if not is_large_gemm:
         configs = GemmConfigPruner(
             m,
             n,
@@ -680,11 +534,7 @@ def get_flydsl_a16w16_configs(
     valid_configs = []
     memory_configs = []
     for config in configs:
-        if (
-            apply_policy_pruning
-            and not is_large_gemm
-            and not config["use_half_tile_interleaved"]
-        ):
+        if not is_large_gemm and not config["use_half_tile_interleaved"]:
             mma_m_iters = config["block_m"] // config["m_waves"] // 16
             mma_n_iters = config["block_n"] // config["n_waves"] // 16
             # Decode tiles can stream a wider N panel per wave. The old

@@ -807,7 +807,7 @@ def flydsl_gemm(
         policy=policy,
         out_dtype=None if skinny else otype,
         bpreshuffle=bpreshuffle,
-        split_k_workspace=flydsl_config.get("use_split_k_workspace", False),
+        split_k_workspace=flydsl_config["use_split_k_workspace"],
     )
 
     if bias is not None and fused_bias is None:

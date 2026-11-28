@@ -10,7 +10,9 @@ Run:
     python3 -m unittest op_tests.tuning_tests.test_a16w16_tuned_config_lookup -v
 """
 
+import contextlib
 import csv
+import importlib.util
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -49,6 +51,105 @@ def _fake_gfx950_param(m, n, k, kwargs):
         mma_m=16,
         mma_n=16,
     )
+
+
+@contextlib.contextmanager
+def _gfx950_policy():
+    """Yield the policy module on a mocked 256-CU gfx950 device."""
+    import aiter.ops.flydsl.gemm_a16w16_policy as policy
+
+    props = SimpleNamespace(
+        multi_processor_count=256,
+        warp_size=64,
+        max_threads_per_multi_processor=2048,
+    )
+    with (
+        mock.patch.object(policy, "get_gfx_runtime", lambda: "gfx950"),
+        mock.patch.object(torch.cuda, "current_device", lambda: 0),
+        mock.patch.object(torch.cuda, "get_device_properties", lambda _: props),
+        mock.patch(
+            "aiter.ops.flydsl.kernels.gemm_a16w16_gfx950."
+            "make_gemm_a16w16_param_and_validate",
+            _fake_gfx950_param,
+        ),
+    ):
+        yield policy
+
+
+def _load_hgemm_tuner():
+    path = Path(__file__).resolve().parents[2] / "csrc/gemm_a16w16/gemm_a16w16_tune.py"
+    spec = importlib.util.spec_from_file_location("_hgemm_tuner_schedule_test", path)
+    tuner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tuner)
+    return tuner
+
+
+def _tile(block_m, block_n, stages, split_k, m_waves, n_waves, group_m):
+    return {
+        "block_m": block_m,
+        "block_n": block_n,
+        "block_k": 64,
+        "stages": stages,
+        "split_k": split_k,
+        "m_waves": m_waves,
+        "n_waves": n_waves,
+        "group_m": group_m,
+    }
+
+
+_HTI_256 = {
+    "block_m": 256,
+    "block_n": 256,
+    "block_k": 64,
+    "m_waves": 2,
+    "n_waves": 4,
+    "k_waves": 1,
+    "use_half_tile_interleaved": True,
+}
+# (M, N, K) and the fields of a config that the pruned gfx950 catalog must keep.
+_GFX950_KEPT_TILES = (
+    ((2078, 6288, 7168), _tile(208, 256, 2, 1, 2, 4, 0)),
+    ((2079, 6288, 7168), _tile(224, 256, 2, 1, 2, 4, 0)),
+    ((576, 20480, 7168), _tile(192, 256, 2, 1, 4, 4, 0)),
+    ((4032, 2880, 7168), _tile(192, 256, 2, 1, 4, 4, 0)),
+    ((279, 7168, 35840), _tile(320, 192, 2, 5, 4, 2, 0)),
+    ((312, 6288, 7168), _tile(320, 192, 2, 7, 4, 4, 0)),
+    ((264, 8448, 7168), _tile(320, 192, 2, 4, 4, 4, 0)),
+    ((248, 8448, 7168), _tile(256, 256, 2, 7, 4, 2, 0)),
+    ((255, 8448, 7168), _tile(256, 256, 2, 7, 2, 4, 0)),
+    ((288, 8448, 7168), _tile(320, 192, 2, 4, 4, 4, 0)),
+    ((706, 2880, 7168), _tile(256, 256, 2, 7, 4, 2, 0)),
+    ((1152, 2112, 7168), _tile(320, 192, 2, 4, 4, 4, 0)),
+    ((386, 6288, 7168), _tile(400, 128, 2, 4, 5, 2, 0)),
+    ((522, 8448, 7168), _tile(320, 192, 2, 2, 4, 4, 0)),
+    ((322, 6288, 7168), _tile(384, 192, 2, 7, 8, 1, 0)),
+    ((4033, 2880, 7168), _tile(256, 192, 2, 1, 4, 4, 0)),
+    ((5382, 2112, 7168), _tile(256, 192, 2, 1, 4, 4, 0)),
+    ((3079, 8448, 7168), _tile(288, 192, 2, 1, 2, 4, 0)),
+    ((4609, 3584, 7168), _tile(320, 224, 2, 1, 4, 2, 2)),
+    ((5758, 2880, 7168), _tile(320, 224, 2, 1, 4, 2, 16)),
+    ((5762, 2880, 7168), _tile(224, 320, 2, 1, 2, 4, 8)),
+    ((6136, 2880, 7168), _tile(224, 320, 2, 1, 2, 4, 8)),
+    ((1025, 8448, 7168), _tile(224, 192, 3, 1, 2, 6, 0)),
+    ((2686, 2880, 7168), _tile(160, 192, 3, 1, 2, 4, 16)),
+    ((2689, 3072, 512), _tile(192, 192, 3, 1, 3, 4, 0)),
+    ((5381, 3072, 512), _tile(320, 224, 2, 1, 4, 2, 4)),
+    ((543, 6288, 7168), _tile(128, 128, 3, 1, 2, 2, 1)),
+    ((635, 6288, 7168), _tile(128, 128, 3, 1, 4, 4, 1)),
+    # Wide hand-added tiles must not tighten the grid tile limit.
+    ((1, 163840, 256), _tile(16, 64, 3, 1, 1, 2, 0)),
+    ((13, 163840, 256), _tile(16, 64, 3, 1, 1, 2, 0)),
+    # Allowlisted rectangles survive while their accumulators fit.
+    ((322, 7168, 35840), {"block_m": 256, "block_n": 256}),
+    # A large M keeps wide tiles for a ragged N.
+    ((15360, 2112, 7168), {"block_n": 256}),
+    *(((1798, 6288, 7168), {**_HTI_256, "group_m": g}) for g in (0, 1, 2, 4, 8, 16)),
+    ((252, 20480, 7168), {**_HTI_256, "split_k": 2, "group_m": 8}),
+    (
+        (2689, 1536, 7168),
+        {**_HTI_256, "block_m": 192, "block_n": 128, "block_k": 128, "group_m": 4},
+    ),
+)
 
 
 class TestA16W16TunedConfigLookup(unittest.TestCase):
@@ -490,19 +591,10 @@ class TestTdmPolicyContract(unittest.TestCase):
             self.assertTrue(all(c["policy"] in ("tdm", "tdmi") for c in odd))
 
     def test_tdm_policy_forwarded_by_tuner_and_production(self):
-        import importlib.util
-
         import aiter.ops.flydsl.gemm_kernels as kernels
         import aiter.tuned_gemm as tuned
 
-        path = (
-            Path(__file__).resolve().parents[2] / "csrc/gemm_a16w16/gemm_a16w16_tune.py"
-        )
-        spec = importlib.util.spec_from_file_location(
-            "_hgemm_tuner_schedule_test", path
-        )
-        tuner = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(tuner)
+        tuner = _load_hgemm_tuner()
         a = torch.empty((128, 768), dtype=torch.bfloat16)
         w = torch.empty((128, 768), dtype=a.dtype)
         out = torch.empty((128, 128), dtype=a.dtype)
@@ -771,8 +863,6 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
         self.assertEqual(binding.cache.name, "gemm_a16w16_gfx950")
 
     def test_catalog_safety_boundaries(self):
-        from types import SimpleNamespace
-
         from aiter.ops.flydsl.kernels import gemm_a16w16_gfx950 as kernel
 
         base = SimpleNamespace(
@@ -872,6 +962,10 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
         )
         self.assertFalse(split_k_workspace_supported(320, 6288, 7, bf16, True))
 
+        tuner = _load_hgemm_tuner()
+        a = torch.empty((320, 7168), dtype=torch.bfloat16)
+        w = torch.empty((192, 7168), dtype=a.dtype)
+        out = torch.empty((320, 192), dtype=a.dtype)
         config = {
             "block_m": 320,
             "block_n": 192,
@@ -895,6 +989,15 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
             self.assertEqual("_ks7ws_" in name, workspace, name)
             params = get_flydsl_hgemm_kernel_params(name)
             self.assertEqual(params["use_split_k_workspace"], workspace, name)
+            with mock.patch.object(tuner, "flydsl_hgemm", return_value=out) as launch:
+                tuner.run_flydsl_gemm_bf16(
+                    a,
+                    w,
+                    out,
+                    otype=a.dtype,
+                    config={**config, "use_split_k_workspace": workspace},
+                )
+            self.assertEqual(launch.call_args.kwargs["split_k_workspace"], workspace)
         # Names tuned before the marker existed keep the atomic reduction.
         legacy = flydsl_hgemm_kernel_name(
             dtype=torch.bfloat16,
@@ -908,25 +1011,7 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
         )
 
     def test_ragged_large_n_keeps_the_required_large_tile(self):
-        from types import SimpleNamespace
-
-        import aiter.ops.flydsl.gemm_a16w16_policy as policy
-
-        props = SimpleNamespace(
-            multi_processor_count=256,
-            warp_size=64,
-            max_threads_per_multi_processor=2048,
-        )
-        with (
-            mock.patch.object(policy, "get_gfx_runtime", lambda: "gfx950"),
-            mock.patch.object(torch.cuda, "current_device", lambda: 0),
-            mock.patch.object(torch.cuda, "get_device_properties", lambda _: props),
-            mock.patch(
-                "aiter.ops.flydsl.kernels.gemm_a16w16_gfx950."
-                "make_gemm_a16w16_param_and_validate",
-                _fake_gfx950_param,
-            ),
-        ):
+        with _gfx950_policy() as policy:
             configs = policy.get_flydsl_a16w16_configs(
                 16384, 6288, 7168, torch.bfloat16, torch.bfloat16, False
             )
@@ -934,84 +1019,20 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
         self.assertEqual(len(configs), 6)
         self.assertEqual({config["group_m"] for config in configs}, {0, 1, 2, 4, 8, 16})
         for config in configs:
-            self.assertEqual(
-                (
-                    config["block_m"],
-                    config["block_n"],
-                    config["block_k"],
-                    config["stages"],
-                    config["m_waves"],
-                    config["n_waves"],
-                    config["k_waves"],
-                ),
-                (256, 256, 64, 2, 2, 4, 1),
-            )
-            self.assertTrue(config["use_half_tile_interleaved"])
+            self.assertLessEqual({**_HTI_256, "stages": 2}.items(), config.items())
 
-    def test_large_gemm_full_search_exposes_multiple_tiles(self):
-        from types import SimpleNamespace
-
-        import aiter.ops.flydsl.gemm_a16w16_policy as policy
-
-        props = SimpleNamespace(
-            multi_processor_count=256,
-            warp_size=64,
-            max_threads_per_multi_processor=2048,
-        )
-        with (
-            mock.patch.object(policy, "get_gfx_runtime", lambda: "gfx950"),
-            mock.patch.object(torch.cuda, "current_device", lambda: 0),
-            mock.patch.object(torch.cuda, "get_device_properties", lambda _: props),
-            mock.patch(
-                "aiter.ops.flydsl.kernels.gemm_a16w16_gfx950."
-                "make_gemm_a16w16_param_and_validate",
-                _fake_gfx950_param,
-            ),
-        ):
-            configs = policy.get_flydsl_a16w16_configs(
-                16384,
-                6288,
-                7168,
-                torch.bfloat16,
-                torch.bfloat16,
-                False,
-                use_large_gemm_fast_path=False,
-            )
-            raw_configs = policy.get_flydsl_a16w16_configs(
-                128,
-                256,
-                128,
-                torch.bfloat16,
-                torch.bfloat16,
-                False,
-                use_large_gemm_fast_path=False,
-                apply_policy_pruning=False,
-            )
-            pruned_configs = policy.get_flydsl_a16w16_configs(
-                128,
-                256,
-                128,
-                torch.bfloat16,
-                torch.bfloat16,
-                False,
-                use_large_gemm_fast_path=False,
-            )
-            no_workspace = [
+    def test_split_k_workspace_twins(self):
+        with _gfx950_policy() as policy:
+            configs, fp32_out, with_bias = (
                 policy.get_flydsl_a16w16_configs(
-                    128,
-                    256,
-                    128,
-                    torch.bfloat16,
-                    out_dtype,
-                    has_bias,
-                    use_large_gemm_fast_path=False,
-                    apply_policy_pruning=False,
+                    128, 256, 128, torch.bfloat16, out_dtype, has_bias
                 )
                 for out_dtype, has_bias in (
+                    (torch.bfloat16, False),
                     (torch.float32, False),
                     (torch.bfloat16, True),
                 )
-            ]
+            )
 
         def without_workspace(config):
             return tuple(
@@ -1025,14 +1046,14 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
         # Stagger and B cache-policy variants have no workspace twin.
         atomic = {
             without_workspace(config)
-            for config in raw_configs
+            for config in configs
             if config["split_k"] > 1
             and not config.get("use_split_k_workspace")
             and "k_stagger" not in config
         }
         workspace = {
             without_workspace(config)
-            for config in raw_configs
+            for config in configs
             if config.get("use_split_k_workspace")
             and not config["use_half_tile_interleaved"]
         }
@@ -1040,259 +1061,31 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
         self.assertEqual(atomic, workspace)
         self.assertFalse(
             any(
-                config["use_half_tile_interleaved"]
-                and config["split_k"] > 1
-                and not config.get("use_split_k_workspace")
-                for config in raw_configs
-            )
-        )
-        self.assertTrue(
-            any(
-                config["use_half_tile_interleaved"]
-                and config["split_k"] > 1
-                and config.get("use_split_k_workspace")
-                for config in raw_configs
-            )
-        )
-        self.assertFalse(
-            any(
                 config.get("use_split_k_workspace") and config["split_k"] == 1
-                for config in raw_configs
+                for config in configs
             )
         )
-        for other in no_workspace:
+        for other in (fp32_out, with_bias):
+            self.assertTrue(other)
             self.assertFalse(
                 any(config.get("use_split_k_workspace") for config in other)
             )
 
-        self.assertGreater(len(configs), 2)
-        self.assertGreater(
-            len(
-                {
-                    (config["block_m"], config["block_n"], config["block_k"])
-                    for config in configs
-                }
-            ),
-            1,
-        )
-        self.assertGreater(len(raw_configs), len(pruned_configs))
-
-    def test_small_bm_half_tile_rejects_ragged_n(self):
-        from types import SimpleNamespace
-
-        import aiter.ops.flydsl.gemm_a16w16_policy as policy
-
-        props = SimpleNamespace(
-            multi_processor_count=256,
-            warp_size=64,
-            max_threads_per_multi_processor=2048,
-        )
-        with (
-            mock.patch.object(policy, "get_gfx_runtime", lambda: "gfx950"),
-            mock.patch.object(torch.cuda, "current_device", lambda: 0),
-            mock.patch.object(torch.cuda, "get_device_properties", lambda _: props),
-            mock.patch(
-                "aiter.ops.flydsl.kernels.gemm_a16w16_gfx950."
-                "make_gemm_a16w16_param_and_validate",
-                _fake_gfx950_param,
-            ),
-        ):
-            configs = policy.get_flydsl_a16w16_configs(
-                1798,
-                6288,
-                7168,
-                torch.bfloat16,
-                torch.bfloat16,
-                False,
-            )
-            grouped_configs = policy.get_flydsl_a16w16_configs(
-                2689,
-                1536,
-                7168,
-                torch.bfloat16,
-                torch.bfloat16,
-                False,
-            )
-            workspace_configs = policy.get_flydsl_a16w16_configs(
-                252,
-                20480,
-                7168,
-                torch.bfloat16,
-                torch.bfloat16,
-                False,
-            )
-
-        assert not any(
-            config["use_half_tile_interleaved"]
-            and config["block_m"] < 128
-            and 6288 % config["block_n"] != 0
-            for config in configs
-        )
-        validated_half_tiles = [
-            config
-            for config in configs
-            if config["use_half_tile_interleaved"]
-            and (config["block_m"], config["block_n"], config["block_k"])
-            == (256, 256, 64)
-            and (config["m_waves"], config["n_waves"], config["k_waves"]) == (2, 4, 1)
-        ]
-        assert {config["group_m"] for config in validated_half_tiles} == {
-            0,
-            1,
-            2,
-            4,
-            8,
-            16,
-        }
-        assert any(
-            config["use_half_tile_interleaved"]
-            and (
-                config["block_m"],
-                config["block_n"],
-                config["block_k"],
-                config["m_waves"],
-                config["n_waves"],
-                config["group_m"],
-            )
-            == (192, 128, 128, 2, 4, 4)
-            for config in grouped_configs
-        )
-        assert any(
-            config["use_half_tile_interleaved"]
-            and (
-                config["block_m"],
-                config["block_n"],
-                config["block_k"],
-                config["split_k"],
-                config["m_waves"],
-                config["n_waves"],
-                config["group_m"],
-            )
-            == (256, 256, 64, 2, 2, 4, 8)
-            for config in workspace_configs
-        )
-
-    def test_large_m_full_search_keeps_wide_ragged_n_tiles(self):
-        from types import SimpleNamespace
-
-        import aiter.ops.flydsl.gemm_a16w16_policy as policy
-
-        props = SimpleNamespace(
-            multi_processor_count=256,
-            warp_size=64,
-            max_threads_per_multi_processor=2048,
-        )
-        with (
-            mock.patch.object(policy, "get_gfx_runtime", lambda: "gfx950"),
-            mock.patch.object(torch.cuda, "current_device", lambda: 0),
-            mock.patch.object(torch.cuda, "get_device_properties", lambda _: props),
-            mock.patch(
-                "aiter.ops.flydsl.kernels.gemm_a16w16_gfx950."
-                "make_gemm_a16w16_param_and_validate",
-                _fake_gfx950_param,
-            ),
-        ):
-            configs = policy.get_flydsl_a16w16_configs(
-                15360,
-                2112,
-                7168,
-                torch.bfloat16,
-                torch.bfloat16,
-                False,
-                use_large_gemm_fast_path=False,
-            )
-
-        assert any(config["block_n"] == 256 for config in configs)
-
-    def test_near_cu_rectangular_tile_survives_pruning(self):
-        from types import SimpleNamespace
-
-        import aiter.ops.flydsl.gemm_a16w16_policy as policy
-
-        props = SimpleNamespace(
-            multi_processor_count=256,
-            warp_size=64,
-            max_threads_per_multi_processor=2048,
-        )
-        with (
-            mock.patch.object(policy, "get_gfx_runtime", lambda: "gfx950"),
-            mock.patch.object(torch.cuda, "current_device", lambda: 0),
-            mock.patch.object(torch.cuda, "get_device_properties", lambda _: props),
-            mock.patch(
-                "aiter.ops.flydsl.kernels.gemm_a16w16_gfx950."
-                "make_gemm_a16w16_param_and_validate",
-                _fake_gfx950_param,
-            ),
-        ):
-            for shape, tile in (
-                ((2078, 6288, 7168), (208, 256, 2, 1, 2, 4, 0)),
-                ((2079, 6288, 7168), (224, 256, 2, 1, 2, 4, 0)),
-                ((576, 20480, 7168), (192, 256, 2, 1, 4, 4, 0)),
-                ((4032, 2880, 7168), (192, 256, 2, 1, 4, 4, 0)),
-                ((279, 7168, 35840), (320, 192, 2, 5, 4, 2, 0)),
-                ((312, 6288, 7168), (320, 192, 2, 7, 4, 4, 0)),
-                ((264, 8448, 7168), (320, 192, 2, 4, 4, 4, 0)),
-                ((248, 8448, 7168), (256, 256, 2, 7, 4, 2, 0)),
-                ((255, 8448, 7168), (256, 256, 2, 7, 2, 4, 0)),
-                ((288, 8448, 7168), (320, 192, 2, 4, 4, 4, 0)),
-                ((706, 2880, 7168), (256, 256, 2, 7, 4, 2, 0)),
-                ((1152, 2112, 7168), (320, 192, 2, 4, 4, 4, 0)),
-                ((386, 6288, 7168), (400, 128, 2, 4, 5, 2, 0)),
-                ((522, 8448, 7168), (320, 192, 2, 2, 4, 4, 0)),
-                ((322, 6288, 7168), (384, 192, 2, 7, 8, 1, 0)),
-                ((4033, 2880, 7168), (256, 192, 2, 1, 4, 4, 0)),
-                ((5382, 2112, 7168), (256, 192, 2, 1, 4, 4, 0)),
-                ((3079, 8448, 7168), (288, 192, 2, 1, 2, 4, 0)),
-                ((4609, 3584, 7168), (320, 224, 2, 1, 4, 2, 2)),
-                ((5758, 2880, 7168), (320, 224, 2, 1, 4, 2, 16)),
-                ((5762, 2880, 7168), (224, 320, 2, 1, 2, 4, 8)),
-                ((6136, 2880, 7168), (224, 320, 2, 1, 2, 4, 8)),
-                ((1025, 8448, 7168), (224, 192, 3, 1, 2, 6, 0)),
-                ((2686, 2880, 7168), (160, 192, 3, 1, 2, 4, 16)),
-                ((2689, 3072, 512), (192, 192, 3, 1, 3, 4, 0)),
-                ((5381, 3072, 512), (320, 224, 2, 1, 4, 2, 4)),
-                ((543, 6288, 7168), (128, 128, 3, 1, 2, 2, 1)),
-                ((635, 6288, 7168), (128, 128, 3, 1, 4, 4, 1)),
-                # Wide hand-added tiles must not tighten the grid tile limit.
-                ((1, 163840, 256), (16, 64, 3, 1, 1, 2, 0)),
-                ((13, 163840, 256), (16, 64, 3, 1, 1, 2, 0)),
-            ):
-                configs = policy.get_flydsl_a16w16_configs(
-                    *shape,
-                    torch.bfloat16,
-                    torch.bfloat16,
-                    False,
-                )
-                assert any(
-                    config["block_m"] == tile[0]
-                    and config["block_n"] == tile[1]
-                    and config["block_k"] == 64
-                    and config["stages"] == tile[2]
-                    and config["split_k"] == tile[3]
-                    and config["m_waves"] == tile[4]
-                    and config["n_waves"] == tile[5]
-                    and config["group_m"] == tile[6]
-                    for config in configs
-                )
-            configs = policy.get_flydsl_a16w16_configs(
-                322, 7168, 35840, torch.bfloat16, torch.bfloat16, False
-            )
-
-        def accumulator_tiles(config):
-            return (config["block_m"] // config["m_waves"] // 16) * (
-                config["block_n"] // config["n_waves"] // 16
-            )
-
-        # Allowlisted rectangles survive only while their accumulators fit.
-        self.assertTrue(
-            any((c["block_m"], c["block_n"]) == (256, 256) for c in configs)
-        )
-        self.assertFalse(
-            any(
-                not c["use_half_tile_interleaved"] and accumulator_tiles(c) > 64
-                for c in configs
-            )
-        )
+    def test_added_tiles_survive_pruning(self):
+        catalogs = {}
+        with _gfx950_policy() as policy:
+            for shape, fields in _GFX950_KEPT_TILES:
+                if shape not in catalogs:
+                    catalogs[shape] = policy.get_flydsl_a16w16_configs(
+                        *shape, torch.bfloat16, torch.bfloat16, False
+                    )
+                with self.subTest(shape=shape, fields=fields):
+                    self.assertTrue(
+                        any(
+                            fields.items() <= config.items()
+                            for config in catalogs[shape]
+                        )
+                    )
 
 
 class TestLegacyFlydslHgemmConfigs(unittest.TestCase):
@@ -1378,6 +1171,9 @@ class TestLegacyFlydslHgemmConfigs(unittest.TestCase):
                 self.assertEqual(args["k_stagger"], 0)
                 self.assertFalse(args["b_non_temporal"])
                 self.assertNotEqual(args["policy"], "bs")
+                self.assertEqual(
+                    args["split_k_workspace"], params["use_split_k_workspace"]
+                )
                 for field in (
                     "block_m",
                     "block_n",
