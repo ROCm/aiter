@@ -1790,6 +1790,14 @@ gfx1250,256,128,4096,1280,32x32,flydsl,bmm,1,14.734,flydsl_bmm_mxfp8_32_wmma_t32
 gfx1250,256,256,4096,1280,32x32,flydsl,bmm,1,14.742,flydsl_bmm_mxfp8_32_wmma_t64x64x256_mw2_nw2_nb2_sk1_cm1_cn1,182.09,,0.0
 gfx1250,256,512,4096,1280,32x32,flydsl,bmm,1,14.814,flydsl_bmm_mxfp8_32_wmma_t64x128x256_mw2_nw2_nb3_sk1_cm1_cn1,362.40,,0.0
 gfx1250,256,1024,4096,1280,32x32,flydsl,bmm,1,15.175,flydsl_bmm_mxfp8_32_wmma_t128x128x256_mw2_nw2_nb2_sk1_cm1_cn1,707.58,,0.0
+gfx1250,256,1088,4096,1280,32x32,flydsl,bmm,1,0,flydsl_bmm_mxfp8_32_wmma_t192x128x256_mw2_nw2_nb3_sk1_cm1_cn1,0,0,0.0
+gfx1250,256,1152,4096,1280,32x32,flydsl,bmm,1,0,flydsl_bmm_mxfp8_32_wmma_t192x128x256_mw2_nw2_nb3_sk1_cm1_cn1,0,0,0.0
+gfx1250,256,1216,4096,1280,32x32,flydsl,bmm,1,0,flydsl_bmm_mxfp8_32_wmma_t192x128x256_mw2_nw2_nb3_sk1_cm1_cn1,0,0,0.0
+gfx1250,256,1280,4096,1280,32x32,flydsl,bmm,1,0,flydsl_bmm_mxfp8_32_wmma_t192x128x256_mw2_nw2_nb3_sk1_cm1_cn1,0,0,0.0
+gfx1250,256,1344,4096,1280,32x32,flydsl,bmm,1,0,flydsl_bmm_mxfp8_32_wmma_t192x128x256_mw2_nw2_nb3_sk1_cm1_cn1,0,0,0.0
+gfx1250,256,1408,4096,1280,32x32,flydsl,bmm,1,0,flydsl_bmm_mxfp8_32_wmma_t192x128x256_mw2_nw2_nb3_sk1_cm1_cn1,0,0,0.0
+gfx1250,256,1472,4096,1280,32x32,flydsl,bmm,1,0,flydsl_bmm_mxfp8_32_wmma_t192x128x256_mw2_nw2_nb3_sk1_cm1_cn1,0,0,0.0
+gfx1250,256,1536,4096,1280,32x32,flydsl,bmm,1,0,flydsl_bmm_mxfp8_32_wmma_t192x128x256_mw2_nw2_nb3_sk1_cm1_cn1,0,0,0.0
 gfx1250,256,2048,4096,1280,32x32,flydsl,bmm,1,16.718,flydsl_bmm_mxfp8_32_wmma_t128x256x256_mw2_nw2_nb3_sk1_cm1_cn1,1284.51,,0.0
 gfx1250,256,4096,4096,1280,32x32,flydsl,bmm,1,18.254,flydsl_bmm_mxfp8_32_wmma_t256x256x128_mw2_nw2_nb3_sk1_cm1_cn1,2352.89,,0.0
 gfx1250,256,8192,4096,1280,32x32,flydsl,bmm,1,24.156,flydsl_bmm_mxfp8_32_wmma_t256x256x128_mw2_nw2_nb3_sk1_cm1_cn1,3556.03,,0.0
