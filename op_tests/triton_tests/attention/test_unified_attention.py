@@ -2661,3 +2661,253 @@ def test_unified_attn_split_rebalance_reduce_configs_k4v8(
     )
     assert not new[live].isnan().any()
     assert torch.equal(old[live].view(torch.int16), new[live].view(torch.int16))
+
+
+def _prefill_2d_run(
+    seq_lens,
+    key_bump=None,
+    long_max_seqlen_k=False,
+    num_blocks=8192,
+    sliding_window=None,
+    attn_2d_config=None,
+):
+    """Run unified_attention (gluon, shuffled KV, page 64, 16 / 2 heads, head 64, causal
+    attention, full or with a sliding window) and return (2D kernel launches, output,
+    reference).
+    key_bump = (start, stop, amplitude): keys of sequence 0 at positions [start, stop)
+    and every query get a shared direction, so those keys score far above the others.
+    attn_2d_config: entries that replace the attn_2d table's config."""
+    from aiter.ops.triton.attention import unified_attention as ua_mod
+
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        _,
+        _,
+        _,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        *_,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=num_blocks,
+        block_size=64,
+        head_size=64,
+        num_heads=(16, 2),
+        sliding_window=sliding_window,
+        shuffled_kv_cache=False,
+        device="cuda",
+    )
+    if key_bump is not None:
+        start, stop, amplitude = key_bump
+        u = torch.full((64,), 0.125, device="cuda")
+        pos = torch.arange(start, stop, device="cuda")
+        blocks = block_tables[0, pos // 64].long()
+        k = key_cache_orig.float()
+        k[blocks, pos % 64] += amplitude * u
+        key_cache_orig = k.to(torch.bfloat16)
+        query = (query.float() + amplitude * u).to(torch.bfloat16)
+    key_cache, value_cache = shuffle_kv_cache(key_cache_orig, value_cache_orig)
+    block_table = block_tables
+    max_seqlen_k = max_kv_len
+    if long_max_seqlen_k:
+        max_seqlen_k = 131072
+        block_table = torch.zeros(
+            (len(seq_lens), max_seqlen_k // 64 + 1),
+            dtype=block_tables.dtype,
+            device=block_tables.device,
+        )
+        block_table[:, : block_tables.shape[1]] = block_tables
+    launched = []
+    kernel_2d = ua_mod._unified_attention_kernel_2d_gfx1250
+
+    def hook(*args, **kwargs):
+        launched.append(
+            {k: kwargs.get(k) for k in ("LOOP_VARIANT", "NUM_SPLITS", "q_block_offset")}
+        )
+
+    table_config = ua_mod.get_unified_attention_config
+
+    def forced_config(op, params, backend="triton", arch=None):
+        config = table_config(op, params, backend=backend, arch=arch)
+        if op == "attn_2d" and attn_2d_config is not None:
+            config.update(attn_2d_config)
+        return config
+
+    kernel_2d.add_pre_run_hook(hook)
+    ua_mod.get_unified_attention_config = forced_config
+    try:
+        unified_attention(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            out=output,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=kv_lens,
+            max_seqlen_q=max_query_len,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window_size,
+            block_table=block_table,
+            softcap=0,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            sinks=None,
+            shuffled_kv_cache=True,
+            backend="gluon",
+        )
+    finally:
+        ua_mod.get_unified_attention_config = table_config
+        kernel_2d.pre_run_hooks.remove(hook)
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=[x[0] for x in seq_lens],
+        kv_lens=[x[1] for x in seq_lens],
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        sliding_window=sliding_window,
+    )
+    return launched, output, ref_output
+
+
+@pytest.mark.parametrize(
+    "seq_lens, key_bump",
+    [
+        ([(4096, 4096)], None),
+        ([(1024, 9216), (1000, 9000), (17, 4113)], None),
+        ([(5, 5), (64, 64), (130, 200), (300, 1000)], None),  # short chunks
+        ([(2048, 10240)], (3000, 3500, 40.0)),  # scores far above the first tile
+        ([(2048, 10240)], (0, 64, 40.0)),  # the first tile holds the maximum
+        ([(1024, 6144), (2048, 10240)], (5000, 5100, 400.0)),  # inf L: exact rerun
+    ],
+)
+@pytest.mark.parametrize("long_max_seqlen_k", [False, True])
+@torch.inference_mode()
+def test_gluon_unified_attn_2d_fixed_max(seq_lens, key_bump, long_max_seqlen_k):
+    """gfx1250 Gluon 2D loop variant 2, full attention: the steady loop keeps a fixed
+    reference max per row and reruns a program with the running max when a row's
+    exp sum overflows. key_bump puts the largest scores away from the reference tiles.
+    """
+    if DEVICE_ARCH != "gfx1250" or not _is_gluon_available():
+        pytest.skip("gfx1250 Gluon only")
+    launched, output, ref_output = _prefill_2d_run(
+        seq_lens, key_bump, long_max_seqlen_k
+    )
+    if max(x[0] for x in seq_lens) >= 1024:
+        assert any(x["LOOP_VARIANT"] == 2 for x in launched)
+    assert not torch.isnan(output).any()
+    torch.testing.assert_close(
+        output.to(torch.float32), ref_output.to(torch.float32), atol=1.5e-2, rtol=1e-2
+    )
+
+
+@pytest.mark.parametrize("multi_seq", [False, True])
+@torch.inference_mode()
+def test_gluon_unified_attn_2d_tail_split(multi_seq):
+    """gfx1250 Gluon 2D, full attention over a long cached prefix: the q blocks of the
+    last, partial dispatch wave run in a second launch with their key range split in
+    3 pieces, and a merge kernel writes their rows."""
+    if DEVICE_ARCH != "gfx1250" or not _is_gluon_available():
+        pytest.skip("gfx1250 Gluon only")
+    from aiter.ops.triton.utils.device_info import get_num_sms
+
+    # attn_2d default: BLOCK_M 128 (16 q rows per block), 4 warps, 2 waves per EU, so
+    # 2 * num_sms resident programs; 37 q blocks per kv head go to the tail launch
+    q_len = 16 * (get_num_sms() + 37) - 5
+    if multi_seq:
+        seq_lens = [(q_len // 2, 40000 + q_len // 2), (q_len - q_len // 2, 36000)]
+    else:
+        seq_lens = [(q_len, 40000 + q_len)]
+    launched, output, ref_output = _prefill_2d_run(seq_lens)
+    assert [x["NUM_SPLITS"] or 1 for x in launched] == [1, 3]
+    assert launched[0]["q_block_offset"] > 0
+    assert not torch.isnan(output).any()
+    torch.testing.assert_close(
+        output.to(torch.float32), ref_output.to(torch.float32), atol=1.5e-2, rtol=1e-2
+    )
+
+
+@pytest.mark.parametrize(
+    "loop_variant, block_m, num_buffers",
+    [(0, 64, 2), (0, 128, 2), (2, 64, 2), (2, 128, 2), (2, 128, 3), (None, 128, 2)],
+)
+@pytest.mark.parametrize("sliding_window", [64, 100, 256, 2048])
+@torch.inference_mode()
+def test_gluon_unified_attn_2d_sliding_window_loop_variants(
+    loop_variant, block_m, num_buffers, sliding_window
+):
+    """gfx1250 Gluon 2D kernel with a sliding window on loop variants 0 and 2. Only the
+    key tiles that cut through a row's window start get the window mask. The cases cover
+    windows shorter than 3 tiles or not aligned to the tile, query blocks whose rows start
+    their window in different tiles, and chunked prefill. loop_variant None keeps the
+    attn_2d table entry, which runs loop variant 2 for this shape (head 64, GQA group 8,
+    page 64, bf16)."""
+    if DEVICE_ARCH != "gfx1250" or not _is_gluon_available():
+        pytest.skip("gfx1250 Gluon only")
+    config = None
+    if loop_variant is not None:
+        config = {
+            "BLOCK_M": block_m,
+            "num_warps": 4,
+            "waves_per_eu": 2,
+            "LOOP_VARIANT": loop_variant,
+            "NUM_BUFFERS": num_buffers,
+        }
+    seq_lens = [(1024, 1024), (700, 1500), (333, 3000), (257, 900), (77, 4100)]
+    launched, output, ref_output = _prefill_2d_run(
+        seq_lens, sliding_window=sliding_window, attn_2d_config=config
+    )
+    assert [x["LOOP_VARIANT"] for x in launched] == [
+        2 if loop_variant is None else loop_variant
+    ]
+    assert not torch.isnan(output).any()
+    torch.testing.assert_close(
+        output.to(torch.float32), ref_output.to(torch.float32), atol=2e-2, rtol=1e-2
+    )
+
+
+@pytest.mark.parametrize(
+    "seq_lens, key_bump",
+    [
+        ([(2048, 2048)], None),  # no cached prefix
+        ([(1024, 1024 + 114688)], None),  # after a 112K prefix
+        ([(1024, 9216), (1000, 9000), (17, 4113), (300, 1000)], None),  # mixed lengths
+        ([(5, 5), (64, 64), (130, 200), (300, 1000)], None),  # short chunks
+        # keys at the start of the reference's second tile, left of some rows' window
+        # start: those rows' sums underflow (exact rerun)
+        ([(2048, 10240)], (6208, 6212, 40.0)),
+        ([(2048, 10240)], (7000, 7500, 40.0)),  # scores far above the reference tiles
+        ([(1024, 6144), (2048, 10240)], (7000, 7100, 400.0)),  # inf L: exact rerun
+    ],
+)
+@pytest.mark.parametrize("sliding_window", [128, 2048])
+@torch.inference_mode()
+def test_gluon_unified_attn_2d_sliding_window_fixed_max(
+    seq_lens, key_bump, sliding_window
+):
+    """gfx1250 Gluon 2D loop variant 2 with a sliding window: the steady loop keeps a
+    fixed reference max per row from the window's first two tiles, and reruns a program
+    with the running max when a valid row's exp sum overflows or underflows."""
+    if DEVICE_ARCH != "gfx1250" or not _is_gluon_available():
+        pytest.skip("gfx1250 Gluon only")
+    launched, output, ref_output = _prefill_2d_run(
+        seq_lens, key_bump, sliding_window=sliding_window
+    )
+    if max(x[1] for x in seq_lens) >= 2048:
+        assert [x["LOOP_VARIANT"] for x in launched] == [2]
+    assert not torch.isnan(output).any()
+    torch.testing.assert_close(
+        output.to(torch.float32), ref_output.to(torch.float32), atol=1.5e-2, rtol=1e-2
+    )

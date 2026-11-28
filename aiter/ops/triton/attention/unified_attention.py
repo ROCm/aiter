@@ -13,6 +13,7 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     attention_output_gate_rows,
     kernel_unified_attention_2d,
     kernel_unified_attention_3d,
+    merge_tail_splits,
     reduce_segments,
     unified_attention_3d_split_rebalance_kernel,
 )
@@ -1356,7 +1357,7 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
     USE_STORE_BUFFER_OP = params.out.nelement() * params.out.element_size() <= MAX_INT32
     if not USE_TDM_STORE:
         USE_STORE_BUFFER_OP = False  # gl.store, not the CDNA4 buffer_store, on gfx1250
-    _unified_attention_kernel_2d_gfx1250[(params.num_kv_heads, total_query_blocks)](
+    common = dict(  # noqa: C408 (the kernel's keyword arguments, shared by both launches)
         query_ptr=params.q,
         key_cache_ptr=params.k,
         value_cache_ptr=params.v,
@@ -1423,6 +1424,110 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
         gate_stride_0=output_gate.stride(0) if output_gate is not None else None,
         GATE=output_gate is not None,
         enable_fp_fusion=True,
+    )
+    tail_qblocks = 0
+    if _2d_tail_split_ok(params, output_gate, loop_variant):
+        # resident workgroups per CU (4 SIMDs per CU; LDS assumed not limiting)
+        slots = max(1, waves_per_eu * 4 // num_warps) * get_num_sms()
+        # exact for one sequence, an estimate for varlen (correctness does not depend on it)
+        items = params.num_kv_heads * triton.cdiv(params.num_tokens, BLOCK_Q)
+        if items > slots:
+            tail_qblocks = min(
+                (items % slots) // params.num_kv_heads, total_query_blocks
+            )
+    main_qblocks = total_query_blocks - tail_qblocks
+    if main_qblocks > 0:
+        _unified_attention_kernel_2d_gfx1250[(params.num_kv_heads, main_qblocks)](
+            **common, q_block_offset=tail_qblocks
+        )
+    if tail_qblocks > 0:
+        _launch_2d_tail_split(params, common, tail_qblocks, BLOCK_Q)
+
+
+# Tail split (2D, full causal prefill over a long cached prefix): programs run the heaviest q block first, so
+# the last, partial dispatch wave holds the lightest q blocks. Those run in a second launch with their key
+# range split in _TAIL_SPLITS pieces, and merge_tail_splits combines the pieces. The last wave then fills the
+# GPU instead of leaving CU slots idle. A fresh prefill has nothing to split and pays two more launches, so
+# the split needs a cached prefix of at least _TAIL_MIN_PREFIX keys.
+_TAIL_SPLITS = 3
+_TAIL_MIN_PREFIX = 32768
+_tail_ws: dict = {}
+
+
+def _2d_tail_split_ok(params: _UAParams, output_gate, loop_variant) -> bool:
+    return (
+        os.environ.get("AITER_UA_2D_TAIL_SPLIT", "1") == "1"
+        and not params.all_decode
+        and not params.spec_decode
+        and params.max_seqlen_k - params.max_seqlen_q >= _TAIL_MIN_PREFIX
+        and params.causal
+        and params.sliding_window == 0
+        and params.sinks is None
+        and output_gate is None
+        and loop_variant == 2
+        and params.q.dtype in (torch.bfloat16, torch.float16)
+        and params.k.dtype == params.q.dtype
+        and params.out.dtype == params.q.dtype
+        and params.q_descale is None
+        and params.k_descale is None
+        and params.v_descale is None
+        and params.output_scale is None
+    )
+
+
+def _launch_2d_tail_split(params: _UAParams, common: dict, tail_qblocks, BLOCK_Q):
+    S = _TAIL_SPLITS
+    # every token of q block g < tail_qblocks is < (g + 2) * BLOCK_Q
+    rows = min(params.num_tokens, (tail_qblocks + 1) * BLOCK_Q)
+    key = (params.q.device, rows, params.num_query_heads, params.head_size, S)
+    ws = _tail_ws.get(key)
+    if ws is None:
+        dev = params.q.device
+        ws = (
+            torch.empty(
+                (rows, params.num_query_heads, S), dtype=torch.float32, device=dev
+            ),
+            torch.empty(
+                (rows, params.num_query_heads, S), dtype=torch.float32, device=dev
+            ),
+            torch.empty(
+                (rows, params.num_query_heads, S, params.head_size),
+                dtype=torch.float32,
+                device=dev,
+            ),
+        )
+        _tail_ws[key] = ws
+    pm, pl, pacc = ws
+    tail_args = dict(
+        common,
+        NUM_SPLITS=S,
+        partial_m_ptr=pm,
+        partial_l_ptr=pl,
+        partial_acc_ptr=pacc,
+        q_block_offset=0,
+    )
+    _unified_attention_kernel_2d_gfx1250[(params.num_kv_heads, tail_qblocks, S)](
+        **tail_args
+    )
+    block_t = 8
+    merge_tail_splits[(triton.cdiv(rows, block_t),)](
+        params.out,
+        pm,
+        pl,
+        pacc,
+        params.cu_seqlens_q,
+        params.out.stride(0),
+        params.out.stride(1),
+        rows,
+        params.num_seqs,
+        tail_qblocks,
+        QK_SCALE=params.softmax_scale * 1.4426950408889634,
+        NUM_HEADS=params.num_query_heads,
+        HEAD_SIZE=params.head_size,
+        NUM_SPLITS=S,
+        BLOCK_Q=BLOCK_Q,
+        BLOCK_T=block_t,
+        num_warps=4,
     )
 
 
