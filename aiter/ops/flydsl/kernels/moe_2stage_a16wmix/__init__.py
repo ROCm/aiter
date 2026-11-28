@@ -369,7 +369,7 @@ def flydsl_a16w4_gemm2(
     epilog="atomic",
     use_valid_token_count=False,
     stream=None,
-    reuse_lds=False,
+    reuse_lds=None,
     shared_inter_bf16=None,
     fused_shared_w2=None,
     shared_tile_n=None,
@@ -385,10 +385,11 @@ def flydsl_a16w4_gemm2(
     grid remap. ``k_batch`` for parity (must be 1). ``b_nt`` is the W-load cache
     modifier (0=cached, 2=nt), taken as-is (cached when unset).
 
-    ``reuse_lds=True`` shares the A tile and atomic-epilogue scratch after
-    the K-loop barrier. It is opt-in; existing calls retain their LDS allocation.
-    Only gfx942 MXFP4 weights with the atomic epilogue are qualified for reuse;
-    other architectures, weight formats and epilogues retain the default path.
+    ``reuse_lds`` sizes the atomic-epilogue LDS as max(A tile, f32 scratch), which
+    the kernel already overlaps after the K-loop barrier, instead of their sum.
+    ``None`` (the default) does so on gfx942 for MXFP4 weights with the atomic
+    epilogue and no shared expert, when it fits the LDS; ``True`` requires it
+    (gfx942 MXFP4 atomic only); ``False`` keeps the summed allocation.
 
     ``shared_inter_bf16`` / ``fused_shared_w2`` (together, atomic epilog): the shared-expert
     prologue adds ``shared_inter_bf16 [M_logical, D_INTER] @ fused_shared_w2^T`` into every

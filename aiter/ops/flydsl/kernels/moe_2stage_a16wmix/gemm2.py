@@ -486,7 +486,7 @@ def compile_gemm2_a16w4_port(
     rocm_arch,
     epilog="atomic",
     topk=1,
-    reuse_lds=False,
+    reuse_lds=None,
     use_valid_token_count=False,
     shared_tile_n=None,
     shared_tile_m=None,
@@ -501,6 +501,13 @@ def compile_gemm2_a16w4_port(
     ``use_valid_token_count`` (atomic only): bound scatter rows by
     min(cumsum[1], M) -- a LocalToken sort pads with token id = real count, which
     is still < M when M is a padded (cudagraph) row count.
+
+    The epilog stages its f32 scratch at LDS offset 0, over the A tile, after the
+    K-loop barrier. ``reuse_lds`` sizes the atomic-epilog LDS to that overlap,
+    max(A tile, f32 scratch), instead of their sum; the code and the result are the
+    same, only the occupancy changes. ``None`` (the default) does so on gfx942 for
+    fp4 W2 with the atomic epilog and no shared expert, when it fits the LDS;
+    ``True`` requires it (gfx942 fp4 atomic only); ``False`` keeps the sum.
 
     ``xcd_swizzle`` (>0) bijectively round-robins the launch index across the 8 XCDs to
     balance per-XCD/HBM traffic (gemm2 is HBM-bound), + optional M-group swizzle for
@@ -530,11 +537,12 @@ def compile_gemm2_a16w4_port(
         )
     if epilog not in ("atomic", "reduce"):
         raise ValueError(f"epilog must be 'atomic' or 'reduce', got {epilog!r}")
-    if reuse_lds and (
-        str(rocm_arch).split(":", 1)[0] != "gfx942"
-        or w_dtype != "fp4"
-        or epilog != "atomic"
-    ):
+    _reuse_qualified = (
+        str(rocm_arch).split(":", 1)[0] == "gfx942"
+        and w_dtype == "fp4"
+        and epilog == "atomic"
+    )
+    if reuse_lds and not _reuse_qualified:
         raise NotImplementedError(
             "LDS reuse is validated only for gfx942 fp4 atomic stage2"
         )
@@ -564,22 +572,25 @@ def compile_gemm2_a16w4_port(
     KH_TILE_BYTES = TILE_K * 2
 
     _a_bytes = BM * KH_TILE_BYTES
-    if _use_reduce:
-        _lds_bytes = max(_a_bytes, BM * TILE_N * 2)
-    elif reuse_lds:
-        _lds_bytes = max(_a_bytes, BM * TILE_N * 4)
-    else:
-        _lds_bytes = _a_bytes + BM * TILE_N * 4
-
-    if reuse_lds:
+    _reuse_bytes = max(_a_bytes, BM * TILE_N * 4)
+    if reuse_lds or (reuse_lds is None and _reuse_qualified and shared_tile_n is None):
         from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
         lds_capacity = get_lds_capacity_bytes(str(rocm_arch))
-        if _lds_bytes > lds_capacity:
+        if reuse_lds is None:
+            reuse_lds = _reuse_bytes <= lds_capacity
+        elif _reuse_bytes > lds_capacity:
             raise NotImplementedError(
-                f"a16w4 gemm2 requires {_lds_bytes} LDS bytes, "
+                f"a16w4 gemm2 requires {_reuse_bytes} LDS bytes, "
                 f"exceeding {rocm_arch} capacity {lds_capacity}"
             )
+    reuse_lds = bool(reuse_lds)
+    if _use_reduce:
+        _lds_bytes = max(_a_bytes, BM * TILE_N * 2)
+    elif reuse_lds:
+        _lds_bytes = _reuse_bytes
+    else:
+        _lds_bytes = _a_bytes + BM * TILE_N * 4
 
     if shared_tile_n is not None:
         assert not _use_reduce, "the shared-expert prologue needs epilog='atomic'"
