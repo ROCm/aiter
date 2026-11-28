@@ -34,7 +34,7 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops.flydsl import flydsl_fp8_paged_mqa_logits
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_common import benchmark, checkAllclose, run_perftest
@@ -419,6 +419,15 @@ def _grade(ref, got, msg):
     )
 
 
+def _worst_row_mismatches(ref, got):
+    """Most out-of-tolerance logits in any one row, with `_grade`'s tolerances."""
+    live = ref != float("-inf")
+    ref = ref.masked_fill(~live, 0)
+    got = got.masked_fill(~live, 0)
+    bad = (got - ref).abs() > 5.0 + 1e-2 * ref.abs()
+    return int(bad.sum(dim=1).max())
+
+
 def _roofline(batch, next_n, kv_len, context_lens, q_fp8, weights, out):
     total_ctx = int(context_lens.sum().item())
     flops = 2 * HEADS * HEAD_DIM * next_n * total_ctx
@@ -701,9 +710,9 @@ def test_fp8_paged_mqa_logits_wide_out(batch, kv_len, kv_block_size=KV_BLOCK_SIZ
 
 @benchmark()
 def test_fp8_paged_mqa_logits_big_cache(batch, kv_len, kv_block_size):
-    """A KV pool past 2 GiB: pages scattered over it need 64-bit cache offsets."""
+    """A KV pool past 4 GiB: pages scattered over it need 64-bit cache offsets."""
     page_bytes = kv_block_size * INDEX_DIM
-    pool_blocks = (5 << 30) // (2 * page_bytes)  # ~2.5 GiB of FP8 pages
+    pool_blocks = (9 << 30) // (2 * page_bytes)  # ~4.5 GiB of FP8 pages
     inp = _build_inputs(
         batch,
         1,
@@ -714,7 +723,7 @@ def test_fp8_paged_mqa_logits_big_cache(batch, kv_len, kv_block_size):
         block_size=kv_block_size,
         pool_blocks=pool_blocks,
     )
-    assert inp.kv_cache_fp8.numel() > (1 << 31)
+    assert inp.kv_cache_fp8.numel() > (1 << 32)
     kv_cache_kernel, out = _kernel_inputs(inp, batch, 1, HEAD_DIM)
     ref = run_torch(
         inp.q,
@@ -744,9 +753,15 @@ def test_fp8_paged_mqa_logits_big_cache(batch, kv_len, kv_block_size):
     flops, nbytes = _roofline(
         batch, 1, kv_len, inp.context_lens, inp.q_fp8, inp.weights, out
     )
-    return _time_candidates(
+    ret = _time_candidates(
         {"flydsl": (flydsl, out)}, ref, flops, nbytes, "paged big_cache"
     )
+    # A wrong page puts a whole kv_block_size of logits out of tolerance in one
+    # row; the lone FP8 MFMA vs fp32 rounding outlier is one element. The count is
+    # per row because a fraction over every element dilutes with the batch.
+    worst = _worst_row_mismatches(ref, out)
+    assert worst < kv_block_size // 2, f"paged big_cache row mismatches: {worst}"
+    return ret
 
 
 def _summarize(name, rows):
@@ -1024,8 +1039,8 @@ def main():
         "--big-cache-batch",
         type=int,
         nargs="*",
-        default=[4] if get_gfx() == "gfx1250" else [],
-        help="Batch for the >2 GiB KV-pool table (gfx1250).",
+        default=[4] if get_gfx_runtime() in ("gfx950", "gfx1250") else [],
+        help="Batch for the >4 GiB KV-pool table.",
     )
     parser.add_argument(
         "--hist-nq",
