@@ -13,6 +13,7 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton._triton_kernels.gated_delta_net.gated_delta_rule_utils import (
+    GATED_DELTA_RULE_TRITON_AUTOTUNE,
     IS_NVIDIA_HOPPER,
     autotune_cache_kwargs,
     check_shared_mem,
@@ -23,10 +24,49 @@ from aiter.ops.triton._triton_kernels.gated_delta_net.utils import (
     prepare_rebased_cu_seqlens,
 )
 from aiter.ops.triton._triton_kernels.gated_delta_net.utils.op import exp
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
+
+_OPT_VK_SHAPE_KEYS = ("H", "Hg", "K", "V", "BT")
+
+
+def _opt_vk_shape_tiles() -> dict:
+    """Tiles of chunk_fwd_kernel_o_opt_vk published for exact shapes on this device.
+
+    Read from the "dispatch" rules of the gated_delta_rule DEFAULT.json, e.g. the
+    80-CU gfx942 tree lists the Qwen3.8 head counts. Any other device, or a missing
+    or unreadable file, gives no tiles, so every shape keeps the first candidate.
+    """
+    try:
+        cfg_dir = resolve_config_dir("attention", "GATED_DELTA_RULE")
+        table = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False) or {}
+        tiles = {}
+        for rule in table.get("chunk_fwd_kernel_o_opt_vk", {}).get("dispatch", ()):
+            cfg = dict(rule["config"])
+            num_warps, num_stages = cfg.pop("num_warps"), cfg.pop("num_stages")
+            shape = tuple(rule[name] for name in _OPT_VK_SHAPE_KEYS)
+            tiles[shape] = triton.Config(
+                cfg, num_warps=num_warps, num_stages=num_stages
+            )
+    except Exception:  # noqa: BLE001 -- no accelerator, unknown arch, bad rule
+        return {}
+    return tiles
+
+
+_OPT_VK_SHAPE_TILES = _opt_vk_shape_tiles()
+
+
+def _opt_vk_select(configs, named_args, **kwargs):
+    """Without autotuning, a published shape gets its tile and any other shape the
+    first candidate; with autotuning, every candidate is tuned."""
+    if GATED_DELTA_RULE_TRITON_AUTOTUNE:
+        return configs
+    args = {**named_args, **kwargs}
+    shape = tuple(args.get(name) for name in _OPT_VK_SHAPE_KEYS)
+    return [_OPT_VK_SHAPE_TILES.get(shape, configs[0])]
 
 
 # tl.make_block_ptr was removed in Triton 3.8 ("Block pointers have been removed
@@ -818,8 +858,11 @@ def chunk_fwd_o_opt(
             for num_warps in NUM_WARPS
             for num_stages in [2, 3, 4]
         ],
-    ),
-    key=["H", "K", "V", "BT", "IS_VARLEN"],
+    )
+    # Published shape tiles of this device (none elsewhere); _opt_vk_select picks one.
+    + list(dict.fromkeys(_OPT_VK_SHAPE_TILES.values())),
+    key=["H", "Hg", "K", "V", "BT", "IS_VARLEN"],
+    prune_configs_by={"early_config_prune": _opt_vk_select},
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T", "T_flat"])
