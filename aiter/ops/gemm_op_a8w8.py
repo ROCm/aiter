@@ -21,11 +21,10 @@ from ..jit.core import (
 )
 from ..jit.utils.asm_guard import require_gfx1250_asm
 from ..jit.utils.build_targets import base_gfx_arch, is_gfx1250_family
-from ..jit.utils.chip_info import get_cu_num
+from ..jit.utils.chip_info import get_cu_num, get_tuned_cu_nums
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..ops.gemm_op_common import (
-    find_padded_m_row,
     get_padded_m,
     mxscale_w_scale_block,
     with_mxscale_w_scale_block,
@@ -33,6 +32,7 @@ from ..ops.gemm_op_common import (
 from ..plugin import route as _route
 from ..utility import dtypes
 from ..utility.graph_alloc import capture_scoped_cache, persistent_alloc
+from .gemm_op_common import find_tuned_row
 from .mxfp8fp4gemm_common import (
     _MXFP8_GEMM_CONFIG_KEYS,
     get_mxfp8_asm_dir,
@@ -1426,16 +1426,22 @@ def get_mxscale_bpreshuffle_config(m: int, n: int, k: int, w_scale_block: str):
         key[0] for key in _mxscale_bpreshuffle_tuned_nk()
     }:
         gfx = base_gfx_arch(gfx)
-    if (gfx, cu_num, n, k, w_scale_block) not in _mxscale_bpreshuffle_tuned_nk():
-        # No row for this N/K at any M: same answer as the walk below.
-        row, padded_m = None, m
-    else:
-        row, padded_m = find_padded_m_row(
+    tuned_nk = _mxscale_bpreshuffle_tuned_nk()
+    # A CU count without a row for this N/K at any M is skipped: same answer
+    # as the walk of find_tuned_row.
+    row, padded_m = None, m
+    if any(
+        (gfx, cu, n, k, w_scale_block) in tuned_nk for cu in get_tuned_cu_nums(cu_num)
+    ):
+        row, padded_m = find_tuned_row(
             _load_mxscale_bpreshuffle_tuned(),
-            lambda pm: (gfx, cu_num, pm, n, k, w_scale_block),
+            lambda cu, pm: (gfx, cu, pm, n, k, w_scale_block),
+            gfx,
+            cu_num,
             m,
             n,
             k,
+            "a8w8_blockscale_mxscale_bpreshuffle",
         )
     if row is not None and row.get("libtype") == "flydsl":
         from .flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
@@ -2928,7 +2934,10 @@ def mxfp8_bpreshuffle_tuned(N: int, K: int) -> bool:
     if not is_gfx1250_family(get_gfx()):
         return False
     tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE_FILE
-    return (get_gfx(), get_cu_num(), N, K) in _mxfp8_bpreshuffle_tuned_nk(tuned_file)
+    tuned_nk = _mxfp8_bpreshuffle_tuned_nk(tuned_file)
+    return any(
+        (get_gfx(), cu, N, K) in tuned_nk for cu in get_tuned_cu_nums(get_cu_num())
+    )
 
 
 def _mxfp8_32_fallback_kernel_name(M: int, N: int, K: int) -> str | None:
@@ -2993,12 +3002,15 @@ def _get_mxfp8_bpreshuffle_config(
         key[0] for key in _load_mxfp8_bpreshuffle_tuned(tuned_file)
     }:
         gfx = base_gfx_arch(gfx)
-    config, padded_m = find_padded_m_row(
+    config, padded_m = find_tuned_row(
         _load_mxfp8_bpreshuffle_tuned(tuned_file),
-        lambda pm: (gfx, cu_num, pm, N, K, w_scale_block),
+        lambda cu, pm: (gfx, cu, pm, N, K, w_scale_block),
+        gfx,
+        cu_num,
         M,
         N,
         K,
+        tuned_file,
     )
     if config is not None and AITER_LOG_TUNED_CONFIG:
         logger.info(
