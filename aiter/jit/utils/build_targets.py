@@ -29,6 +29,8 @@ GFX_MAP = {
     17: "gfx1201",
     18: "gfx1250",
     19: "gfx1250-strict",
+    20: "gfx1170",
+    21: "gfx1171",
 }
 
 # CU counts an explicit GPU_ARCHS build targets for each supported gfx arch, full
@@ -46,6 +48,8 @@ GFX_CU_NUMS_MAP = {
     "gfx1103": (12,),  # Radeon 780M
     "gfx1150": (16, 12),  # Radeon 890M, Radeon 880M
     "gfx1151": (40,),  # Strix Halo / Radeon 8060S
+    "gfx1170": (4,),  # gfx1170 iGPU
+    "gfx1171": (4,),  # gfx1171 iGPU
     "gfx1200": (32, 28),  # Radeon RX 9060 XT, Radeon RX 9060
     "gfx1201": (64,),  # Radeon RX 9070 XT / Radeon AI PRO R9700
     "gfx1250": (256, 192, 96),

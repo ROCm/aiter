@@ -15,6 +15,8 @@ defaultDtypes = {
     "gfx1102": {"fp8": torch.float8_e4m3fn},
     "gfx1150": {"fp8": torch.float8_e4m3fn},
     "gfx1151": {"fp8": torch.float8_e4m3fn},
+    "gfx1170": {"fp8": torch.float8_e4m3fn},
+    "gfx1171": {"fp8": torch.float8_e4m3fn},
     "gfx1200": {"fp8": torch.float8_e4m3fn},
     "gfx1201": {"fp8": torch.float8_e4m3fn},
     "gfx1250": {"fp8": torch.float8_e4m3fn},
