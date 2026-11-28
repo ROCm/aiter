@@ -20,6 +20,8 @@
 #include "aiter_hip_common.h"
 
 #include <ATen/hip/HIPContext.h>
+#include <atomic>
+#include <climits>
 
 namespace {
 
@@ -39,7 +41,9 @@ void launch_d128(at::Tensor& q,
                  int max_seqlen_q,
                  int max_seqlen_k,
                  int window_size_left,
-                 std::optional<at::Tensor>& sink)
+                 std::optional<at::Tensor>& sink,
+                 std::optional<at::Tensor>& block_table,
+                 int num_splits)
 {
     // Both head dims share the tile shape; the dispatcher only routes 64 or 128 here.
     const int D = static_cast<int>(q.size(-1));
@@ -63,11 +67,16 @@ void launch_d128(at::Tensor& q,
                 "OPUS D=", D, ": window_size_left >= 0 requires causal");
     TORCH_CHECK(window_size_left < 0 || D == 128,
                 "OPUS D=64 kernel has no sliding window");
-    TORCH_CHECK(window_size_left < 0 || !sink.has_value(),
-                "OPUS: attention sink is not supported with a sliding window");
     args.window_size_left = window_size_left;
 
     HipDeviceGuard guard(q.device().index());
+
+    // Split-KV partials; they only need to outlive the enqueue (stream-ordered allocator).
+    at::Tensor o_acc, lse_acc;
+    TORCH_CHECK(num_splits >= 0 && num_splits <= 16, "OPUS D=128: num_splits must be in [0, 16]");
+    TORCH_CHECK(num_splits <= 1 || block_table.has_value(), "OPUS D=128: num_splits > 1 needs paged KV");
+    TORCH_CHECK(!block_table.has_value() || is_group, "OPUS D=128: paged KV needs group mode (seqstart_q)");
+    TORCH_CHECK(!block_table.has_value() || D == 128, "OPUS: paged KV needs head dim 128");
 
     int B, N, N_KV, H, H_KV;
     int num_q_blocks;   // only used for the empty-launch short circuit below
@@ -75,18 +84,35 @@ void launch_d128(at::Tensor& q,
     if (is_group) {
         // Packed / varlen: q [total_q, H, D], k/v [total_k, H_KV, D],
         // out [total_q, H, D]. group = num sequences.
-        TORCH_CHECK(q.dim() == 3 && k.dim() == 3 && v.dim() == 3 && out.dim() == 3,
-                    "group mode expects packed 3-D q/k/v/out [total, H, D]");
-        TORCH_CHECK(static_cast<int>(q.size(2)) == D && static_cast<int>(k.size(2)) == D &&
-                        static_cast<int>(v.size(2)) == D && static_cast<int>(out.size(2)) == D,
-                    "group mode q/k/v/out head dim must equal q head dim D");
+        // Paged KV: k/v are [num_blocks, 128, H_KV, D] views of a page pool (any strides with a
+        // contiguous head dim, e.g. the K and V halves of one cache), block_table
+        // [num_groups, max_pages] int32 maps each group's pages, seqstart_k gives the lengths.
+        const bool paged = block_table.has_value();
+        TORCH_CHECK(q.dim() == 3 && out.dim() == 3, "group mode expects packed 3-D q/out [total, H, D]");
+        TORCH_CHECK(static_cast<int>(out.size(2)) == D,
+                    "group mode q/out head dim must equal q head dim D");
         TORCH_CHECK(seqstart_q.has_value() && seqstart_k.has_value(),
                     "group mode requires seqstart_q and seqstart_k");
-        H    = static_cast<int>(q.size(1));
-        H_KV = static_cast<int>(k.size(1));
-        TORCH_CHECK(static_cast<int>(v.size(1)) == H_KV, "group mode k/v must share H_KV");
-        TORCH_CHECK(static_cast<int>(v.size(0)) == static_cast<int>(k.size(0)),
-                    "group mode k/v must share total_k");
+        H = static_cast<int>(q.size(1));
+        if (paged) {
+            TORCH_CHECK(k.dim() == 4 && v.dim() == 4,
+                        "paged KV expects 4-D k/v [num_blocks, 128, H_KV, D]");
+            TORCH_CHECK(k.size(1) == 128 && v.size(1) == 128, "paged KV page size must be 128");
+            TORCH_CHECK(static_cast<int>(k.size(3)) == D && static_cast<int>(v.size(3)) == D,
+                        "paged KV head dim must be 128");
+            H_KV = static_cast<int>(k.size(2));
+            TORCH_CHECK(static_cast<int>(v.size(2)) == H_KV && v.size(0) == k.size(0),
+                        "paged k/v must share num_blocks and H_KV");
+        } else {
+            TORCH_CHECK(k.dim() == 3 && v.dim() == 3,
+                        "group mode expects packed 3-D k/v [total, H_KV, D]");
+            TORCH_CHECK(static_cast<int>(k.size(2)) == D && static_cast<int>(v.size(2)) == D,
+                        "group mode k/v head dim must equal q head dim D");
+            H_KV = static_cast<int>(k.size(1));
+            TORCH_CHECK(static_cast<int>(v.size(1)) == H_KV, "group mode k/v must share H_KV");
+            TORCH_CHECK(static_cast<int>(v.size(0)) == static_cast<int>(k.size(0)),
+                        "group mode k/v must share total_k");
+        }
         TORCH_CHECK(static_cast<int>(out.size(0)) == static_cast<int>(q.size(0)) &&
                     static_cast<int>(out.size(1)) == H,
                     "group mode out must be [total_q, H, D]");
@@ -115,8 +141,36 @@ void launch_d128(at::Tensor& q,
         // Packed single-sequence strides (no batch stride).
         args.stride_q_b = 0; args.stride_q_n = static_cast<int>(q.stride(0));   args.stride_q_h = static_cast<int>(q.stride(1));
         args.stride_o_b = 0; args.stride_o_n = static_cast<int>(out.stride(0)); args.stride_o_h = static_cast<int>(out.stride(1));
-        args.stride_k_b = 0; args.stride_k_n = static_cast<int>(k.stride(0));   args.stride_k_h = static_cast<int>(k.stride(1));
-        args.stride_v_b = 0; args.stride_v_n = static_cast<int>(v.stride(0));   args.stride_v_h = static_cast<int>(v.stride(1));
+        if (paged) {
+            const at::Tensor& bt = *block_table;
+            TORCH_CHECK(bt.device() == q.device(), "block_table must be on the same device as q");
+            TORCH_CHECK(bt.scalar_type() == at::kInt, "block_table must be int32");
+            TORCH_CHECK(bt.dim() == 2 && static_cast<int>(bt.size(0)) == B,
+                        "block_table must be [num_groups, max_pages]");
+            TORCH_CHECK(bt.stride(1) == 1, "block_table must be contiguous along the page dim");
+            TORCH_CHECK(bt.size(1) * 128LL >= max_seqlen_k,
+                        "block_table has too few pages for max_seqlen_k");
+            // Each 64-row KV tile gets its own 32-bit descriptor, so its byte extent must
+            // stay under 2^32; the kernel keeps the row and head strides in int.
+            const long long kv_stride_n = std::max(k.stride(1), v.stride(1));
+            const long long kv_stride_h = std::max(k.stride(2), v.stride(2));
+            TORCH_CHECK(64LL * kv_stride_n * 2LL < (1LL << 32) && kv_stride_h <= INT_MAX,
+                        "OPUS D=128: paged k/v row stride ", kv_stride_n, " or head stride ",
+                        kv_stride_h, " is too large for a 32-bit KV tile descriptor");
+            // The tile's extent is rows * row stride, so rows must not overlap.
+            const long long kv_stride_n_min = std::min(k.stride(1), v.stride(1));
+            TORCH_CHECK(kv_stride_n_min >= D, "OPUS D=128: paged k/v row stride ",
+                        kv_stride_n_min, " is below the head dim (overlapping or broadcast rows)");
+            args.stride_k_b = 0; args.stride_k_n = static_cast<int>(k.stride(1)); args.stride_k_h = static_cast<int>(k.stride(2));
+            args.stride_v_b = 0; args.stride_v_n = static_cast<int>(v.stride(1)); args.stride_v_h = static_cast<int>(v.stride(2));
+            args.stride_k_page   = k.stride(0);
+            args.stride_v_page   = v.stride(0);
+            args.block_table_ptr = reinterpret_cast<const int*>(bt.data_ptr());
+            args.stride_bt_b     = static_cast<int>(bt.stride(0));
+        } else {
+            args.stride_k_b = 0; args.stride_k_n = static_cast<int>(k.stride(0));   args.stride_k_h = static_cast<int>(k.stride(1));
+            args.stride_v_b = 0; args.stride_v_n = static_cast<int>(v.stride(0));   args.stride_v_h = static_cast<int>(v.stride(1));
+        }
 
         args.seqstart_q_ptr     = reinterpret_cast<const int*>(seqstart_q->data_ptr());
         args.seqstart_k_ptr     = reinterpret_cast<const int*>(seqstart_k->data_ptr());
@@ -142,6 +196,41 @@ void launch_d128(at::Tensor& q,
         const long long total_q = q.size(0);
         args.total_q            = static_cast<int>(total_q);
         args.total_q_blocks     = static_cast<int>(total_q / Q_BLOCK + B);
+
+        // The combine needs the groups to be contiguous (no padded seqstart_q) and stores four
+        // bf16 at a time. Auto split falls back to one share when it cannot run; an explicit
+        // num_splits > 1 is rejected below instead. With no rows there is nothing to split.
+        const bool contiguous_groups =
+            !seqstart_q_pad.has_value() || seqstart_q_pad->data_ptr() == seqstart_q->data_ptr();
+        const bool out_aligned = out.stride(1) % 4 == 0 && out.stride(0) % 4 == 0 &&
+                                 reinterpret_cast<uintptr_t>(out.data_ptr()) % 8 == 0;
+        if (total_q == 0) num_splits = 1;
+        if (num_splits == 0 && !(contiguous_groups && out_aligned)) num_splits = 1;
+        if (num_splits == 0) {
+            static std::atomic<int> cu_count[64];  // per device, queried once
+            const int dev = q.device().index();
+            TORCH_CHECK(dev >= 0 && dev < 64, "OPUS D=128: device index out of range");
+            int num_cus = cu_count[dev].load(std::memory_order_relaxed);
+            if (num_cus == 0) {
+                HIP_CALL(hipDeviceGetAttribute(&num_cus, hipDeviceAttributeMultiprocessorCount, dev));
+                cu_count[dev].store(num_cus, std::memory_order_relaxed);
+            }
+            num_splits = paged ? fmha_fwd_bf16_opus_detail::d128_auto_splits(
+                                     H, static_cast<int>(total_q), B, max_seqlen_q, max_seqlen_k,
+                                     window_size_left, num_cus)
+                               : 1;
+        }
+        if (num_splits > 1) {
+            TORCH_CHECK(contiguous_groups,
+                        "OPUS D=128: num_splits > 1 does not take a padded seqstart_q");
+            TORCH_CHECK(out_aligned, "OPUS D=128: num_splits > 1 needs out rows 8-byte aligned");
+            const auto f32 = q.options().dtype(at::kFloat);
+            o_acc   = at::empty({num_splits, total_q, H, D}, f32);
+            lse_acc = at::empty({num_splits, H, total_q}, f32);
+            args.num_splits  = num_splits;
+            args.o_acc_ptr   = o_acc.data_ptr();
+            args.lse_acc_ptr = lse_acc.data_ptr();
+        }
     } else {
         // Dense batch: q/k/v/out 4-D [B, N, H, D]. Cross-attention allowed (N != N_KV).
         TORCH_CHECK(q.dim() == 4, "q must be 4-D [B, N, H, D], got ndim=", q.dim());
@@ -178,7 +267,8 @@ void launch_d128(at::Tensor& q,
     // wrong output), reject instead. In group mode the kernel rebases the descriptor per
     // sequence, so the bound is the longest sequence rather than the packed total.
     // dim -3 is the token axis in both layouts: dense BSHD and packed THD.
-    const long long kv_slice_bytes =
+    // Paged KV rebases every tile's descriptor, so the pool's extent does not matter.
+    const long long kv_slice_bytes = block_table.has_value() ? 0LL :
         (long long)N_KV * std::max(k.stride(-3), v.stride(-3)) * 2LL;  // bf16
     TORCH_CHECK(kv_slice_bytes < (1LL << 32),
                 "OPUS D=", D, ": KV byte extent ", kv_slice_bytes,
@@ -394,7 +484,9 @@ void fmha_fwd_bf16_opus_fwd(at::Tensor& q,
                             int max_seqlen_q,
                             int max_seqlen_k,
                             int window_size_left,
-                            std::optional<at::Tensor> sink)
+                            std::optional<at::Tensor> sink,
+                            std::optional<at::Tensor> block_table,
+                            int num_splits)
 {
     TORCH_CHECK(q.is_cuda(), "q must be a GPU tensor");
     TORCH_CHECK(k.device() == q.device() && v.device() == q.device() &&
@@ -411,12 +503,14 @@ void fmha_fwd_bf16_opus_fwd(at::Tensor& q,
     if (D_QK == D_V && (D_QK == 64 || D_QK == 128)) {
         launch_d128(q, k, v, out, causal, softmax_scale, lse,
                     seqstart_q, seqstart_k, seqstart_q_pad, seqstart_k_pad,
-                    max_seqlen_q, max_seqlen_k, window_size_left, sink);
+                    max_seqlen_q, max_seqlen_k, window_size_left, sink, block_table, num_splits);
     } else if (D_QK == 192 && D_V == 128) {
         TORCH_CHECK(window_size_left < 0,
                     "OPUS D_QK=192/D_V=128 kernel has no sliding window");
         TORCH_CHECK(!sink.has_value(),
                     "OPUS D_QK=192/D_V=128 kernel does not support attention sinks");
+        TORCH_CHECK(!block_table.has_value() && num_splits == 1,
+                    "OPUS D_QK=192/D_V=128 kernel has no paged or split KV");
         launch_d192_v128(q, k, v, out, causal, softmax_scale, lse,
                          seqstart_q, seqstart_k, seqstart_q_pad, seqstart_k_pad,
                          max_seqlen_q, max_seqlen_k);

@@ -35,7 +35,7 @@ struct fmha_fwd_bf16_opus_args
     // nullptr => the kernel skips the log-sum-exp store entirely.
     void* lse_ptr = nullptr;
     // Optional attention sink: one fp32 logit per query head, [nhead]. nullptr => no sink.
-    // Symmetric D=64/128 kernels only, and not with a sliding window.
+    // Symmetric D=64/128 kernels only.
     const void* sink_ptr = nullptr;
 
     // Group / varlen, int32, length batch+1. A null seqstart_q_ptr selects batch mode.
@@ -87,6 +87,23 @@ struct fmha_fwd_bf16_opus_args
     // keep the rectangular grid.
     int total_q = 0;
 
+    // Group mode only. Paged KV: block_table [batch, stride_bt_b] int32 page ids, pages of
+    // 128 rows; k/v point at the pool and stride_k_page / stride_v_page step one page. The
+    // kernel then reads each KV tile through its own descriptor, so the pool is not bound by
+    // the 32-bit extent; seqstart_k still carries each group's KV length.
+    const int* block_table_ptr = nullptr;
+    int stride_bt_b            = 0;
+    long long stride_k_page    = 0;
+    long long stride_v_page    = 0;
+
+    // Paged only. Split-KV: num_splits > 1 cuts each Q block's KV range into that many
+    // shares (grid z; page-aligned without a window). Their fp32 partials go to o_acc
+    // [num_splits, total_q, H, 128] and lse_acc [num_splits, H, total_q], contiguous and
+    // caller-allocated, and a combine kernel then writes o / lse. Needs total_q.
+    int num_splits    = 1;
+    void* o_acc_ptr   = nullptr;
+    void* lse_acc_ptr = nullptr;
+
     std::string data_type = "bf16";
 };
 
@@ -99,10 +116,142 @@ struct fmha_fwd_bf16_opus_args
 #define FMHA_FWD_HD192_V128_BF16_OPUS_IMPL
 #include "fmha_fwd_hd192_v128_bf16_opus.h"
 
+#include <algorithm>
 #include <cmath>
 #include <type_traits>
 
 namespace fmha_fwd_bf16_opus_detail {
+
+constexpr int kMaxSplits = 16;
+
+// Split-KV merge: o[q, h] = sum_s exp(lse_s - lse) * o_acc[s, q, h], lse = log sum_s exp(lse_s).
+// One 32-lane group per (q, h), four head-dim elements per lane. The module builds with
+// -ffast-math, so a share with no keys (lse = -inf) or a -inf sink is recognized by its bit
+// pattern, never by comparing against infinity, and is skipped. Rows outside
+// [seqstart_q[0], seqstart_q[batch]) belong to no group; their partials were never written.
+__global__ void __launch_bounds__(256)
+    opus_splitkv_combine_kernel(const float* __restrict__ o_acc,
+                                const float* __restrict__ lse_acc,
+                                unsigned short* __restrict__ o,
+                                float* __restrict__ lse,
+                                const float* __restrict__ sink,
+                                const int* __restrict__ seqstart_q,
+                                int batch,
+                                int num_splits,
+                                int total_q,
+                                int nhead,
+                                int stride_o_n,
+                                int stride_o_h,
+                                int stride_lse_h)
+{
+    constexpr int D            = 128;
+    constexpr unsigned NEG_INF = 0xff800000u;
+    const int pair             = blockIdx.x * 8 + threadIdx.x / 32;
+    if(pair >= total_q * nhead)
+        return;
+    const int qi = pair / nhead, h = pair % nhead, d = (threadIdx.x % 32) * 4;
+    if(qi < seqstart_q[0] || qi >= seqstart_q[batch])
+        return;
+    const long long acc_split = static_cast<long long>(total_q) * nhead * D;
+    const long long lse_split = static_cast<long long>(nhead) * total_q;
+
+    float ls[kMaxSplits];
+    float m  = 0.f;
+    bool any = false;
+#pragma unroll
+    for(int s = 0; s < kMaxSplits; ++s)
+    {
+        ls[s] = s < num_splits ? lse_acc[s * lse_split + static_cast<long long>(h) * total_q + qi]
+                               : 0.f;
+        if(s < num_splits && __float_as_uint(ls[s]) != NEG_INF)
+        {
+            m   = any ? fmaxf(m, ls[s]) : ls[s];
+            any = true;
+        }
+    }
+    // A sink is one more term with no value, added once per row; none or -inf adds nothing.
+    // The empty asm keeps -ffast-math from folding the -inf test into the fmaxf below.
+    unsigned sink_bits = sink != nullptr ? __float_as_uint(sink[h]) : NEG_INF;
+    asm volatile("" : "+v"(sink_bits));
+    const bool has_sink = sink_bits != NEG_INF;
+    const float sink_h  = __uint_as_float(sink_bits);
+    if(has_sink)
+    {
+        m   = any ? fmaxf(m, sink_h) : sink_h;
+        any = true;
+    }
+    float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+    float sum  = 0.f;
+#pragma unroll
+    for(int s = 0; s < kMaxSplits; ++s)
+    {
+        if(s >= num_splits)
+            break;
+        if(__float_as_uint(ls[s]) == NEG_INF)
+            continue;
+        const float w  = __expf(ls[s] - m);
+        const float4 x = *reinterpret_cast<const float4*>(
+            o_acc + s * acc_split + (static_cast<long long>(qi) * nhead + h) * D + d);
+        acc.x += w * x.x;
+        acc.y += w * x.y;
+        acc.z += w * x.z;
+        acc.w += w * x.w;
+        sum += w;
+    }
+    if(has_sink) // when the sink is m its term is exactly 1, which also covers +inf
+        sum += sink_h >= m ? 1.f : __expf(sink_h - m);
+    if(any)
+    {
+        const float inv = 1.f / sum;
+        acc.x *= inv;
+        acc.y *= inv;
+        acc.z *= inv;
+        acc.w *= inv;
+    }
+    auto bf16 = [](float f) -> unsigned int { // round to nearest even, NaN kept
+        return __builtin_bit_cast(unsigned short, static_cast<__bf16>(f));
+    };
+    *reinterpret_cast<uint2*>(o + static_cast<long long>(qi) * stride_o_n +
+                              static_cast<long long>(h) * stride_o_h + d) =
+        make_uint2(bf16(acc.x) | (bf16(acc.y) << 16), bf16(acc.z) | (bf16(acc.w) << 16));
+    if(lse != nullptr && threadIdx.x % 32 == 0)
+        lse[static_cast<long long>(h) * stride_lse_h + qi] =
+            any ? m + logf(sum) : __uint_as_float(NEG_INF);
+}
+
+// Split count for num_splits == 0. The D=128 kernel fits one workgroup per CU (its LDS), so
+// the grid runs in ceil(workgroups / CUs) waves and a ragged last wave costs a full one.
+// Pick the count with the shortest critical path, waves(S) / S, taking more splits only for
+// a 3% gain (each adds combine traffic), with shares of at least 4096 keys.
+inline int d128_auto_splits(int nhead,
+                            int total_q,
+                            int batch,
+                            int max_seqlen_q,
+                            int max_seqlen_k,
+                            int window_size_left,
+                            int num_cus)
+{
+    // Workgroups that hold rows: at most the flat grid's extent, at most batch full-length
+    // groups; exact for one group or equal lengths. A window bounds each one's keys.
+    const int wgs   = nhead * std::min(total_q / 256 + batch, batch * ceil_div(max_seqlen_q, 256));
+    const int keys =
+        window_size_left >= 0 ? std::min(max_seqlen_k, window_size_left + 1) : max_seqlen_k;
+    const int max_s = std::min(kMaxSplits, std::max(1, keys / 4096));
+    if(wgs <= 0 || num_cus <= 0)
+        return 1;
+    int best      = 1;
+    double best_t = ceil_div(wgs, num_cus);
+    for(int s = 2; s <= max_s; ++s)
+    {
+        const double t = static_cast<double>(ceil_div(wgs * s, num_cus)) / s;
+        if(t < best_t * 0.97)
+        {
+            best   = s;
+            best_t = t;
+        }
+    }
+    return best;
+}
 
 inline float resolve_scale(float softmax_scale, int hdim_q)
 {
@@ -161,6 +310,27 @@ inline bool fill_d128_kargs(opus_gqa_kargs& kargs, const fmha_fwd_bf16_opus_args
     // A window at least as wide as the longest KV bounds nothing; fold it to plain causal.
     is_local               = a.causal && a.window_size_left >= 0 && a.window_size_left < a.seqlen_k;
     kargs.window_size_left = is_local ? a.window_size_left : -1;
+
+    kargs.ptr_block_table = a.block_table_ptr;
+    kargs.stride_bt_b     = a.stride_bt_b;
+    kargs.stride_k_page   = a.stride_k_page;
+    kargs.stride_v_page   = a.stride_v_page;
+    // Paged KV is group mode.
+    if(a.block_table_ptr != nullptr && !is_group)
+        return false;
+
+    kargs.num_splits          = a.num_splits > 1 ? a.num_splits : 1;
+    kargs.ptr_o_acc           = a.o_acc_ptr;
+    kargs.ptr_lse_acc         = a.lse_acc_ptr;
+    kargs.stride_oacc_h       = a.hdim_v;
+    kargs.stride_oacc_n       = a.nhead * a.hdim_v;
+    kargs.stride_oacc_split   = static_cast<long long>(a.total_q) * a.nhead * a.hdim_v;
+    kargs.stride_lseacc_h     = a.total_q;
+    kargs.stride_lseacc_split = static_cast<long long>(a.nhead) * a.total_q;
+    if(a.num_splits > 1 &&
+       (a.block_table_ptr == nullptr || a.total_q <= 0 || a.num_splits > kMaxSplits ||
+        a.o_acc_ptr == nullptr || a.lse_acc_ptr == nullptr))
+        return false;
     return true;
 }
 
@@ -170,8 +340,13 @@ inline bool d128_preflight(const fmha_fwd_bf16_opus_args& a, bool& ok)
     ok = false;
     // A kv extent reaching 2^32 wraps the async-load offset and silently produces wrong
     // output, so refuse it instead.
+    // Paged KV rebases every tile, so there the bound applies to one 64-row tile.
     const int kv_stride_n = (a.stride_k_n > a.stride_v_n ? a.stride_k_n : a.stride_v_n);
-    if(static_cast<long long>(a.seqlen_k) * kv_stride_n * 2LL >= (1LL << 32))
+    const long long kv_rows = a.block_table_ptr != nullptr ? 64LL : a.seqlen_k;
+    if(kv_rows * kv_stride_n * 2LL >= (1LL << 32))
+        return false;
+    // A paged tile's extent is rows * row stride, so rows must not overlap.
+    if(a.block_table_ptr != nullptr && (a.stride_k_n < a.hdim_q || a.stride_v_n < a.hdim_q))
         return false;
     ok = true;
     // Nothing to launch, but not an error.
@@ -211,9 +386,9 @@ inline bool launch_d128(const fmha_fwd_bf16_opus_args& a, hipStream_t stream)
         // short-circuit together; the Q-block extent is the longest group. Batch mode
         // keeps q-block=y, batch=z.
         const bool flat = Traits::GROUP_MODE && kargs.total_q_blocks > 0;
-        dim3 grid       = flat ? dim3(a.nhead, kargs.total_q_blocks, 1)
-                               : (Traits::GROUP_MODE ? dim3(a.nhead, a.batch, num_q_blk)
-                                                     : dim3(a.nhead, num_q_blk, a.batch));
+        dim3 grid = flat ? dim3(a.nhead, kargs.total_q_blocks, Traits::SPLIT ? kargs.num_splits : 1)
+                         : (Traits::GROUP_MODE ? dim3(a.nhead, a.batch, num_q_blk)
+                                               : dim3(a.nhead, num_q_blk, a.batch));
         dim3 block(Traits::BLOCK_SIZE);
         // The sliding window has its own form of this kernel (fmha_fwd_hd128_bf16_opus_swa.h);
         // everything else stays on the shared one.
@@ -222,6 +397,25 @@ inline bool launch_d128(const fmha_fwd_bf16_opus_args& a, hipStream_t stream)
         else
             gqa_d128_kernel<Traits><<<grid, block, 0, stream>>>(kargs);
         HIP_CALL_LAUNCH(hipGetLastError());
+        if constexpr(Traits::SPLIT)
+        {
+            const int pairs = a.total_q * a.nhead;
+            opus_splitkv_combine_kernel<<<ceil_div(pairs, 8), 256, 0, stream>>>(
+                static_cast<const float*>(a.o_acc_ptr),
+                static_cast<const float*>(a.lse_acc_ptr),
+                static_cast<unsigned short*>(a.o_ptr),
+                static_cast<float*>(a.lse_ptr),
+                static_cast<const float*>(a.sink_ptr),
+                a.seqstart_q_ptr,
+                a.batch,
+                kargs.num_splits,
+                a.total_q,
+                a.nhead,
+                a.stride_o_n,
+                a.stride_o_h,
+                a.stride_lse_h);
+            HIP_CALL_LAUNCH(hipGetLastError());
+        }
     };
 
     // D=64 shares the tile shape (Q=32, KV=64, 8 waves); only D_TILE_SIZE differs, and
@@ -243,8 +437,26 @@ inline bool launch_d128(const fmha_fwd_bf16_opus_args& a, hipStream_t stream)
         return true;
     }
 
-    // causal x group x local. LOCAL implies CAUSAL, so there is no non-causal window.
-    if(is_group)
+    // causal x group x local (x paged). LOCAL implies CAUSAL, so there is no non-causal window.
+    if(a.block_table_ptr != nullptr && kargs.num_splits > 1)
+    {
+        if(is_local)
+            launch(opus_gqa_traits<32, 64, 128, 8, true, true, true, true, true>{});
+        else if(a.causal)
+            launch(opus_gqa_traits<32, 64, 128, 8, true, true, false, true, true>{});
+        else
+            launch(opus_gqa_traits<32, 64, 128, 8, false, true, false, true, true>{});
+    }
+    else if(a.block_table_ptr != nullptr)
+    {
+        if(is_local)
+            launch(opus_gqa_traits<32, 64, 128, 8, true, true, true, true>{});
+        else if(a.causal)
+            launch(opus_gqa_traits<32, 64, 128, 8, true, true, false, true>{});
+        else
+            launch(opus_gqa_traits<32, 64, 128, 8, false, true, false, true>{});
+    }
+    else if(is_group)
     {
         if(a.causal)
         {
@@ -420,10 +632,17 @@ inline bool fmha_fwd_bf16_opus_launch(const fmha_fwd_bf16_opus_args& a, hipStrea
         AITER_LOG_WARNING("opus fwd: hdim 64 has no sliding-window kernel");
         return false;
     }
-    // Only gqa_d128_kernel reads the sink; refuse it where it would be ignored.
-    if(a.sink_ptr != nullptr && (a.window_size_left >= 0 || a.hdim_q != a.hdim_v))
+    // Paged and split KV are D=128 only.
+    if(a.hdim_q != 128 && (a.block_table_ptr != nullptr || a.num_splits > 1))
     {
-        AITER_LOG_WARNING("opus fwd: attention sink needs a symmetric head dim and no window");
+        AITER_LOG_WARNING("opus fwd: paged and split KV need hdim 128");
+        return false;
+    }
+    // Only the symmetric kernels and the split combine read the sink; refuse it where it
+    // would be ignored.
+    if(a.sink_ptr != nullptr && a.hdim_q != a.hdim_v)
+    {
+        AITER_LOG_WARNING("opus fwd: attention sink needs a symmetric head dim");
         return false;
     }
 

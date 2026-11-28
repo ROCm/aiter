@@ -35,7 +35,7 @@ struct opus_gqa_kargs {
     int stride_lse_h;
     // Optional attention sink: one fp32 logit per QUERY head, [H], unit stride -- a
     // valueless extra key in the softmax denominator (see store_result). nullptr => none.
-    // Read by gqa_d128_kernel only; the sliding-window kernel is never given one.
+    // Read by both the causal and the sliding-window kernel.
     const void* __restrict__ ptr_sink;
 
     // ── group mode (varlen / packed sequences) ──
@@ -61,6 +61,28 @@ struct opus_gqa_kargs {
     // 0 means "not supplied" and keeps the rectangular grid, where every group is given as
     // many Q-blocks as the longest group needs and the surplus returns immediately.
     int total_q_blocks;
+
+    // ── paged KV (PAGED traits; group mode only) ──
+    // ptr_block_table [B, stride_bt_b] int32: the page id of each group's p-th PAGE_SIZE-row
+    // page. Page p of KV head h_kv starts at ptr_k + id * stride_k_page + h_kv * stride_k_h,
+    // its rows stride_k_n apart (likewise V); seqstart_k still gives each group's KV length.
+    const int* ptr_block_table;
+    int stride_bt_b;
+    long long stride_k_page;  // elements
+    long long stride_v_page;  // elements
+
+    // ── split-KV (SPLIT traits; paged only) ──
+    // Grid z = split. Each split writes its share's normalized O to o_acc [S, total_q, H, D]
+    // and its lse to lse_acc [S, H, total_q] (fp32, strides in elements); a combine kernel
+    // merges them into O / lse.
+    int num_splits;
+    void* ptr_o_acc;
+    void* ptr_lse_acc;
+    int stride_oacc_n;
+    int stride_oacc_h;
+    long long stride_oacc_split;
+    int stride_lseacc_h;
+    long long stride_lseacc_split;
 };
 
 // Configuration traits for the GQA kernel (tile sizes, data types, vector lengths,
@@ -74,7 +96,9 @@ template<int Q_TILE_SIZE_ = 32,
         int NUM_WARPS_ = 8,
         bool CAUSAL_ = false,
         bool GROUP_MODE_ = false,
-        bool LOCAL_ = false>
+        bool LOCAL_ = false,
+        bool PAGED_ = false,
+        bool SPLIT_ = false>
 struct opus_gqa_traits {
     static_assert(D_TILE_SIZE_ == 64 || D_TILE_SIZE_ == 128,
                   "opus_gqa_traits supports D_TILE_SIZE 64 or 128");
@@ -89,6 +113,16 @@ struct opus_gqa_traits {
     // Sliding window: bound the KV range on the left too, via kargs.window_size_left.
     static constexpr bool LOCAL = LOCAL_;
     static_assert(!LOCAL_ || CAUSAL_, "LOCAL needs CAUSAL for the right-hand bound");
+    // Paged KV: one descriptor per KV tile, rebased onto the tile's page (a tile never
+    // straddles one), so K/V may live in a pool past the 32-bit buffer extent.
+    static constexpr bool PAGED = PAGED_;
+    static constexpr int PAGE_SIZE = 128;
+    static constexpr int KV_TILES_PER_PAGE = PAGE_SIZE / KV_TILE_SIZE_;
+    static_assert(PAGE_SIZE % KV_TILE_SIZE_ == 0, "a KV tile must not straddle a page");
+    static_assert(!PAGED_ || GROUP_MODE_, "PAGED is group mode");
+    // Split-KV: grid z splits each Q-block's KV range into shares (page-aligned unless LOCAL).
+    static constexpr bool SPLIT = SPLIT_;
+    static_assert(!SPLIT_ || PAGED_, "SPLIT runs on the paged path");
 
     static constexpr int WARP_SIZE = 64; // AMD wavefront size
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
