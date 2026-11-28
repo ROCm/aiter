@@ -17,13 +17,14 @@ sys.path.insert(0, str(REPO_ROOT))
 
 class TestFastScanCliSafety(unittest.TestCase):
     def test_generic_fmoe_rejects_fast_scan_before_dispatch(self):
+        from aiter.tuning.moe import fused_moe
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
         tuner = gemm_moe_tune.FmoeTuner.__new__(gemm_moe_tune.FmoeTuner)
         args = SimpleNamespace(fast_scan=True)
         with (
             mock.patch.object(
-                gemm_moe_tune,
+                fused_moe,
                 "mp_tuner",
                 side_effect=AssertionError("generic candidates were dispatched"),
             ),
@@ -85,7 +86,7 @@ class TestFastScanCliSafety(unittest.TestCase):
 
 class TestMxfp4ActivationPrecision(unittest.TestCase):
     def setUp(self):
-        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune as moe
+        from aiter.tuning.moe import mxfp4 as moe
 
         self.moe = moe
         self.row = {
@@ -246,13 +247,13 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         return {key: f"fixture:{key}" for key in inputs}
 
     def test_performance_finalists_keep_global_fastest(self):
-        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+        from aiter.tuning.moe import mxfp4
 
         candidates = [self._candidate(f"candidate_{i}") for i in range(6)]
         for index, candidate in enumerate(candidates):
             candidate.update(us=100.0 + index * 0.2, err1=0.01 * (6 - index))
 
-        finalists = gemm_moe_tune._select_mxfp4_performance_finalists(
+        finalists = mxfp4._select_mxfp4_performance_finalists(
             candidates, finalist_count=5
         )
 
@@ -263,7 +264,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         self.assertIs(finalists[0], candidates[0])
 
     def test_final_global_gate_prefers_accuracy_without_chaining(self):
-        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+        from aiter.tuning.moe import mxfp4
 
         fastest = self._candidate("fastest")
         fastest.update(us=100.0, err1=0.03)
@@ -272,26 +273,24 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         chained_only = self._candidate("chained_only")
         chained_only.update(us=101.8, err1=0.001)
 
-        selected = gemm_moe_tune._select_mxfp4_finalist(
-            [chained_only, fastest, accurate_tie]
-        )
+        selected = mxfp4._select_mxfp4_finalist([chained_only, fastest, accurate_tie])
 
         self.assertIs(selected, accurate_tie)
 
     def test_final_global_gate_includes_exactly_one_percent(self):
-        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+        from aiter.tuning.moe import mxfp4
 
         fastest = self._candidate("fastest")
         fastest.update(us=100.0, err1=0.03)
         accurate_boundary = self._candidate("accurate_boundary")
         accurate_boundary.update(us=101.0, err1=0.01)
 
-        selected = gemm_moe_tune._select_mxfp4_finalist([fastest, accurate_boundary])
+        selected = mxfp4._select_mxfp4_finalist([fastest, accurate_boundary])
 
         self.assertIs(selected, accurate_boundary)
 
     def test_accuracy_promotion_selects_best_candidate_outside_speed_set(self):
-        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+        from aiter.tuning.moe import mxfp4
 
         fast = self._candidate("fast")
         fast.update(us=100.0, err1=0.03)
@@ -300,7 +299,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         accuracy_candidate = self._candidate("accuracy_candidate")
         accuracy_candidate.update(us=102.0, err1=0.001)
 
-        promoted = gemm_moe_tune._select_mxfp4_accuracy_promotion(
+        promoted = mxfp4._select_mxfp4_accuracy_promotion(
             [fast, speed_finalist, accuracy_candidate],
             [fast, speed_finalist],
         )
@@ -308,7 +307,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         self.assertIs(promoted, accuracy_candidate)
 
     def test_accuracy_promotion_skips_accurate_speed_finalist(self):
-        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+        from aiter.tuning.moe import mxfp4
 
         globally_accurate = self._candidate("globally_accurate")
         globally_accurate.update(us=100.0, err1=0.001)
@@ -317,7 +316,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         less_accurate = self._candidate("less_accurate")
         less_accurate.update(us=103.0, err1=0.01)
 
-        promoted = gemm_moe_tune._select_mxfp4_accuracy_promotion(
+        promoted = mxfp4._select_mxfp4_accuracy_promotion(
             [globally_accurate, next_accurate, less_accurate],
             [globally_accurate],
         )
@@ -325,6 +324,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         self.assertIs(promoted, next_accurate)
 
     def test_inaccurate_candidate_is_rejected_before_timing(self):
+        from aiter.tuning.moe import mxfp4
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
         tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(gemm_moe_tune.Mxfp4FlydslTuner)
@@ -339,7 +339,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         args = SimpleNamespace(fast_scan=True, errRatio=0.1, warmup=1, iters=1)
         with (
             mock.patch.object(tuner, "_port_e2e", return_value="output"),
-            mock.patch.object(gemm_moe_tune, "cosine_diff_compare", return_value=0.2),
+            mock.patch.object(mxfp4, "cosine_diff_compare", return_value=0.2),
             mock.patch(
                 "aiter.test_common.run_perftest",
                 side_effect=AssertionError("inaccurate candidate was timed"),
@@ -355,6 +355,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
             )
 
     def test_finalists_are_revalidated_and_failures_are_discarded(self):
+        from aiter.tuning.moe import mxfp4
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
         tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(gemm_moe_tune.Mxfp4FlydslTuner)
@@ -393,7 +394,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
                 candidate["us"] = 1.0 if "fast_bad" in candidate["kernelName1"] else 2.0
                 return candidate["us"]
             if "fast_bad" in candidate["kernelName1"]:
-                raise gemm_moe_tune.Mxfp4AccuracyError("finalist accuracy regression")
+                raise mxfp4.Mxfp4AccuracyError("finalist accuracy regression")
             candidate["us"] = 2.0
             return candidate["us"]
 
@@ -417,6 +418,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         precompile.assert_called_once()
 
     def test_finalist_failures_backfill_from_coarse_survivors(self):
+        from aiter.tuning.moe import mxfp4
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
         tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(gemm_moe_tune.Mxfp4FlydslTuner)
@@ -461,7 +463,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
                 candidate["us"], candidate["err1"] = order[name]
                 return candidate["us"]
             if name in {"g1_candidate_1", "g1_candidate_2", "g1_candidate_3"}:
-                raise gemm_moe_tune.Mxfp4AccuracyError("final validation failed")
+                raise mxfp4.Mxfp4AccuracyError("final validation failed")
             candidate["us"] = 4.0
             return candidate["us"]
 
@@ -487,6 +489,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         )
 
     def test_backfill_is_latency_ordered_after_accuracy_promotion(self):
+        from aiter.tuning.moe import mxfp4
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
         tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(gemm_moe_tune.Mxfp4FlydslTuner)
@@ -528,7 +531,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
 
             final_calls.append(name)
             if index in {*range(5), 9}:
-                raise gemm_moe_tune.Mxfp4AccuracyError("final validation failed")
+                raise mxfp4.Mxfp4AccuracyError("final validation failed")
             return candidate["us"]
 
         with (
@@ -558,6 +561,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         )
 
     def test_warmup_outputs_are_accuracy_checks_outside_timing(self):
+        from aiter.tuning.moe import mxfp4
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
         # _run_candidate finishes by building the tuned row through calculate(),
@@ -614,7 +618,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
                 tuner, "_port_e2e", side_effect=["warm", "timed"]
             ) as port,
             mock.patch.object(
-                gemm_moe_tune,
+                mxfp4,
                 "cosine_diff_compare",
                 side_effect=[0.01, 0.02],
             ) as compare,
@@ -698,6 +702,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         self.assertEqual(limits, [3.5])
 
     def test_candidate_kernel_and_reference_share_the_tuned_swiglu_limit(self):
+        from aiter.tuning.moe import mxfp4
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
         tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(gemm_moe_tune.Mxfp4FlydslTuner)
@@ -728,7 +733,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
             mock.patch.dict(os.environ, {"AITER_MXFP4_TUNE_SWIGLU_LIMIT": "3.5"}),
             mock.patch.object(tuner, "_port_e2e", side_effect=port_e2e),
             mock.patch.object(tuner, "_torch_ref", return_value="ref") as torch_ref,
-            mock.patch.object(gemm_moe_tune, "cosine_diff_compare", return_value=0.01),
+            mock.patch.object(mxfp4, "cosine_diff_compare", return_value=0.01),
             mock.patch.object(tuner, "calculate", return_value=(0.0, 0.0)),
             mock.patch(
                 "aiter.test_common.run_perftest",
@@ -748,6 +753,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         self.assertEqual(torch_ref.call_args.kwargs["swiglu_limit"], 3.5)
 
     def test_finalist_retime_preserves_unrounded_coarse_error(self):
+        from aiter.tuning.moe import mxfp4
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
         tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(gemm_moe_tune.Mxfp4FlydslTuner)
@@ -779,7 +785,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
             mock.patch.dict(os.environ, {"AITER_MXFP4_TUNE_SWIGLU_LIMIT": "3.5"}),
             mock.patch.object(tuner, "_port_e2e", return_value="out"),
             mock.patch.object(tuner, "_torch_ref", return_value="ref"),
-            mock.patch.object(gemm_moe_tune, "cosine_diff_compare", return_value=0.010),
+            mock.patch.object(mxfp4, "cosine_diff_compare", return_value=0.010),
             mock.patch.object(tuner, "calculate", return_value=(0.0, 0.0)),
             mock.patch(
                 "aiter.test_common.run_perftest",
@@ -799,6 +805,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         self.assertEqual(candidate["err2"], "1.1%")
 
     def test_accuracy_failure_rejects_only_the_candidate(self):
+        from aiter.tuning.moe import mxfp4
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
         tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(gemm_moe_tune.Mxfp4FlydslTuner)
@@ -839,7 +846,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
 
             def candidate_result(_row, candidate, _args, **kwargs):
                 if "bad" in candidate["kernelName1"]:
-                    raise gemm_moe_tune.Mxfp4AccuracyError("warmup failed")
+                    raise mxfp4.Mxfp4AccuracyError("warmup failed")
                 candidate.update(us=2.0, err1=0.01, err2=0.01)
                 return 2.0
 
@@ -851,6 +858,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         self.assertEqual(result["us"], 2.0)
 
     def test_shape_fails_only_when_no_accurate_candidate_survives(self):
+        from aiter.tuning.moe import mxfp4
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
         tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(gemm_moe_tune.Mxfp4FlydslTuner)
@@ -889,7 +897,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
             mock.patch.object(
                 tuner,
                 "_run_candidate",
-                side_effect=gemm_moe_tune.Mxfp4AccuracyError("warmup failed"),
+                side_effect=mxfp4.Mxfp4AccuracyError("warmup failed"),
             ) as run_candidate,
             mock.patch("builtins.print"),
         ):
@@ -1058,8 +1066,8 @@ class TestMoePowerRanking(unittest.TestCase):
     def test_power_rank_orders_pairs_by_stage_energy(self):
         import pandas as pd
 
+        from aiter.tuning.moe.fused_moe import rank_moe_pairs
         from aiter.utility.selection_policy import POWER
-        from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import rank_moe_pairs
 
         pairs = pd.DataFrame(
             [
@@ -1112,8 +1120,8 @@ class TestMoePowerRanking(unittest.TestCase):
     def test_latency_rank_ignores_energy_order(self):
         import pandas as pd
 
+        from aiter.tuning.moe.fused_moe import rank_moe_pairs
         from aiter.utility.selection_policy import LATENCY
-        from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import rank_moe_pairs
 
         pairs = pd.DataFrame(
             [
@@ -1143,8 +1151,8 @@ class TestMoePowerRanking(unittest.TestCase):
     def test_unmeasured_power_sorts_last(self):
         import pandas as pd
 
+        from aiter.tuning.moe.fused_moe import rank_moe_pairs
         from aiter.utility.selection_policy import POWER
-        from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import rank_moe_pairs
 
         pairs = pd.DataFrame(
             [
@@ -1830,10 +1838,8 @@ class TestPowerTableSeparation(unittest.TestCase):
                 os.environ["AITER_SELECT"] = previous
 
     def test_moe_post_process_keeps_measured_watts(self):
-        from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import (
-            GroupedFmoeTuner,
-            _frame_keeping_watts,
-        )
+        from aiter.tuning.moe.fused_moe import _frame_keeping_watts
+        from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import GroupedFmoeTuner
 
         frame = _frame_keeping_watts(
             ["token", "us"],

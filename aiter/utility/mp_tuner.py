@@ -31,12 +31,12 @@ def clear_inherited_rocprofiler_env():
         os.unsetenv(name)
 
 
-def _new_pool(parallel_num, task_start_times, task_pids):
+def _new_pool(parallel_num, task_start_times, task_pids, default_device=None):
     clear_inherited_rocprofiler_env()
     return mp.Pool(
         processes=parallel_num,
         initializer=_init_task_start_times,
-        initargs=(task_start_times, task_pids),
+        initargs=(task_start_times, task_pids, default_device),
     )
 
 
@@ -69,9 +69,11 @@ def _raise_if_gpu_fault(exc: BaseException):
         raise GpuContextLost(_candidate_failure_detail(exc)) from error
 
 
-def _init_task_start_times(task_start_times, task_pids=None):
+def _init_task_start_times(task_start_times, task_pids=None, default_device=None):
     global _TASK_START_TIMES, _TASK_PIDS
     configure_worker_subprocesses()
+    if default_device is not None:
+        torch.set_default_device(default_device)
     _TASK_START_TIMES = task_start_times
     _TASK_PIDS = task_pids
 
@@ -585,6 +587,8 @@ def mp_tuner(
     policy=None,
     final_timing=None,
     return_status=False,
+    *,
+    default_device=None,
 ):
     """Multi-process tuner with one long-lived worker per selected GPU.
 
@@ -606,6 +610,9 @@ def mp_tuner(
         final_timing: whether these times pick the winner (default: not fast_mode).
             Only a final timing pass is power-sampled.
         return_status: Also return each candidate's status and detail
+        default_device: if set, each worker calls ``torch.set_default_device``
+            with this value once at process start. ``None`` leaves the default
+            unchanged. Pass ``"cuda"`` (current device), not ``"cuda:0"``.
 
     A candidate that faults the GPU, kills its worker or hangs fails alone: the
     pool restarts and the group's remaining candidates are resubmitted, keeping
@@ -772,7 +779,7 @@ def mp_tuner(
     # Create initial pool and submit all tasks
     task_start_times = mp.RawArray("d", len(task_group))
     task_pids = mp.RawArray("i", len(task_group))
-    pool = _new_pool(parallel_num, task_start_times, task_pids)
+    pool = _new_pool(parallel_num, task_start_times, task_pids, default_device)
     pid_delay = 0 if mp_num == 1 else 3
     pids = [
         pool.apply_async(get_pid, args=(pid_delay,)) for i in range(start_idx, mp_num)
@@ -962,7 +969,9 @@ def mp_tuner(
             mapping_error_tasks.clear()
             if remaining_tasks:
                 # Create new pool
-                pool = _new_pool(parallel_num, task_start_times, task_pids)
+                pool = _new_pool(
+                    parallel_num, task_start_times, task_pids, default_device
+                )
 
                 # Recreate gpu_map for new processes (new PIDs)
                 pids = [pool.apply_async(get_pid) for i in range(start_idx, mp_num)]

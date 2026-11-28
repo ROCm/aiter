@@ -14,6 +14,15 @@ Minimal test suite for validating the aiter tuning infrastructure.
 | `test_mp_tuner_fault.py` | 2 | Yes | `mp_tuner` when a candidate faults, kills its worker, or fails preparing inputs: only that candidate fails, for untyped and `return_status` callers |
 | `test_dispatch_verification.py` | 1 | No | `dispatch_verification` against a stub family: verified, wrong selection, wrong output, unchecked, other-GPU rows; `TunerCommon.run_config` against the config file's row, unchecked-row warning, model_configs merge |
 | `test_online_tune.py` | 1 | No | `AITER_ONLINE_TUNE` decision logic, `mp_lock` synchronization, MainFunc CSV write, cfg_2stages reload |
+| `test_fmoe_winner_replay.py` | 1 | No | `FmoeTuner.post_process` winner on hand-made results: filters, stage pairing, ties, power ranking, fairness costs, FLAT head-to-head (timing replaced) |
+| `test_fmoe_tune_dispatch.py` | 1 | No | `FmoeTuner.tune()` generator dispatch, opus/FlyDSL shape filters, grouped and MXFP4 candidate selection, `result_to_csv` |
+| `test_fmoe_e2e_tune.py` | 1 | No | FlyDSL gfx942 `--e2e_tune` on stubbed timings: configs tried per shape, a failed config never wins, the winner must beat the baseline, whole-MoE TFLOPS and bandwidth, existing rows kept unless replaced |
+| `test_fmoe_calculate.py` | 1 | No | `FmoeTuner.calculate` TFLOPS and bandwidth: first GEMM for stage1, second GEMM for stage2, whole MoE for any other stage, `(0, 0)` for an invalid time |
+| `test_fmoe_tag_rows.py` | 1 | No | `FmoeTuner` tuned rows by `_tag`: which rows a run with or without `--swiglu_limit` keeps, replaces and skips |
+| `test_fmoe_ck_swiglu_limit.py` | 1 | No | `--swiglu_limit` in the CK two-stage candidates: stage-1 kwargs, torch reference and compare of both stages, only for FP8 `per_1x128`, `per_Token` and `per_Tensor` |
+| `test_fmoe_aiter_import.py` | 1 | No | fmoe tuner modules that read `aiter.<name>` have a module-level `import aiter`; `aiter` is also a Python builtin, so ruff and the import do not catch a missing one |
+| `test_fmoe_candidate_snapshot.py` | 1 | Yes (no kernel timing) | Reads the real GPU architecture and compares candidates against the matching architecture entry in a snapshot taken on the refactor-branch commit that adds the test (`AITER_FMOE_CANDIDATE_SNAPSHOT`). Record each entry on a node of that architecture; skipped without the snapshot. |
+| `test_fmoe_task_record.py` | 1 | No | The snapshot's task record on hand-made tasks: a different tolerance, compare function, kernel function or kwargs gives a different record; guarded ops by the op they wrap; `MOVED` renames only a function's location |
 | `test_tune_pipeline.py` | 2 | Yes | End-to-end: run each tuner on small shapes (mp=1 + mp=default), verify output CSV; `--compare --update_improved`; `AITER_ONLINE_TUNE` e2e |
 | `test_asm_splitk_guard.py` | 1 | No | `GemmTuner.asm_gemm_all_solutions` SplitK semaphore grid guard |
 | `test_run_config.py` | 2 | Yes | Run --run_config on ALL existing tuned CSVs (configs + model_configs) |
@@ -23,8 +32,12 @@ Minimal test suite for validating the aiter tuning infrastructure.
 Fast deterministic tuning validation is part of the normal pull-request test
 sharding through `.github/scripts/split_tests.sh`. That gate includes CSV
 validation, shape-collision checks, the mixed-MXFP tuner unit tests, the
-compare logic, the dispatch verification, and the one-GPU `mp_tuner` fault and
-worker-death tests.
+compare logic, the dispatch verification, the one-GPU `mp_tuner` fault and
+worker-death tests, the fused-MoE winner replay, the fused-MoE tune-dispatch
+locks, the FlyDSL gfx942 e2e tune selection, the fused-MoE TFLOPS and
+bandwidth estimate, the fused-MoE `--swiglu_limit` rows and CK candidates, the
+`aiter` import check of the fused-MoE tuner modules, and the fused-MoE snapshot
+task record.
 
 The full Level 0+1 workflow repeats the broader CPU suite on its daily/manual
 schedule. GPU tuner-pipeline and all-shape `--run_config` validation remain
@@ -71,6 +84,14 @@ python3 -m unittest op_tests.tuning_tests.test_csv_validation \
   op_tests.tuning_tests.test_mp_tuner_logic \
   op_tests.tuning_tests.test_arch_resolution \
   op_tests.tuning_tests.test_mixed_mxfp_tuning \
+  op_tests.tuning_tests.test_fmoe_winner_replay \
+  op_tests.tuning_tests.test_fmoe_tune_dispatch \
+  op_tests.tuning_tests.test_fmoe_e2e_tune \
+  op_tests.tuning_tests.test_fmoe_calculate \
+  op_tests.tuning_tests.test_fmoe_tag_rows \
+  op_tests.tuning_tests.test_fmoe_task_record \
+  op_tests.tuning_tests.test_fmoe_ck_swiglu_limit \
+  op_tests.tuning_tests.test_fmoe_aiter_import \
   op_tests.tuning_tests.test_online_tune -v
 python3 -m pytest op_tests/tuning_tests/test_fhmoe_tuner.py -v
 
