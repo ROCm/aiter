@@ -93,8 +93,8 @@ class MegaMoEV2:
         self.act = act
         self.situ_beta = float(situ_beta)
         self.situ_linear_beta = float(situ_linear_beta)
-        if self.act not in ("silu", "situv2"):
-            raise ValueError(f"MegaMoEV2 act must be 'silu' or 'situv2', got {self.act!r}")
+        if self.act not in ("silu", "situv2", "swigluoai"):
+            raise ValueError(f"MegaMoEV2 act must be 'silu', 'situv2' or 'swigluoai', got {self.act!r}")
         if self.act == "situv2" and (self.situ_beta <= 0.0 or self.situ_linear_beta <= 0.0):
             raise ValueError("situv2 requires positive situ_beta / situ_linear_beta")
         self._initial_fanout_masks = tuple(int(mask) for mask in fanout_masks)
@@ -102,6 +102,8 @@ class MegaMoEV2:
             raise ValueError("fanout_masks must contain one mask per destination")
         if self.swiglu_limit < 0:
             raise ValueError("swiglu_limit must be non-negative")
+        if self.act == "swigluoai" and self.swiglu_limit <= 0:
+            raise ValueError("swigluoai requires a positive swiglu_limit")
         self.dev = torch.device("cuda", rank)
         # routed=True: the caller passes forward(max_tokens=...), so the fused routes this layout supports are
         # built and the plan picks one route per call (see MegaMoEBundlePlan.route_for). Without it the instance
@@ -233,6 +235,7 @@ class MegaMoEV2:
                     w2_scale=self.w2_scale,
                     max_tok_per_rank=m,
                     swiglu_limit=self.swiglu_limit,
+                    act=self.act,
                     payload_arena=self._payload_arena if m in self._small_m_shared else None,
                     s1_output_arena=self._s1_output_arena,
                     combine_input=self._combine_input if m in self._small_m_shared else None,

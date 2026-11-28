@@ -16,15 +16,19 @@ weight rebinding with interleaved staged calls, the 32-bit epoch wrap with zero
 rows, CUDA graph replay against eager, and paired timing against the staged route.
 The fused routes need an a8w4 layout of FUSED_LAYOUTS (mega_moe_config.py) on an
 8-XCD gfx950: DeepSeek-V4-Pro (--network v4_pro) on 8 ranks, or DeepSeek-V4.1-Flash
-(--network v41_flash) on the rank counts listed there (EP8: 8 ranks, EP4: 4 ranks, EP2: 2 ranks).
+(--network v41_flash) on the rank counts listed there (EP8: 8 ranks, EP4: 4 ranks, EP2: 2 ranks),
+or MiniMax-M3.1 (--network m31) on 4 ranks, which has no large-input route.
 
     torchrun --nproc-per-node 8 test_mega_moe_v2.py --bs-list 1,64,128
     torchrun --nproc-per-node 8 test_mega_moe_v2.py --max-tok-per-rank 8192 \
         --expect-large-m --compare-main --bs-list 1,64,513,8192 --accuracy-max-bs 8192
     torchrun --nproc-per-node 8 test_mega_moe_v2.py --suite routes
+    # MiniMax-M3.1 EP4 with its SwiGLU-OAI activation, staged route:
+    torchrun --nproc-per-node 4 test_mega_moe_v2.py --network m31 --bs-list 104,128
     # every timed route also checked against the reference:
     torchrun --nproc-per-node 4 test_mega_moe_v2.py --suite routes --network v41_flash --check-time-acc
     torchrun --nproc-per-node 2 test_mega_moe_v2.py --suite routes --network v41_flash --check-time-acc
+    torchrun --nproc-per-node 4 test_mega_moe_v2.py --suite routes --network m31 --mtpr 1024 --check-time-acc
     # against a same-MTPR staged route, timing only:
     torchrun --nproc-per-node 8 test_mega_moe_v2.py --suite routes \
         --mtpr 256 --small-m-mtprs 256 --time-only --time-bs 140,168,196,224,252
@@ -108,7 +112,19 @@ NETWORKS = {
         "situ_beta": 4.0,
         "situ_linear_beta": 25.0,
     },
+    # MiniMax-M3.1 EP4 layout and activation: SwiGLU-OAI (alpha 1.702, up + 1)
+    # clamped at the checkpoint's swiglu_limit of 7.
+    "m31": {
+        "model_dim": 6144,
+        "inter_dim": 3072,
+        "experts": 128,
+        "topk": 4,
+        "swiglu_limit": 7.0,
+        "act": "swigluoai",
+    },
 }
+# Networks whose fused routes must send BF16 combine rows, a hot expert's included.
+BF16_COMBINE_NETWORKS = {"m31"}
 
 
 def _setup_dist():
@@ -155,6 +171,15 @@ def _rel_l2(output, reference):
     if not reference_sq.item():
         return -1.0
     return float(torch.sqrt(error_sq / reference_sq))
+
+
+def _mxfp8_round(v):
+    """Round-trip through MXFP8: 1x32 blocks, E8M0 scale rounded up, E4M3 values."""
+    blocks = v.float().reshape(*v.shape[:-1], -1, 32)
+    amax = blocks.abs().amax(-1, keepdim=True).clamp_min(1e-10)
+    scale = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))
+    q = (blocks / scale).to(torch.float8_e4m3fn).float() * scale
+    return q.reshape(v.shape)
 
 
 def _all_ranks(flag, device):
@@ -362,7 +387,10 @@ def _reference(
     act="silu",
     situ_beta=1.0,
     situ_linear_beta=1.0,
+    quantize=False,
 ):
+    """fp32 MoE output; ``quantize`` emulates the a8w4 op's MXFP8 rounding of
+    the input and of the GEMM1 activation output."""
     x_all, token_counts = _all_gather_variable(x)
     weights_all, _ = _all_gather_variable(route_weights, token_counts)
     ids_all, _ = _all_gather_variable(ids, token_counts)
@@ -384,6 +412,8 @@ def _reference(
         )
         w2 = _dequant_expert(w2_q[local_id], w2_scale[local_id], model_dim, inter_dim)
         inp = x_all[rows].float()
+        if quantize:
+            inp = _mxfp8_round(inp)
         gate = inp @ w1[:inter_dim].T
         up = inp @ w1[inter_dim:].T
         if act == "situv2":
@@ -392,6 +422,10 @@ def _reference(
             gate = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
             up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
             hidden = gate * up
+        elif act == "swigluoai":
+            gate = gate.clamp(max=swiglu_limit)
+            up = up.clamp(-swiglu_limit, swiglu_limit)
+            hidden = gate * torch.sigmoid(1.702 * gate) * (up + 1)
         else:
             # MegaMoEV2 treats swiglu_limit <= 0 as "no clamp"; clamping here
             # unconditionally turns up into zeros at the operator's own default of
@@ -400,6 +434,8 @@ def _reference(
                 gate = gate.clamp(max=swiglu_limit)
                 up = up.clamp(-swiglu_limit, swiglu_limit)
             hidden = F.silu(gate) * up
+        if quantize:
+            hidden = _mxfp8_round(hidden)
         out = (hidden @ w2.T) * weights_all[rows, slots, None]
         partial.index_add_(0, rows, out)
         del w1, w2, inp, hidden, out
@@ -408,7 +444,7 @@ def _reference(
     return partial[start : start + x.shape[0]]
 
 
-def _moe_reference(moe, x, route_weights, ids, ref_weights):
+def _moe_reference(moe, x, route_weights, ids, ref_weights, quantize=False):
     """_reference() for the layout and activation of ``moe``."""
     return _reference(
         x,
@@ -424,6 +460,7 @@ def _moe_reference(moe, x, route_weights, ids, ref_weights):
         moe.act,
         moe.situ_beta,
         moe.situ_linear_beta,
+        quantize,
     )
 
 
@@ -1256,7 +1293,8 @@ def _routes_instance(args, rank, world, device):
     if moe.small_m_mtpr != max(args.small_m_mtprs):
         raise AssertionError(
             f"small-input route not built (small_m_mtpr={moe.small_m_mtpr}); it needs a fused "
-            "a8w4 layout of FUSED_LAYOUTS (DeepSeek-V4-Pro on 8 ranks, DeepSeek-V4.1-Flash on 8, 4 or 2 ranks) "
+            "a8w4 layout of FUSED_LAYOUTS (DeepSeek-V4-Pro on 8 ranks, DeepSeek-V4.1-Flash on 8, 4 or 2 ranks, "
+            "MiniMax-M3.1 on 4 ranks) "
             "on an 8-XCD gfx950"
         )
     x, w, ids = _make_inputs(
@@ -1400,9 +1438,18 @@ def _routes_edges(ctx, args):
         _barrier()
         rel_ref = _rel_l2(out, _moe_reference(moe, xi, wi, ii, ctx.refw[0]))
         ok = rel_ref < args.rtol and _all_ranks(torch.isfinite(out).all(), device)
+        # Each peer publishes its flag here as (flag << 1 | sent FP8 rows).
+        fp8_peers = sum(
+            int((rt.comb_op.shmem_xdev_bar_mem[:world] & 1).sum())
+            for rt in moe._small_m_runtimes
+        )
+        fp8_peers = int(_reduce_float(fp8_peers, device, dist.ReduceOp.SUM))
+        if args.network in BF16_COMBINE_NETWORKS:
+            ok = ok and fp8_peers == 0
         if rank == 0:
             print(
-                f"[EDGE] {name} tpr={n} relL2_vs_ref={rel_ref:.6f} {'PASS' if ok else 'FAIL'}",
+                f"[EDGE] {name} tpr={n} relL2_vs_ref={rel_ref:.6f} fp8_peers={fp8_peers} "
+                f"{'PASS' if ok else 'FAIL'}",
                 flush=True,
             )
         if not ok:
@@ -1453,6 +1500,44 @@ def _routes_alternation(ctx, args, outputs):
         ctx.failures.append("alternation")
     _barrier()
     return keys
+
+
+def _routes_above_small_m(ctx, args):
+    """A call one row above the small-input capacity takes the staged route on every
+    rank (or the large-input one where the layout builds it) and matches the reference.
+    """
+    moe, rank, device = ctx.moe, ctx.rank, ctx.device
+    n = moe.small_m_mtpr + 1
+    if n > moe.mtpr:
+        return
+    tx, tw, ti = _make_inputs(
+        n,
+        ctx.net["model_dim"],
+        ctx.net["experts"],
+        ctx.net["topk"],
+        rank,
+        args.seed + 300,
+        device,
+        force_fanout_boundary=False,
+        inject_invalid_route=False,
+        force_padding_boundary=False,
+    )
+    ctx.bind(0, 0)
+    expect = ROUTE_LARGE_M if ctx.large_m else ROUTE_STAGED
+    # Ranks with fewer rows still see the EP-wide max_tokens, so they take the same route.
+    k = n if rank == 0 else n // 2
+    out = _routed(moe, tx[:k], tw[:k], ti[:k], n, expect)
+    _barrier()
+    rel_ref = _rel_l2(out, _moe_reference(moe, tx[:k], tw[:k], ti[:k], ctx.refw[0]))
+    ok = rel_ref < args.rtol and _all_ranks(torch.isfinite(out).all(), device)
+    if rank == 0:
+        print(
+            f"[ABOVE] max_tokens={n} route={expect} relL2_vs_ref={rel_ref:.6f} "
+            f"{'PASS' if ok else 'FAIL'}",
+            flush=True,
+        )
+    if not ok:
+        ctx.failures.append("above small-input capacity")
 
 
 def _routes_graph(ctx, args):
@@ -1626,6 +1711,7 @@ def _run_routes(args, rank, world, device):
             )
         if wrap_mism:
             ctx.failures.append("epoch wrap")
+        _routes_above_small_m(ctx, args)
         _routes_graph(ctx, args)
     _routes_timing(ctx, args)
     _barrier()
@@ -1858,9 +1944,9 @@ def main():
                 f"[SKIP] the small- and large-input routes need gfx950, got {get_gfx()}"
             )
             return
-        if args.network not in ("v4_pro", "v41_flash") or args.quant != "a8w4":
+        if args.network not in ("v4_pro", "v41_flash", "m31") or args.quant != "a8w4":
             raise ValueError(
-                "--suite routes needs --network v4_pro or v41_flash and --quant a8w4"
+                "--suite routes needs --network v4_pro, v41_flash or m31 and --quant a8w4"
             )
         args.seed = 7 if args.seed is None else args.seed
         args.rtol = 0.08 if args.rtol is None else args.rtol
