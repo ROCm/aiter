@@ -2455,5 +2455,22 @@
         "verbose": "False",
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
+    },
+    "module_fp8_mqa_topk": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/fp8_mqa_topk_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/fp8_mqa_topk.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-fno-honor-nans'",
+            "'-fno-slp-vectorize'",
+            "'-mllvm -disable-machine-sink'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
     }
 }
