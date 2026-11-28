@@ -122,7 +122,13 @@ def select_3d_config(
         if tuned is not None:
             tuned = tuned.get(str(kv_dtype).removeprefix("torch."))
         if tuned is not None:
-            attn_num_warps = tuned["attn"]["num_warps"]
+            # Optional per-tile override: {block_size: {BLOCK_M: num_warps}}.
+            attn_num_warps = (
+                tuned["attn"]
+                .get("num_warps_by_block_size_block_m", {})
+                .get(str(block_size), {})
+                .get(str(BLOCK_M), tuned["attn"]["num_warps"])
+            )
             seg_cap = tuned["attn"]["MAX_SEGMENTS"]
 
     MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
@@ -139,7 +145,12 @@ def select_3d_config(
         if tuned is not None:
             # The reduce kernel holds a [NUM_SEGMENTS, KV_LORA_RANK] fp32 tile.
             # One warp spills it to scratch from 16 segments, much more from 32.
-            reduce_num_warps = tuned["reduce"]["num_warps"]
+            # Use the per-segment-count value if listed, else the tuned default.
+            reduce_num_warps = (
+                tuned["reduce"]
+                .get("num_warps_by_num_segments", {})
+                .get(str(num_segments), tuned["reduce"]["num_warps"])
+            )
 
     attn_config = {
         "TILE_SIZE": TILE_SIZE,
