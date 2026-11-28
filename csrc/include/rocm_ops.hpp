@@ -2017,6 +2017,30 @@ namespace py = pybind11;
           py::arg("handle_ptrs"));                                                         \
     m.def("qr_max_size", &aiter::qr_max_size);
 
+#define MESH_LEND_ALL_REDUCE_PYBIND                                                        \
+    AITER_SET_STREAM_PYBIND;                                                               \
+    m.def("mesh_lend_create",                                                              \
+          &aiter::mesh_lend_create,                                                        \
+          py::arg("device_id"),                                                            \
+          py::arg("rank"),                                                                 \
+          py::arg("world_size"),                                                           \
+          py::arg("max_bytes"),                                                            \
+          py::arg("max_lenders"));                                                         \
+    m.def("mesh_lend_export_size", &aiter::mesh_lend_export_size);                         \
+    m.def("mesh_lend_export", &aiter::mesh_lend_export, py::arg("fa"), py::arg("out_ptr")); \
+    m.def("mesh_lend_connect",                                                             \
+          &aiter::mesh_lend_connect,                                                       \
+          py::arg("fa"),                                                                   \
+          py::arg("export_ptrs"));                                                         \
+    m.def("mesh_lend_all_reduce",                                                          \
+          &aiter::mesh_lend_all_reduce,                                                    \
+          py::arg("fa"),                                                                   \
+          py::arg("inp"),                                                                  \
+          py::arg("out"),                                                                  \
+          py::arg("bits") = 0);                                                            \
+    m.def("mesh_lend_num_lenders", &aiter::mesh_lend_num_lenders, py::arg("fa"));          \
+    m.def("mesh_lend_destroy", &aiter::mesh_lend_destroy, py::arg("fa"));
+
 #define ROPE_1C_UNCACHED_FWD_PYBIND AITER_SET_STREAM_PYBIND; m.def("rope_fwd_impl", &rope_fwd_impl);
 #define ROPE_2C_UNCACHED_FWD_PYBIND AITER_SET_STREAM_PYBIND; m.def("rope_2c_fwd_impl", &rope_2c_fwd_impl);
 #define ROPE_1C_CACHED_FWD_PYBIND AITER_SET_STREAM_PYBIND; m.def("rope_cached_fwd_impl", &rope_cached_fwd_impl);

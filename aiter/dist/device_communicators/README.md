@@ -191,6 +191,35 @@ used. To preserve an existing limit, replace the old name with
 when both are set, including when its value is negative. Older AITER versions
 that do not support the new name still need the old name.
 
+### Mesh-Lending All-Reduce
+
+`MeshLendAllReduce` (`mesh_lend_all_reduce.py`) is a standalone bfloat16
+all-reduce for a group of 2 or 4 GPUs on an xGMI full mesh. The payload moves on
+SDMA engines: over the group's own links and through the GPUs outside the group
+(lenders), whose links to the group are otherwise idle. It is not part of
+`CudaCommunicator`'s dispatch; the caller picks the payloads it is used for.
+
+```python
+from aiter.dist.device_communicators.mesh_lend_all_reduce import MeshLendAllReduce
+
+comm = MeshLendAllReduce(cpu_group, device, max_bytes=256 << 20)
+if comm.supports(x):
+    y = comm.all_reduce(x)           # exact
+    y = comm.all_reduce(x, bits=4)   # two ranks: each input quantized once
+comm.close()
+```
+
+- Construction is collective and raises `RuntimeError` on every rank when any
+  rank cannot set it up (not an xGMI mesh, KFD ioctl older than 1.17, no SDMA
+  queue left, a guest without `/dev/kfd` access).
+- The lenders are the GPUs outside the group that ROCr sees in every rank,
+  including GPUs HIP does not see. Narrow `ROCR_VISIBLE_DEVICES` or pass
+  `max_lenders` (0 for none) when other jobs on the node need those links.
+- Every call synchronizes the caller's stream and posts SDMA packets from the
+  host, so it cannot be captured into a CUDA graph and it does not pay off for
+  small payloads. `op_tests/multigpu_tests/test_mesh_lend_all_reduce.py --bench`
+  prints the per-call time by size.
+
 ### Mutual Exclusion with Standard Interfaces
 
 Custom groups and standard parallel group interfaces are **mutually exclusive**:
