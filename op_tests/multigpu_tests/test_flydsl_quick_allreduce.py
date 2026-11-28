@@ -23,10 +23,15 @@ sweep ends in a markdown table:
 * ``test_quick_allreduce_edge_inputs`` -- payloads that land on the group
   scale's edge cases, sums above E4M3's old ceiling of 480 on every rank, and
   degenerate groups that must stay finite.
-* ``test_quick_allreduce_divisor`` -- the mesh's shared divisor at TP8: an
-  outlier fill must reach the SQNR floor at divisor 1 (the E5M2 scale does not
-  clip it) and lose at most ``DIVISOR_MAX_LOSS_DB`` at divisor 8, and a
+* ``test_quick_allreduce_divisor`` -- the fp32 divisor on the mesh at TP8: an
+  outlier fill must reach the SQNR floor at divisor 1 (the group scale does
+  not clip it) and lose at most ``DIVISOR_MAX_LOSS_DB`` at divisor 8, and a
   small-magnitude fill must keep full SQNR at the default.
+* ``test_quick_allreduce_scale_range`` -- the pair-shared-exponent group scale
+  on every wire format of both schedules: fills whose group magnitudes span
+  the scale's range must reach the codec's SQNR floor, rows away from the
+  outliers must keep it, and sums above fp16's 65504 must stay finite at
+  divisor 1 and reach the floor at ``ABOVE_FP16_DIVISOR``.
 * ``test_quick_allreduce_transport`` -- the ``fp16`` wire format, a lossless
   passthrough, on an exactly representable input: the result must be
   bit-identical to the fp32 reference, which separates a chunk-addressing or
@@ -40,7 +45,9 @@ the narrow blocks where a VMEM store-data hazard once showed up; the fp16
 transport over a matrix of pinned ``super_tile``/``block``; and
 ``test_quick_allreduce_pinned_codec`` -- the ring with its wire formats
 pinned per lap: all-INT4 at TP8, and one lap lossless to isolate the other;
-and the mesh on its opt-in INT5 and INT6 wire formats at TP4 and TP8.
+and the mesh on its opt-in INT5 and INT6 wire formats at TP4 and TP8; and the
+scale-range rows of a schedule with no ladder on this host (the ring on
+gfx950 xGMI), on ``SCALE_RANGE_PINNED_CFG``.
 
 Every row also checks that all ranks wrote bit-identical output: each rank
 decodes every chunk from the same packets, its own included -- its own from the
@@ -176,6 +183,7 @@ from aiter.ops.flydsl.allreduce_policy import (
     SUPPORTED_BLOCKS,
     SUPPORTED_WORLDS,
     TwoShotRung,
+    default_codecs,
     mesh_st_ladder,
     ring_st_ladder,
 )
@@ -200,10 +208,10 @@ ALGORITHMS = ("mesh", "ring")
 # The ring's reduce-scatter lap requantizes N-1 times where the mesh requantizes
 # once, and the partial sum it requantizes grows with the contributions folded
 # in, so on an all-INT4 wire the ring's SQNR degrades with N: 17.9 dB at TP4
-# and 15.3 at TP8 with the E5M2 group scale (gfx950). Defaulting the
-# ring's reduce-scatter lap to INT6 from TP4 (RS_INT6_MIN_WORLD) lifts it to
-# ~21 dB, so anything below 18.0 is a regression, not a known cost of the
-# schedule.
+# and 15.3 at TP8 (gfx950, measured with the former E5M2 group scale).
+# Defaulting the ring's reduce-scatter lap to INT6 from TP4 (RS_INT6_MIN_WORLD)
+# lifts it to ~21 dB, so anything below 18.0 is a regression, not a known cost
+# of the schedule.
 SQNR_MIN_DB = 18.0
 
 # INT4 at TP8 on the ring is still a supported configuration -- pinning both
@@ -281,9 +289,9 @@ LEGACY_SHAPES_PER_WORLD_SIZE = {
     2: [(512, 5120), (9216, 4096)],
 }
 
-# The divisor cases: ``outlier`` at this divisor against ``outlier`` at 1. With
-# the E5M2 group scale divisor 1 no longer clips, so the opt-in divisor has
-# nothing to recover and may cost at most this much.
+# The divisor cases: ``outlier`` at this divisor against ``outlier`` at 1. The
+# group scale does not clip at divisor 1, so the opt-in divisor has nothing to
+# recover and may cost at most this much.
 OUTLIER_DIVISOR = 8.0
 DIVISOR_MAX_LOSS_DB = 1.0
 
@@ -320,6 +328,54 @@ PINNED_CODEC_CASES = (
 # The mesh's pinned INT5/INT6 floors, so a wider codec that decodes at INT4
 # quality fails.
 MESH_PINNED_SQNR_MIN_DB = {"int5": 23.0, "int6": 29.0}
+
+# The ring with both laps at INT6: its reduce-scatter requantizes N-1 times,
+# so it sits below the mesh's INT6 floor and loses about 2.4 dB per doubling
+# of TP (27.4 dB at TP8 on gfx950).
+RING_INT6_SQNR_MIN_DB = 25.0
+
+# The ``channel_outliers`` floors, per ``(algorithm, rs_codec, ag_codec)``. Its
+# log-normal channel magnitudes put a wide range inside many groups of 16, so
+# the group extremum, not the scale format, sets the noise of the rest of each
+# group. On gfx950 at TP8-TP2 the mesh measures INT5 23.5-24.4 dB and INT6
+# 28.4-29.4 dB, ~0.3 dB above E5M2 group scales on the same fill in an
+# emulation with the real codecs, and the ring with INT6 on both laps 25.1-29.3
+# dB. Each floor still fails a codec that decodes at the next narrower width's
+# quality (ring INT4 stays under 20.5 dB here).
+CHANNEL_OUTLIERS_SQNR_MIN_DB = {
+    ("mesh", "int5", "int5"): 22.0,
+    ("mesh", "int6", "int6"): 27.0,
+    ("ring", "int6", "int6"): 23.0,
+}
+
+# The scale-range cases, ``(fill, divisor)``. ``above_fp16`` puts sums above
+# fp16's 65504 on every row: at divisor 1 they saturate, so only finiteness and
+# cross-rank identity are checked, and ``ABOVE_FP16_DIVISOR`` brings every
+# input and partial sum back under it.
+ABOVE_FP16_DIVISOR = 8.0
+SCALE_RANGE_FILLS = (
+    ("normal", DEFAULT_DIVISOR),
+    ("tiny", DEFAULT_DIVISOR),
+    ("channel_outliers", DEFAULT_DIVISOR),
+    ("massive_tokens", DEFAULT_DIVISOR),
+    ("above_fp16", DEFAULT_DIVISOR),
+    ("above_fp16", ABOVE_FP16_DIVISOR),
+)
+# ``(rs_codec, ag_codec)`` per schedule: every width each lap supports, and the
+# ring's TP4+ default of an INT6 reduce-scatter.
+SCALE_RANGE_CODECS = {
+    "mesh": (("int4", "int4"), ("int5", "int5"), ("int6", "int6")),
+    "ring": (("int4", "int4"), ("int6", "int6"), ("int6", "int4")),
+}
+# ``(super_tile, block)`` at TRANSPORT_GRID_CAP for a schedule with no ladder
+# on this host (the ring on gfx950 xGMI): the ring's gfx950 PCIe rung.
+SCALE_RANGE_PINNED_CFG = (32, 512)
+# Rows whose reduced magnitude stays under QUIET_ROW_MAX_ABS hold every fill's
+# bulk and none of ``massive_tokens``'s outliers. An outlier coarsens only its
+# own pair of groups, so on the mesh those rows keep at least
+# QUIET_SQNR_MIN_DB.
+QUIET_ROW_MAX_ABS = 480.0
+QUIET_SQNR_MIN_DB = 19.0
 
 # (tp, algorithm, tokens, hidden, super_tile, block) on the lossless
 # fp16 wire, with the geometry pinned. ``--extended`` only: a default run
@@ -400,17 +456,59 @@ _FILLS = (
     "overflow_512",
     "large_every_rank",
     "zeros",
+    "tiny",
+    "channel_outliers",
+    "massive_tokens",
+    "above_fp16",
 )
 
 
 def _make_inp(
-    tokens: int, hidden: int, fill: str, *, rank: int, device: torch.device
+    tokens: int,
+    hidden: int,
+    fill: str,
+    *,
+    rank: int,
+    device: torch.device,
+    world_size: int | None = None,
 ) -> torch.Tensor:
-    """One rank's contribution, for whichever edge case *fill* names."""
+    """One rank's contribution, for whichever edge case *fill* names.
+    ``channel_outliers`` and ``massive_tokens`` size their outliers by
+    *world_size*, so the reduced sum is the same at every world size."""
     shape = (tokens, hidden)
     gen = torch.Generator().manual_seed(1234 + rank)
-    if fill in ("normal", "outlier", "small"):
-        std = {"normal": 0.1, "outlier": 100.0, "small": 0.005}[fill]
+    if fill in ("channel_outliers", "massive_tokens") and world_size is None:
+        raise ValueError(f"fill {fill!r} needs world_size")
+    if fill == "channel_outliers":
+        # The same log-normal factor per channel on every rank, so group
+        # magnitudes within a row span up to ~2^15. The largest channel's
+        # reduced standard deviation is 80, so the sum stays near 400.
+        shared = torch.Generator().manual_seed(77)
+        channels = torch.exp(torch.randn(hidden, generator=shared) * 1.5)
+        channels *= 400.0 / (float(channels.max()) * 5.0 * world_size**0.5)
+        src = torch.randn(shape, generator=gen) * channels
+    elif fill == "massive_tokens":
+        # 2% of rows, the same on every rank, carry four values whose reduced
+        # sum is 3e3..2e4 in magnitude; the rest is unit-variance noise.
+        src = torch.randn(shape, generator=gen)
+        shared = torch.Generator().manual_seed(78)
+        rows = torch.randperm(tokens, generator=shared)[: max(1, tokens // 50)]
+        cols = torch.randperm(hidden, generator=shared)[:4]
+        magnitude = torch.empty(len(rows), 4).uniform_(3e3, 2e4, generator=shared)
+        sign = torch.where(torch.rand(len(rows), 4, generator=shared) < 0.5, -1.0, 1.0)
+        src[rows[:, None], cols[None, :]] = sign * magnitude / world_size
+    elif fill == "above_fp16":
+        # Column 5 of every 64 is +-132000 on ranks 0 and 1 and +-11700 on the
+        # rest: above fp16's 65504 on input and in every partial sum, and
+        # under it at divisor 8 up to TP8.
+        src = torch.randn(shape, generator=gen)
+        columns = torch.arange(hidden)
+        large = columns % 64 == 5
+        sign = 1.0 - 2.0 * ((columns // 64) % 2).float()
+        magnitude = 132000.0 if rank < 2 else 11700.0
+        src[:, large] = (sign * magnitude)[large]
+    elif fill in ("normal", "outlier", "small", "tiny"):
+        std = {"normal": 0.1, "outlier": 100.0, "small": 0.005, "tiny": 1e-3}[fill]
         src = torch.randn(shape, generator=gen, dtype=torch.float32) * std
     elif fill == "degenerate":
         # Half the rows exactly zero, half far below the scale's magnitude
@@ -442,7 +540,7 @@ def _make_inp(
             "overflow_512": 512.0 if rank == 0 else 0.0,
             # Every partial and the reduced sum above 480: the E4M3 scale
             # clipped both packs here (SQNR about 1 dB), and on the ring every
-            # requantized hop. MiniMax-M3 all-reduce outputs reach 6400-16800.
+            # requantized hop.
             "large_every_rank": 2048.0,
             "zeros": 0.0,
         }[fill]
@@ -725,8 +823,13 @@ def _metrics(
         printLog=False,
         msg=f"quick_allreduce rank {rank}",
     )
+    quiet = ref.abs().amax(dim=-1) < QUIET_ROW_MAX_ABS
     return {
+        "finite": bool(torch.isfinite(got).all()),
         "sqnr_db": _sqnr_db(got, ref),
+        "quiet_sqnr_db": (
+            _sqnr_db(got[quiet], ref[quiet]) if bool(quiet.any()) else math.inf
+        ),
         "min_tile_sqnr_db": _min_tile_sqnr_db(got, ref, tile_bytes),
         "lanes_differing": _lanes_differing(out, group),
         "rel_mae": _rel_mae(got, ref),
@@ -740,10 +843,11 @@ def _metrics(
 def _worst(a: dict, b: dict) -> dict:
     """Per-field worst of two metric dicts, for a row checked several times."""
     out = dict(a)
-    for key in ("sqnr_db", "min_tile_sqnr_db"):
+    for key in ("sqnr_db", "min_tile_sqnr_db", "quiet_sqnr_db"):
         out[key] = min(a[key], b[key])
     for key in ("err", "n_mismatch", "max_abs_err", "lanes_differing"):
         out[key] = max(a[key], b[key])
+    out["finite"] = a["finite"] and b["finite"]
     # NaN must win, so compare with isfinite rather than max().
     if not math.isfinite(b["rel_mae"]) or b["rel_mae"] > a["rel_mae"]:
         out["rel_mae"] = b["rel_mae"]
@@ -782,10 +886,20 @@ def _test_ladder(
 ) -> tuple:
     """The ladder of a test engine, from the knobs this test pins: the
     production ladder, with *super_tile* and *block* overriding and *grid_cap*
-    bounding every rung.
+    bounding every rung. With all three pinned, a schedule that has no ladder
+    on this host runs on that one rung.
     """
     link = fly_policy.detect_link()
-    ladder = _ladder(algorithm, world_size, link)
+    try:
+        ladder = _ladder(algorithm, world_size, link)
+    except fly_policy.NoPolicyError:
+        if None in (super_tile, grid_cap, block):
+            raise
+        ladder = (
+            TwoShotRung(
+                min_bytes=0, super_tile=super_tile, grid_cap=grid_cap, block=block
+            ),
+        )
     return tuple(
         dataclasses.replace(
             r,
@@ -873,7 +987,12 @@ def _run_ahead(fly, rank: int, tp: int, device, tokens: int, hidden: int, group)
         )
         sqnr = min(sqnr, _sqnr_db(out.float(), ref))
         lanes = max(lanes, _lanes_differing(out, group))
-    return {"calls": len(outs), "sqnr_db": sqnr, "lanes_differing": lanes}
+    return {
+        "calls": len(outs),
+        "sqnr_db": sqnr,
+        "lanes_differing": lanes,
+        "finite": all(bool(torch.isfinite(out).all()) for out in outs),
+    }
 
 
 def _run_rank(
@@ -922,7 +1041,7 @@ def _run_rank(
                     }
                 )
                 continue
-            inp = _make_inp(ntok, hidden, fill, rank=rank, device=device)
+            inp = _make_inp(ntok, hidden, fill, rank=rank, device=device, world_size=tp)
             ref = inp.to(torch.float32)
             dist.all_reduce(ref, group=group)
             dist.barrier(group=group)
@@ -1411,8 +1530,13 @@ def _check(label: str, fails: list[str]) -> bool:
 
 
 def _identity_fails(rows: list[dict], algorithm: str) -> list[str]:
-    """Cross-rank bit-identity, asserted for both schedules."""
+    """Finite output and cross-rank bit-identity, asserted for both
+    schedules."""
     return [
+        f"rank {rank}: non-finite output"
+        for rank, row in enumerate(rows)
+        if not row["finite"]
+    ] + [
         f"rank {rank}: {row['lanes_differing']} bf16 lanes differ between ranks"
         for rank, row in enumerate(rows)
         if row["lanes_differing"]
@@ -1620,9 +1744,9 @@ def test_quick_allreduce_edge_inputs(tokens, hidden, tp, algorithm, fill):
     rows = _result(_ship_key(tp, algorithm, None), (tokens, hidden, fill, False))
     label = f"tp={tp} {algorithm} {tokens}x{hidden} fill={fill}"
     if fill == "degenerate":
-        # A group whose extremum is zero decodes to a zero scale, so the encode
-        # reciprocal saturates; before it was clamped, that reached the codec
-        # as Inf and 0 * Inf poisoned the tile. Only finiteness is asserted.
+        # A group whose extremum is zero or under the scale's magnitude floor
+        # takes the floor scale, so its codes decode to exact zeros or to
+        # values within one step of the input. Only finiteness is asserted.
         _check(
             label,
             [
@@ -1646,13 +1770,13 @@ def test_quick_allreduce_edge_inputs(tokens, hidden, tp, algorithm, fill):
 
 @benchmark()
 def test_quick_allreduce_divisor(tokens, hidden, tp, fill, divisor):
-    """The shared divisor on the shipping mesh engine; correctness only.
+    """The fp32 divisor on the shipping mesh engine; correctness only.
 
     ``small`` at the default divisor must keep the plain INT4 accuracy. An
     ``outlier`` fill used to clip the E4M3 scale at divisor 1, which the
-    divisor existed to recover. The E5M2 scale does not clip it, so divisor 1
-    must reach the SQNR floor and the opt-in divisor may cost at most
-    ``DIVISOR_MAX_LOSS_DB``.
+    divisor existed to recover. The pair-shared-exponent scale does not clip
+    it, so divisor 1 must reach the SQNR floor and the opt-in divisor may cost
+    at most ``DIVISOR_MAX_LOSS_DB``.
     """
     key = _ship_key(tp, "mesh", None)
     nbytes = tokens * hidden * 2
@@ -1688,6 +1812,97 @@ def test_quick_allreduce_divisor(tokens, hidden, tp, fill, divisor):
         check_close=fill != "outlier",
     )
     return ret
+
+
+def _scale_key(tp, algorithm, rs_codec, ag_codec, cfg=None) -> tuple:
+    """The engine of a scale-range row. Codecs that match the schedule's
+    default are left to it, so those rows share the shipping engine; *cfg*
+    pins ``(super_tile, block)`` at ``TRANSPORT_GRID_CAP``."""
+    kw = {"algorithm": algorithm}
+    if default_codecs(algorithm, tp) != (rs_codec, ag_codec):
+        kw.update(rs_codec=rs_codec, ag_codec=ag_codec)
+    if cfg is not None:
+        kw.update(super_tile=cfg[0], grid_cap=TRANSPORT_GRID_CAP, block=cfg[1])
+    return _key(tp, **kw)
+
+
+def _scale_floor(tp, algorithm, rs_codec, ag_codec, fill) -> float:
+    """The whole-payload SQNR floor of one wire format on one fill: the
+    pinned-codec floors, the heavy-tailed fill's own, and the ring's where it
+    requantizes N-1 times."""
+    wire = (algorithm, rs_codec, ag_codec)
+    if fill == "channel_outliers" and wire in CHANNEL_OUTLIERS_SQNR_MIN_DB:
+        return CHANNEL_OUTLIERS_SQNR_MIN_DB[wire]
+    if algorithm == "mesh":
+        return MESH_PINNED_SQNR_MIN_DB.get(rs_codec, SQNR_MIN_DB)
+    if rs_codec == ag_codec == "int6":
+        return RING_INT6_SQNR_MIN_DB
+    if rs_codec == "int4" and tp >= 4:
+        return SQNR_MIN_DB_TP8_INT4_RING
+    return SQNR_MIN_DB
+
+
+@benchmark()
+def test_quick_allreduce_scale_range(
+    tokens, hidden, tp, algorithm, rs_codec, ag_codec, fill, divisor, cfg=None
+):
+    """The group scale and the fp32 divisor across magnitudes; correctness
+    only. At divisor 1 an ``above_fp16`` sum saturates, so it is held only to
+    finite, cross-rank-identical output; every other row reaches the wire
+    format's SQNR floor, and its rows away from the outliers keep it."""
+    key = _scale_key(tp, algorithm, rs_codec, ag_codec, cfg)
+    rows = _result(key, (tokens, hidden, fill, False, divisor))
+    label = (
+        f"tp={tp} {algorithm} {rs_codec}/{ag_codec} {tokens}x{hidden} "
+        f"fill={fill} divisor={divisor:g}"
+    )
+    floor = _scale_floor(tp, algorithm, rs_codec, ag_codec, fill)
+    if fill == "above_fp16" and divisor == DEFAULT_DIVISOR:
+        _check(label, _identity_fails(rows, algorithm))
+    else:
+        # CLOSE_ATOL is calibrated to the 0.1-std fill, not to these.
+        _check_sqnr(
+            label,
+            rows,
+            floor=floor,
+            expected_st=(
+                None
+                if cfg is not None
+                else _shipping_st(rows, tokens * hidden * 2, algorithm, tp)
+            ),
+            algorithm=algorithm,
+            check_close=False,
+        )
+        # Every row of ``channel_outliers`` carries its heavy channels, so it
+        # has no quiet rows to hold to more than its own floor.
+        quiet_floor = (
+            max(floor, QUIET_SQNR_MIN_DB)
+            if algorithm == "mesh" and fill != "channel_outliers"
+            else floor
+        )
+        _check(
+            label,
+            [
+                f"rank {rank}: quiet-row SQNR {row['quiet_sqnr_db']:.2f} dB "
+                f"< {quiet_floor}"
+                for rank, row in enumerate(rows)
+                if row["quiet_sqnr_db"] < quiet_floor
+            ],
+        )
+    _check(
+        label,
+        [
+            f"rank {rank}: resolved codecs {row['rs_codec']}/{row['ag_codec']}"
+            for rank, row in enumerate(rows)
+            if (row["rs_codec"], row["ag_codec"]) != (rs_codec, ag_codec)
+        ],
+    )
+    return {
+        **_summary(rows),
+        "divisor": divisor,
+        "quiet_sqnr_db": min(r["quiet_sqnr_db"] for r in rows),
+        "finite": all(r["finite"] for r in rows),
+    }
 
 
 @benchmark()
@@ -3812,6 +4027,30 @@ def _verify(args, tps, algos, dts, link) -> None:
         _register(key, (tokens, hidden, fill, False, div))
         if fill == "outlier":
             _register(key, (tokens, hidden, fill, False, DEFAULT_DIVISOR))
+    # The scale range on every wire format of each schedule, on its smallest
+    # and largest shipping payloads. With --extended, a schedule with no ladder
+    # on this host runs it pinned, on a 4 MiB and a TOP_PAYLOAD_BYTES payload.
+    scale_range = []
+    for tp, algorithm in itertools.product(tps, algos):
+        if (tp, algorithm) in plans:
+            payloads = plans[(tp, algorithm)][0]
+            shapes = [(n // _ROW_BYTES, HIDDEN) for n in (payloads[0], payloads[-1])]
+            cfg = None
+        elif args.extended and not _ships(tp, algorithm, link):
+            shapes = [RUN_AHEAD_SHAPE, (TOP_PAYLOAD_BYTES // _ROW_BYTES, HIDDEN)]
+            cfg = SCALE_RANGE_PINNED_CFG
+        else:
+            continue
+        scale_range += [
+            (tokens, hidden, tp, algorithm, rs, ag, fill, div, cfg)
+            for rs, ag in SCALE_RANGE_CODECS[algorithm]
+            for tokens, hidden in dict.fromkeys(shapes)
+            for fill, div in SCALE_RANGE_FILLS
+        ]
+    for tokens, hidden, tp, algorithm, rs, ag, fill, div, cfg in scale_range:
+        _register(
+            _scale_key(tp, algorithm, rs, ag, cfg), (tokens, hidden, fill, False, div)
+        )
     pinned = []
     if args.extended:
         pinned = [c for c in PINNED_CODEC_CASES if (c[0], c[1]) in plans]
@@ -3890,6 +4129,10 @@ def _verify(args, tps, algos, dts, link) -> None:
             test_quick_allreduce_divisor(tokens, hidden, tp, fill, div)
             for tokens, hidden, tp, fill, div in divisor
         ],
+    )
+    _summarize(
+        "flydsl quick allreduce scale range",
+        [test_quick_allreduce_scale_range(*case) for case in scale_range],
     )
     _summarize(
         "flydsl quick allreduce pinned codec",
@@ -4865,8 +5108,9 @@ def main():
         "--extended",
         action="store_true",
         help="Also run what production never selects: the legacy fixed\n"
-        "shipping shapes, the block sweep, the pinned-codec ring and the\n"
-        "pinned-geometry fp16 transport matrix.",
+        "shipping shapes, the block sweep, the pinned-codec ring, the\n"
+        "pinned-geometry fp16 transport matrix and the scale range of a\n"
+        "schedule with no ladder on this host.",
     )
     parser.add_argument(
         "--operation",

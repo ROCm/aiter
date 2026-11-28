@@ -5,8 +5,8 @@
 
 Topology of each lap: every rank pushes directly to all ``N-1`` peers, twice.
 
-INT4 nibble: [-8,+7], −1/8, 4 B/thread, 1152 B rank-tile. Scale is
-group-16 signed E5M2 (bias 12) in the 128 B region. Super-tile ST∈{1,8}; host
+INT4 nibble: [-8,+7], −1/8, 4 B/thread, 1152 B rank-tile. Scale is a
+group-16 signed pair-shared-exponent float in the 128 B region. Super-tile ST∈{1,8}; host
 uses ST=1 when ``num_tiles ≤`` the occupancy-clamped persistent grid.
 Payload HBM is bf16; in-kernel math is packed fp16. Each rank owns
 ``ATOMS / world_size`` atoms of a tile (8 GPUs → 1, 4 → 2, 2 → 4); LDS
@@ -23,11 +23,11 @@ A rank never round-trips through its own inbox: its reduce-scatter share is
 added from registers, and its reduced chunk is decoded from the same packet it
 sends. That needs the rank at trace time, which costs one binary per rank.
 
-``divisor`` defaults to ``DEFAULT_DIVISOR``. Loaded fp16 is divided by it
-before the first pack; the gathered sum is multiplied by it once, through
-the all-gather dequant scale, before the bf16 store. The second pack is
-left unchanged. Only a codec with a scale plane (INT4) uses it, and the
-fused all-reduce + RMSNorm build does not take one.
+``divisor`` defaults to ``DEFAULT_DIVISOR``. Every bf16 load is divided by it
+in f32 before the fp16 narrowing, and every bf16 store is multiplied back in
+f32 after the fp16 widening, so magnitudes up to ``65504 * divisor`` survive
+the packed-fp16 math. The packs in between see only scaled values. The fused
+all-reduce + RMSNorm build does not take one.
 """
 
 import flydsl.compiler as flyc
@@ -50,7 +50,6 @@ from .quick_allreduce_codec import (
     _f16x2,
     _i32,
     _scale_from_word,
-    _splat_f16x2,
     codecs_for_block,
     scale_slot_of,
     thread_lane,
@@ -391,6 +390,12 @@ def make_quick_allreduce_mesh_kernel(
         # moves whole tiles through ``_payload_io``, a fused one reaches the
         # same rows as raw bf16 atoms. Its LDS, if any, comes from this kernel's
         # one allocator, after the pack staging.
+        #
+        # One shared divisor, applied by the plain epilogue in f32 on both
+        # sides of the fp16 math: every input load is divided, so the first
+        # pack and our own share see the scaled values, and every final store
+        # is multiplied back. The fused build keeps the divisor at 1.
+        scaling = {} if const_expr(epilogue.takes_operands) else {"divisor": divisor}
         ep = epilogue.bind(
             tid=tid,
             nbytes=nbytes,
@@ -405,42 +410,17 @@ def make_quick_allreduce_mesh_kernel(
             q_ptr=q_ptr,
             q_scale_ptr=q_scale_ptr,
             allocator=allocator,
+            **scaling,
         )
         # Bare names, not ``ep.<hook>(...)``: the rewriter takes a method call
         # inside a runtime loop or branch as a possible mutation of its base
         # and would try to carry ``ep`` through the loop as an SSA value.
-        _load_atom_raw = ep.load_atom
+        _load_atom = ep.load_atom
         _stash_own = ep.stash_own
         _unstash_own = ep.unstash_own
         _prefetch = ep.prefetch
         _finish_tile = ep.finish_tile
         _load_color, _store_color = _color_io(colors_ptr, bid)
-
-        # One shared divisor. Every read of the input is scaled, so the group
-        # max and E4M3 byte of the first pack see the scaled values, and so
-        # does our own share, which stays in registers or is reloaded. The
-        # second pack's input is already a scaled sum, so it must not scale.
-        # A packed fp16 divide expands per element, so multiply by a
-        # reciprocal taken once.
-        inv_div_h = _splat_f16x2((fx.Float32(1.0) / divisor).to(fx.Float16))
-        div_h = _splat_f16x2(divisor.to(fx.Float16))
-
-        # The fused build keeps the divisor at 1, so it skips the scaling.
-        scaled = c.has_scale and not epilogue.takes_operands
-
-        def _load_atom(tile, atom):
-            raw = _load_atom_raw(tile, atom)
-            if const_expr(not scaled):
-                return raw
-            return fx.Vector.from_elements(
-                [_i32(_f16x2(raw[j]) * inv_div_h) for j in range_constexpr(4)],
-                fx.Int32,
-            )
-
-        def _ag_scale(scale):
-            """The all-gather dequant scale, with the divisor multiply folded in:
-            one packed multiply per packet instead of one per fp16 pair."""
-            return scale * div_h if const_expr(scaled) else scale
 
         def _pack_off(peer, i32_idx):
             return fx.get_scalar(fx.crd2idx((peer, i32_idx), pack_layout))
@@ -514,7 +494,7 @@ def make_quick_allreduce_mesh_kernel(
                     _codec_dequant(
                         c,
                         words,
-                        _ag_scale(_scale_from_word(c, scale, pair_in_slot)),
+                        _scale_from_word(c, scale, pair_in_slot),
                         tid,
                     )
                 )
@@ -682,8 +662,8 @@ def make_quick_allreduce_mesh_kernel(
             """Dequantize every peer's all-gather packet back into full-tile atoms.
 
             Our own chunk is *own*, with ``None`` for atoms stored already.
-            Both are already multiplied back by the divisor, which is folded
-            into each packet's group scale.
+            Both are still divided by the divisor; the epilogue's store
+            multiplies them back.
             """
             gathered = []
             for src in range_constexpr(world_size):
@@ -694,7 +674,7 @@ def make_quick_allreduce_mesh_kernel(
                         words, scale = _recv_quantized(
                             PHASE_ALL_GATHER, fx.Int32(src), sub, k
                         )
-                        gathered.append(_codec_dequant(c, words, _ag_scale(scale), tid))
+                        gathered.append(_codec_dequant(c, words, scale, tid))
             return gathered
 
         # ST>1 carries nothing in registers between the three super-tile

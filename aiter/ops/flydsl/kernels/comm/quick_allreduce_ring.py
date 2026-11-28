@@ -250,6 +250,8 @@ def make_quick_allreduce_ring_kernel(
         peer5: fx.Int64,
         peer6: fx.Int64,
         peer7: fx.Int64,
+        # Read only by the plain epilogue; the fused launcher passes 1.
+        divisor: fx.Float32,
     ):
         _clamp_fp16_overflow()
         tid = fx.Int32(gpu.thread_id("x"))
@@ -281,7 +283,9 @@ def make_quick_allreduce_ring_kernel(
         # Everything that touches HBM goes through the epilogue: the plain one
         # moves atoms through ``_payload_io``, a fused one reaches the same rows
         # as raw bf16 atoms. Its LDS, if any, comes from this kernel's one
-        # allocator, after the pack staging.
+        # allocator, after the pack staging. The plain one also applies the
+        # shared divisor, in f32 around the fp16 math.
+        scaling = {} if const_expr(epilogue.takes_operands) else {"divisor": divisor}
         ep = epilogue.bind(
             tid=tid,
             nbytes=nbytes,
@@ -296,6 +300,7 @@ def make_quick_allreduce_ring_kernel(
             q_ptr=q_ptr,
             q_scale_ptr=q_scale_ptr,
             allocator=allocator,
+            **scaling,
         )
         # Bare names, not ``ep.<hook>(...)``: the rewriter takes a method call
         # inside a runtime loop or branch as a possible mutation of its base
@@ -660,6 +665,7 @@ def make_quick_allreduce_ring_kernel(
         peer7: fx.Int64,
         colors_ptr: fx.Int64,
         grid_x: fx.Int32,
+        divisor: fx.Float32 = fx.Float32(1.0),  # noqa: B008
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         quick_allreduce_ring(
@@ -685,6 +691,7 @@ def make_quick_allreduce_ring_kernel(
             peer5,
             peer6,
             peer7,
+            divisor,
             value_attrs={"rocdl.flat_work_group_size": flat_wg},
         ).launch(
             grid=(grid_x, 1, 1),
@@ -741,6 +748,7 @@ def make_quick_allreduce_ring_kernel(
             peer5,
             peer6,
             peer7,
+            fx.Float32(1.0),
             value_attrs={"rocdl.flat_work_group_size": flat_wg},
         ).launch(
             grid=(grid_x, 1, 1),
