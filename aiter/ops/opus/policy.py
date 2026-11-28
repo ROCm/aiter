@@ -34,7 +34,7 @@ from ...jit.utils.build_targets import base_gfx_arch
 from ...jit.utils.chip_info import get_cu_num
 from ...jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..gemm_op_common import (
-    get_padded_m,
+    find_tuned_row,
     mxscale_bmm_groups_of_block,
     with_mxscale_w_scale_block,
 )
@@ -752,11 +752,15 @@ def lookup_mxscale_bmm_config(
     bpreshuffle: bool = False,
     gfx: str | None = None,
     cu_num: int | None = None,
+    device: int | None = None,
 ):
     """Return the exact or existing padded-M tuned row for one shape.
 
     ``bpreshuffle`` picks the table, and therefore B's layout; see
     _load_mxscale_bmm_tuned for why the two are separate files.
+
+    ``device`` is the HIP ordinal whose partition gives the CU counts of the
+    lookup (get_tuned_cu_nums), and defaults to the current device.
 
     ``w_scale_block`` is the caller's weight-scale block ("128x128" or "32x32"
     for OPUS), and it selects among rows rather than describing them: a row
@@ -770,12 +774,17 @@ def lookup_mxscale_bmm_config(
     # A0 bring-up: reuse gfx1250 family tuned rows when strict has none.
     if base_gfx_arch(gfx) != gfx and gfx not in {key[0] for key in tuned}:
         gfx = base_gfx_arch(gfx)
-    row, padded_m = None, m
-    for gl in (None, 0, 1):
-        padded_m = m if gl is None else get_padded_m(m, n, k, gl)
-        row = tuned.get((gfx, cu_num, b, padded_m, n, k, w_scale_block))
-        if row is not None:
-            break
+    row, padded_m = find_tuned_row(
+        tuned,
+        lambda cu, pm: (gfx, cu, b, pm, n, k, w_scale_block),
+        gfx,
+        cu_num,
+        m,
+        n,
+        k,
+        "MXFP8 BMM",
+        device,
+    )
 
     if row is None:
         logger.info(
@@ -999,6 +1008,7 @@ def resolve_a8w8_mxscale_bmm_plan(
     w_scale_block: str = "128x128",
     gfx: str | None = None,
     cu_num: int | None = None,
+    device: int | None = None,
 ) -> tuple[int, int]:
     """Resolve one final local kid/split pair for the caller's scale blocks."""
     gfx = gfx or get_gfx()
@@ -1007,7 +1017,9 @@ def resolve_a8w8_mxscale_bmm_plan(
     group_size = mxscale_bmm_group_of_block(w_scale_block)
     if w_scale_block == "1x32":
         raise ValueError("1x32 OPUS BMM requires the preshuffled-weight entry")
-    config = lookup_mxscale_bmm_config(g, m, n, k, w_scale_block=w_scale_block, **scope)
+    config = lookup_mxscale_bmm_config(
+        g, m, n, k, w_scale_block=w_scale_block, device=device, **scope
+    )
     libtype = config.get("libtype", "opus") if config is not None else "opus"
     if libtype != "opus":
         raise NotImplementedError(

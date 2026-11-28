@@ -201,6 +201,7 @@ def lookup_mxscale_bmm_config(
     bpreshuffle: bool = False,
     gfx: str | None = None,
     cu_num: int | None = None,
+    device: int | None = None,
 ):
     """Exact tuned row for this shape and weight-scale block, else one at a
     padded M; None when no level hits. The row is shared: treat it as read-only."""
@@ -216,6 +217,7 @@ def lookup_mxscale_bmm_config(
         bpreshuffle=bpreshuffle,
         gfx=gfx,
         cu_num=cu_num,
+        device=device,
     )
 
 
@@ -233,9 +235,10 @@ def _get_mxscale_bmm_launch_plan(
     w_scale_block: str = "128x128",
     gfx: str | None = None,
     cu_num: int | None = None,
+    device: int | None = None,
 ) -> tuple[int, int]:
     return _resolve_a8w8_mxscale_bmm_plan(
-        g, m, n, k, w_scale_block=w_scale_block, gfx=gfx, cu_num=cu_num
+        g, m, n, k, w_scale_block=w_scale_block, gfx=gfx, cu_num=cu_num, device=device
     )
 
 
@@ -255,8 +258,11 @@ def _batched_gemm_a8w8_mxscale_impl(
     w_scale_block = _w_scale_block_of(tuple(w_scale.shape), n, k)
     from .opus._arch import _device_arch_and_cu
 
-    gfx, cu = _device_arch_and_cu(x.device)
-    kid, split_k = _get_mxscale_bmm_launch_plan(g, m, n, k, w_scale_block, gfx, cu)
+    device = x.device
+    gfx, cu = _device_arch_and_cu(device)
+    kid, split_k = _get_mxscale_bmm_launch_plan(
+        g, m, n, k, w_scale_block, gfx, cu, device.index
+    )
 
     Y = torch.empty((m, g, n), dtype=dtype, device=x.device)
     if split_k <= 1:
@@ -377,6 +383,7 @@ def _batched_gemm_a8w8_mxscale_bpreshuffle_impl(
         bpreshuffle=True,
         gfx=gfx,
         cu_num=cu_num,
+        device=x.device.index,
     )
     libtype = cfg["libtype"] if cfg is not None else "flydsl"
     kid = None
@@ -484,7 +491,9 @@ def batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant(
     from .opus._arch import _device_arch_and_cu
 
     gfx, cu_num = _device_arch_and_cu(x.device)
-    kernel_name = _fused_quant_tuned_kernel(g, m, n, k, w_scale_block, gfx, cu_num)
+    kernel_name = _fused_quant_tuned_kernel(
+        g, m, n, k, w_scale_block, gfx, cu_num, x.device.index
+    )
     if kernel_name is not None and gfx == "gfx950":
         from .flydsl.batched_gemm_a8w8_gfx950 import _fused_quant_falls_back
 
@@ -515,7 +524,14 @@ def batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant(
 
 @functools.lru_cache(maxsize=1024)
 def _fused_quant_tuned_kernel(
-    g: int, m: int, n: int, k: int, w_scale_block: str, gfx: str, cu_num: int
+    g: int,
+    m: int,
+    n: int,
+    k: int,
+    w_scale_block: str,
+    gfx: str,
+    cu_num: int,
+    device: int | None = None,
 ) -> str | None:
     """The kernelName of the preshuffle table's flydsl row for this shape, the
     row the bf16 entry runs, so both entries share the tuned tile, on gfx950.
@@ -534,6 +550,7 @@ def _fused_quant_tuned_kernel(
         bpreshuffle=True,
         gfx=gfx,
         cu_num=cu_num,
+        device=device,
     )
     if cfg is None or cfg["libtype"] != "flydsl":
         return None
