@@ -413,7 +413,7 @@ def test_ep8_fused_configs_keep_fused_knobs_off():
 
 # Fused knobs added with the EP2 V4.1-Flash tune and after it: they enter the table only when set, so a digest
 # pinned before them changes only where a config sets one.
-_EP2_KNOBS = ("stream_w", "pair_tiles")
+_EP2_KNOBS = ("stream_w", "pair_tiles", "en_order")
 
 
 def _knob_table(config):
@@ -493,10 +493,10 @@ def test_ep4_small_m_buckets_share_one_protocol(mtpr):
 
 
 # The EP8 V4.1-Flash fused configs (_tune_v41_flash_ep8_small / _large). On a mismatch the assertion shows the
-# current table. Pinned with the 256-wide GEMM1 / GEMM2 n-tiles at 16 and 32 tokens and pair_tiles at 64 and 128
-# tokens.
+# current table. Pinned with the 256-wide GEMM1 / GEMM2 n-tiles at 16 and 32 tokens and the per-bucket small-input
+# knobs (_V41_FLASH_EP8_SMALL_KNOBS; en_order in place of pair_tiles at 64 and 128 tokens).
 _V41EP8_FUSED_DIGEST = (
-    "66f44ffe68a7668c3d75c54543796e00df694daec7f8795f12ec778cd75a5127"
+    "267922443e99411115b62607796fca51e1ff92b704b5c7270471f0cb9b0912af"
 )
 
 

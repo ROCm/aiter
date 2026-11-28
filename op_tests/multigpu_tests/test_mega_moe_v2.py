@@ -25,6 +25,8 @@ The fused routes need an a8w4 layout of FUSED_LAYOUTS (mega_moe_config.py) on an
     # every timed route also checked against the reference:
     torchrun --nproc-per-node 4 test_mega_moe_v2.py --suite routes --network v41_flash --check-time-acc
     torchrun --nproc-per-node 2 test_mega_moe_v2.py --suite routes --network v41_flash --check-time-acc
+    # EP8 DeepSeek-V4.1-Flash: the per-bucket small-input knobs leave every output bit for bit:
+    torchrun --nproc-per-node 8 test_mega_moe_v2.py --suite routes --network v41_flash --compare-untuned
     # against a same-MTPR staged route, timing only:
     torchrun --nproc-per-node 8 test_mega_moe_v2.py --suite routes \
         --mtpr 256 --small-m-mtprs 256 --time-only --time-bs 140,168,196,224,252
@@ -50,7 +52,7 @@ import torch.nn.functional as F
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.kernels.mega_moe import MegaMoEV2
+from aiter.ops.flydsl.kernels.mega_moe import MegaMoEV2, mega_moe_config
 from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
     ROUTE_LARGE_M,
     ROUTE_SMALL_M,
@@ -1600,6 +1602,56 @@ def _routes_timing(ctx, args):
             print(f"{line} (median of {args.time_trials}, max over ranks)", flush=True)
 
 
+def _routes_compare_untuned(ctx, outputs):
+    """The small-input runtimes again with the configs their layout selects without its per-bucket knob table
+    (mega_moe_config._V41_FLASH_EP8_SMALL_KNOBS): every case must repeat its output bit for bit.
+    """
+    moe = ctx.moe
+    table = mega_moe_config._V41_FLASH_EP8_SMALL_KNOBS
+    mega_moe_config._V41_FLASH_EP8_SMALL_KNOBS = {}
+    mega_moe_config._fused_config.cache_clear()
+    tuned = [runtime._configs for runtime in moe._small_m_runtimes]
+    try:
+        for runtime in moe._small_m_runtimes:
+            runtime._configs = {
+                bucket: mega_moe_config.select_fused_config(
+                    bucket,
+                    runtime.mtpr,
+                    world_size=runtime.world_size,
+                    experts_per_rank=runtime.epr,
+                    model_dim=runtime.model_dim,
+                    inter_dim=runtime.inter_dim,
+                )
+                for bucket in runtime._configs
+            }
+        changed = sum(
+            runtime._configs != configs
+            for runtime, configs in zip(moe._small_m_runtimes, tuned)
+        )
+        mism = 0
+        for (name, which), (xi, wi, ii, expect, real, mt) in outputs.items():
+            ctx.bind(which, which)
+            out = _routed(moe, xi, wi, ii, mt, ROUTE_SMALL_M)[:real]
+            mism += int((out != expect[:real]).any(dim=-1).sum().item())
+            _barrier()
+    finally:
+        for runtime, configs in zip(moe._small_m_runtimes, tuned):
+            runtime._configs = configs
+        mega_moe_config._V41_FLASH_EP8_SMALL_KNOBS = table
+        mega_moe_config._fused_config.cache_clear()
+    mism_t = torch.tensor(mism, device=ctx.device)
+    dist.all_reduce(mism_t)
+    ok = int(mism_t.item()) == 0
+    if ctx.rank == 0:
+        print(
+            f"[UNTUNED] cases={len(outputs)} runtimes_with_table={changed} "
+            f"mismatched_rows_vs_tuned={int(mism_t.item())} {'PASS' if ok else 'FAIL'}",
+            flush=True,
+        )
+    if not ok:
+        ctx.failures.append("untuned")
+
+
 def _run_routes(args, rank, world, device):
     ctx = _routes_instance(args, rank, world, device)
     moe = ctx.moe
@@ -1611,6 +1663,8 @@ def _run_routes(args, rank, world, device):
         )
     if not args.time_only:
         outputs = _routes_accuracy(ctx, args)
+        if args.compare_untuned:
+            _routes_compare_untuned(ctx, outputs)
         _routes_edges(ctx, args)
         keys = _routes_alternation(ctx, args, outputs)
         # Zero rows on every rank; 32-bit epochs wrapping.
@@ -1847,6 +1901,12 @@ def main():
         "--check-time-acc",
         action="store_true",
         help="check every timed route against the fp32 reference",
+    )
+    routes.add_argument(
+        "--compare-untuned",
+        action="store_true",
+        help="check the small-input outputs bit for bit against the configs selected "
+        "without the per-bucket knob table (--network v41_flash on 8 ranks)",
     )
     routes.add_argument("--time-calls", type=int, default=50)
     routes.add_argument("--time-trials", type=int, default=15)
