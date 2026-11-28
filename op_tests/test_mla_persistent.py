@@ -1371,60 +1371,9 @@ def test_mla(
             work_info_set=work_info_set,
         )
 
-    # """ test code for decode_update_mla_metadata_v1 """
-    # torch.set_printoptions(linewidth=200)
-    # print(f"{kv_indptr=}")
-    # print(f"{work_indptr=}")
-    # print(f"{work_info_set[:32]}")
-    # print(f"{reduce_indptr=}")
-    # print(f"{reduce_final_map=}")
-    # print(f"{reduce_partial_map=}")
-
-    # print("*************** decode_update_mla_metadata_v1 ********************")
-    # if decode_qlen > 1:
-    #     num_reject_tokens = torch.randint(0, 4, (batch_size,), dtype=torch.int32)
-    #     kv_len_delta_csum = torch.cumsum(num_reject_tokens - 1, dim=0).to(torch.int32)
-    #     kv_indptr[1:] = kv_indptr[1:] - kv_len_delta_csum
-    # else:
-    #     kv_indptr = kv_indptr + torch.arange(batch_size + 1, dtype=torch.int32)
-    #     num_reject_tokens = None
-    # num_page = kv_indptr[-1].item()
-    # kv_indices = torch.randperm(num_page, dtype=torch.int)
-    # from aiter.ops.attention import decode_update_mla_metadata_v1
-
-    # decode_update_mla_metadata_v1(
-    #     qo_indptr,
-    #     kv_indptr,
-    #     kv_last_page_lens,
-    #     nhead // nhead_kv,
-    #     nhead_kv,
-    #     False,
-    #     work_meta_data,
-    #     work_info_set,
-    #     work_indptr,
-    #     reduce_indptr,
-    #     reduce_final_map,
-    #     reduce_partial_map,
-    #     page_size=page_size,
-    #     kv_granularity=max(page_size, 16),
-    #     max_seqlen_qo=1,
-    #     dtype_q=dtype,
-    #     dtype_kv=kvtype,
-    #     num_reject_tokens=num_reject_tokens,
-    # )
-    # print(f"{num_reject_tokens=}")
-    # print(f"{kv_indptr=}")
-    # print(f"{work_info_set[:32]=}")
-    # print(f"{work_indptr=}")
-    # print(f"{reduce_indptr=}")
-    # print(f"{reduce_final_map=}")
-    # print(f"{reduce_partial_map=}")
-    # return
-
     def test_absorb_decode_bf16_fp8():
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
-        kv_buffer_fp8 = kv_buffer.to(kvtype)
-        kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
+        kv_buffer_fp8, kv_scale = aiter.per_tensor_quant(kv_buffer, quant_dtype=kvtype)
 
         out_ref_fp8, _lse_ref_fp8 = torch_mla_extend(
             q,
@@ -1469,11 +1418,6 @@ def test_mla(
         )
 
         err = checkAllclose(
-            out_ref,
-            out_asm,
-            msg=f"mla_decode-absorb    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
-        )
-        checkAllclose(
             out_ref_fp8,
             out_asm,
             msg=f"mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
@@ -1605,13 +1549,17 @@ def test_mla(
         # for page_size == 1.
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
 
-        q_fp8 = q.to(dtypes.fp8)
-        q_scale = torch.ones([1], dtype=torch.float, device="cuda")
+        q_fp8, q_scale = aiter.per_tensor_quant(q, quant_dtype=dtypes.fp8)
+        # Q and KV are both bf16 randn, so amax quantization gives them the same
+        # scale. Quantizing KV against a smaller bound keeps kv_scale distinct, so
+        # a kernel that applies q_scale to V fails.
+        kv_buffer_fp8, kv_scale = aiter.per_tensor_quant(
+            kv_buffer,
+            quant_dtype=dtypes.fp8,
+            dtypeMax=0.75 * torch.finfo(dtypes.fp8).max,
+        )
 
-        kv_buffer_fp8 = kv_buffer.to(dtypes.fp8)
-        kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
-
-        out_ref_fp8, _lse_ref_fp8 = torch_mla_extend(
+        out_ref_fp8, lse_ref_fp8 = torch_mla_extend(
             q_fp8 if dtype == dtypes.fp8 else q,
             kv_buffer_fp8,
             qo_indptr,
@@ -1623,7 +1571,7 @@ def test_mla(
             qk_rope_head_dim,
             dtype=out_dtype,
             is_causal=causal,
-            q_scale=None,
+            q_scale=q_scale,
             kv_scale=kv_scale,
         )
 
@@ -1656,22 +1604,16 @@ def test_mla(
         )
 
         err = checkAllclose(
-            out_ref,
-            out_asm,
-            msg=f"mla_decode-absorb_fp8    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
-        )
-
-        if not non_persistent_mode and return_lse:
-            err = checkAllclose(
-                lse_ref,
-                attn_lse.reshape(total_q, nhead),
-                msg=f"mla_decode-absorb_fp8    [lse_ref vs attn_lse]: {us_asm_decode:>8.2f} us......",
-            )
-        err = checkAllclose(
             out_ref_fp8,
             out_asm,
             msg=f"mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
+        if not non_persistent_mode and return_lse:
+            checkAllclose(
+                lse_ref_fp8,
+                attn_lse.reshape(total_q, nhead),
+                msg=f"mla_decode-absorb_fp8    [lse_ref_fp8 vs attn_lse]: {us_asm_decode:>8.2f} us......",
+            )
 
         if not non_persistent_mode:
             partial_out_ref, _partial_lse_ref, split_out_ref, _split_lse_ref = (
@@ -1720,7 +1662,7 @@ def test_mla(
                 if nhead == 64 and get_gfx() == "gfx942":
                     assert partial_err < 0.05
 
-        cal_diff(out_ref, out_asm, "out", True)
+        cal_diff(out_ref_fp8, out_asm, "out", True)
         return err, us_asm_decode
 
     def test_absorb_decode_3buffer():
@@ -1753,12 +1695,6 @@ def test_mla(
             scale_dim=scale_dim,
         )
 
-        checkAllclose(
-            out_ref,
-            out_ref_fp8,
-            msg="mla_decode-absorb_fp8    [golden fp8 vs golden]:......",
-        )
-
         (attn_logits, _attn_lse), us_asm_decode = run_perftest(
             aiter.mla.mla_decode_fwd,
             q,
@@ -1785,11 +1721,6 @@ def test_mla(
         )
 
         err = checkAllclose(
-            out_ref,
-            out_asm,
-            msg=f"mla_decode-absorb_fp8    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
-        )
-        checkAllclose(
             out_ref_fp8,
             out_asm,
             msg=f"mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
@@ -1837,7 +1768,7 @@ def test_mla(
                     msg=f"mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]: {us_asm_decode:>8.2f} us......",
                 )
 
-        cal_diff(out_ref, out_asm, "out", True)
+        cal_diff(out_ref_fp8, out_asm, "out", True)
         return err, us_asm_decode
 
     def test_absorb_decode_ds32_opus():
@@ -1865,13 +1796,6 @@ def test_mla(
             is_causal=True,
             scale_dim=scale_dim,
         )
-
-        err = checkAllclose(
-            out_ref,
-            out_ref_fp8,
-            msg="mla_decode-absorb_fp8    [golden fp8 vs golden]:......",
-        )
-        us_asm_decode = 1e12
 
         (_attn_logits, _attn_lse), us_asm_decode = run_perftest(
             aiter.mla.mla_decode_fwd_ds32,
@@ -1901,17 +1825,12 @@ def test_mla(
         )
 
         err = checkAllclose(
-            out_ref,
-            out_asm,
-            msg=f"mla_decode-absorb_fp8    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
-        )
-        checkAllclose(
             out_ref_fp8,
             out_asm,
             msg=f"mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
 
-        cal_diff(out_ref, out_asm, "out", True)
+        cal_diff(out_ref_fp8, out_asm, "out", True)
         return err, us_asm_decode
 
     err = None
