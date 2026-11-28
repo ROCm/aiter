@@ -66,7 +66,9 @@ def _gemm_splitk_reduce_kernel(
     if ACTUAL_KSPLIT == MAX_KSPLIT:
         c = tl.load(c_in_ptrs)
     else:
-        c = tl.load(c_in_ptrs, mask=offs_k[:, None, None] < ACTUAL_KSPLIT, other=0.0)
+        # Async copy ignores a mask that has no lower bound.
+        k_mask = (offs_k >= 0) & (offs_k < ACTUAL_KSPLIT)
+        c = tl.load(c_in_ptrs, mask=k_mask[:, None, None], other=0.0)
     c = tl.sum(c, axis=0)
 
     if ADD_BIAS:
