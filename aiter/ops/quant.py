@@ -474,6 +474,25 @@ def per_token_quant_hip(
 SCALE_LAYOUT_M32K4_SUPPORTED = True
 
 
+def _mx32_shuffled_scale(shape, scale_type, device):
+    """Scale buffers for the MX-shuffled group-32 e8m0 layout.
+
+    The shuffle writes 32-row x 8-group tiles (``mx_scale_shuffle_idx``), so the
+    kernel needs ``pad32(rows) * pad8(K // 32)`` bytes even though callers see
+    ``(*shape[:-1], K // 32)``. Returns ``(buf, view)``: ``buf`` is what the
+    kernel writes, ``view`` is the contiguous caller-visible prefix of it.
+    """
+    scale_n = shape[-1] // 32
+    rows = 1
+    for d in shape[:-1]:
+        rows *= d
+    padded = (rows + 31) // 32 * 32 * ((scale_n + 7) // 8 * 8)
+    buf = torch.empty(padded, dtype=scale_type, device=device)
+    if padded != rows * scale_n:
+        return buf, buf[: rows * scale_n].view(*shape[:-1], scale_n)
+    return buf, buf.view(*shape[:-1], scale_n)
+
+
 # Routed on a neutrally named layer, not on the public spelling: a route's
 # contract is the decorated function's whole signature, so decorating
 # `per_group_quant_hip` would put a backend-named function into a contract
@@ -504,6 +523,8 @@ def _per_group_quant_fake(
         return y, torch.empty(
             ((m + 31) // 32 * 32, shape[-1] // 32), dtype=scale_type, device=x.device
         )
+    if transpose_scale and scale_type == dtypes.fp8_e8m0 and group_size == 32:
+        return y, _mx32_shuffled_scale(shape, scale_type, x.device)[1]
     return y, torch.empty(
         (*shape[:-1], shape[-1] // group_size), dtype=scale_type, device=x.device
     )
@@ -561,10 +582,16 @@ def _per_group_quant_routed(
             y, x, scale, group_size, num_rows=num_rows, scale_layout_m32k4=True
         )
         return y, scale
+    # The kernel writes the MX-shuffled group-32 e8m0 scale in 32x8 tiles, past
+    # the (*shape[:-1], K // 32) bytes the caller sees; it gets the padded buffer.
+    kernel_scale = None
     if scale is None:
-        scale = torch.empty(
-            (*shape[:-1], shape[-1] // group_size), dtype=scale_type, device=device
-        )
+        if transpose_scale and scale_type == dtypes.fp8_e8m0 and group_size == 32:
+            kernel_scale, scale = _mx32_shuffled_scale(shape, scale_type, device)
+        else:
+            scale = torch.empty(
+                (*shape[:-1], shape[-1] // group_size), dtype=scale_type, device=device
+            )
     else:
         raise ValueError("unsupported: static per token quant")
     assert group_size in [
@@ -577,7 +604,7 @@ def _per_group_quant_routed(
         dynamic_per_group_scaled_quant(
             y,
             x,
-            scale,
+            scale if kernel_scale is None else kernel_scale,
             group_size,
             shuffle_scale=transpose_scale,
             num_rows=num_rows,

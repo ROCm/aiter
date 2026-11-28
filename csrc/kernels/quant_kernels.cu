@@ -2417,6 +2417,20 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                 " expects scales.dtype in {fp8_e8m0, u8, fp32}, got ",
                 AiterDtype_to_str(scales.dtype()));
 
+    if(use_e8m0_scale && shuffle_scale && group_size == 32)
+    {
+        // The MX shuffle writes whole 32-row x 8-group tiles (mx_scale_shuffle_idx), so a
+        // scale of rows * cols / 32 bytes is overrun unless rows % 32 == 0 and cols % 256 == 0.
+        const int64_t need = (static_cast<int64_t>(rows) + 31) / 32 * 32 *
+                             ((static_cast<int64_t>(cols) / 32 + 7) / 8 * 8);
+        AITER_CHECK(scales.numel() >= need,
+                    __func__,
+                    " shuffled e8m0 group-32 scale needs pad32(rows) * pad8(cols / 32) = ",
+                    need,
+                    " bytes, got ",
+                    scales.numel());
+    }
+
     HipDeviceGuard device_guard(input.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
     const DynGqDevice dev = dyn_gq_device();
