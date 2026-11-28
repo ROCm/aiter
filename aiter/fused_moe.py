@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
+import itertools
 import math
 import os
 import re
@@ -39,7 +40,9 @@ from aiter.jit.utils.chip_info import (  # noqa: F401
     get_cu_num,
     get_gfx,
     get_gfx_runtime,
+    get_tuned_cu_nums,
     gfx_from_cu_num,
+    log_tuned_cu_fallback,
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
@@ -4685,6 +4688,7 @@ def get_2stage_cfgs(
             cfg_2stages_by_file[tune_file] = active_cfg_2stages
     cu_num = get_cu_num()
     gfx = get_gfx_runtime()
+    tuned_cu_nums = get_tuned_cu_nums(cu_num)
     keys = (
         gfx,
         cu_num,
@@ -4749,26 +4753,23 @@ def get_2stage_cfgs(
             return None, None
         primary, fallback = c2s
         lookup_keys = keys[:7] + (str(activation),) + keys[8:]
-        tier = token
-        result = primary.get(lookup_keys, None)
-        if result is None and config_file is None:
-            result = fallback.get(keys_disabled, None)
+        tokens = [token]
         # Tier fallback: if current tier not found, try smaller tiers in descending order
-        if result is None and config_file is None and token > _PADDED_M_TIERS[0]:
+        if config_file is None and token > _PADDED_M_TIERS[0]:
             tier_idx = _PADDED_M_TIERS.index(token) if token in _PADDED_M_TIERS else -1
-            for fallback_tier in reversed(_PADDED_M_TIERS[:tier_idx]):
-                tier = fallback_tier
-                # keys layout: (gfx, cu_num, token, ...); replace token (idx 2).
-                keys_fb = lookup_keys[:2] + (fallback_tier,) + lookup_keys[3:]
-                keys_fb_disabled = (
-                    keys_disabled[:2] + (fallback_tier,) + keys_disabled[3:]
+            tokens += reversed(_PADDED_M_TIERS[:tier_idx])
+        for tier, tuned_cu in itertools.product(tokens, tuned_cu_nums):
+            # keys layout: (gfx, cu_num, token, ...); replace cu_num and token.
+            result = primary.get(lookup_keys[:1] + (tuned_cu, tier) + lookup_keys[3:])
+            if result is None and config_file is None:
+                result = fallback.get(
+                    keys_disabled[:1] + (tuned_cu, tier) + keys_disabled[3:]
                 )
-                result = primary.get(keys_fb, None)
-                if result is None:
-                    result = fallback.get(keys_fb_disabled, None)
-                if result is not None:
-                    break
-        return result, tier
+            if result is not None:
+                if tuned_cu != cu_num:
+                    log_tuned_cu_fallback("fused_moe", gfx, cu_num, tuned_cu)
+                return result, tier
+        return None, None
 
     cfg, cfg_tier = _lookup_cfg(active_cfg_2stages)
     limit_tag = (
