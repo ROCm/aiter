@@ -76,6 +76,12 @@ K3_MODEL_DIM, K3_INTER_DIM = 3584, 3072
 # EPLB redundant-expert profiles (r32 / r64) share V4-Pro's shape and FP4
 # prelude but have no per-bucket tuner of their own.
 V4_EPLB_EXPERTS_PER_RANKS = (52, 56)
+# DeepSeek-V4.1-Flash EP8 with one redundant expert slot per rank (EPLB,
+# 384 + 8 physical experts).  Unlike V4-Pro's family it also runs the epr48
+# tuner: none of its rules depend on the expert count (fixed-slot dispatch is
+# epr48-only, so those rules never fire here), and on MI355X the tuned configs
+# are faster than the base config at epr49 with the same output.
+V41_FLASH_EP8_EPLB_EXPERTS_PER_RANKS = (49,)
 # Compact route metadata dedicates ten bits to the global expert/group segment.
 # Under the EP8 protocol this admits 8 * 127 expert segments plus 8 group
 # segments.  The next expert would require segment 1024 and cannot be encoded.
@@ -1152,8 +1158,10 @@ class NetworkProfile:
     (R1 and V4-Pro only tune FP4; Kimi-K3 tunes both FP4 and FP8).
 
     ``family_experts_per_rank`` lists extra experts-per-rank values (EPLB
-    redundant-expert profiles) that share this network's shape and FP4 prelude
-    but have no per-bucket tuner of their own.
+    redundant-expert profiles) that share this network's shape and FP4 prelude.
+    They have no per-bucket tuner of their own and get the base config, unless
+    ``tune_family`` is set: then they also run this network's tuner, for a
+    network whose tuning has been validated at those expert counts.
     """
 
     name: str
@@ -1163,6 +1171,7 @@ class NetworkProfile:
     tuner: Callable[[MegaMoEConfig, _TuningContext], MegaMoEConfig]
     family_experts_per_rank: tuple[int, ...] = ()
     fp4_prelude: bool = False
+    tune_family: bool = False
 
 
 _NETWORKS = (
@@ -1194,7 +1203,15 @@ _NETWORKS = (
         _tune_v41_flash_ep2,
         fp4_prelude=True,
     ),
-    NetworkProfile("v41_flash_ep8", 48, 5120, 2304, _tune_v41_flash_ep8),
+    NetworkProfile(
+        "v41_flash_ep8",
+        48,
+        5120,
+        2304,
+        _tune_v41_flash_ep8,
+        V41_FLASH_EP8_EPLB_EXPERTS_PER_RANKS,
+        tune_family=True,
+    ),
 )
 
 
@@ -1334,7 +1351,9 @@ def select_mega_moe_config(
     # silently retune its FP4 path. EPLB families inherit their profile's prelude.
     if apply_fp4 and profile is not None and profile.fp4_prelude:
         config = _fp4_common_prelude(config, ctx)
-    if profile is not None and experts_per_rank == profile.experts_per_rank:
+    if profile is not None and (
+        experts_per_rank == profile.experts_per_rank or profile.tune_family
+    ):
         config = profile.tuner(config, ctx)
     if (
         a_dtype == ACTIVATION_FP4

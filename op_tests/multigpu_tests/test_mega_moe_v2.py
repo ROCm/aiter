@@ -86,6 +86,15 @@ NETWORKS = {
         "topk": 6,
         "swiglu_limit": 10.0,
     },
+    # V4.1-Flash with EPLB redundant experts: one replica slot per rank at EP8
+    # (384 + 8 physical experts, 49 per rank).
+    "v41_flash_eplb49": {
+        "model_dim": 5120,
+        "inter_dim": 2304,
+        "experts": 392,
+        "topk": 6,
+        "swiglu_limit": 10.0,
+    },
     "r1_v3": {
         "model_dim": 7168,
         "inter_dim": 2048,
