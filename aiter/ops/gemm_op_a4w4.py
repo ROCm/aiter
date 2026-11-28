@@ -342,6 +342,66 @@ def gemm_a4w4_fake(
     return torch.empty((*A.shape[:-1], n), dtype=dtype, device=A.device)
 
 
+# gfx950 OPUS MXFP4 kernels: tuned rows whose kernelName is an OPUS a4w4 instance
+# name launch through opus_gemm (its C++ launcher checks shapes and scales again).
+_A4W4_PRESHUFFLE_PREFIXES = ("triton_", "flydsl_", "opus_")
+
+
+@functools.cache
+def _opus_a4w4_kid(name, gfx, cu_num):
+    from csrc.opus_gemm.opus_gemm_common import get_registry
+
+    for kid, inst in get_registry("a4w4", gfx, cu_num).items():
+        if inst.name == name:
+            return kid, inst
+    raise ValueError(f"Invalid tuned OPUS a4w4 kernel {name!r}")
+
+
+def _gemm_a4w4_opus(A, B, A_scale, B_scale, out, name):
+    m, n, k = A.numel() // A.shape[-1], B.shape[0], A.shape[-1] * 2
+    # Decline (-> CK/ASM fallback) what the OPUS launcher would reject, like the
+    # triton_/flydsl_ branch below: e8m0_shuffle scales are 2D, K/32 wide and
+    # padded to whole 32-row blocks.
+    if not (
+        out.dtype == dtypes.bf16
+        and n % 16 == 0
+        and k % 256 == 0
+        and all(
+            t.is_contiguous() and t.element_size() == 1
+            for t in (A, B, A_scale, B_scale)
+        )
+        and A_scale.ndim == 2
+        and B_scale.ndim == 2
+        and A_scale.shape[-1] == k // 32
+        and B_scale.shape[-1] == k // 32
+        and A_scale.shape[0] % 32 == 0
+        and B_scale.shape[0] % 32 == 0
+        and A_scale.shape[0] >= m
+        and B_scale.shape[0] >= n
+    ):
+        return None
+    gfx, cu_num = get_gfx(), get_cu_num()
+    kid, inst = _opus_a4w4_kid(name, gfx, cu_num)
+    # A row tuned at a padded M also serves the smaller M that pad up to it; a
+    # no-bounds-check (nob) tile only fits whole tiles, so run its bounded twin.
+    if inst.co_variant == "nob" and (m % inst.B_M or n % inst.B_N):
+        kid, _ = _opus_a4w4_kid(name.removesuffix("_nob"), gfx, cu_num)
+    from .opus import opus_gemm
+
+    # out is padded to 32 rows; the kernel writes the first m.
+    opus_gemm(
+        A.view(m, -1).view(dtypes.fp4x2),
+        B.view(dtypes.fp4x2),
+        out[:m],
+        kid=kid,
+        family="a4w4",
+        layout="bpreshuffle",
+        x_scale=A_scale,
+        w_scale=B_scale,
+    )
+    return out[:m].view(*A.shape[:-1], n)
+
+
 def _gemm_a4w4_preshuffle(A, B, A_scale, B_scale, out, kernel_name):
     """CSV/tuner adapter for gfx950 MXFP4 with default shuffled 1x32 scales.
 
@@ -349,6 +409,8 @@ def _gemm_a4w4_preshuffle(A, B, A_scale, B_scale, out, kernel_name):
     call is unsupported. Compilation and kernel errors propagate.
     """
     name = str(kernel_name)
+    if name.startswith("opus_"):
+        return _gemm_a4w4_opus(A, B, A_scale, B_scale, out, name)
     if name.startswith("triton_"):
         params = dict(_parse_triton_a4w4_kernel(name))
         output_dtype = dtypes.bf16
@@ -514,7 +576,7 @@ def gemm_a4w4(
         )
     ck_config = get_GEMM_config(m, n, k)
     if ck_config is not None and str(ck_config["kernelName"]).startswith(
-        ("triton_", "flydsl_")
+        _A4W4_PRESHUFFLE_PREFIXES
     ):
         if (
             gfx_arch == "gfx950"

@@ -13,7 +13,11 @@ from aiter import dtypes
 from aiter.jit.core import AITER_ASM_DIR, AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
-from aiter.ops.gemm_op_a4w4 import _FLYDSL_AVAILABLE, gemm_a4w4
+from aiter.ops.gemm_op_a4w4 import (
+    _A4W4_PRESHUFFLE_PREFIXES,
+    _FLYDSL_AVAILABLE,
+    gemm_a4w4,
+)
 from aiter.ops.shuffle import shuffle_mxfp8fp4_scale, shuffle_weight
 from aiter.test_common import (
     assertAllclose,
@@ -533,9 +537,122 @@ def tuned_shapes():
     table = table[(table["gfx"] == get_gfx()) & (table["cu_num"] == get_cu_num())]
     if gfx950:
         table = table[
-            table["kernelName"].str.startswith(("triton_", "flydsl_"), na=False)
+            table["kernelName"].str.startswith(_A4W4_PRESHUFFLE_PREFIXES, na=False)
         ]
     return sorted(set(table[["M", "N", "K"]].itertuples(index=False, name=None)))
+
+
+def opus_a4w4_kid_sweep(dtype=dtypes.bf16):
+    """gfx950: every registered OPUS a4w4 kid once against the torch reference.
+
+    The tuned CSV reaches only some kids and always with splitK=0, so this also
+    takes M off the tile grid (nob kids need whole tiles) and forces split_k=2 on
+    the split-K and small-tile kids.
+    """
+    from aiter.ops.opus import opus_gemm
+    from csrc.opus_gemm.opus_gemm_common import get_registry
+
+    try:
+        kids = get_registry("a4w4", get_gfx(), get_cu_num())
+    except ValueError:
+        return []  # no OPUS a4w4 table for this CU count
+    quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
+    K = 2048
+    rows = []
+    for kid, inst in sorted(kids.items()):
+        nob = inst.co_variant == "nob"
+        M = 4 * inst.B_M if nob else 3 * inst.B_M + 17
+        N = 4 * inst.B_N if nob else 2 * inst.B_N + 16
+        x = torch.randn((M, K), dtype=dtype)
+        w = torch.randn((N, K), dtype=dtype)
+        _, x_scales = quant_func(x, shuffle=False)
+        _, w_scales = quant_func(w, shuffle=False)
+        x, x_scales_shuffle = quant_func(x, shuffle=True)
+        w, w_scales_shuffle = quant_func(w, shuffle=True)
+        ref = run_torch(
+            x, w, x_scales.view(torch.uint8), w_scales.view(torch.uint8), dtype
+        )
+        wshuffle = shuffle_weight(w, layout=(16, 16))
+        splits = (
+            (0, 2)
+            if inst.kernel_tag == "a4w4_mxfp4_nt_bpreshuffle_small"
+            or inst.co_variant == "sk"
+            else (0,)
+        )
+        for split_k in splits:
+            y = torch.empty((M, N), dtype=dtype)
+            opus_gemm(
+                x.view(dtypes.fp4x2),
+                wshuffle.view(dtypes.fp4x2),
+                y,
+                kid=kid,
+                family="a4w4",
+                layout="bpreshuffle",
+                x_scale=x_scales_shuffle,
+                w_scale=w_scales_shuffle,
+                split_k=split_k,
+            )
+            err = checkAllclose(
+                ref.float(),
+                y.float(),
+                msg=f"opus a4w4 kid {kid} M={M} N={N} K={K} split_k={split_k}",
+                catastrophic_check=True,
+            )
+            rows.append(
+                {
+                    "kid": kid,
+                    "kernel": inst.name,
+                    "M": M,
+                    "N": N,
+                    "K": K,
+                    "split_k": split_k,
+                    "err": err,
+                }
+            )
+    return rows
+
+
+def check_bpreshuffle_large_offset(kids=(0, 10, 30), M=65792, N=32768, K=256):
+    """Pre-compiled bpreshuffle kids on a Y of > 2^31 elements: (M - 256) * N = 2^31,
+    so the last tile row's offset overflows 32-bit arithmetic. Only the first and
+    last rows are compared against the reference (the full one would need 8 GiB)."""
+    from aiter.ops.opus import opus_gemm
+
+    dtype = dtypes.bf16
+    quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
+    x = torch.randn((M, K), dtype=dtype)
+    w = torch.randn((N, K), dtype=dtype)
+    _, x_scales = quant_func(x, shuffle=False)
+    _, w_scales = quant_func(w, shuffle=False)
+    x, x_scales_shuffle = quant_func(x, shuffle=True)
+    w, w_scales_shuffle = quant_func(w, shuffle=True)
+    wshuffle = shuffle_weight(w, layout=(16, 16))
+    x_scales, w_scales = x_scales.view(torch.uint8), w_scales.view(torch.uint8)
+    rows_ref = [
+        (rows, run_torch(x[rows], w, x_scales[rows], w_scales, dtype))
+        for rows in (slice(0, 4), slice(M - 4, M))
+    ]
+    y = torch.empty((M, N), dtype=dtype)
+    for kid in kids:
+        y.fill_(float("nan"))
+        opus_gemm(
+            x.view(dtypes.fp4x2),
+            wshuffle.view(dtypes.fp4x2),
+            y,
+            kid=kid,
+            family="a4w4",
+            layout="bpreshuffle",
+            x_scale=x_scales_shuffle,
+            w_scale=w_scales_shuffle,
+        )
+        for rows, ref in rows_ref:
+            checkAllclose(
+                ref.float(),
+                y[rows].float(),
+                msg=f"opus a4w4 kid {kid} rows {rows.start}:{rows.stop} of M={M}",
+                catastrophic_check=True,
+            )
+    del y
 
 
 def main():
@@ -639,6 +756,13 @@ def main():
             (1792, 8192, 28672),
             (1920, 8192, 28672),
             (3072, 8192, 28672),
+            # gfx950 OPUS rows reached only through the padded-M lookup
+            # (M -> tuned M, kid): small-tile 3 -> 4 (415), one-tile 65 -> 128 (13),
+            # split-K 97 -> 112 (22), persistent 129 -> 256 (1); nob is the 1664 row above.
+            (3, 512, 4096),
+            (65, 32768, 512),
+            (97, 51200, 5120),
+            (129, 32768, 512),
         ],
         help="""Shape of mnk.
     e.g. -mnk 1280,8192,1024""",
@@ -708,13 +832,16 @@ def main():
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
     aiter.logger.info("gemm_a4w4 summary (markdown):\n%s", df_md)
-    if (
-        get_gfx() == "gfx950"
-        and args.csv is None
-        and args.shape is parser.get_default("shape")
-    ):
-        check_asm_last_tile_at_allocation_end()
-        check_asm_4gib_operands()
+    if get_gfx() == "gfx950" and args.shape is parser.get_default("shape"):
+        if args.csv is None:
+            check_asm_last_tile_at_allocation_end()
+            check_asm_4gib_operands()
+        check_bpreshuffle_large_offset()
+        sweep = pd.DataFrame(opus_a4w4_kid_sweep())
+        if not sweep.empty:
+            aiter.logger.info(
+                "opus a4w4 kid sweep (markdown):\n%s", sweep.to_markdown(index=False)
+            )
 
     if gfx1250:
         return  # the split-K test runs the gfx950 256x256 kernels
