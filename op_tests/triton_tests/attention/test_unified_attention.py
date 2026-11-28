@@ -1040,6 +1040,54 @@ def test_triton_unified_attn_sw_split_no_sinks(seq_lens, num_heads, block_size):
     torch.testing.assert_close(out.float(), ref, atol=1.5e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("seq_lens", [[(2048, 2048)], [(1, 4096)] * 16])
+@torch.inference_mode()
+def test_unified_attn_gfx950_gluon_bf16_unbiased(seq_lens):
+    # L sums P in fp32, so the PV MFMA must get P rounded to nearest in bf16.
+    # A truncated P is low against L and makes the output too small.
+    from aiter.ops.triton.attention import unified_attention as ua
+
+    # Without the gfx950 kernel, backend="gluon" runs the Triton kernel.
+    if DEVICE_ARCH != "gfx950" or ua._unified_attention_kernel_gfx950 is None:
+        pytest.skip("gfx950 gluon kernel")
+    query_lens = [q for q, _ in seq_lens]
+    kv_lens = [kv for _, kv in seq_lens]
+    q, k, v, _, _, _, out, cu_q, kv_lens_t, max_q, max_k, scale, window, table = (
+        generate_data(
+            seq_lens,
+            num_blocks=len(seq_lens) * -(-max(kv_lens) // 64),
+            block_size=64,
+            head_size=128,
+            num_heads=(8, 1),
+        )[:14]
+    )
+    ref = ref_paged_attn(q, k, v, query_lens, kv_lens, table, scale, torch.float32)
+
+    unified_attention(
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        cu_seqlens_q=cu_q,
+        max_seqlen_q=max_q,
+        seqused_k=kv_lens_t,
+        max_seqlen_k=max_k,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window,
+        block_table=table,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        backend="gluon",
+    )
+    err = out.float() - ref
+    # mean signed relative error: -s for an output scaled by (1 - s)
+    bias = ((err * ref.sign()).sum() / ref.abs().sum()).item()
+    assert abs(bias) < 5e-4, f"bf16 output biased by {bias:.2e} against fp32"
+
+
 @pytest.mark.parametrize(
     "seq_lens",
     [
