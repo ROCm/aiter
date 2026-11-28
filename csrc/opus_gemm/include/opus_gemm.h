@@ -35,3 +35,15 @@ void opus_gemm_a8w8_blockscale_bpreshuffle_launch(
     aiter_tensor_t& Y,
     int kid,
     std::optional<aiter_tensor_t> workspace = std::nullopt);
+
+// MXFP4 x MXFP4 (gfx950), row-major (Triton gemm_afp4wfp4 layout): fp4x2
+// XQ [B, M, K/2], WQ [B, N, K/2], e8m0 scales [rows, K/32], bf16 Y [B, M, N];
+// split-K kids take a caller workspace.
+void opus_gemm_a4w4_launch(aiter_tensor_t& XQ,
+                           aiter_tensor_t& WQ,
+                           aiter_tensor_t& Y,
+                           aiter_tensor_t& x_scale,
+                           aiter_tensor_t& w_scale,
+                           std::optional<aiter_tensor_t> workspace,
+                           int kid,
+                           int split_k);

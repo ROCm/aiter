@@ -3,6 +3,8 @@
 
 import argparse
 import functools
+import hashlib
+import json
 import os
 
 import pandas as pd
@@ -517,6 +519,186 @@ def test_compute_switch_penalty(
     }
 
 
+# ---- gfx950 OPUS a4w4, layout="plain": row-major inputs (Triton gemm_afp4wfp4) ----
+# One case per kid class of the a4w4 plain family, each on M/N tails (M not a tile
+# multiple, N % 8 but not % 32) unless the kid needs aligned M/N, through every entry:
+# opus_gemm (2D), opus_bmm (3D scales), gemm_afp4wfp4_opus (batched, 2D scales with
+# rows > M so the per-batch scale stride is not M * K/32).
+#   (entry, batch, M, N, K, kid, split_k)
+PLAIN_KID_CASES = [
+    *(("opus_gemm", 1, 1000, 1032, 1024, kid, 0) for kid in range(100, 106)),
+    *(("opus_gemm", 1, 1000, 1032, 1024, kid, 0) for kid in range(110, 116)),
+    ("opus_gemm", 1, 512, 512, 1024, 130, 0),  # nob: M, N multiples of 256
+    *(("opus_gemm", 1, 33, 264, 2048, kid, 0) for kid in range(500, 505)),
+    ("opus_gemm", 1, 7, 264, 4096, 500, 4),  # split-K through the fp32 workspace
+    ("opus_gemm", 1, 50, 136, 2048, 503, 2),
+    ("opus_bmm", 3, 200, 136, 512, 102, 0),
+    ("opus_bmm", 2, 40, 520, 1024, 501, 2),
+    ("gemm_afp4wfp4_opus", 2, 300, 264, 512, 112, 0),
+    ("gemm_afp4wfp4_opus", 3, 17, 72, 1024, 504, 3),
+    # Odd K-tile counts >= 3 (K / 256 = 3, 5): the 2x2 pipeline's extra even step and
+    # its last, half-used scale panel; the small-tile ring's half-filled last step.
+    *(
+        ("opus_gemm", 1, 1000, 1032, k, kid, 0)
+        for k in (768, 1280)
+        for kid in (*range(100, 106), *range(110, 116))
+    ),
+    *(("opus_gemm", 1, 512, 512, k, 130, 0) for k in (768, 1280)),
+    # More tiles than CUs (256): a persistent block runs several tiles, so the next
+    # tile's K tile 0 / scale panel 0 are prefetched behind an odd K-tile count.
+    ("opus_gemm", 1, 4200, 4104, 768, 100, 0),
+    ("opus_gemm", 1, 2200, 2056, 1280, 103, 0),
+    ("opus_gemm", 1, 4352, 4352, 768, 130, 0),
+    *(
+        ("opus_gemm", 1, 33, 264, k, kid, 0)
+        for k in (768, 1280)
+        for kid in range(500, 505)
+    ),
+    ("opus_gemm", 1, 7, 264, 1280, 500, 2),
+    ("opus_bmm", 3, 200, 136, 768, 102, 0),
+    ("gemm_afp4wfp4_opus", 2, 300, 264, 1280, 112, 0),
+]
+PLAIN_SCALE_PAD = 3  # extra scale rows per batch for the 2D batched scales
+
+
+def _quant_plain(B, rows, K, dtype, pad=0):
+    """Row-major fp4x2 [B, rows, K/2] and e8m0 scales [B, rows + pad, K/32]."""
+    quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
+    q, sc = quant_func(torch.randn((B * rows, K), dtype=dtype), shuffle=False)
+    sc = sc.view(torch.uint8).view(B, rows, K // SCALE_GROUP_SIZE)
+    if pad:
+        filler = torch.full((B, pad, K // SCALE_GROUP_SIZE), 127, dtype=torch.uint8)
+        sc = torch.cat([sc, filler], dim=1)
+    return q.view(dtypes.fp4x2).view(B, rows, K // 2), sc.contiguous()
+
+
+def _ref_plain(xq, wq, xs, ws, dtype):
+    return torch.stack(
+        [run_torch(xq[b], wq[b], xs[b], ws[b], dtype) for b in range(xq.shape[0])]
+    )
+
+
+def _check_plain(name, ref, out):
+    assert not out.isnan().any(), f"{name}: unwritten (NaN) output elements"
+    err = checkAllclose(
+        ref.float(), out.float(), msg=f"{name}: a4w4 plain", catastrophic_check=True
+    )
+    # No allowance: the M / N tails these cases exist for are under 1% of the elements.
+    assert err == 0, f"{name}: {err:.2%} of elements outside rtol/atol"
+    return err
+
+
+@benchmark()
+def test_gemm_plain_kid(entry, B, M, N, K, kid, split_k):
+    """One exact a4w4 plain kid through one public entry, against the torch reference."""
+    from aiter.ops.opus import opus_bmm, opus_gemm
+    from aiter.ops.opus.gemm_op_a4w4 import gemm_afp4wfp4_opus
+
+    dtype = dtypes.bf16
+    pad = PLAIN_SCALE_PAD if entry == "gemm_afp4wfp4_opus" else 0
+    xq, xs = _quant_plain(B, M, K, dtype, pad)
+    wq, ws = _quant_plain(B, N, K, dtype, pad)
+    ref = _ref_plain(xq, wq, xs, ws, dtype)
+    # NaN sentinel: an output element the kernel never writes fails the check.
+    y = torch.full((B, M, N), float("nan"), dtype=dtype)
+    kw = {"kid": kid, "family": "a4w4", "layout": "plain", "split_k": split_k}
+    if entry == "opus_gemm":
+        fn = lambda: opus_gemm(xq[0], wq[0], y[0], x_scale=xs[0], w_scale=ws[0], **kw)
+    elif entry == "opus_bmm":
+        fn = lambda: opus_bmm(xq, wq, y, x_scale=xs, w_scale=ws, **kw)
+    else:
+        fn = lambda: gemm_afp4wfp4_opus(
+            xq,
+            wq,
+            xs.view(B * (M + pad), -1),
+            ws.view(B * (N + pad), -1),
+            y=y,
+            kernelId=kid,
+            splitK=split_k,
+        )
+    _, us = run_perftest(fn)
+    err = _check_plain(f"{entry} kid {kid}", ref, y)
+    return {
+        "gfx": get_gfx(),
+        "us": us,
+        "TFLOPS": B * M * N * K * 2 / us / 1e6,
+        "err": err,
+    }
+
+
+@benchmark()
+def test_gemm_plain(dtype, M, N, K):
+    """Triton gemm_afp4wfp4 and its OPUS counterpart (heuristic kid) on row-major inputs."""
+    from aiter.ops.opus.gemm_op_a4w4 import gemm_afp4wfp4_opus
+    from aiter.ops.opus.policy import a4w4_heuristic_kid
+    from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import gemm_afp4wfp4
+
+    xq, xs = _quant_plain(1, M, K, dtype)
+    wq, ws = _quant_plain(1, N, K, dtype)
+    ref = _ref_plain(xq, wq, xs, ws, dtype)[0]
+    x, w, x_scales, w_scales = xq[0], wq[0], xs[0], ws[0]
+    # Triton takes the fp4x2 operands as uint8 (older Triton has no float4 dtype).
+    x8, w8 = x.view(torch.uint8), w.view(torch.uint8)
+    candidates = {
+        "triton": lambda: gemm_afp4wfp4(x8, w8, x_scales, w_scales, dtype),
+        "opus": lambda: gemm_afp4wfp4_opus(x, w, x_scales, w_scales, dtype),
+    }
+    nbytes = x.nbytes + w.nbytes + x_scales.nbytes + w_scales.nbytes + M * N * 2
+    ret = {
+        "gfx": get_gfx(),
+        "opus kid": a4w4_heuristic_kid(M, N, K, 1, gfx=get_gfx(), cu_num=get_cu_num()),
+    }
+    for name, fn in candidates.items():
+        out, us = run_perftest(fn)
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = M * N * K * 2 / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = _check_plain(name, ref, out)
+    return ret
+
+
+def check_plain_large_offset(kid=100, M=65792, N=32768, K=256):
+    """A pre-compiled kid on a Y of > 2^31 elements: (M - 256) * N = 2^31, so the
+    last tile row's offset overflows 32-bit arithmetic. Only the first and last
+    rows are compared against the reference (the full one would need 8 GiB)."""
+    from aiter.ops.opus import opus_gemm
+
+    dtype = dtypes.bf16
+    xq, xs = _quant_plain(1, M, K, dtype)
+    wq, ws = _quant_plain(1, N, K, dtype)
+    y = torch.full((M, N), float("nan"), dtype=dtype)
+    opus_gemm(xq[0], wq[0], y, kid=kid, family="a4w4", x_scale=xs[0], w_scale=ws[0])
+    for rows in (slice(0, 4), slice(M - 4, M)):
+        ref = run_torch(xq[0][rows], wq[0], xs[0][rows], ws[0], dtype)
+        _check_plain(f"kid {kid} rows {rows.start}:{rows.stop} of M={M}", ref, y[rows])
+    del y
+
+
+def check_plain_co_images():
+    """The committed a4w4 .co images are the ones gen_co/gfx950/a4w4/build_info.json
+    records: same kids and entry symbols as co_kernels_gfx950_a4w4.json, same sha256."""
+    from csrc.opus_gemm.opus_gemm_common import (
+        A4W4_CO_DIR,
+        A4W4_CO_JSON,
+        a4w4_co_kernels_declared,
+        a4w4_co_kernels_list,
+    )
+
+    image_dir = os.path.join(os.path.dirname(A4W4_CO_JSON), A4W4_CO_DIR)
+    with open(os.path.join(image_dir, "build_info.json")) as f:
+        built = {entry["kid"]: entry for entry in json.load(f)["kernels"]}
+    declared = {kid: k.name for kid, k in a4w4_co_kernels_declared.items()}
+    assert {kid: entry["symbol"] for kid, entry in built.items()} == declared
+    assert set(a4w4_co_kernels_list) == set(declared), "a declared .co image is missing"
+    for kid, entry in built.items():
+        with open(os.path.join(image_dir, f"{entry['symbol']}.co"), "rb") as f:
+            sha256 = hashlib.sha256(f.read()).hexdigest()
+        assert sha256 == entry["co_sha256"], (
+            f"kid {kid}: {entry['symbol']}.co does not match build_info.json; "
+            "rebuild with gen_co/build_co.py --arch gfx950 --family a4w4"
+        )
+
+
 def tuned_shapes():
     """CSV-selected preshuffle shapes on gfx950; all tuned shapes on gfx1250."""
     gfx950 = get_gfx() == "gfx950"
@@ -644,6 +826,20 @@ def main():
     e.g. -mnk 1280,8192,1024""",
     )
     parser.add_argument(
+        "-pmnk",
+        "--plain_shape",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=[
+            (m, n, k)
+            for n, k in ((2048, 7168), (3072, 6144), (4096, 4096), (4096, 8192))
+            for m in (1, 8, 16, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
+        ],
+        help="""gfx950: shapes of the row-major (layout="plain") sweep, OPUS vs Triton
+    gemm_afp4wfp4.
+    e.g. -pmnk 1024,4096,4096""",
+    )
+    parser.add_argument(
         "--csv",
         type=str,
         default=None,
@@ -726,6 +922,24 @@ def main():
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
     aiter.logger.info("gemm_a4w4 split K summary (markdown):\n%s", df_md)
+
+    if get_gfx() == "gfx950":  # the OPUS a4w4 plain family is gfx950-only
+        check_plain_co_images()
+        df = pd.DataFrame([test_gemm_plain_kid(*case) for case in PLAIN_KID_CASES])
+        aiter.logger.info(
+            "gemm_a4w4 plain kids summary (markdown):\n%s", df.to_markdown(index=False)
+        )
+        check_plain_large_offset()
+        df = pd.DataFrame(
+            [
+                test_gemm_plain(dtype, m, n, k)
+                for dtype in args.dtype
+                for m, n, k in args.plain_shape
+            ]
+        )
+        aiter.logger.info(
+            "gemm_a4w4 plain summary (markdown):\n%s", df.to_markdown(index=False)
+        )
 
 
 if __name__ == "__main__":

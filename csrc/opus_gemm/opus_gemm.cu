@@ -387,7 +387,8 @@ static void opus_check_a8_family_tensors(
     const char* entry,
     const aiter_tensor_t &XQ,
     const aiter_tensor_t &WQ,
-    const aiter_tensor_t &Y)
+    const aiter_tensor_t &Y,
+    AiterDtype ab_dtype = AITER_DTYPE_fp8)
 {
   AITER_CHECK(XQ.is_gpu() && WQ.is_gpu() && Y.is_gpu(),
               entry, ": XQ, WQ, and Y must be GPU tensors");
@@ -399,8 +400,8 @@ static void opus_check_a8_family_tensors(
   AITER_CHECK(current_device == XQ.device_id,
               entry, ": current HIP device ", current_device,
               " does not match tensor device ", XQ.device_id);
-  AITER_CHECK(XQ.dtype() == AITER_DTYPE_fp8 && WQ.dtype() == AITER_DTYPE_fp8,
-              entry, ": expected fp8 XQ/WQ, got ",
+  AITER_CHECK(XQ.dtype() == ab_dtype && WQ.dtype() == ab_dtype,
+              entry, ": expected ", AiterDtype_to_str(ab_dtype), " XQ/WQ, got ",
               AiterDtype_to_str(XQ.dtype()), "/",
               AiterDtype_to_str(WQ.dtype()));
 }
@@ -505,6 +506,76 @@ void opus_gemm_a8w8_blockscale_bpreshuffle_launch(
                 entry, ": unsupported Y dtype ",
                 AiterDtype_to_str(Y.dtype()), "; expected bf16 or fp32");
   }
+}
+
+// MXFP4 x MXFP4 NT (gfx950) with plain row-major inputs (Triton gemm_afp4wfp4).
+// Shapes: XQ [batch, M, K/2], WQ [batch, N, K/2] (fp4x2, both row-major),
+// Y [batch, M, N] bf16; N % 8, K % 256. Scales: row-major e8m0, 2D
+// [batch * rows, K/32] or 3D [batch, rows, K/32] with rows >= M / N.
+void opus_gemm_a4w4_launch(
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    aiter_tensor_t &x_scale,
+    aiter_tensor_t &w_scale,
+    std::optional<aiter_tensor_t> workspace,
+    int kid,
+    int split_k)
+{
+  aiter_detail::g_aiter_can_throw = true;
+  constexpr const char* entry = "opus_gemm_a4w4_launch";
+  opus_check_a8_family_tensors(entry, XQ, WQ, Y, AITER_DTYPE_fp4x2);
+  opus_check_a8_scale_devices(entry, XQ, x_scale, w_scale);
+  AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16,
+              entry, ": expected bf16 Y, got ", AiterDtype_to_str(Y.dtype()));
+  AITER_CHECK(XQ.dim() == 3 && WQ.dim() == 3 && Y.dim() == 3,
+              entry, ": XQ/WQ/Y must be 3D [batch, M, K/2], [batch, N, K/2], [batch, M, N]");
+  AITER_CHECK(XQ.is_contiguous() && WQ.is_contiguous() && Y.is_contiguous() &&
+                  x_scale.is_contiguous() && w_scale.is_contiguous(),
+              entry, ": tensors must be contiguous");
+  const int64_t batch = XQ.size(0), M = XQ.size(1), K = XQ.size(2) * 2, N = WQ.size(1);
+  AITER_CHECK(batch >= 1 && M >= 1 && WQ.size(0) == batch && WQ.size(2) * 2 == K,
+              entry, ": WQ must be [batch, N, K/2] matching XQ");
+  AITER_CHECK(Y.size(0) == batch && Y.size(1) == M && Y.size(2) == N,
+              entry, ": Y must be [batch, M, N]");
+  AITER_CHECK(K % 256 == 0 && K > 0,
+              entry, ": K must be a multiple of 256 (got K=", K, ")");
+  AITER_CHECK(N % 8 == 0 && N > 0,
+              entry, ": N must be a multiple of 8 (got N=", N, ")");
+  auto check_scale = [&](const aiter_tensor_t& s, int64_t rows, const char* name) {
+    AITER_CHECK(s.element_size() == 1, entry, ": ", name, " must be e8m0 (1 byte)");
+    AITER_CHECK(s.dim() == 2 || (s.dim() == 3 && s.size(0) == batch),
+                entry, ": ", name, " must be 2D or [batch, rows, K/32]");
+    AITER_CHECK(s.dim() == 3 || s.size(0) % batch == 0,
+                entry, ": ", name, " rows are not divisible by batch");
+    const int64_t r = s.dim() == 3 ? s.size(1) : s.size(0) / batch;
+    AITER_CHECK(s.size(-1) == K / 32, entry, ": ", name, " must be row-major with K/32 = ",
+                K / 32, " columns (got ", s.size(-1), ")");
+    AITER_CHECK(r >= rows, entry, ": ", name, " needs >= ", rows,
+                " rows per batch (got ", r, ")");
+  };
+  check_scale(x_scale, M, "x_scale");
+  check_scale(w_scale, N, "w_scale");
+  if (workspace.has_value())
+  {
+    AITER_CHECK(workspace->is_gpu() && workspace->device_id == XQ.device_id,
+                entry, ": workspace device ", workspace->device_id,
+                " must match input device ", XQ.device_id);
+  }
+
+  const auto &info = opus_get_arch_info();
+  if (info.arch == OpusGfxArch::Gfx950)
+  {
+#ifdef OPUS_BUILD_HAS_GFX950
+    opus_a4w4_kid_dispatch_gfx950(kid)(XQ, WQ, Y, x_scale, w_scale, workspace, split_k);
+    return;
+#else
+    AITER_CHECK(false, entry, ": module was not built with gfx950 support for current device ",
+                info.dev);
+#endif
+  }
+  AITER_CHECK(false, "no registered kernel for OPUS a4w4 on device ", info.dev,
+              " with gcnArchName='", info.name, "'");
 }
 
 #endif // !__HIP_DEVICE_COMPILE__

@@ -1,0 +1,304 @@
+{
+  "_comment": [
+    "Pre-compiled (.co) kernels of the gfx950 a4w4 family (layout=\"plain\"), images in",
+    "gen_co/gfx950/a4w4/. READ BY BOTH: opus_gemm_common.py (kid table)",
+    "and gen_co/build_co.py --arch gfx950 (builds the .co).",
+    "",
+    "gfx950 entries (tag a4w4_mxfp4_nt_co: MXFP4 x MXFP4 NT, 1x32 e8m0 scales,",
+    "row-major A / B / scales, 2x2 waves):",
+    "  kid            local to the a4w4/gfx950/CU namespace.",
+    "  wave_layout    [T_M, T_N] (2x2).",
+    "  variant        \"\" persistent, \"np\" one tile per block, \"nob\" persistent",
+    "                 without M/N boundary handling; also the name suffix:",
+    "                 opus_gemm_gfx950_a4w4_mxfp4_nt_co_{B_M}x{B_N}x{B_K}[_{variant}].",
+    "  block_size, tile, launch_bounds and device_flags as in co_kernels.json."
+  ],
+  "gfx950": [
+    {
+      "kid": 100,
+      "tag": "a4w4_mxfp4_nt_co",
+      "block_size": 256,
+      "tile": [
+        256,
+        256,
+        256
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": ""
+    },
+    {
+      "kid": 101,
+      "tag": "a4w4_mxfp4_nt_co",
+      "block_size": 256,
+      "tile": [
+        256,
+        128,
+        256
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": ""
+    },
+    {
+      "kid": 102,
+      "tag": "a4w4_mxfp4_nt_co",
+      "block_size": 256,
+      "tile": [
+        128,
+        256,
+        256
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": ""
+    },
+    {
+      "kid": 103,
+      "tag": "a4w4_mxfp4_nt_co",
+      "block_size": 256,
+      "tile": [
+        128,
+        128,
+        256
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": ""
+    },
+    {
+      "kid": 104,
+      "tag": "a4w4_mxfp4_nt_co",
+      "block_size": 256,
+      "tile": [
+        192,
+        256,
+        256
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": ""
+    },
+    {
+      "kid": 105,
+      "tag": "a4w4_mxfp4_nt_co",
+      "block_size": 256,
+      "tile": [
+        256,
+        192,
+        256
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": ""
+    },
+    {
+      "kid": 110,
+      "tag": "a4w4_mxfp4_nt_co",
+      "block_size": 256,
+      "tile": [
+        256,
+        256,
+        256
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": "np"
+    },
+    {
+      "kid": 111,
+      "tag": "a4w4_mxfp4_nt_co",
+      "block_size": 256,
+      "tile": [
+        256,
+        128,
+        256
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": "np"
+    },
+    {
+      "kid": 112,
+      "tag": "a4w4_mxfp4_nt_co",
+      "block_size": 256,
+      "tile": [
+        128,
+        256,
+        256
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": "np"
+    },
+    {
+      "kid": 113,
+      "tag": "a4w4_mxfp4_nt_co",
+      "block_size": 256,
+      "tile": [
+        128,
+        128,
+        256
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": "np"
+    },
+    {
+      "kid": 114,
+      "tag": "a4w4_mxfp4_nt_co",
+      "block_size": 256,
+      "tile": [
+        192,
+        256,
+        256
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": "np"
+    },
+    {
+      "kid": 115,
+      "tag": "a4w4_mxfp4_nt_co",
+      "block_size": 256,
+      "tile": [
+        256,
+        192,
+        256
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": "np"
+    },
+    {
+      "kid": 130,
+      "tag": "a4w4_mxfp4_nt_co",
+      "block_size": 256,
+      "tile": [
+        256,
+        256,
+        256
+      ],
+      "wave_layout": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        256,
+        1
+      ],
+      "device_flags": [
+        "-ffast-math"
+      ],
+      "variant": "nob"
+    }
+  ]
+}

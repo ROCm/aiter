@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Caller-side selection policy for OPUS A16W16 and MXFP8 BMM.
+"""Caller-side selection policy for OPUS A16W16, MXFP8 BMM and A4W4 (plain).
 
 This module runs before the exact-kid :func:`opus_gemm` or :func:`opus_bmm`
 entry. A16W16 policy validates tuned candidates and supplies explicit
 per-architecture heuristic candidates. The gfx950 MXFP8 BMM policy owns tuned
-CSV discovery, local-id lookup and its fallback kid/split selection.
+CSV discovery, local-id lookup and its fallback kid/split selection. The gfx950
+A4W4 ``layout="plain"`` policy is a shape heuristic over its kids.
 Exact launch, workspace materialization and C++ dispatch remain outside this
 module; no policy path replaces a caller-supplied exact kid inside the public
 launcher.
@@ -1058,7 +1059,96 @@ def resolve_a8w8_mxscale_bmm_plan(
     return kid, 1
 
 
+# ---- gfx950 A4W4 (layout="plain") heuristic ------------------------------
+
+
+@lru_cache(maxsize=4096)
+def a4w4_heuristic_kid(
+    M: int, N: int, K: int, batch: int, *, gfx: str, cu_num: int
+) -> int:
+    """Kid the OPUS a4w4 layout="plain" (row-major MXFP4) GEMM runs for a shape.
+
+    M <= 64: the small-tile pipeline (B_M need not cover M; more M blocks beat a
+    taller tile): 16x32 KS2 (500) for M <= 32, else 32x32 KS2 (501).
+    Otherwise the cheaper of two estimates, both calibrated on gfx950 (CU256):
+    * 2x2 .co (tile, variant):
+        t = 3.2 us + rounds * B_M * B_N * K * R(tile) * (1 + 0.5 * util),
+        R: 256x256 6.7e-8, 192x256 / 256x192 7.35e-8, 256x128 / 128x256 7.5e-8,
+        128x128 8.3e-8 us per MAC-element.
+    * 1x4 small-tile kids 501-504 (one block per CU, so time steps per round of
+      cu_num tiles): t = 2.0 us + rounds * (B_M + B_N) * K * S(tile),
+        S: 32x32 9.95e-6, 32x64 1.04e-5, 64x64 1.07e-5, 64x128 1.17e-5.
+      The .co model underestimates by ~30-40% at one round, so the small-tile
+      estimate is compared against 1.4x the .co one (fit over M = 80..1024 and
+      six (N, K): regret vs the fastest kid mean 1.003, max 1.06).
+    """
+    kids = get_registry("a4w4", gfx, cu_num)
+    if not kids:
+        raise ValueError(f"no OPUS a4w4 kernels for {gfx}/{cu_num}")
+    if M <= 64:
+        smalls = sorted(
+            k for k, i in kids.items() if i.kernel_tag == "a4w4_mxfp4_nt_small"
+        )
+        want = 500 if M <= 32 else 501
+        if want in smalls:
+            return want
+        if smalls:
+            return smalls[0]
+    best, best_cost = None, float("inf")
+    for kid, inst in sorted(kids.items()):
+        if inst.kernel_tag != "a4w4_mxfp4_nt_co":
+            continue
+        # "np": one tile per block; "" / "nob": persistent ("nob": no M/N boundary).
+        boundary = inst.co_variant != "nob"
+        if not boundary and (M % inst.B_M or N % inst.B_N):
+            continue
+        tiles = -(-M // inst.B_M) * -(-N // inst.B_N) * batch
+        area = inst.B_M * inst.B_N
+        R = (
+            6.7e-8
+            if area >= 65536
+            else 7.35e-8 if area >= 49152 else 7.5e-8 if area >= 32768 else 8.3e-8
+        )
+        if inst.co_variant != "np":
+            # One round: the one-tile-per-block variant does it without cross-tile code.
+            if tiles <= cu_num:
+                continue
+            cost = 3.2 + -(-tiles // cu_num) * area * K * R * 1.5
+            if boundary:
+                cost *= 1.003  # prefer the no-boundary variant when it applies
+        else:
+            if tiles > cu_num:
+                continue
+            cost = 3.2 + area * K * R * (1.0 + 0.5 * tiles / cu_num)
+        if cost < best_cost:
+            best, best_cost = kid, cost
+    best_cost *= _A4W4_PLAIN_CO_COST_SCALE
+    for kid, inst in sorted(kids.items()):
+        slope = _A4W4_PLAIN_SMALL_SLOPE.get((inst.B_M, inst.B_N))
+        if inst.kernel_tag != "a4w4_mxfp4_nt_small" or slope is None:
+            continue
+        tiles = -(-M // inst.B_M) * -(-N // inst.B_N) * batch
+        cost = 2.0 + -(-tiles // cu_num) * (inst.B_M + inst.B_N) * K * slope
+        if cost < best_cost:
+            best, best_cost = kid, cost
+    if best is None:
+        raise ValueError(f"no OPUS a4w4 plain kernel applies to M={M} N={N} K={K}")
+    return best
+
+
+# a4w4 plain small-tile cost per round, us per (B_M + B_N) * K, keyed by (B_M, B_N);
+# see a4w4_heuristic_kid.
+_A4W4_PLAIN_SMALL_SLOPE = {
+    (32, 32): 9.95e-6,
+    (32, 64): 1.04e-5,
+    (64, 64): 1.07e-5,
+    (64, 128): 1.17e-5,
+}
+_A4W4_PLAIN_CO_COST_SCALE = 1.4
+
+
 __all__ = [
+    "a4w4_heuristic_kid",
     "lookup_a16w16_opus_config",
     "lookup_mxscale_bmm_config",
     "mxscale_bmm_group_of_block",
