@@ -1907,7 +1907,12 @@ def make_s1f_stage1(
 
             def pre_ready(fv, ts):
                 if const_expr(SUB == 1):
-                    return ready_of(fv, ts[0])
+                    # The single-b128 flag pre-check covers only 4 sources, so
+                    # for npes > 4 (POLL == 0) skip it and let the main loop's
+                    # _wait_tile_flags (one lane per source) decide readiness.
+                    if const_expr(POLL):
+                        return ready_of(fv, ts[0])
+                    return fx.Int32(0)
                 return ready_sub(fv, ts)
 
             # ---- the first item ----
