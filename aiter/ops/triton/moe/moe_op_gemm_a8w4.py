@@ -500,6 +500,15 @@ def moe_gemm_a8w4(
             "emits per-(token, expert) rows and never reduces them. Fold the "
             "residual into the combine's output instead."
         )
+        # The fused epilogue scatters from registers with buffer_store. A
+        # scatter has no common tile origin, so the whole row index sits in the
+        # 32-bit voffset, which counts bytes.
+        _y = ep_scatter.out
+        _last_byte = (_y.numel() - 1) * _y.element_size()
+        assert _last_byte < 2**31, (
+            f"ep_scatter window is {_last_byte + 1} bytes, over the 32-bit "
+            f"buffer offset. Split the combine window."
+        )
     # Fold the EP scatter into the GEMM epilogue when the kernel we are about to
     # launch has one. Only the two non-persistent gluon kernels do: the persistent
     # decode kernel writes back inside its N-tile loop through a rolling
