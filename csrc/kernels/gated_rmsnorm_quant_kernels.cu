@@ -441,21 +441,23 @@ __global__ void gated_rmsnorm_fp8_per_token_quant_kernel(
         }
     }
 
-    // Token-wide amax: reduce across the FULL warp (all heads in the warp)...
+    // Token-wide amax: reduce across the FULL hardware warp (all heads in the warp)...
+    constexpr int HW_WARP_SIZE = opus::get_warp_size();
+    constexpr int HW_WARPS_PER_WARP = WARP_SIZE / HW_WARP_SIZE;  // 1 on wave64, 2 on wave32
     #pragma unroll
-    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+    for (int mask = HW_WARP_SIZE / 2; mask > 0; mask >>= 1) {
         local_max = fmaxf(local_max, __shfl_xor(local_max, mask));
     }
     // ...then across warps via shared memory.
-    __shared__ float s_warp_max[MAX_WARPS];
-    if (lane_id == 0) {
-        s_warp_max[warp_id] = local_max;
+    __shared__ float s_warp_max[MAX_WARPS * HW_WARPS_PER_WARP];
+    if (tid % HW_WARP_SIZE == 0) {
+        s_warp_max[tid / HW_WARP_SIZE] = local_max;
     }
     __syncthreads();
 
     float block_max = -INFINITY;
     if (tid == 0) {
-        for (int w = 0; w < num_warps; w++) {
+        for (int w = 0; w < num_warps * HW_WARPS_PER_WARP; w++) {
             block_max = fmaxf(block_max, s_warp_max[w]);
         }
         s_warp_max[0] = block_max;
