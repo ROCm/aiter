@@ -102,8 +102,8 @@ def _kernel_unified_attention_sparse_mla_2d(
     kv_head_idx = 0  # assume there is single kv head
 
     q_block_global_idx = tl.program_id(0)
-    q_ind = q_block_global_idx // (num_query_heads // BLOCK_M)
-    head_ind = q_block_global_idx % (num_query_heads // BLOCK_M)
+    q_ind = q_block_global_idx // cdiv_fn(num_query_heads, BLOCK_M)
+    head_ind = q_block_global_idx % cdiv_fn(num_query_heads, BLOCK_M)
     seq_idx = find_seq_idx(query_start_len_ptr, q_ind, num_seqs, BLOCK_Q, False)
     q_block_start_idx = tl.load(query_start_len_ptr + seq_idx)
 
@@ -121,10 +121,12 @@ def _kernel_unified_attention_sparse_mla_2d(
     offs_lora = tl.arange(0, KV_LORA_RANK)
     offs_rope = tl.arange(KV_LORA_RANK, KV_LORA_RANK + ROPE_RANK)
 
-    query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
+    # one query token per program: rows past the head count are masked, not
+    # wrapped into the next token
+    query_pos = q_block_local_idx * BLOCK_Q + tl.zeros([BLOCK_M], dtype=tl.int32)
 
     query_offset_0 = cur_batch_in_all_start_index + query_pos
-    query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
+    query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m
 
     query_mask_0 = query_pos < cur_batch_query_len
     query_mask_1 = query_offset_1 < num_query_heads
