@@ -170,7 +170,7 @@ configs/<arch>/<backend>/<op>/<d_type>/DEFAULT.json
 configs/<arch>/<backend>/<op>/<d_type>/<CONFIG_NAME>-<suffix>.json
 ```
 
-`<op>` is `gemm`, `moe`, `conv`, `mhc`, `attention`, `gmm`, `fusions`, `quant`
+`<op>` is `gemm`, `moe`, `conv`, `mhc`, `attention`, `gmm`, `comms`, `fusions`, `quant`
 or `normalization`.
 
 The plain `<arch>/` folder holds the configs of the CU count the arch was
@@ -231,3 +231,35 @@ pytest op_tests/triton_tests/              # all tests
 pytest op_tests/triton_tests/gemm/basic/   # one folder
 python op_tests/op_benchmarks/triton/bench_gemm_a16w16.py
 ```
+
+### TP4 FP4 all-gather on gfx1250
+
+`comms/all_gather_fp4.py` gathers already-packed uint8 FP4 codes and optional
+row metadata. It does not quantize or dequantize. Each rank supplies
+`[local_rows, hidden / 2]` codes. For MXFP4 scales and MoE routing, metadata
+has `hidden / 32 + 8 * topk` bytes per row. Outputs contain four shards in
+rank order. The global row count is `4 * local_rows`.
+
+Create `Fp4AllGather` on each rank with the same CPU process group and buffer
+limits. Call `all_gather_fp4` in the same order on one stream per rank.
+The IPC storage has two banks. Calls support HIP graphs. Check `comm.errors`
+outside graph capture, then call `comm.close()` on every rank.
+
+```bash
+torchrun --standalone --nproc-per-node=4 -m pytest -q op_tests/triton_tests/comms/test_all_gather_fp4.py
+torchrun --standalone --nproc-per-node=4 -m op_tests.op_benchmarks.triton.bench_all_gather_fp4 --rows 8192 16384 --output /tmp/fp4_ag.csv
+```
+
+The benchmark uses `RotatingBufferBench.bench_synced` and reports the slowest
+rank. Payload bandwidth is gathered output bytes divided by time. Bus
+bandwidth is three quarters of payload bandwidth for TP4, per rank and per
+direction. TX+RX bandwidth is twice this bus bandwidth. These are effective
+payload rates in GB/s (decimal bytes), not hardware traffic counters. Timing
+includes publication, peer synchronization and the copy into the local output;
+it excludes quantization and IPC setup.
+
+The gfx1250 config uses 4096 words per block and eight warps. Publication also
+copies the local shard to the output. The read kernel uses a one-dimensional
+grid grouped by peer and reads only the three remote shards. `PEER_GROUP=0`
+selects this schedule; a positive value interleaves groups of that many tiles.
+`LOCAL_COPY` controls the local copy during publication.

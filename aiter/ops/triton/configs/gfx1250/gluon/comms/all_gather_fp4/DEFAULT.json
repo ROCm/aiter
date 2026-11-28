@@ -1,0 +1,6 @@
+{
+    "BLOCK_WORDS": 4096,
+    "num_warps": 8,
+    "PEER_GROUP": 0,
+    "LOCAL_COPY": true
+}
