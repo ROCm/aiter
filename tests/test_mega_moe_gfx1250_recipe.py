@@ -14,6 +14,7 @@ import itertools
 import sys
 import types
 
+import flydsl.expr as fx
 import pytest
 import torch
 
@@ -27,12 +28,17 @@ from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import (
     recipe,
     transport,
 )
+from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import compact_plan as CP
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import mega_moe as MM
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.compact_plan import (
+    PLAN_LDS_BYTES,
     compact_done_nbytes,
     compact_hist_stride,
+    compact_plan_lds_bytes,
     compact_row_capacity,
 )
+from aiter.ops.flydsl.kernels.mega_moe_gfx1250.s1f_ctl import s1f_max_recv
+from aiter.ops.flydsl.kernels.tensor_shim import _preload_compiled
 
 D, C = MM.DispatchKind, MM.CombineKind
 COMPACT_TILE = 64
@@ -503,6 +509,115 @@ def test_compact_plan_limits():
     # An LDS histogram of at most 1024 (rank, expert) segments.
     with pytest.raises(ValueError, match="at most 1024"):
         _config(D.COMPACT, C.FUSED_SCATTER, "fp4", ("bf16",), 32, 7168, 8, 16, 64)
+
+
+# Kimi-K3 EP8: 112 experts a rank, top-16, 16384 tokens a rank (ws, hidden,
+# topk, max_tokens_per_rank, experts_per_rank), at the 16-row tile its grouped
+# CSV picks for decode.
+K3_EP8 = (8, 3584, 16, 16384, 112)
+
+
+def _k3_ep8_stage(monkeypatch):
+    monkeypatch.setenv("AITER_TDM_TILE_M", "16")
+    monkeypatch.delenv("AITER_S1F_MAX_RECV", raising=False)
+    config = _config(D.COMPACT, C.FUSED_SCATTER, "fp4", ("bf16",), *K3_EP8)
+    return recipe._stage_classes(config.recipe)[0](config, None)
+
+
+def test_s1f_plan_lds_is_bounded_by_the_receive_cap(mori, monkeypatch):
+    stage = _k3_ep8_stage(monkeypatch)
+    geo, fusion = stage.compact, stage.fusion
+    # Sized by the arena's rows, the stage-1 plan's m-tile table alone is over
+    # the workgroup's LDS, and its launch fails with hipErrorInvalidValue.
+    whole_arena = compact_plan_lds_bytes(
+        npes=8,
+        experts_per_rank=112,
+        max_routes=geo.max_routes,
+        s1f=True,
+        compact_cap=geo.cap,
+        tile_m=16,
+    )
+    assert whole_arena > PLAN_LDS_BYTES
+    assert fusion.plan_cap() < geo.cap
+    assert fusion.plan_lds_bytes(16) <= PLAN_LDS_BYTES
+
+
+def test_s1f_tile_reasons_name_a_plan_over_the_lds(mori, monkeypatch):
+    def armed(stage):
+        # what arm() reads off the device: the 16-row tile fits this model_dim
+        stage.fusion.tiles, stage.fusion.cu = {16}, 256
+        return stage.fusion
+
+    assert armed(_k3_ep8_stage(monkeypatch)).tile_reasons(16) == []
+    fusion = armed(_k3_ep8_stage(monkeypatch))
+    monkeypatch.setattr(fusion, "plan_lds_bytes", lambda align_m: PLAN_LDS_BYTES + 16)
+    reasons = fusion.tile_reasons(16)
+    assert len(reasons) == 1 and "LDS" in reasons[0]
+
+
+def _plan_kwargs(npes, epr, topk, mtpr, s1f, plan_blocks, tile_m=16):
+    max_routes = mtpr * topk
+    recv = s1f_max_recv(npes, topk) if s1f else npes * mtpr
+    return {
+        "rank": 0,
+        "npes": npes,
+        "experts_per_rank": epr,
+        "topk": topk,
+        "tile_m": tile_m,
+        "compact_cap": compact_row_capacity(
+            max_recv=recv, topk=topk, experts_per_rank=epr, tile_m=tile_m
+        ),
+        "off_hist": 0,
+        "off_done": 0,
+        "hist_stride": compact_hist_stride(
+            npes=npes, experts_per_rank=epr, max_routes=max_routes
+        ),
+        "max_routes": max_routes,
+        "hist_pingpong": False,
+        "plan_blocks": plan_blocks,
+        "s1f": s1f,
+    }
+
+
+def _trace_plan(kwargs):
+    """Compile (and so trace) a plan kernel without launching it."""
+    CP.compile_tdm_compact_plan.cache_clear()
+    launch = CP.compile_tdm_compact_plan(**kwargs)
+    # the launcher's addresses, rank and token count; a stage-1 plan's send
+    # list, runs, tile_src, quant source and wire; the stream
+    args = [0] * (15 if kwargs["s1f"] else 10) + [fx.Stream(None)]
+    _preload_compiled(launch, *args)
+
+
+@pytest.fixture
+def plan_compile(monkeypatch):
+    monkeypatch.setenv("FLYDSL_GPU_ARCH", "gfx1250")
+    # a FlyDSL cache hit would skip the trace, and with it the check
+    monkeypatch.setenv("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
+    monkeypatch.delenv("AITER_S1F_MAX_RECV", raising=False)
+    yield
+    CP.compile_tdm_compact_plan.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "shape,s1f,plan_blocks",
+    [
+        ((8, 112, 16, 16384), False, 1),  # Kimi-K3 EP8, the S1F=0 plan
+        ((8, 112, 16, 16384), True, 1),  # Kimi-K3 EP8, a stage-1 plan
+        ((8, 48, 6, 1024), True, 4),  # LDS route and send tables, 4 blocks
+    ],
+)
+def test_compact_plan_allocates_what_it_sized(plan_compile, shape, s1f, plan_blocks):
+    _trace_plan(_plan_kwargs(*shape, s1f, plan_blocks))
+
+
+def test_compact_plan_refuses_a_size_its_allocator_differs_from(
+    plan_compile, monkeypatch
+):
+    sized = CP.compact_plan_lds_bytes
+    monkeypatch.setattr(CP, "compact_plan_lds_bytes", lambda **kw: sized(**kw) + 16)
+    with pytest.raises(RuntimeError, match="compact plan allocated"):
+        _trace_plan(_plan_kwargs(8, 112, 16, 16384, True, 1))
 
 
 def test_compact_default_bound_is_the_capacity(mori):

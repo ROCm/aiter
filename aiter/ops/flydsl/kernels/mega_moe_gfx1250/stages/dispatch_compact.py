@@ -622,19 +622,22 @@ class _CompactDispatch(_Dispatch):
             nxt = 1 - slot
             count = int(next_topk_ids.shape[0])
             ahead = self._step_for(self._recv_bound(next_recv_token_bound))
-            # tok_map follows the NEXT step's tile, then this step is restored:
-            # GEMM1 still reads the alignment just dispatched.
+            # The NEXT step's plan follows the next step: its tile, and its
+            # receive bound for whether the plan is a stage-1 one. This step is
+            # restored after: GEMM1 still reads the alignment just dispatched.
             saved = self._step
             self._step = ahead
-            drop_tok_map = self.fusion.step_will_run()
-            self._step = saved
-            self._launch_plan(
-                next_topk_ids,
-                count,
-                nxt,
-                ahead.align_m,
-                tok_map=not drop_tok_map,
-            )
+            try:
+                drop_tok_map = self.fusion.step_will_run()
+                self._launch_plan(
+                    next_topk_ids,
+                    count,
+                    nxt,
+                    ahead.align_m,
+                    tok_map=not drop_tok_map,
+                )
+            finally:
+                self._step = saved
             self._slot = nxt
         return batch
 
@@ -860,19 +863,25 @@ class _CompactDispatch(_Dispatch):
             # Stage-1: runs and tile_info per producer flag tile; experts are
             # still padded to the step's GEMM1 tile (align_m).
             tile_m = align_m
+            compact_cap = geo.cap
             if plan_s1f:
                 from ..s1f_stage1 import s1f_flag_m
 
                 tile_m = s1f_flag_m(align_m)
+                # An S1F step's rows fit its receive cap; the arena's row
+                # count can size the plan's per-m-tile LDS table past the
+                # workgroup's LDS (s1f_ctl._Stage1Fusion.plan_cap).
+                compact_cap = self.fusion.plan_cap()
             launch = compile_tdm_compact_plan(
                 rank=config.rank,
                 npes=config.world_size,
                 experts_per_rank=config.experts_per_rank,
                 topk=config.topk,
                 tile_m=tile_m,
-                # The arena's row count, not this step's: the plan bounds what
-                # it may write against the region it writes into.
-                compact_cap=geo.cap,
+                # Not this step's rows: the S1F=0 plan bounds what it may
+                # write by the arena's row count, the region it writes into; a
+                # stage-1 plan by the S1F receive cap's rows (above).
+                compact_cap=compact_cap,
                 off_hist=arena.offset("compact_hist") + slot * geo.hist_stride * 4,
                 off_done=arena.offset("compact_done") + slot * 4,
                 hist_stride=geo.hist_stride,

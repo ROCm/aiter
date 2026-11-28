@@ -62,7 +62,8 @@ Launch (4x gfx1250; every env knob below is already the script's default):
 
 Env / CLI: --layers --logits_tol --acc_verify --dispatch_backend
            --stage1_fused --stage2_fused --dispatch_wire --combine --combine_quant
-           -tpr -hd -id -e -k --fused_shared_experts --routing --zipf_s -q
+           -tpr --max_tokens_per_rank -hd -id -e -k --fused_shared_experts
+           --activation --situ_beta --situ_linear_beta --routing --zipf_s -q
            --data-init --seed --warmup --iters --prof_replays
 
 ``--data-init`` / ``--scale-init`` / ``--seed`` are the shared ubench knobs from
@@ -139,7 +140,7 @@ def _import_mori_comm():
 
 
 # Config / quant-path spec
-def resolve_spec(quant_key):
+def resolve_spec(quant_key, activation="silu", situ_betas=(1.0, 1.0)):
     """How to prepare weights / quantize activations / call fused_moe for a quant
     key.
 
@@ -152,7 +153,11 @@ def resolve_spec(quant_key):
         "key": quant_key,
         "aiter_qtype": QuantType.per_1x32,
         "gate_mode": GateMode.INTERLEAVE,
-        "activation": ActivationType.Silu,
+        "activation": (
+            ActivationType.Situv2 if activation == "situv2" else ActivationType.Silu
+        ),
+        # (beta, linear_beta) of SiTUv2, e.g. Kimi-K3's (4, 25); unused for Silu.
+        "situ_betas": tuple(float(b) for b in situ_betas),
     }
 
 
@@ -617,9 +622,13 @@ class RefModel:
             wd = self._cache[g] = (w1d, w2d)
         return wd
 
-    @staticmethod
-    def _ffn(x, w1d, w2d):
+    def _ffn(self, x, w1d, w2d):
         gate, up = (x @ w1d.t()).chunk(2, dim=-1)
+        if self.spec["activation"] == ActivationType.Situv2:
+            # SiTUv2: beta*tanh(g/beta)*sigmoid(g) * linear_beta*tanh(u/linear_beta)
+            b, lb = self.spec["situ_betas"]
+            act = b * torch.tanh(gate / b) * torch.sigmoid(gate)
+            return (act * (lb * torch.tanh(up / lb))) @ w2d.t()
         return (torch.nn.functional.silu(gate) * up) @ w2d.t()
 
     def layer(self, x, ids, wts):
@@ -671,6 +680,7 @@ class DeviceMoEPipeline:
         stage1_fused=False,
         stage2_fused=True,
         combine_quant="none",
+        max_tokens_per_rank=None,
     ):
         self.dist_ctx = dist_ctx
         self.E, self.hdim, self.idim, self.topk = E, hdim, idim, topk
@@ -683,6 +693,12 @@ class DeviceMoEPipeline:
         self.stage1_fused = stage1_fused
         self.stage2_fused = stage2_fused
         self.combine_quant = combine_quant
+        # The arena's tokens per rank. Above ct, a ct-token step runs on an arena
+        # sized for wider steps, as a serving engine's decode does.
+        self.max_tpr = ct if max_tokens_per_rank is None else max_tokens_per_rank
+        # What a rank can receive this step, passed the way ATOM passes it. With
+        # max_tpr == ct it equals the arena's bound, the default when omitted.
+        self.recv_bound = dist_ctx.world * ct
         self.EPR = E // dist_ctx.world
         self.n_shared = 0 if sw1 is None else sw1.shape[0]
         self.dev = torch.device("cuda", dist_ctx.local_rank)
@@ -737,7 +753,7 @@ class DeviceMoEPipeline:
             inter_dim=self.idim,
             experts=self.E + self.n_shared * self.dist_ctx.world,
             topk=self.topk + self.n_shared,
-            max_tokens_per_rank=self.ct,
+            max_tokens_per_rank=self.max_tpr,
         )
         # The communicator carries nothing but this op's arena.
         uid = Communicator.get_unique_id() if r == 0 else None
@@ -748,7 +764,16 @@ class DeviceMoEPipeline:
             uid,
             per_rank_vmm=MegaMoEGfx1250.required_vmm_bytes(recipe, geometry),
         )
-        self.mega = MegaMoEGfx1250.from_recipe(recipe, geometry, communicator=self.comm)
+        situ = {}
+        if self.spec["activation"] == ActivationType.Situv2:
+            beta, linear_beta = self.spec["situ_betas"]
+            situ = {
+                "situ_beta": torch.tensor(beta, device=self.dev),
+                "situ_linear_beta": torch.tensor(linear_beta, device=self.dev),
+            }
+        self.mega = MegaMoEGfx1250.from_recipe(
+            recipe, geometry, communicator=self.comm, **situ
+        )
         self.comm.barrier()
 
     # ---- one graph-capturable layer + full chain (calls grouped together) ---- #
@@ -764,6 +789,8 @@ class DeviceMoEPipeline:
             xn,
             wts,
             ids,
+            recv_token_bound=self.recv_bound,
+            next_recv_token_bound=self.recv_bound if next_ids is not None else None,
             w1=self.w1_a,
             w2=self.w2_a,
             w1_scale=self.w1_s,
@@ -778,7 +805,9 @@ class DeviceMoEPipeline:
     def _pipeline(self, x0):
         x = x0
         if _PLAN_PREFETCH:
-            self.mega.prefetch_compact_plan(self.routings[0][0])
+            self.mega.prefetch_compact_plan(
+                self.routings[0][0], recv_token_bound=self.recv_bound
+            )
         for layer_idx in range(self.n_layers):
             x = self._layer_step(x, layer_idx)
         return x
@@ -1215,7 +1244,9 @@ def main():
     # Set, not setdefault: the wire has to match this, so a stale environment
     # value would otherwise make -q a4w4_mxfp4 silently measure a8w4.
     os.environ["AITER_FORCE_A8W4"] = "0" if args.quant_type == "a4w4_mxfp4" else "1"
-    spec = resolve_spec(args.quant_type)
+    spec = resolve_spec(
+        args.quant_type, args.activation, (args.situ_beta, args.situ_linear_beta)
+    )
     spec["dispatch_wire"] = resolve_dispatch_wire(args.dispatch_wire, args.quant_type)
 
     if get_gfx() != "gfx1250":
@@ -1256,6 +1287,9 @@ def main():
             f"combine_quant={args.combine_quant} "
             f"force_a8w4={os.environ['AITER_FORCE_A8W4']} "
             f"gate={spec['gate_mode'].name} fused_shared_experts={n_shared} "
+            f"max_tokens_per_rank={args.max_tokens_per_rank or ct} "
+            f"activation={args.activation}"
+            f"{f' situ_betas={args.situ_beta},{args.situ_linear_beta}' if args.activation == 'situv2' else ''} "
             f"routing={args.routing}"
             f"{f' zipf_s={args.zipf_s}' if args.routing != 'uniform' else ''} "
             f"expert_balance={expert_balance} data_init={data_dist} "
@@ -1401,6 +1435,7 @@ def main():
             stage1_fused=stage1_fused,
             stage2_fused=stage2_fused,
             combine_quant=combine_quant,
+            max_tokens_per_rank=args.max_tokens_per_rank,
         )
         pipe.setup(x0)
         pipe.capture(x0)
@@ -1597,6 +1632,31 @@ def _parse_args():
     p.add_argument(
         "-tpr", "--token_per_rank", type=int, default=128, help="tokens per rank"
     )
+    p.add_argument(
+        "--max_tokens_per_rank",
+        type=int,
+        default=None,
+        help="the arena's tokens per rank (MegaMoEGeometry.max_tokens_per_rank); "
+        "default -tpr. Larger runs each -tpr step on an arena sized for wider "
+        "steps, as a serving engine's decode does",
+    )
+    p.add_argument(
+        "--activation",
+        type=str,
+        choices=["silu", "situv2"],
+        default="silu",
+        help="the GEMM1 activation: silu, or SiTUv2 (Kimi-K3) with --situ_beta "
+        "and --situ_linear_beta",
+    )
+    p.add_argument(
+        "--situ_beta", type=float, default=4.0, help="SiTUv2 beta (Kimi-K3: 4)"
+    )
+    p.add_argument(
+        "--situ_linear_beta",
+        type=float,
+        default=25.0,
+        help="SiTUv2 linear beta (Kimi-K3: 25)",
+    )
     p.add_argument("-hd", "--hidden", type=int, default=7168, help="model/hidden dim")
     p.add_argument("-id", "--inter", type=int, default=3072, help="intermediate dim")
     p.add_argument(
@@ -1720,6 +1780,11 @@ def _parse_args():
         "Falls back to $COMBINE_QUANT.",
     )
     args = p.parse_args()
+    if (
+        args.max_tokens_per_rank is not None
+        and args.max_tokens_per_rank < args.token_per_rank
+    ):
+        p.error("--max_tokens_per_rank must be >= -tpr")
     if args.shared_experts is not None:
         p.error(
             "--shared_experts (a dense shared FFN added after the MoE) is gone; "

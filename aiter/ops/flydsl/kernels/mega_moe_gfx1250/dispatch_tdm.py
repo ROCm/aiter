@@ -42,6 +42,7 @@ from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr.rocdl import ballot, ds_bpermute, mbcnt_lo, readfirstlane, readlane
 from flydsl.expr.typing import Int32, Int64, T
 
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels import communication_ops_utils as comm_ops
 from aiter.ops.flydsl.kernels.buffer_ops import (
     buffer_load,
@@ -61,7 +62,7 @@ from .config import (
 )
 
 #: gfx1250 LDS per workgroup. The payload tiles are the whole budget.
-_LDS_BUDGET = 327680
+_LDS_BUDGET = get_lds_capacity_bytes("gfx1250")
 
 
 def _align(v, a):

@@ -76,6 +76,7 @@ from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr.rocdl import ballot, ds_bpermute, readfirstlane, readlane, s_nop
 from flydsl.expr.typing import T
 
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels import communication_ops_utils as comm_ops
 from aiter.ops.flydsl.kernels.buffer_ops import (
     buffer_load,
@@ -509,7 +510,8 @@ def make_s1f_stage1(
     ``arg_a1_scale`` / ``arg_w1_scale`` / ``arg_a2_scale`` (tensors),
     ``arg_psum`` (pointer), then i64 addresses ``arena, inp_tok, inp_scale,
     inp_wts, send_list, runs, tile_src, ctl``, then ``i32_m`` (GEMM1 rows
-    capacity), ``inp_cur_tok``, ``f32_swiglu_limit``, ``stream``.
+    capacity), ``inp_cur_tok``, ``f32_swiglu_limit``, ``f32_situ_beta``,
+    ``f32_situ_linear_beta`` (SiTUv2, ``stage1_act`` 3), ``stream``.
 
     ``inp_tok`` holds whole ``row_stride`` wire rows (payload | e8m0 | pad,
     written by the sender quant), so one 16-bit-index TDM gather fetches an
@@ -740,6 +742,8 @@ def make_s1f_stage1(
         i32_m: fx.Int32,
         inp_cur_tok: fx.Int32,
         f32_swiglu_limit: fx.Float32,
+        f32_situ_beta: fx.Float32,
+        f32_situ_linear_beta: fx.Float32,
         stream: fx.Stream,
     ):
         g1_buffers = min(num_buffers, max(1, model_dim // tile_k))
@@ -805,7 +809,10 @@ def make_s1f_stage1(
             raise ValueError(
                 f"producer LDS {prod_lds} B exceeds the GEMM arena {ARENA} B"
             )
-        if int(ctas_per_cu) * (((ARENA_LDS + 256) + 2047) // 2048 * 2048) > 327680:
+        # A gfx1250 workgroup may take all of its CU's LDS, so the CU holds the
+        # workgroup capacity.
+        cu_lds = get_lds_capacity_bytes("gfx1250")
+        if int(ctas_per_cu) * (((ARENA_LDS + 256) + 2047) // 2048 * 2048) > cu_lds:
             raise ValueError(
                 f"{ctas_per_cu} CTAs of {ARENA_LDS + 256} B LDS do not fit one CU"
             )
@@ -838,6 +845,8 @@ def make_s1f_stage1(
             i32_m: fx.Int32,
             inp_cur_tok: fx.Int32,
             f32_swiglu_limit: fx.Float32,
+            f32_situ_beta: fx.Float32,
+            f32_situ_linear_beta: fx.Float32,
         ):
             tid = fx.Int32(fx.thread_idx.x)
             lane = tid & fx.Int32(WAVE - 1)
@@ -2070,8 +2079,8 @@ def make_s1f_stage1(
                     i32_m,
                     n1,
                     f32_swiglu_limit,
-                    fx.Float32(1.0),
-                    fx.Float32(1.0),
+                    f32_situ_beta,
+                    f32_situ_linear_beta,
                     m,
                     n,
                 )
@@ -2100,6 +2109,8 @@ def make_s1f_stage1(
             i32_m,
             inp_cur_tok,
             f32_swiglu_limit,
+            f32_situ_beta,
+            f32_situ_linear_beta,
             value_attrs=lay["kernel_attrs"],
         ).launch(grid=(G, 1, 1), block=(block, 1, 1), stream=stream)
 
