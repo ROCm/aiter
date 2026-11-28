@@ -947,6 +947,59 @@ class TestGlm53TunedArtifact(unittest.TestCase):
         )
 
 
+class TestFmoeFlat1StageInputs(unittest.TestCase):
+    def test_flat_candidates_get_fused_moe_inputs(self):
+        import torch
+
+        from aiter import ActivationType, QuantType, dtypes
+        from aiter.fused_moe import AsmMoeMode
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        tuner = gemm_moe_tune.FmoeTuner.__new__(gemm_moe_tune.FmoeTuner)
+        # gfx950 has FLAT rows in the bf16-input manifest, gfx942 in the fp8 one.
+        for gfx in ("gfx950", "gfx942"):
+            key = (gfx, 256, 1, 4096, 1024, 289, 9, ActivationType.Silu)
+            key += (dtypes.bf16, dtypes.fp8, dtypes.fp8, QuantType.per_1x128, 1, 0)
+            with (
+                self.subTest(gfx=gfx),
+                mock.patch.object(gemm_moe_tune, "get_gfx", return_value=gfx),
+                mock.patch.object(
+                    gemm_moe_tune,
+                    "get_asm_dir",
+                    return_value=str(REPO_ROOT / "hsa" / gfx),
+                ),
+            ):
+                tasks = gemm_moe_tune.FmoeTuner.gen_1stage_asm_task(tuner, key)
+                modes = [AsmMoeMode(task[0][4]) for task in tasks]
+                self.assertIn(AsmMoeMode.NO_SORT, modes)
+                for task, mode in zip(tasks, modes):
+                    want = {} if mode is AsmMoeMode.SORTED else {"flat": mode}
+                    self.assertEqual(task[5], want, task[0][2])
+
+        seen = {}
+
+        def fake_op(out, a1, w1, w2, ids, weights, expert_ids, num_valid_ids, *a, **k):
+            seen["num_valid_ids"] = num_valid_ids
+
+        m, model_dim, topk = 2, 256, 3
+        with (
+            torch.device("cpu"),
+            mock.patch.object(gemm_moe_tune.aiter, "fmoe_fp8_blockscale_g1u1", fake_op),
+        ):
+            a1 = torch.zeros((m, model_dim), dtype=dtypes.bf16)
+            topk_ids = torch.zeros((m, topk), dtype=dtypes.i32)
+            topk_weights = torch.ones((m, topk), dtype=dtypes.fp32)
+            out = gemm_moe_tune.FmoeTuner.run_1stage_fmoe_fp8_blockscale_g1u1(
+                *(a1, a1, None, None, topk_ids, topk_weights, topk_ids, topk_ids),
+                *(None, None, None),
+                flat=AsmMoeMode.NO_SORT,
+            )
+        # FLAT kernels write 8 bytes past the output rows; fused_moe reserves them.
+        self.assertGreaterEqual(out.untyped_storage().nbytes(), m * model_dim * 2 + 8)
+        # A non-empty num_valid_ids would be read as the token count.
+        self.assertEqual(seen["num_valid_ids"].numel(), 0)
+
+
 class TestParallelMxfp4Precompile(unittest.TestCase):
     def test_uses_forkserver_pool_and_reports_failed_cache_jobs(self):
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune

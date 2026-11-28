@@ -35,6 +35,7 @@ from aiter import (
 )
 from aiter.fused_moe import (
     AsmMoeMode,
+    _moe_prepare_unsorted_input,
     _mxfp4_a4w4_stage1_fw,
     _mxfp4_a4w4_stage2_fw,
     asm_stage1,
@@ -2125,12 +2126,26 @@ class FmoeTuner(TunerCommon):
         kernel_name="",
         topk=2,
         dtype=dtypes.bf16,
+        flat: AsmMoeMode | int = AsmMoeMode.SORTED,
     ):
-        moe_buf = torch.zeros(
-            (a1.shape[0], a1.shape[1]),
-            dtype=dtype,
-            device="cuda",
-        )
+        if AsmMoeMode(flat).requires_host_sort:
+            moe_buf = torch.zeros(
+                (a1.shape[0], a1.shape[1]),
+                dtype=dtype,
+                device="cuda",
+            )
+        else:
+            # FLAT kernels get fused_moe's inputs: an empty num_valid_ids (token
+            # count M) and an output followed by the region the kernel writes.
+            (
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                moe_buf,
+            ) = _moe_prepare_unsorted_input(
+                sorted_ids, sorted_weights, a1.shape[1], dtype
+            )
         aiter.fmoe_fp8_blockscale_g1u1(
             moe_buf,
             a1,
@@ -3590,11 +3605,7 @@ class FmoeTuner(TunerCommon):
                             topk,
                             dtype,
                         ),
-                        (
-                            {"flat": asm_mode}
-                            if asm_mode is AsmMoeMode.POST_REDUCE
-                            else {}
-                        ),
+                        {} if asm_mode is AsmMoeMode.SORTED else {"flat": asm_mode},
                         (
                             FmoeTuner.torch_moe_blockscale
                             if q_type == QuantType.per_1x128
@@ -3705,7 +3716,11 @@ class FmoeTuner(TunerCommon):
                                 topk,
                                 dtype,
                             ),
-                            {},
+                            (
+                                {}
+                                if asm_mode is AsmMoeMode.SORTED
+                                else {"flat": asm_mode}
+                            ),
                             (FmoeTuner.torch_moe_blockscale),
                             (
                                 [
