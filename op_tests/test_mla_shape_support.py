@@ -208,6 +208,48 @@ def test_gfx1250_flydsl_ps1_backend(monkeypatch):
     assert (s.backend, s.fold_factor, s.supported) == (MlaBackend.FLYDSL_PS1, 4, False)
 
 
+@pytest.mark.parametrize("arch", ["gfx942", "gfx950"])
+def test_low_head_bf16_fp8_flydsl_backend(arch):
+    # The FlyDSL low-head kernel is the only BF16-Q/FP8-KV route for these
+    # shapes, so the planner takes it without AITER_MLA_DECODE_PS1_FLYDSL. The
+    # KV dtype is pinned per arch: the host's dtypes.fp8 would pick asm-only.
+    kv_dtype = dtypes.defaultDtypes[arch]["fp8"]
+
+    def support(heads, qlen, **kwargs):
+        return get_mla_decode_shape_support(
+            heads,
+            qlen,
+            torch.bfloat16,
+            kv_dtype,
+            arch=arch,
+            enable_experimental=False,
+            flydsl_ps1=False,
+            **kwargs,
+        )
+
+    for heads, qlens in ((4, range(1, 9)), (8, range(1, 9)), (12, range(1, 9))):
+        for qlen in qlens:
+            s = support(heads, qlen)
+            assert s.backend is MlaBackend.FLYDSL_PS1, (heads, qlen)
+            assert s.native and s.kernel_num_heads == heads, (heads, qlen)
+            assert s.supported is True, (heads, qlen, s.reasons)
+    for qlen in range(5, 9):
+        s = support(16, qlen)
+        assert (s.backend, s.kernel_num_heads, s.supported) == (
+            MlaBackend.FLYDSL_PS1,
+            16,
+            True,
+        )
+    # The asm QH16 kernel keeps qlen <= 4.
+    assert support(16, 4).backend is MlaBackend.ASM
+    # No (6, 512) reduce case, qlen past the kernel's 8, a page size or a CP
+    # setting the kernel does not take: not routed to it.
+    assert not support(6, 6).planner_accepts
+    assert not support(12, 9).planner_accepts
+    assert not support(12, 6, page_size=64).planner_accepts
+    assert support(12, 6, cp_world_size=2).backend is not MlaBackend.FLYDSL_PS1
+
+
 def test_ps1_asm_cprr_kernel(monkeypatch):
     monkeypatch.delenv("AITER_MLA_DECODE_PS1_ASM", raising=False)
     fp8 = torch.float8_e4m3fn

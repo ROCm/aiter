@@ -18,6 +18,7 @@
     F(32, 512, __VA_ARGS__) F(40, 128, __VA_ARGS__) F(48, 128, __VA_ARGS__)                 \
     F(64, 64, __VA_ARGS__) F(64, 128, __VA_ARGS__) F(64, 512, __VA_ARGS__)                  \
     F(96, 128, __VA_ARGS__) F(128, 128, __VA_ARGS__) F(128, 512, __VA_ARGS__)               \
-    F(8, 512, __VA_ARGS__) F(12, 512, __VA_ARGS__) F(48, 512, __VA_ARGS__)                  \
+    F(4, 512, __VA_ARGS__) F(8, 512, __VA_ARGS__) F(12, 512, __VA_ARGS__)                   \
+    F(48, 512, __VA_ARGS__)                                                                 \
     F(80, 512, __VA_ARGS__) F(96, 512, __VA_ARGS__) F(112, 512, __VA_ARGS__)
 // clang-format on

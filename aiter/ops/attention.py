@@ -1999,7 +1999,7 @@ class MlaDecodeShapeSupport:
     decides supported.
     supported is True when the selected backend has a kernel for the shape,
     False when it does not, and None when it cannot be determined (opus, HK
-    and FlyDSL routes, or a failed asm query); reasons explains every
+    and gfx1250 FlyDSL routes, or a failed asm query); reasons explains every
     False/None. Some routes write no final LSE for a KV split of one, so
     return_lse is False on them: HK always, and gfx1250 stage 1 unless the Q
     head count is 64. HK is also False with causal=False at max_seqlen_qo > 1
@@ -2626,6 +2626,15 @@ def _get_mla_decode_shape_support_cached(
     ):
         supported = False
     elif asm_route and asm_status is MlaAsmStatus.OK:
+        supported = True
+    elif (
+        backend is MlaBackend.FLYDSL_PS1
+        and arch in ("gfx942", "gfx950")
+        and v_head_dim == 512
+        and cp_world_size == 1
+    ):
+        # The planner selects this route only for shapes the gfx942/gfx950
+        # low-head FlyDSL kernel covers (mla_flydsl_low_head).
         supported = True
     else:
         supported = None

@@ -72,6 +72,18 @@ __device__ auto buf_load_vec(gmem_t& g, int32_t byte_offset)
     return result;
 }
 
+// fp32 -> out_t for the final output. opus truncates fp32 -> bf16 by default on
+// targets without a conversion instruction (gfx942), which biases every output
+// by up to 1 ulp toward zero; round to nearest even instead (mode 5, software RNE).
+template <typename out_t, typename V>
+__device__ auto cast_final_output(const V& v)
+{
+    if constexpr(std::is_same_v<out_t, opus::bf16_t>)
+        return opus::cast<out_t>(v, opus::number<5>{});
+    else
+        return opus::cast<out_t>(v);
+}
+
 // Helper: store kVec elements via multiple buffer ops of at most kMaxBufVec<T> each
 template <int32_t kVec, typename gmem_t, typename V>
 __device__ void buf_store_vec(gmem_t& g, const V& data, int32_t byte_offset)
@@ -454,7 +466,7 @@ __device__ void reduce_output_massive(const MlaReduceKernelV1Params& params,
 
     using out_t                     = typename gmem_final_t::scalar_type;
     const int32_t store_byte_offset = threadIdx.x * kVecWidth * int32_t(sizeof(out_t));
-    auto reg_out_casted             = opus::cast<out_t>(reg_out);
+    auto reg_out_casted             = cast_final_output<out_t>(reg_out);
     buf_store_vec<kVecWidth>(g_final_output, reg_out_casted, store_byte_offset);
 }
 
@@ -707,7 +719,7 @@ __device__ void mla_reduce_v1_impl_simple(const MlaReduceKernelV1Params& params,
 
         const int32_t store_byte_offset = threadIdx.x * kVecWidth * int32_t(sizeof(out_t));
         auto g_final_output             = make_final_output(seq_idx);
-        auto reg_out_casted             = opus::cast<out_t>(reg_out);
+        auto reg_out_casted             = cast_final_output<out_t>(reg_out);
         buf_store_vec<kVecWidth>(g_final_output, reg_out_casted, store_byte_offset);
 
         if(params.output_lse)
@@ -998,7 +1010,7 @@ __global__ void kn_mla_reduce_v1_d64(const MlaReduceKernelV1Params params)
 
         const int64_t final_out_offset =
             int64_t(seq_idx) * params.stride_s_o + head_idx * params.stride_h_o + dim_idx;
-        final_output[final_out_offset] = opus::cast<out_t>(acc);
+        final_output[final_out_offset] = cast_final_output<out_t>(acc);
 
         if(params.output_lse && dim_idx == 0)
         {
@@ -1316,7 +1328,7 @@ __launch_bounds__(Traits::kNumThreads) __global__
                     auto g_out = opus::make_gmem<out_t>(
                         reinterpret_cast<out_t*>(params.p_final_output) + out_elem);
                     buf_store_vec<kVec>(
-                        g_out, opus::cast<out_t>(acc), lane * kVec * int32_t(sizeof(out_t)));
+                        g_out, cast_final_output<out_t>(acc), lane * kVec * int32_t(sizeof(out_t)));
                 }
             }
             else
@@ -1335,7 +1347,7 @@ __launch_bounds__(Traits::kNumThreads) __global__
                         {
                             s += unit_acc[q * kChunkDV + e];
                         }
-                        p_out[e] = opus::cast<out_t>(s);
+                        p_out[e] = cast_final_output<out_t>(s);
                     }
                 }
             }
