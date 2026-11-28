@@ -1,0 +1,14 @@
+{
+    "any": {
+        "BLOCK_C": 512,
+        "num_warps": 16,
+        "num_stages": 1
+    },
+    "shapes_cblocked": {
+        "N=1,C=640,D=3,H=46,W=82,K=640,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_C": 512,
+            "num_warps": 4,
+            "num_stages": 1
+        }
+    }
+}
