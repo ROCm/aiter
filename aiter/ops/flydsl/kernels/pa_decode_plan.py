@@ -386,6 +386,44 @@ def plan_pa_decode(
     the window and query length when decoding or refreshing. Dense plans use
     query length only for the gfx950 default budget.
     """
+    # A refresh of a plan this function already launched for the same lengths
+    # tensor, batch, heads, window and query length: the same compiled planner
+    # and arguments, so skip re-validating and re-deriving them (about 6 us of
+    # host time a call on gfx1250, once per decode step).
+    fast_key = None
+    if (
+        plan is not None
+        and max_partitions is None
+        and max_batch_size is None
+        and workgroup_budget is None
+        # Only the layout the full path accepts: a strided view shares the
+        # pointer and size of a contiguous one.
+        and context_lengths.ndim == 1
+        and context_lengths.is_contiguous()
+    ):
+        fast_key = (
+            id(plan),
+            plan.work_info.data_ptr(),
+            plan.reduce_info.data_ptr(),
+            plan.capacity,
+            plan.max_partitions,
+            context_lengths.data_ptr(),
+            context_lengths.numel(),
+            context_lengths.dtype,
+            num_kv_heads,
+            sliding_window,
+            query_length,
+        )
+        hit = _FAST_REFRESH.get(fast_key)
+        if (
+            hit is not None
+            and context_lengths.device.index == torch.cuda.current_device()
+        ):
+            launch, args = hit
+            _run_compiled(
+                launch, *args, torch.cuda.current_stream(context_lengths.device)
+            )
+            return plan
     if not isinstance(sliding_window, int):
         raise TypeError("sliding_window must be an int")
     sliding_window = max(sliding_window, 0)
@@ -491,8 +529,7 @@ def plan_pa_decode(
             sliding_window > 0,
             properties.gcnArchName.split(":", 1)[0] in ("gfx942", "gfx950"),
         )
-        _run_compiled(
-            launch,
+        args = (
             ptr_arg(context_lengths, fx.Int32),
             ptr_arg(plan.work_info, fx.Int32),
             ptr_arg(plan.reduce_info, fx.Int32),
@@ -500,6 +537,16 @@ def plan_pa_decode(
             plan.capacity,
             plan.max_partitions,
             window,
-            torch.cuda.current_stream(dev),
         )
+        _run_compiled(launch, *args, torch.cuda.current_stream(dev))
+    if fast_key is not None:
+        if len(_FAST_REFRESH) >= 256:
+            _FAST_REFRESH.pop(next(iter(_FAST_REFRESH)))
+        _FAST_REFRESH[fast_key] = (launch, args)
     return plan
+
+
+# plan_pa_decode's refresh fast path: key -> (compiled planner, its arguments
+# but the stream). The key names the plan by identity and buffer addresses and
+# the lengths tensor by address, so a freed and reallocated one misses.
+_FAST_REFRESH: dict = {}

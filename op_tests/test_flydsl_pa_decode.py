@@ -173,6 +173,38 @@ def test_pa_decode_plan(
         graph.replay()
         check(plan, values)
         assert (plan.work_info.data_ptr(), plan.reduce_info.data_ptr()) == pointers
+    # A second refresh of the same plan and lengths tensor reuses the planner
+    # launch of the first, without compiling or re-deriving it.
+    compiled = len(calls)
+    context.copy_(torch.tensor(lengths, dtype=torch.int32, device=device))
+    assert (
+        planner.plan_pa_decode(
+            context, 2, sliding_window=window, query_length=query_length, plan=plan
+        )
+        is plan
+    )
+    check(plan, lengths)
+    assert len(calls) == compiled
+    assert any(key[0] == id(plan) for key in planner._FAST_REFRESH)
+    # A strided view with the pointer and size of a cached contiguous one is
+    # still rejected, not served from the cache.
+    storage = torch.tensor(lengths * 2, dtype=torch.int32, device=device)
+    for _ in range(2):
+        planner.plan_pa_decode(
+            storage[:batch],
+            2,
+            sliding_window=window,
+            query_length=query_length,
+            plan=plan,
+        )
+    with pytest.raises(ValueError, match="contiguous"):
+        planner.plan_pa_decode(
+            storage[::2],
+            2,
+            sliding_window=window,
+            query_length=query_length,
+            plan=plan,
+        )
 
     if bucket > 1:
         # Change every runtime value inside the same batch/block-size bucket
