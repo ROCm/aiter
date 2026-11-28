@@ -1446,7 +1446,7 @@ def _routes_bf16_return(ctx, args):
     staged calls above the small-input capacity (the MTPR class whose "auto" return is FP8 elsewhere) stay within
     --rtol of the fp32 reference.
     """
-    moe, rank, world, device = ctx.moe, ctx.rank, ctx.world, ctx.device
+    moe, rank, device = ctx.moe, ctx.rank, ctx.device
     x, w, ids = ctx.x, ctx.w, ctx.ids
     staged_quant = {e.config.p2p_quant for e in moe._bundle_plan.entries}
     small_rows = {
@@ -1466,7 +1466,12 @@ def _routes_bf16_return(ctx, args):
     staged_rtol = args.rtol if args.staged_rtol is None else args.staged_rtol
     ctx.bind(0, 0)
     hot = torch.arange(moe.topk, dtype=ids.dtype, device=device)
-    for name, n, share in (("hot60", 128, 3), ("one_rank", 64, 5), ("hot60", 448, 3), ("hot100", 512, 5)):
+    for name, n, share in (
+        ("hot60", 128, 3),
+        ("one_rank", 64, 5),
+        ("hot60", 448, 3),
+        ("hot100", 512, 5),
+    ):
         if n > moe.small_m_mtpr:
             continue
         xi, wi, ii = x[:n].clone(), w[:n].clone(), ids[:n].clone()
@@ -1494,7 +1499,12 @@ def _routes_bf16_return(ctx, args):
     for n in (640, 2048, 4096):
         if n > moe.mtpr:
             continue
-        xm = torch.randn((n, ctx.net["model_dim"]), dtype=torch.bfloat16, device=device, generator=gen)
+        xm = torch.randn(
+            (n, ctx.net["model_dim"]),
+            dtype=torch.bfloat16,
+            device=device,
+            generator=gen,
+        )
         wm = w[:1].expand(n, -1).contiguous()
         scores = torch.rand((n, ctx.net["experts"]), device=device, generator=gen)
         im = scores.argsort(dim=1)[:, : moe.topk].to(ids.dtype).contiguous()
@@ -1553,8 +1563,12 @@ def _routes_bf16_return_staged(ctx, args):
     for n in (1, 10, 64, 256, 640, 2048, 4096):
         if n > moe.mtpr:
             continue
-        xm = torch.randn((n, net["model_dim"]), dtype=torch.bfloat16, device=device, generator=gen)
-        wm = torch.rand((n, moe.topk), dtype=torch.float32, device=device, generator=gen)
+        xm = torch.randn(
+            (n, net["model_dim"]), dtype=torch.bfloat16, device=device, generator=gen
+        )
+        wm = torch.rand(
+            (n, moe.topk), dtype=torch.float32, device=device, generator=gen
+        )
         wm = (wm / wm.sum(dim=1, keepdim=True)).contiguous()
         scores = torch.rand((n, net["experts"]), device=device, generator=gen)
         im = scores.argsort(dim=1)[:, : moe.topk].to(ctx.ids.dtype).contiguous()

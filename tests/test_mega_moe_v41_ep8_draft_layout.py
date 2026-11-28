@@ -188,9 +188,7 @@ def test_staged_route_returns_bf16_at_every_capacity(mtpr):
         bucket = entry.token_bucket
         # Only the return format (and the FP8-only aligned-pair Stage2 it rules out) differs from the base config
         # of the same dims: the draft layout has no staged tune of its own.
-        base = select_mega_moe_config(
-            bucket, mtpr, p2p_quant="none", **DRAFT_SHAPE
-        )
+        base = select_mega_moe_config(bucket, mtpr, p2p_quant="none", **DRAFT_SHAPE)
         assert entry.config == base, bucket
         assert main_entry.token_bucket == bucket
 
@@ -208,7 +206,12 @@ def test_other_layouts_keep_their_returns(mtpr):
     """bf16_rows_always and the BF16 staged return are the draft layout's: every other fused layout keeps the
     rows-received choice and the "auto" staged return."""
     assert cfg.BF16_RETURN_LAYOUTS == frozenset(
-        {(8, 16, 5120, 2304), (4, 32, 5120, 2304), (2, 64, 5120, 2304), (1, 128, 5120, 2304)}
+        {
+            (8, 16, 5120, 2304),
+            (4, 32, 5120, 2304),
+            (2, 64, 5120, 2304),
+            (1, 128, 5120, 2304),
+        }
     )
     for shape in TARGET_SHAPES:
         for bucket in _buckets(mtpr):
@@ -222,7 +225,9 @@ def test_other_layouts_keep_their_returns(mtpr):
             )
 
 
-@pytest.mark.parametrize("shape", STAGED_DRAFT_SHAPES, ids=lambda s: f"ep{s['world_size']}")
+@pytest.mark.parametrize(
+    "shape", STAGED_DRAFT_SHAPES, ids=lambda s: f"ep{s['world_size']}"
+)
 def test_staged_draft_layouts_have_no_fused_route(shape):
     layout = dict(DRAFT, world_size=shape["world_size"])
     assert not fused_layout_supported(**layout)
@@ -232,7 +237,9 @@ def test_staged_draft_layouts_have_no_fused_route(shape):
         assert plan.route_for(min(10, mtpr))[0] == ROUTE_STAGED
 
 
-@pytest.mark.parametrize("shape", STAGED_DRAFT_SHAPES, ids=lambda s: f"ep{s['world_size']}")
+@pytest.mark.parametrize(
+    "shape", STAGED_DRAFT_SHAPES, ids=lambda s: f"ep{s['world_size']}"
+)
 @pytest.mark.parametrize("mtpr", [b for b in TOKEN_BUCKETS if b >= 16])
 def test_staged_draft_layouts_return_bf16_at_every_capacity(shape, mtpr):
     """The draft MoE on 1 / 2 / 4 ranks (the DEP4 / DEP2 draft instance has a 16384-token capacity, where "auto"

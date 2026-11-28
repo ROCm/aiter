@@ -1404,7 +1404,11 @@ def select_mega_moe_config(
         # is the race-safe path (only the SYNC reg->LDS copy races at SBM32+nw8)
         # and it reclaims the small-bucket cost that forcing sync would add.
         config = _replace_config(config, stage1={"async_a_copy": True})
-    if bf16_return and config.stage2.aligned_pair and config.p2p_quant == P2P_QUANT_NONE:
+    if (
+        bf16_return
+        and config.stage2.aligned_pair
+        and config.p2p_quant == P2P_QUANT_NONE
+    ):
         # The aligned-pair Stage2 only emits FP8 rows: the plain Stage2 of the same bucket instead.
         config = _replace_config(
             config, stage2={"aligned_pair": False, "pair_cu": 0, "skew_cu": 96}
@@ -1922,7 +1926,9 @@ def _fused_config(
     if layout == V41_FLASH_EP8_DRAFT_LAYOUT:
         return _tune_v41_flash_ep8_draft_small(config, bucket)
     if layout in BF16_RETURN_LAYOUTS:
-        return replace(config, fused_stage1=replace(config.fused_stage1, bf16_rows_always=True))
+        return replace(
+            config, fused_stage1=replace(config.fused_stage1, bf16_rows_always=True)
+        )
     return config
 
 
