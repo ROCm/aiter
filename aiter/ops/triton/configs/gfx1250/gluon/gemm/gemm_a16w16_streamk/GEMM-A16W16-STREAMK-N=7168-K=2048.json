@@ -1,0 +1,25 @@
+{
+    "DEFAULT_FALLBACK": true,
+    "M_LEQ_4096": {
+        "BLOCK_M": 1024,
+        "BLOCK_N": 1024,
+        "BLOCK_K": 128,
+        "NUM_BUFFERS": 2,
+        "CTAS_M": 4,
+        "CTAS_N": 4,
+        "GROUP_SIZE_M": 2,
+        "num_warps": 4,
+        "waves_per_eu": 1
+    },
+    "any": {
+        "BLOCK_M": 1024,
+        "BLOCK_N": 1024,
+        "BLOCK_K": 128,
+        "NUM_BUFFERS": 2,
+        "CTAS_M": 4,
+        "CTAS_N": 4,
+        "GROUP_SIZE_M": 2,
+        "num_warps": 4,
+        "waves_per_eu": 1
+    }
+}
