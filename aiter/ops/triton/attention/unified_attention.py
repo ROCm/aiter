@@ -276,6 +276,133 @@ def gfx950_gluon_supported(
     )
 
 
+def _gfx1250_2d_gluon_supported(
+    *,
+    q_dtype: torch.dtype,
+    kv_cache_dtype: torch.dtype,
+    v_cache_dtype: torch.dtype,
+    head_size: int,
+    head_size_v: int,
+    block_size: int,
+    shuffled_kv_cache: bool,
+    softcap: float,
+    use_alibi_slopes: bool,
+    use_qq_bias: bool,
+) -> bool:
+    """GFX1250 2D Gluon supported configs."""
+    return (
+        _unified_attention_kernel_2d_gfx1250 is not None
+        and not softcap
+        and not use_qq_bias
+        and not use_alibi_slopes
+        and (
+            q_dtype == kv_cache_dtype
+            # NVFP4 KV: fp8 Q (A8W4) or NVFP4 Q (A4W4), shuffled 128-token pages
+            or (kv_cache_dtype == torch.uint8 and q_dtype.itemsize == 1)
+        )
+        and (
+            kv_cache_dtype != torch.uint8
+            or (
+                shuffled_kv_cache
+                and (
+                    block_size == 128
+                    # A8K4V8 (fp8 V) also runs 64-token pages
+                    or (block_size == 64 and v_cache_dtype != torch.uint8)
+                )
+            )
+        )
+        and head_size_v == head_size
+    )
+
+
+def _gfx1250_3d_gluon_supported(*, shuffled_kv_cache: bool) -> bool:
+    """GFX1250 3D Gluon supported configs."""
+    return _unified_attention_kernel_3d_gfx1250 is not None and shuffled_kv_cache
+
+
+def unified_attention_gluon_supported(
+    *,
+    q_dtype: torch.dtype,
+    kv_cache_dtype: torch.dtype,
+    head_size: int,
+    block_size: int,
+    head_size_v: int | None = None,
+    shuffled_kv_cache: bool = False,
+    k_width: int | None = None,
+    softcap: float = 0.0,
+    use_alibi_slopes: bool = False,
+    use_qq_bias: bool = False,
+    v_cache_dtype: torch.dtype | None = None,
+    all_decode: bool = False,
+    sliding_window: bool = False,
+) -> bool:
+    """Return True if `unified_attention` runs these arguments on a Gluon kernel on this device.
+
+    Args:
+        q_dtype (torch.dtype): Dtype of q.
+        kv_cache_dtype (torch.dtype): Dtype of the K cache.
+        head_size (int): Head size of q and k. Double it for an fp4-packed q.
+        block_size (int): Page size of the KV cache.
+        head_size_v (int | None): Head size of v. Default: head_size.
+        shuffled_kv_cache (bool): True if the KV cache uses the shuffled layout.
+        k_width (int | None): Last dimension of the shuffled K cache. Required if
+            shuffled_kv_cache is True.
+        softcap (float): Softcap of the call.
+        use_alibi_slopes (bool): True if the call gives alibi_slopes.
+        use_qq_bias (bool): True if the call gives qq_bias.
+        v_cache_dtype (torch.dtype | None): Dtype of the V cache. Default: kv_cache_dtype.
+        all_decode (bool): True if every sequence of the call has one query
+            (max_seqlen_q == 1). Read on gfx1250 only.
+        sliding_window (bool): True if the call gives a sliding window
+            (window_size[0] >= 0). Read on gfx1250 only.
+
+    Returns:
+        bool: On gfx950, True if its Gluon kernel supports the call. On gfx1250, where
+            the 2D and the 3D kernel have separate gates, the gate of the kernel the
+            call routes to: the 2D one if sliding_window, else the 3D one if
+            all_decode, else both, since the batch decides between them. False on
+            other architectures.
+    """
+    if IS_DEVICE_ARCH_GFX12:
+        if head_size_v is None:
+            head_size_v = head_size
+        if v_cache_dtype is None:
+            v_cache_dtype = kv_cache_dtype
+        gluon_2d = _gfx1250_2d_gluon_supported(
+            q_dtype=q_dtype,
+            kv_cache_dtype=kv_cache_dtype,
+            v_cache_dtype=v_cache_dtype,
+            head_size=head_size,
+            head_size_v=head_size_v,
+            block_size=block_size,
+            shuffled_kv_cache=shuffled_kv_cache,
+            softcap=softcap,
+            use_alibi_slopes=use_alibi_slopes,
+            use_qq_bias=use_qq_bias,
+        )
+        gluon_3d = _gfx1250_3d_gluon_supported(shuffled_kv_cache=shuffled_kv_cache)
+        # use_2d_kernel's order
+        if sliding_window:
+            return gluon_2d
+        if all_decode:
+            return gluon_3d
+        return gluon_2d and gluon_3d
+    if DEVICE_ARCH == "gfx950":
+        return gfx950_gluon_supported(
+            q_dtype=q_dtype,
+            kv_cache_dtype=kv_cache_dtype,
+            head_size=head_size,
+            block_size=block_size,
+            head_size_v=head_size_v,
+            shuffled_kv_cache=shuffled_kv_cache,
+            k_width=k_width,
+            softcap=softcap,
+            use_alibi_slopes=use_alibi_slopes,
+            use_qq_bias=use_qq_bias,
+        )
+    return False
+
+
 def _gfx950_gluon_supported(params: _UAParams):
     """GFX950 Gluon supported configs."""
     return gfx950_gluon_supported(
@@ -921,34 +1048,17 @@ def is_2d_gluon_available(params: _UAParams, backend: str):
     # arch-specific gates
     use_gluon_arch = False
     if DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
-        use_gluon_arch = (
-            _unified_attention_kernel_2d_gfx1250 is not None
-            and not params.softcap
-            and not params.use_qq_bias
-            and not params.use_alibi_slopes
-            and (
-                params.q_dtype == params.kv_cache_dtype
-                # NVFP4 KV: fp8 Q (A8W4) or NVFP4 Q (A4W4), shuffled 128-token pages
-                or (
-                    params.kv_cache_dtype == torch.uint8
-                    and params.q_dtype.itemsize == 1
-                )
-            )
-            and (
-                params.kv_cache_dtype != torch.uint8
-                or (
-                    params.shuffled_kv_cache
-                    and (
-                        params.block_size == 128
-                        # A8K4V8 (fp8 V) also runs 64-token pages
-                        or (
-                            params.block_size == 64
-                            and params.v_cache_dtype != torch.uint8
-                        )
-                    )
-                )
-            )
-            and params.head_size_v == params.head_size
+        use_gluon_arch = _gfx1250_2d_gluon_supported(
+            q_dtype=params.q_dtype,
+            kv_cache_dtype=params.kv_cache_dtype,
+            v_cache_dtype=params.v_cache_dtype,
+            head_size=params.head_size,
+            head_size_v=params.head_size_v,
+            block_size=params.block_size,
+            shuffled_kv_cache=params.shuffled_kv_cache,
+            softcap=params.softcap,
+            use_alibi_slopes=params.use_alibi_slopes,
+            use_qq_bias=params.use_qq_bias,
         )
     elif DEVICE_ARCH == "gfx950":
         use_gluon_arch = _gfx950_gluon_supported(params)
@@ -962,9 +1072,8 @@ def is_3d_gluon_available(params: _UAParams, backend: str):
     # arch-specific gates
     use_gluon_arch = False
     if DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
-        use_gluon_arch = (
-            _unified_attention_kernel_3d_gfx1250 is not None
-            and params.shuffled_kv_cache
+        use_gluon_arch = _gfx1250_3d_gluon_supported(
+            shuffled_kv_cache=params.shuffled_kv_cache
         )
     elif DEVICE_ARCH == "gfx950":
         use_gluon_arch = _gfx950_gluon_supported(params)
