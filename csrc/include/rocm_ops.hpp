@@ -3187,3 +3187,22 @@ namespace py = pybind11;
           py::arg("decode_gate")               = py::none(),                                  \
           py::arg("decode_slot_mapping")       = py::none(),                                  \
           py::arg("decode_positions")          = py::none());
+
+#define M3_TT_SPARSE_PREFILL_PYBIND                                            \
+    m.def("m3_tt_sparse_prefill",                                              \
+          &aiter::m3_tt_sparse_prefill,                                        \
+          "MiniMax-M3 TP1 token-tiled FP8 sparse prefill attention (gfx950)", \
+          py::arg("q"),                                                        \
+          py::arg("k_cache"),                                                  \
+          py::arg("v_cache"),                                                  \
+          py::arg("k_scale"),                                                  \
+          py::arg("v_scale"),                                                  \
+          py::arg("topk_idx"),                                                 \
+          py::arg("block_table"),                                              \
+          py::arg("row_req"),                                                  \
+          py::arg("row_kv_len"),                                               \
+          py::arg("tile_t0"),                                                  \
+          py::arg("tile_n"),                                                   \
+          py::arg("ntiles"),                                                   \
+          py::arg("sm_scale"),                                                 \
+          py::arg("out"));

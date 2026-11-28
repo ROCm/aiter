@@ -2455,5 +2455,20 @@
         "verbose": "False",
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
+    },
+    "module_m3_tt_sparse_prefill": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/m3_tt_sparse_prefill_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/m3_sparse_prefill/tt_sparse_prefill.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-fno-honor-nans -mno-amdgpu-ieee'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
     }
 }
