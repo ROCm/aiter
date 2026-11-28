@@ -32,6 +32,8 @@ DT_fp8_nvfp4_fp8, then that same chain.
 SW is the keys a row can see, min(window, max_seqlen_k), and 0 with no window:
 SW_GEQ_<n> targets a window size, a bare SW matches any window, and a table
 may not mix SW_LEQ and SW_GEQ keys.
+NS is the launch's sequence count, padded slots included. A table that lists it
+puts it last, so a key naming only DT and NS outranks nothing but "any".
 
 A section with no axes, like reduce above, is just a config.
 
@@ -82,6 +84,7 @@ _AXIS_KIND = {
     "K": "num",  # maximum KV length
     "SIMPLE": "bool",  # single-sequence, plain causal MHA prefill
     "EQ": "bool",  # equal query and KV lengths
+    "NS": "num",  # num_seqs in the launch (mixed prefill+decode batches carry many)
 }
 
 
@@ -404,6 +407,24 @@ def _get_unified_attention_config_cached(
     return compute_tile_params(config, block_size)
 
 
+@functools.lru_cache(maxsize=64)
+def _uses_ns(op: str, backend, arch) -> bool:
+    return "NS" in _load(op, backend, arch)[1]
+
+
+def _launch_axes(op: str, params, backend, arch) -> tuple:
+    """Axes kept out of the fixed cache key.
+
+    Prefill axes apply to gluon attn_2d. NS is appended only when this table
+    names it, so a caller that omits num_seqs still fails there, and other
+    tables keep the smaller key.
+    """
+    extra = _prefill_axes(params) if op == "attn_2d" and backend == "gluon" else ()
+    if _uses_ns(op, backend, arch):
+        extra += (("NS", params.num_seqs),)
+    return extra
+
+
 def get_unified_attention_config(
     op: str,
     params,
@@ -439,9 +460,7 @@ def get_unified_attention_config(
         arch,
         params.num_queries_per_kv,
         v_cache_dtype=getattr(params, "v_cache_dtype", None),
-        extra_axes=(
-            _prefill_axes(params) if op == "attn_2d" and backend == "gluon" else ()
-        ),
+        extra_axes=_launch_axes(op, params, backend, arch),
     )
     # NUM_SEGMENTS is derived out here rather than in the cached lookup: it
     # reads the launch's program count, which is not part of the cache key.
@@ -463,9 +482,7 @@ def explain(op: str, params, backend: str = "triton", arch: str | None = None) -
         _programs_per_cu(params),
         params.num_queries_per_kv,
         v_dtype=getattr(params, "v_cache_dtype", None),
-        extra_axes=(
-            _prefill_axes(params) if op == "attn_2d" and backend == "gluon" else ()
-        ),
+        extra_axes=_launch_axes(op, params, backend, arch),
     )
     key, config = _lookup(table, axes, values)
     derived = compute_segment_params(

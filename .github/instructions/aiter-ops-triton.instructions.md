@@ -166,6 +166,7 @@ In unified attention configs, flag:
 - A three-dtype key (`DT_<q>_<k>_<v>`) with `any` in it, or with the same V
   and K tags. The loader tries a three-dtype key only when the V cache dtype
   is not the K cache dtype, and only with exact tags.
+- An `NS` axis that is not the last axis of its schema.
 - A change to the `DT` fallback order (`DT_<q>_<k>_<v>`, `DT_<q>_<k>`,
   `DT_<q>_any`, `DT_any_<k>`, `any`) without an update to
   `configs/AGENTS.md#unified-attention` and `aiter/ops/triton/README.md`.
