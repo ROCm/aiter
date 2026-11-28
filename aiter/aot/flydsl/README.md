@@ -14,6 +14,7 @@ compiles them up front so the runtime JIT path hits the cache.
 | `gdn_fused_prefill.py` | gfx950 single-kernel GDN prefill, by replaying `gdn_fused_prefill_fwd` per head shape in `DEFAULT_SHAPES` |
 | `mega_moe.py` | MegaMoE A8W4 and A4W4 bundles of every deployment profile, by preloading `MegaMoEV2` itself (see below) |
 | `fmha_fp8.py` | gfx950 FP8 flash-attention forward, by replaying `flydsl_flash_attn_fp8_func` per head shape in `DEFAULT_SHAPES` |
+| `qkv_front.py` | gfx950 MiniMax-M3.1 TP4 QKV front (one-launch and split-K tiers), by replaying `qkv_chain_insert` over 1-128 rows |
 | `pa_decode_plan.py` | PA decode planner, every batch bucket, block size and window mode up to each arch's LDS limit, by replaying `plan_pa_decode` (see below) |
 | `mxfp4_moe.py` | Not part of the AOT build; the MXFP4 tuner's `--fast-scan` precompiles its candidates with it |
 | `common.py` | Job collection, the deadlock-free fork pool, `run_aot` (what `setup.py` runs), and cache-hit checking logic |
@@ -261,6 +262,9 @@ per rank, layout `varlen_cross` for the chunked-prefill serving path).
 python -m aiter.aot.flydsl.fmha_fp8
 # ad hoc shape, without editing DEFAULT_SHAPES
 python -m aiter.aot.flydsl.fmha_fp8 --shape 12:12:192:128
+
+# the MiniMax-M3.1 TP4 QKV front, rows 1-128 bisected where the tier or tile switches
+python -m aiter.aot.flydsl.qkv_front
 ```
 
 The PA decode planner compiles one kernel per batch bucket (1, 2, 4, ...,

@@ -36,6 +36,12 @@ class _Event:
     def __init__(self, *_args, **_kwargs):
         pass
 
+    def record(self, _stream=None):
+        pass
+
+    def synchronize(self):
+        pass
+
 
 class _Device:
     """Stand-in for ``torch.cuda.device``: entering it selects nothing. A class,

@@ -65,6 +65,96 @@ def _fused_qknorm_idxrqknorm_hip(
     pass
 
 
+def _take_deferred_front(qkv: Tensor):
+    from .gemm_a8w8_qkv_front import take_deferred
+
+    return take_deferred(qkv)
+
+
+def _run_deferred_front(
+    deferred,
+    q_norm_weight,
+    k_norm_weight,
+    cos_sin_cache,
+    positions,
+    num_heads,
+    num_kv_heads,
+    rotary_dim,
+    eps,
+    index_q_norm_weight,
+    index_k_norm_weight,
+    num_index_heads,
+    slot_mapping,
+    kv_cache_k,
+    kv_cache_v,
+    index_cache,
+    block_size,
+    q_out,
+    index_q_out,
+    index_slot_mapping,
+    kv_cache_dtype,
+    index_cache_dtype,
+    k_scale,
+    v_scale,
+    asm_layout,
+    skip_index_branch,
+) -> None:
+    """Dispatch a parked fused QKV front. The chain kernel is the TP4 MiniMax-M3.1 head set with NVFP4 K / V / index-K
+    pages; anything else cannot consume the parked activation (the QKV was never computed), so it raises.
+    """
+    from .gemm_a8w8_qkv_front import run_deferred
+
+    if not (
+        (num_heads, num_kv_heads, num_index_heads, rotary_dim) == (16, 1, 1, 64)
+        and kv_cache_dtype == "nvfp4"
+        and index_cache_dtype == "nvfp4"
+        and not skip_index_branch
+        and not asm_layout
+        and block_size == 128
+        and q_out is not None
+        and index_q_out is not None
+        and kv_cache_k is not None
+        and kv_cache_v is not None
+        and kv_cache_k.data_ptr() == kv_cache_v.data_ptr()
+        and index_cache is not None
+        and slot_mapping is not None
+    ):
+        raise RuntimeError(
+            "fused_qknorm_idxrqknorm: a deferred QKV front (gemm_a8w8_qkv_front) serves only the 16/1/1-head, rot 64, "
+            "NVFP4 K / V / index-K, block 128, non-asm-layout insert with q_out and index_q_out"
+        )
+    if index_slot_mapping is None:
+        index_slot_mapping = slot_mapping
+    # ``[pages, 2 * kv heads * 9216]`` uint8 pages (K side then V side) as the kernel's [pages, 2, 128, 72] views
+    pages = kv_cache_k
+    kv_pages = torch.as_strided(
+        pages,
+        (pages.shape[0], 2 * num_kv_heads, 128, 72),
+        (pages.stride(0), 128 * 72, 72, 1),
+    )
+    run_deferred(
+        deferred,
+        q_norm_weight,
+        k_norm_weight,
+        index_q_norm_weight,
+        index_k_norm_weight,
+        cos_sin_cache,
+        positions,
+        slot_mapping,
+        index_slot_mapping,
+        kv_pages,
+        index_cache.view(-1, 128, 72),
+        k_scale,
+        v_scale,
+        q_out,
+        index_q_out,
+        num_heads,
+        num_kv_heads,
+        num_index_heads,
+        eps,
+    )
+
+
 # ---- NVFP4 raw front ---------------------------------------------------------------------------
 # The MiniMax-M3 TP4 NVFP4 insert (16 q / 1 kv / 1 index heads, head_dim 128, rotary 64, bf16) is
 # launched eagerly at prefill sizes, where the generic entry's marshalling of 16 tensors through
@@ -288,6 +378,40 @@ def fused_qknorm_idxrqknorm(
             if _is_fp8_e4m3_tensor(index_cache) or _is_fp8_e4m3_tensor(index_q_out)
             else "auto"
         )
+
+    # A QKV projection parked by gemm_a8w8_qkv_front (its static tier is a fused one): the GEMM runs here, in the
+    # same launch as the insert (1-64 rows) or ahead of the reduce-insert (65-128 rows). ``qkv`` is uncomputed.
+    deferred = _take_deferred_front(qkv)
+    if deferred is not None:
+        _run_deferred_front(
+            deferred,
+            q_norm_weight,
+            k_norm_weight,
+            cos_sin_cache,
+            positions,
+            num_heads,
+            num_kv_heads,
+            rotary_dim,
+            eps,
+            index_q_norm_weight,
+            index_k_norm_weight,
+            num_index_heads,
+            slot_mapping,
+            kv_cache_k,
+            kv_cache_v,
+            index_cache,
+            block_size,
+            q_out,
+            index_q_out,
+            index_slot_mapping,
+            kv_cache_dtype,
+            index_cache_dtype,
+            k_scale,
+            v_scale,
+            asm_layout,
+            skip_index_branch,
+        )
+        return
 
     if (
         kv_cache_dtype == "nvfp4"
