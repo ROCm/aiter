@@ -62,6 +62,7 @@ from .mega_moe_config import (
     fused_layout_supported,
     large_m_mtprs_for,
     select_fused_config,
+    shared_in_layout_enabled,
 )
 from .mega_moe_fused_gemm import (
     AddrBuffer,
@@ -1858,9 +1859,12 @@ def compile_mega_moe_stage1(
     async_a_copy: bool = False, use_tile_resource: bool = True,
     waves_per_eu_hint: int = 2, num_cu: int = 256, num_dispatch_cu: int = 32, b_nt: int = -1,
     work_shards: int = 4, payload_chunk_rows: int = 384, swiglu_limit: float = 0.0, fused_g2_chunk: int = 1,
-    payload_min_blocks: int = 0,
+    payload_min_blocks: int = 0, shared_add: bool = False,
 ):
     # fused_stage2 / fused_combine are hashable (key, value) specs and part of the compile key.
+    # shared_add (default False = the kernel as it was): the combine output rows already hold the model's shared
+    # expert output (BF16, written there by the caller's dense launches on the launch stream); the reducers add the
+    # routed sum to them: bf16(f32(bf16(sum)) + f32(shared)), bit for bit ``routed + shared`` on BF16 tensors.
     arch = get_gfx_runtime()
     if arch != "gfx950":
         raise RuntimeError(f"MegaMoE stage1 requires gfx950, got {arch}")
@@ -2092,6 +2096,7 @@ def compile_mega_moe_stage1(
         f"{f'_pmb{payload_min_blocks}' if payload_min_blocks else ''}"
         f"{swiglu_suffix}"
         f"_s2bm{S2_BM}bn{S2_BN}nw{S2_NW}c{G2_CHUNK}_{S2_KEY}_combu{C_U}"
+        f"{'_sha' if shared_add else ''}"
     )
 
     def _g2_decode(unit, total_m):
@@ -2158,7 +2163,11 @@ def compile_mega_moe_stage1(
             if const_expr(C_ROUTE_I8):
                 c_acc = c_acc - Vec.filled(4, 128.0, fx.Float32) * c_sc_sum
             skw = {"soffset_bytes": u * 512} if u > 0 else {}
-            buffer_store(c_acc.to(fx.BFloat16).bitcast(fx.Int32), c_out_rsrc, c_ec * fx.Int32(2),
+            c_res = c_acc.to(fx.BFloat16)
+            if const_expr(shared_add):
+                c_mine = buffer_load(c_out_rsrc, c_ec * fx.Int32(2), vec_width=2, dtype=T.i32, **skw)
+                c_res = (c_res.to(fx.Float32) + Vec(c_mine).bitcast(fx.BFloat16).to(fx.Float32)).to(fx.BFloat16)
+            buffer_store(c_res.bitcast(fx.Int32), c_out_rsrc, c_ec * fx.Int32(2),
                 cache_modifier=C_STORE_CACHE, **skw)
     @flyc.kernel(name=kernel_name, known_block_size=[TOTAL_THREADS, 1, 1])
     def kernel(
@@ -2985,7 +2994,7 @@ def bind_mega_moe_stage1(*, model_dim, inter_dim, rank, experts_per_rank, fuse_n
     fused_combine_args, sort_block_m=32, tile_n=256, tile_k=256, num_waves=4, grid_mult=4, pipe_weights=True,
     mfma_amajor=False, swizzle_a=True, async_a_copy=False, num_dispatch_cu=32,
     use_tile_resource=True, waves_per_eu_hint=2, b_nt=-1, work_shards=4, payload_chunk_rows=384,
-    swiglu_limit=0.0, fused_g2_chunk=1, payload_min_blocks=0):
+    swiglu_limit=0.0, fused_g2_chunk=1, payload_min_blocks=0, shared_add=False):
     """The persistent kernel's launcher and its fused Stage2/Combine launch arguments.
 
     Returns ``(launch, fused, combine_cur_tok, combine_row_nbytes)``: ``fused`` are the i64 addresses that
@@ -3008,6 +3017,7 @@ def bind_mega_moe_stage1(*, model_dim, inter_dim, rank, experts_per_rank, fuse_n
         waves_per_eu_hint=waves_per_eu_hint, num_cu=num_cu, num_dispatch_cu=num_dispatch_cu,
         b_nt=b_nt, work_shards=int(work_shards), payload_chunk_rows=payload_chunk_rows,
         swiglu_limit=swiglu_limit, fused_g2_chunk=int(fused_g2_chunk), payload_min_blocks=int(payload_min_blocks),
+        **({"shared_add": True} if shared_add else {}),
     )
     fused = (fx.Int64(int(mtile_ctr)), *[fx.Int64(int(v)) for v in s2_args], *[fx.Int64(int(v)) for v in c_args[:5]])
     return launch, fused, int(c_args[5]), fx.Int32(int(c_args[6]))
@@ -3028,6 +3038,9 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
 
 
 # Bound launches kept per runtime: every (config, layer slot, weights) a model cycles through.
+# Index of the combine output address in a bound launch's args after the inputs (_bind_fused_launch's tail: parity,
+# expected, the m-tile counters, 13 Stage2 addresses, the combine input, the combine output, ...).
+_TAIL_COMB_OUT = 2 + 1 + 13 + 1
 _LAUNCH_CACHE_MAX = 1024
 
 
@@ -3405,7 +3418,10 @@ class LargeMRuntime:
         self._active_config = config
         return config
 
-    def _run_fused_stage1(self, x, wts, scales, topk_ids, stream, config: MegaMoEConfig, *, preload=False):
+    def _run_fused_stage1(self, x, wts, scales, topk_ids, stream, config: MegaMoEConfig, *, preload=False,
+                          comb_out=None):
+        """``comb_out``: the BF16 rows of the call's own output, holding the shared expert's rows, which the
+        shared_add kernel's combine adds the routed sum to (None: the routed kernel, into the combine buffer)."""
         if stream is None:
             stream = fx.Stream(torch.cuda.current_stream().cuda_stream)
         elif hasattr(stream, "cuda_stream"):
@@ -3442,15 +3458,17 @@ class LargeMRuntime:
             # (see MegaMoEV2's weight attributes), so the pointers are part of the key.
             key = (
                 config, self._active_layer_slot, self._s1_w1.data_ptr(), self._s1_w1_scale.data_ptr(),
-                self.w2.data_ptr(), self.w2_scale.data_ptr(),
+                self.w2.data_ptr(), self.w2_scale.data_ptr(), comb_out is not None,
             )
             bound = self._launch_cache.get(key)
             if bound is None:
                 if len(self._launch_cache) >= _LAUNCH_CACHE_MAX:
                     # Cached launches hold their W1 tensors; drop the old bindings.
                     self._launch_cache.clear()
-                bound = self._launch_cache[key] = self._bind_fused_launch(config)
+                bound = self._launch_cache[key] = self._bind_fused_launch(config, shared_add=comb_out is not None)
             launch, head, tail, c_row_nbytes, tile_m = bound
+            if comb_out is not None:
+                tail = (*tail[:_TAIL_COMB_OUT], fx.Int64(comb_out.data_ptr()), *tail[_TAIL_COMB_OUT + 1:])
             _run_compiled(
                 launch, *head, fx.Int32(cur_tok), fx.Int64(x.data_ptr()), fx.Int64(topk_ids.data_ptr()),
                 fx.Int64(wts.data_ptr()), fx.Int64(scales.data_ptr()), *tail, fx.Int32(cur_tok), c_row_nbytes,
@@ -3460,6 +3478,10 @@ class LargeMRuntime:
             return
         op = self._s1_op
         s1, fused_kw = self._fused_all_kwargs(cur_tok, config)
+        if comb_out is not None:
+            c_args = list(fused_kw["fused_combine_args"])
+            c_args[1] = comb_out.data_ptr()
+            fused_kw.update(shared_add=True, fused_combine_args=tuple(c_args))
         # fmt: off
         self._s1_mega(
             self._s1_out, self._s1_rx, self._s1_w1, self._s1_scale_i32, self._s1_w1_scale,
@@ -3482,10 +3504,12 @@ class LargeMRuntime:
         # fmt: on
         self._s1_active_tile_m = s1.sort_block_m
 
-    def _bind_fused_launch(self, config):
+    def _bind_fused_launch(self, config, shared_add=False):
         """(launch, leading args, args after the inputs, combine row stride, tile_m) of the active slot and
         weights; the same arguments the _s1_mega call below passes."""
         s1, fused_kw = self._fused_all_kwargs(0, config)
+        if shared_add:
+            fused_kw["shared_add"] = True
         # fmt: off
         launch, fused, _, c_row_nbytes = bind_mega_moe_stage1(
             model_dim=self.model_dim, inter_dim=self.inter_dim, rank=self.rank,
@@ -3520,13 +3544,13 @@ class LargeMRuntime:
             )
         return per_1x32_mx_quant(x_bf16, quant_mode="fp8")
 
-    def _run_joint(self, x, scales, wts, topk_ids, run_tokens, stream, slice_output):
+    def _run_joint(self, x, scales, wts, topk_ids, run_tokens, stream, slice_output, comb_out=None):
         if not 0 <= run_tokens <= self.mtpr:
             raise ValueError(f"run_tokens={run_tokens} outside [0, {self.mtpr}]")
         # Launch geometry, tile_m and producer counts are part of the
         # cross-rank wire protocol, so every rank selects the MTPR config.
         config = self._select_config(self.mtpr)
-        self._run_fused_stage1(x, wts, scales, topk_ids, stream, config)
+        self._run_fused_stage1(x, wts, scales, topk_ids, stream, config, comb_out=comb_out)
         out_tok = self.comb_op.combine_output(self.mtpr)
         return out_tok[:run_tokens] if slice_output else out_tok
 
@@ -3632,11 +3656,29 @@ class LargeMRuntime:
         self._run_fused_stage1(
             x_q, wts, scales, topk_ids, stream, self._select_config(self.mtpr), preload=True
         )
+        if self.swiglu_limit > 0 and shared_in_layout_enabled(
+            self.world_size, self.epr, self.model_dim, self.inter_dim
+        ):
+            # The shared_in calls' kernel (shared_add).
+            self._run_fused_stage1(
+                x_q, wts, scales, topk_ids, stream, self._select_config(self.mtpr), preload=True,
+                comb_out=x_bf16,
+            )
 
-    def forward(self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True):
+    def forward(self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True, shared_in=None):
+        """``shared_in``: a weights.SharedExpertInput for which ``shared_in_ready`` holds. The call's own output is
+        then ``routed + shared``, bit for bit ``routed + shared_in.dense()`` on BF16 tensors: the shared expert's dense
+        launches run on this call's MXFP8 rows (the bits the model's own quant gives x) and write their BF16 rows into
+        a fresh output, to which the persistent kernel's combine adds the routed sum -- without the shared expert's
+        quant of x or a separate add."""
         run_tokens = check_forward_inputs(
             x_bf16, wts, topk_ids, max_rows=self.mtpr, model_dim=self.model_dim, topk=self.topk, device=self.dev
         )
+        out = None
+        if shared_in is not None:
+            if not (run_tokens and self.shared_in_ready(run_tokens, shared_in)):
+                raise ValueError("shared_in: this call cannot take the shared expert (see shared_in_ready)")
+            out = torch.empty((run_tokens, self.model_dim), dtype=torch.bfloat16, device=self.dev)
         # The quant kernel runs on the launch stream, ahead of the persistent kernel
         # that reads its output, into the runtime's own buffers (no allocation).
         x_q = self._quant_x[:run_tokens]
@@ -3644,7 +3686,49 @@ class LargeMRuntime:
         if run_tokens:
             with torch.cuda.stream(torch_stream(stream)):
                 per_1x32_mx_quant(x_bf16, quant_mode="fp8", out=(x_q, scales))
+                if out is not None:
+                    self._shared_dense_into(shared_in, x_q, scales, out)
+        if out is not None:
+            self._run_joint(x_q, scales, wts, topk_ids, run_tokens, stream, slice_output, comb_out=out)
+            return out
         return self._run_joint(x_q, scales, wts, topk_ids, run_tokens, stream, slice_output)
+
+    def shared_in_ready(self, tokens: int, shared) -> bool:
+        """Whether a ``tokens``-row call can take ``shared`` (a weights.SharedExpertInput) with the bits of
+        ``routed + shared.dense()``: the layout enabled for shared_in (AITER_MEGA_SHARED_IN, as the small-input
+        route), a clamped SwiGLU, the weights in the layout the dense launches read, and unsplit dense GEMMs at that
+        row count (shared_expert.dense_gate_up_ksplit: the model's own launches, whose MXFP8 quant of the activation
+        between them this route's quant reproduces)."""
+        from .shared_expert import dense_gate_up_ksplit
+
+        return (
+            0 < tokens <= self.mtpr and self.swiglu_limit > 0
+            and shared_in_layout_enabled(self.world_size, self.epr, self.model_dim, self.inter_dim)
+            and shared.weights_fit(self.model_dim, self.inter_dim)
+            and dense_gate_up_ksplit(tokens, self.model_dim, self.inter_dim) == 1
+        )
+
+    def _shared_dense_into(self, shared, x_q, scales, out):
+        """The shared expert's dense launches, the model's own -- group-32 MXFP8 gate_up GEMM on (16, 16)-
+        preshuffled weights, SiLU-mul, MXFP8 quant, down GEMM -- on this call's MXFP8 rows, the down GEMM writing its
+        BF16 rows into ``out``."""
+        from aiter import silu_and_mul
+        from aiter.ops.gemm_op_a8w8 import (
+            gemm_a8w8_blockscale,
+            gemm_a8w8_blockscale_bpreshuffle,
+        )
+
+        f8, e8 = torch.float8_e4m3fn, dtypes.fp8_e8m0
+        rows = int(out.shape[0])
+        # The model's own call (its preshuffled group-32 linear), so the same kernel of the tuned table runs.
+        gate_up = gemm_a8w8_blockscale(
+            x_q, shared.gate_up.view(f8), scales.view(e8), shared.gate_up_scale.view(e8), dtype=torch.bfloat16,
+            isBpreshuffled=True)
+        mid = torch.empty((rows, self.inter_dim), dtype=torch.bfloat16, device=self.dev)
+        silu_and_mul(mid, gate_up, self.swiglu_limit)
+        mid_q, mid_scale = per_1x32_mx_quant(mid, quant_mode="fp8")
+        gemm_a8w8_blockscale_bpreshuffle(
+            mid_q, shared.down.view(f8), mid_scale.view(e8), shared.down_scale.view(e8), torch.bfloat16, out=out)
 
     def forward_prequant(self, x_q, scales, wts, topk_ids, *, stream=None, slice_output=True):
         run_tokens = int(x_q.shape[0])

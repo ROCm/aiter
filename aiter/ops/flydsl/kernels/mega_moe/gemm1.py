@@ -439,9 +439,12 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     source_rows=0, a_dtype="fp8", out_dtype="fp8", swiglu_limit=0.0, pair_k=False, evec,
     act="silu", situ_beta=1.0, situ_linear_beta=1.0, narrow_final_a=False, rows_rsrc=None, lookahead=0,
     out_cache_modifier=0, tile_zero=False, fused_v8=False, epi_lean=0, row_map=None, short_rows=0, fold_rows=0,
-    a_async_lds=False, ascale_packed=False, plan_lookup=None, a_ahead=1):
+    a_async_lds=False, ascale_packed=False, plan_lookup=None, a_ahead=1, mfma_m_active=None):
     # fmt: on
     """Build the GEMM1 atoms and return its expert resolver and tile runner.
+
+    ``mfma_m_active``: MfmaScaleGU's m_active for the lookahead tile runner (rows past
+    mfma_m_active * 16 of every tile it runs must be padding).
 
     ``lookahead > 0`` runs tiles with :func:`do_tile_la`, clamping each tile to its ``rows_rsrc`` row count;
     ``out_cache_modifier`` is the epilogue store cache policy (not used with ``lookahead > 0``, whose stores use
@@ -490,7 +493,8 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
         row_map_rsrc=row_map_rsrc,
         packed=ascale_packed,
     )
-    mfma = MfmaScaleGU(m_repeat=m_repeat, num_acc_n=num_acc_n, a_dtype=a_dtype)
+    mfma = MfmaScaleGU(m_repeat=m_repeat, num_acc_n=num_acc_n, a_dtype=a_dtype, m_active=mfma_m_active)
+    assert mfma_m_active is None or lookahead > 0
 
     def make_epilogue(e_repeat, tile_rows=None):
         # fmt: off

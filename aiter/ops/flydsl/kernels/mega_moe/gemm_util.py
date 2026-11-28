@@ -673,8 +673,12 @@ class AScaleLoader:
 class MfmaScaleGU:
     """Gate/up scaled-MFMA atoms for FP8/FP4 A x FP4 B."""
 
-    def __init__(self, *, m_repeat, num_acc_n, a_dtype="fp8"):
+    def __init__(self, *, m_repeat, num_acc_n, a_dtype="fp8", m_active=None):
         self._m_repeat = m_repeat
+        # m_active < m_repeat: only the first m_active 16-row groups run their MFMAs; the accumulators of
+        # the others keep their value (zero). For tiles whose rows past m_active * 16 are all padding.
+        self._m_active = m_repeat if m_active is None else int(m_active)
+        assert 1 <= self._m_active <= m_repeat
         self._num_acc_n = num_acc_n
         self._is_fp4 = a_dtype == "fp4"
         assert self._is_fp4 or a_dtype == "fp8"
@@ -716,7 +720,7 @@ class MfmaScaleGU:
     def call(self, a_load, b, acc, sa, sb):
         """Non-pipelined lazy-A K-step: a_load(mi,ksub) on demand (one A operand live -> low VGPR, wins small bs)."""
         for ksub in range_constexpr(_PACK):
-            for mi in range_constexpr(self._m_repeat):
+            for mi in range_constexpr(self._m_active):
                 a_op = a_load(mi, ksub)
                 sa_v = sa[mi // _PACK]
                 ia = mi % _PACK
@@ -737,7 +741,7 @@ class MfmaScaleGU:
     def call_pipe(self, a_load, b_prev, acc, sa, sb, load_next):
         """B-major pipe: MFMA b_prev while load_next(ni) issues next-tile B[ni] before its group."""
         a_ops = []
-        for mi in range_constexpr(self._m_repeat):
+        for mi in range_constexpr(self._m_active):
             a_ops.append([a_load(mi, ks) for ks in range_constexpr(_PACK)])
         b_next = []
         for ni in range_constexpr(self._num_acc_n):
@@ -745,7 +749,7 @@ class MfmaScaleGU:
             jb = ni % _PACK
             sb_v = sb[ni // _PACK]
             for ksub in range_constexpr(_PACK):
-                for mi in range_constexpr(self._m_repeat):
+                for mi in range_constexpr(self._m_active):
                     aidx = self.idx(mi, ni)
                     acc[aidx] = self._mfma(
                         a_ops[mi][ksub],
