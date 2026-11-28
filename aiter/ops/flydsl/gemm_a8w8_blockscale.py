@@ -18,6 +18,20 @@ from .gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
     kernels_by_name,
 )
 
+#: M at or below which the 8-wave prefill tile computes mostly padding; the
+#: decode kernel splits N and K instead.
+DECODE_M_MAX = 32
+#: Smallest K with a measured op-level gain.  At K=512 the routed op is flat
+#: (0.99-1.03x over 1..32 rows at N=320/512; graph, A/A 1.00), so those calls
+#: keep the existing backend.
+DECODE_K_MIN = 1024
+#: Largest K with no measured loss against the tuned CK/asm/Triton rows.  At
+#: K=6144, 30 of 96 sweep points are 1-3% slower (worst re-measured median
+#: 0.98x), so those rows keep their kernel; every production decode shape here
+#: has K <= 4096.
+DECODE_K_MAX = 4096
+DECODE_N = 16
+
 
 def is_supported(XQ: Tensor, WQ: Tensor, Out: Tensor, preshuffle_b: bool) -> bool:
     """Whether this backend can honor the call; tuned dispatch asserts this."""
@@ -36,6 +50,46 @@ def is_supported(XQ: Tensor, WQ: Tensor, Out: Tensor, preshuffle_b: bool) -> boo
         return False
     gfx = torch.cuda.get_device_properties(XQ.device).gcnArchName.split(":", 1)[0]
     return kernel_fits_shape(kernelInstance(preshuffle_b), M, N, K, gfx)
+
+
+def decode_supported(XQ: Tensor, WQ: Tensor, Out: Tensor, preshuffle_b: bool) -> bool:
+    """Whether the small-M decode kernel can honor this call on gfx950.
+
+    The decode kernel keeps the 8-wave kernel's scale and dtype contract; it
+    only changes the output tiling.  Its FP8 fragment layout needs N % 16 and
+    its 128-element K blocks need K % 256, both already true for every tuned
+    blockscale row of this backend.
+    """
+    if preshuffle_b or not is_supported(XQ, WQ, Out, preshuffle_b):
+        return False
+    M, K = XQ.shape
+    return (
+        M <= DECODE_M_MAX
+        and DECODE_K_MIN <= K <= DECODE_K_MAX
+        and K % 256 == 0
+        and WQ.shape[0] % 16 == 0
+    )
+
+
+def _prepare_decode_scale(x_scale: Tensor, w_scale: Tensor, M: int, N: int, K: int):
+    """The decode kernel's scales, without a transpose or copy.
+
+    The routed op's plain-scale contract is vLLM's row-major ``[M, K/128]``
+    x_scale; the decode kernel reads exactly that layout.  The 8-wave path's
+    ``_prepare_scales`` keeps its own ``[K/128, M]`` contract unchanged.
+    """
+    KB = K // 128
+    if x_scale.dtype != torch.float32 or w_scale.dtype != torch.float32:
+        raise ValueError("FlyDSL blockscale requires FP32 scales")
+    if tuple(w_scale.shape) != ((N + 127) // 128, KB):
+        raise ValueError("w_scale must have shape (ceil(N / 128), K / 128)")
+    if x_scale.nelement() != M * KB:
+        raise ValueError("x_scale tensor must have the correct number of elements")
+    if tuple(x_scale.shape) != (M, KB):
+        x_scale = x_scale.view(M, KB)
+    if not x_scale.is_contiguous():
+        raise ValueError("decode x_scale must be row-major contiguous (M, K / 128)")
+    return x_scale.view(-1), w_scale.contiguous().view(-1)
 
 
 def _prepare_scales(
@@ -107,6 +161,104 @@ def _compile_gemm(
     return launch
 
 
+@aot_factory("gemm_a8w8_blockscale")
+@functools.lru_cache(maxsize=1024)
+def _compile_decode_gemm(
+    N: int,
+    K: int,
+    tile_m: int,
+    device: torch.device,
+    out_dtype: torch.dtype = torch.bfloat16,
+):
+    import flydsl.expr as fx
+
+    from .kernels.gemm_a8w8_blockscale_decode import (
+        compile_gemm_fp8_decode,
+        decode_k_waves,
+        decode_waves_per_eu,
+    )
+
+    if out_dtype == torch.bfloat16:
+        elem = fx.BFloat16
+    elif out_dtype == torch.float16:
+        elem = fx.Float16
+    else:
+        raise ValueError("FlyDSL blockscale requires BF16 or FP16 output")
+    waves = decode_k_waves(N, K, tile_m, DECODE_N)
+    launch = compile_gemm_fp8_decode(
+        N,
+        K,
+        tile_m,
+        DECODE_N,
+        elem,
+        num_stages=4,
+        k_waves=waves,
+    )
+    launch.compile_hints["opt_level"] = 2
+    # The heuristic and this hint agree on the wave count (compile_hints are
+    # not part of the launcher's cache key, so keep them a pure function of
+    # the arguments).  ``waves_per_eu`` is FlyDSL's supported occupancy knob;
+    # ``maxnreg`` is rejected by this version.
+    launch.compile_hints["waves_per_eu"] = decode_waves_per_eu(waves)
+    return launch
+
+
+def _decode_tile_m(M: int) -> int:
+    return 32 if M > 16 else 16
+
+
+def _run_launcher(
+    launch,
+    XQ: Tensor,
+    WQ: Tensor,
+    Out: Tensor,
+    sa: Tensor,
+    sb: Tensor,
+    M: int,
+) -> Tensor:
+    from .kernels.tensor_shim import _run_compiled, current_stream_arg
+
+    out_contiguous = Out.contiguous()
+    # Keep matrix dimensions separate in the launch ABI: flattening a
+    # >2**31-element matrix overflows a dynamic i32 FlyDSL extent.
+    _run_compiled(
+        launch,
+        XQ.contiguous().view(torch.int8),
+        WQ.contiguous().view(torch.int8),
+        out_contiguous,
+        sa,
+        sb,
+        M,
+        current_stream_arg(XQ.device),
+    )
+    if out_contiguous is not Out:
+        Out.copy_(out_contiguous)
+    return Out
+
+
+def run_gemm_a8w8_blockscale_decode(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Out: Tensor,
+) -> Tensor:
+    """Run the small-M plain-weight decode kernel into ``Out``; never fall back silently."""
+    if not decode_supported(XQ, WQ, Out, False):
+        raise ValueError("Unsupported gfx, shape or dtype for FlyDSL decode GEMM")
+    if x_scale.device != XQ.device or w_scale.device != XQ.device:
+        raise ValueError("FlyDSL blockscale scales must be on the input device")
+
+    M, K = XQ.shape
+    N = WQ.shape[0]
+    with torch.cuda.device(XQ.device):
+        sa, sb = _prepare_decode_scale(x_scale, w_scale, M, N, K)
+        launch = _compile_decode_gemm.lazy(
+            N, K, _decode_tile_m(M), XQ.device, Out.dtype
+        )
+        return _run_launcher(launch, XQ, WQ, Out, sa, sb, M)
+
+
 def run_gemm_a8w8_blockscale(
     XQ: Tensor,
     WQ: Tensor,
@@ -132,29 +284,13 @@ def run_gemm_a8w8_blockscale(
     if x_scale.device != XQ.device or w_scale.device != XQ.device:
         raise ValueError("FlyDSL blockscale scales must be on the input device")
 
-    from .kernels.tensor_shim import _run_compiled, current_stream_arg
-
     M, K = XQ.shape
     N = WQ.shape[0]
     with torch.cuda.device(XQ.device):
         sa, sb = _prepare_scales(x_scale, w_scale, M, N, K, preshuffle_b)
-        out_contiguous = Out.contiguous()
         # Every tensor is contiguous and only Out's dtype varies, so the
         # compile arguments determine the launcher's argument signature. The
         # device keeps one launcher per device on the JIT path; on disk the
         # entry is shared by every device.
-        # Keep matrix dimensions separate in the launch ABI: flattening a
-        # >2**31-element matrix overflows a dynamic i32 FlyDSL extent.
-        _run_compiled(
-            _compile_gemm.lazy(N, K, kernel_name, XQ.device, Out.dtype),
-            XQ.contiguous().view(torch.int8),
-            WQ.contiguous().view(torch.int8),
-            out_contiguous,
-            sa,
-            sb,
-            M,
-            current_stream_arg(XQ.device),
-        )
-        if out_contiguous is not Out:
-            Out.copy_(out_contiguous)
-    return Out
+        launch = _compile_gemm.lazy(N, K, kernel_name, XQ.device, Out.dtype)
+        return _run_launcher(launch, XQ, WQ, Out, sa, sb, M)

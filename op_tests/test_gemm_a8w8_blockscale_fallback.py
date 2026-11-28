@@ -122,5 +122,73 @@ def test_gemm_a8w8_blockscale_triton_fallback_matches_ck():
     torch.testing.assert_close(routed, expected, rtol=2e-2, atol=2e-2)
 
 
+def _decode_dispatch(
+    monkeypatch, m, n, k, config=None, gfx="gfx950", dtype=dtypes.bf16, decode_ok=True
+):
+    """Record which backend ``gemm_a8w8_blockscale`` reaches at a small M.
+
+    The decode launcher itself needs gfx950 and real FlyDSL compilation; these
+    cases stub its gate/launch so they test the dispatch order on any CUDA
+    device.
+    """
+    import aiter.ops.flydsl.gemm_a8w8_blockscale as decode_mod
+
+    reached = []
+    monkeypatch.setattr(gemm_mod, "get_CKGEMM_config", lambda *a, **kw: config)
+    monkeypatch.setattr(gemm_mod, "get_gfx", lambda: gfx)
+    monkeypatch.setattr(
+        gemm_mod,
+        "gemm_a8w8_blockscale_ck",
+        lambda XQ, WQ, x_scale, w_scale, Y, **kw: reached.append("ck") or Y,
+    )
+    monkeypatch.setattr(
+        triton_mod,
+        "gemm_a8w8_blockscale",
+        lambda xq, wq, x_scale, w_scale, dtype=dtypes.bf16, **kw: (
+            reached.append("triton")
+            or torch.empty(xq.shape[0], wq.shape[0], dtype=dtype, device=xq.device)
+        ),
+    )
+    monkeypatch.setattr(decode_mod, "decode_supported", lambda *a, **kw: decode_ok)
+    monkeypatch.setattr(
+        decode_mod,
+        "run_gemm_a8w8_blockscale_decode",
+        lambda XQ, WQ, x_scale, w_scale, Out: reached.append("decode") or Out,
+    )
+    xq = torch.zeros((m, k), device="cuda", dtype=dtypes.fp8)
+    wq = torch.zeros((n, k), device="cuda", dtype=dtypes.fp8)
+    x_scale = torch.ones((m, k // BLOCK), device="cuda", dtype=torch.float32)
+    w_scale = torch.ones(
+        (-(-n // BLOCK), k // BLOCK), device="cuda", dtype=torch.float32
+    )
+    gemm_mod.gemm_a8w8_blockscale(xq, wq, x_scale, w_scale, dtype)
+    assert len(reached) == 1, f"expected one backend call, got {reached}"
+    return reached[0]
+
+
+def test_blockscale_decode_runs_for_untuned_small_m(monkeypatch):
+    assert _decode_dispatch(monkeypatch, 8, 320, 2560) == "decode"
+
+
+def test_blockscale_decode_keeps_a_tuned_row(monkeypatch):
+    assert _decode_dispatch(monkeypatch, 8, 320, 2560, config=CK_CONFIG) == "ck"
+
+
+def test_blockscale_decode_not_routed_for_fp16(monkeypatch):
+    assert _decode_dispatch(monkeypatch, 8, 320, 2560, dtype=dtypes.fp16) == "ck"
+
+
+def test_blockscale_decode_not_routed_on_other_gfx(monkeypatch):
+    assert _decode_dispatch(monkeypatch, 8, 320, 2560, gfx="gfx942") == "ck"
+
+
+def test_blockscale_decode_not_routed_above_m_max(monkeypatch):
+    assert _decode_dispatch(monkeypatch, 33, 320, 2560) == "ck"
+
+
+def test_blockscale_decode_not_routed_when_unsupported(monkeypatch):
+    assert _decode_dispatch(monkeypatch, 8, 320, 2560, decode_ok=False) == "ck"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

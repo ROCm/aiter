@@ -1633,12 +1633,44 @@ def gemm_a8w8_blockscale(
         else:
             assert 0, "asm kernel only support B preshuffle and m >= 16"
 
+    # Configuration first, as this op documents: a tuned row for this exact
+    # (padded) M/N/K keeps its kernel.  Only an untuned plain BF16 small-M
+    # call on gfx950 may use the FlyDSL decode kernel: the tuned CK/asm/Triton
+    # rows have no tile below 16 rows either, and the FlyDSL 8-wave fallback
+    # computes a 256x256 tile.  The decode kernel keeps the same per-128-K
+    # block math in FP32 with 16/32-row tiles and splits N and K instead.
+    # FP16 is not routed (the tables and measurements are BF16; the adapter
+    # still supports fp16 for a direct caller).
     tuned_file = (
         AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32_FILE
         if is_group32
         else AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE
     )
     config = get_CKGEMM_config(m, n, k, tuned_file)
+    if (
+        config is None
+        and not is_group32
+        and not isBpreshuffled
+        and get_gfx() == "gfx950"
+        and dtype == dtypes.bf16
+        # The decode kernel reads vLLM's row-major [M, K/128] scale in place;
+        # any other layout keeps the existing backend instead of copying.
+        and x_scale.is_contiguous()
+        and x_scale.nelement() == m * (k // 128)
+    ):
+        from .flydsl.gemm_a8w8_blockscale import (
+            DECODE_K_MAX,
+            DECODE_K_MIN,
+            DECODE_M_MAX,
+            decode_supported,
+            run_gemm_a8w8_blockscale_decode,
+        )
+
+        if m <= DECODE_M_MAX and DECODE_K_MIN <= k <= DECODE_K_MAX:
+            Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+            if decode_supported(XQ, WQ, Y, False):
+                return run_gemm_a8w8_blockscale_decode(XQ, WQ, x_scale, w_scale, Y)
+
     if config is not None:
         libtype = config["libtype"]
         if libtype == "triton":
