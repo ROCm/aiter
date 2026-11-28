@@ -26,7 +26,7 @@ def _load_tuned_tiles(path: Path) -> dict[tuple, A16W4Tiles]:
         for row in csv.DictReader(source):
             if (
                 row["act"] != "silu_clamped"
-                or row["activation_bf16"] != "1"
+                or row["activation_bf16"] not in ("0", "1")
                 or row["w_dtype"] != "fp4"
                 or row["w_layout"] != "standard"
                 or row["reuse_lds"] not in ("0", "1")
@@ -48,6 +48,7 @@ def _load_tuned_tiles(path: Path) -> dict[tuple, A16W4Tiles]:
                         "topk",
                     )
                 ),
+                row["activation_bf16"] == "1",
                 float(row["swiglu_limit"]),
             )
             if key in entries:
@@ -96,12 +97,7 @@ def get_a16w4_tuned_tiles(
     Lookup uses host metadata only; it does not inspect routing tensors or time
     candidates during inference.
     """
-    if (
-        act != "silu_clamped"
-        or not activation_bf16
-        or w_dtype != "fp4"
-        or w_layout != "standard"
-    ):
+    if act != "silu_clamped" or w_dtype != "fp4" or w_layout != "standard":
         return None
     if not float(swiglu_limit) > 0.0:
         raise ValueError("silu_clamped requires swiglu_limit > 0")
@@ -117,6 +113,7 @@ def get_a16w4_tuned_tiles(
         logical_inter_dim,
         experts,
         topk,
+        bool(activation_bf16),
         float(swiglu_limit),
     )
     return _TUNED_TILES.get(key)
