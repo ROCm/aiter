@@ -27,6 +27,7 @@ from aiter.ops.asm.mla_decode_v4 import (
 )
 from aiter.ops.attention import (
     _mla_decode_launch_plan,
+    _mla_partial_rows_per_split,
     _MlaBackendId,
     _MlaHeadPlanKind,
     mla_ps64_qh128_fp8_asm_fwd,
@@ -1098,6 +1099,10 @@ def mla_decode_fwd(
     provider must return them or decline. ``lse`` is the natural-log FP32 final LSE
     ``[total_q, nhead]`` when ``return_lse`` is set; without it the second
     element is unspecified (None or scratch).
+
+    Persistent metadata must come from ``get_mla_metadata_v1`` with the same
+    ``fast_mode`` and ``intra_batch_mode``. Its ``max_seqlen_qo`` must be -1 or
+    >= the q length of every request. The split buffers are sized from that plan.
     """
     if kv_layout == "nvfp4_n128":
         from aiter.ops.mla_nvfp4 import mla_decode_nvfp4_fwd
@@ -1615,14 +1620,19 @@ def mla_decode_fwd(
         else:
             assert False, f"{nhead=} and {max_seqlen_q=} not supported"
 
-        split_rows = reduce_partial_map.size(0) * max_seqlen_q if has_partials else 0
+        partial_rows = (
+            reduce_partial_map.size(0)
+            * _mla_partial_rows_per_split(head_plan, max_seqlen_q)
+            if has_partials
+            else 0
+        )
         logits = torch.empty(
-            (split_rows, 1, nhead, v_head_dim),
+            (partial_rows, 1, nhead, v_head_dim),
             dtype=dtypes.fp32,
             device=device,
         )
         attn_lse = torch.empty(
-            (split_rows, 1, nhead, 1),
+            (partial_rows, 1, nhead, 1),
             dtype=dtypes.fp32,
             device=device,
         )
