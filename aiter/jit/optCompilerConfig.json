@@ -773,6 +773,21 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
+    "module_moe_token_reorder_opus": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/opus_moe_token_reorder/opus_moe_token_reorder.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/opus_moe_token_reorder_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/opus_moe_token_reorder/include'"
+        ],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
     "module_moe_opus": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/opus_moe_pybind.cu'",
